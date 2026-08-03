@@ -22,6 +22,7 @@ import {
   Users,
   Wrench,
 } from "lucide-react";
+import { MarkdownText } from "./assistant-ui/markdown-text";
 import { cn } from "../lib/utils";
 import { jsonForDisplay } from "../lib/session-activity";
 import type {
@@ -423,14 +424,23 @@ function ActivityDataPart({ data }: DataMessagePartProps<ActivityItem>) {
 
 export function ActivityMessageParts() {
   return (
-    <MessagePrimitive.Parts
-      components={{
-        Reasoning: ActivityReasoningPart,
-        tools: { Fallback: ActivityToolPart },
-        data: { by_name: { [ACTIVITY_DATA_PART]: ActivityDataPart } },
-        ToolGroup: ({ children }) => <div className="grid min-w-0 gap-2">{children}</div>,
-        ReasoningGroup: ({ children }) => <div className="grid min-w-0 gap-2">{children}</div>,
+    <MessagePrimitive.Parts>
+      {({ part }) => {
+        switch (part.type) {
+          case "text":
+            return <MarkdownText />;
+          case "reasoning":
+            return <ActivityReasoningPart {...part} />;
+          case "tool-call":
+            return part.toolUI ?? <ActivityToolPart {...part} />;
+          case "data":
+            return part.name === ACTIVITY_DATA_PART
+              ? <ActivityDataPart {...part} data={part.data as ActivityItem} />
+              : part.dataRendererUI;
+          default:
+            return null;
+        }
       }}
-    />
+    </MessagePrimitive.Parts>
   );
 }

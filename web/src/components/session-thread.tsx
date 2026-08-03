@@ -3,6 +3,7 @@ import {
   AssistantRuntimeProvider,
   ComposerPrimitive,
   MessagePrimitive,
+  QueueItemPrimitive,
   ThreadPrimitive,
   useAui,
   useAuiState,
@@ -280,7 +281,7 @@ function SteerButton({ enabled }: { enabled: boolean }) {
       type="button"
       variant="outline"
       disabled={!enabled || !canSend}
-      onClick={() => aui.composer().send({ steer: true })}
+      onClick={() => aui.composer.send({ steer: true })}
       title="Interrupt the current turn with this message"
     >
       <ArrowRight /> Steer now
@@ -303,6 +304,15 @@ function AgentComposer({
   return (
     <div className="border-t bg-background/95 px-3 pt-3 [padding-bottom:max(0.75rem,env(safe-area-inset-bottom))] backdrop-blur sm:px-4 md:px-6">
       <ComposerPrimitive.Root className="mx-auto grid w-full max-w-3xl gap-2 rounded-xl border bg-background p-2 shadow-sm focus-within:ring-2 focus-within:ring-ring/30">
+        <ComposerPrimitive.Queue>
+          {() => (
+            <div className="flex min-w-0 items-center gap-2 rounded-lg border bg-muted/35 px-2.5 py-2 text-xs">
+              <Clock3 className="size-3.5 shrink-0 text-muted-foreground" />
+              <span className="shrink-0 font-medium text-muted-foreground">Queued</span>
+              <QueueItemPrimitive.Text className="min-w-0 flex-1 truncate" />
+            </div>
+          )}
+        </ComposerPrimitive.Queue>
         <ComposerPrimitive.Input
           disabled={disabled}
           rows={2}
@@ -708,7 +718,9 @@ export function SessionThread({
                 : <TranscriptEmptyState session={session} transcript={transcript} />}
             </ThreadPrimitive.Empty>
             <ActivityExpansionProvider command={expansion}>
-              <ThreadPrimitive.Messages components={{ UserMessage, AssistantMessage }} />
+              <ThreadPrimitive.Messages>
+                {({ message }) => message.role === "user" ? <UserMessage /> : <AssistantMessage />}
+              </ThreadPrimitive.Messages>
             </ActivityExpansionProvider>
             {unseenUpdates > 0 && (
               <Button

@@ -168,6 +168,20 @@ describe("SessionThread transcript states", () => {
     expect(screen.getByText(longUrl)).toBeInTheDocument();
     expect(screen.getByText(longUrl).closest("[class*='overflow-wrap']")).not.toBeNull();
   });
+
+  it("renders assistant markdown through the assistant-ui markdown component", () => {
+    renderThread(rawSession({
+      messages: [{ id: "answer", role: "assistant", text: "## Result\n\n- first\n- second" }],
+      transcript: {
+        state: "available",
+        source: "codex-rollout",
+        messageCount: 1,
+      },
+    }));
+
+    expect(screen.getByRole("heading", { name: "Result", level: 2 })).toBeInTheDocument();
+    expect(screen.getByText("first").closest("ul")).not.toBeNull();
+  });
 });
 
 describe("SessionThread live activity", () => {
@@ -492,6 +506,17 @@ describe("SessionThread live activity", () => {
 });
 
 describe("SessionThread asymmetric composer capabilities", () => {
+  it("renders the provider queue with assistant-ui queue primitives", () => {
+    renderWritableThread(rawSession({
+      queue: [{ id: "queued-1", prompt: "Run this after the active turn" }],
+      control: { capabilities: ["queue"] },
+      transcript: { state: "available", source: "provider-api", messageCount: 0 },
+    }));
+
+    expect(screen.getByText("Queued")).toBeInTheDocument();
+    expect(screen.getByText("Run this after the active turn")).toBeInTheDocument();
+  });
+
   it("does not dispatch or clear a queue-only draft when the steer hotkey is pressed", () => {
     const { onSend } = renderWritableThread(rawSession({
       control: { capabilities: ["queue"] },
