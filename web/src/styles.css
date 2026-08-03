@@ -1,0 +1,135 @@
+@import "tailwindcss";
+
+@custom-variant dark {
+  @media (prefers-color-scheme: dark) {
+    @slot;
+  }
+}
+
+:root {
+  --background: oklch(0.985 0.004 95);
+  --foreground: oklch(0.205 0.015 255);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.205 0.015 255);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.205 0.015 255);
+  --primary: oklch(0.45 0.13 162);
+  --primary-foreground: oklch(0.985 0.004 95);
+  --secondary: oklch(0.945 0.009 95);
+  --secondary-foreground: oklch(0.28 0.02 255);
+  --muted: oklch(0.96 0.006 95);
+  --muted-foreground: oklch(0.52 0.02 255);
+  --accent: oklch(0.94 0.014 162);
+  --accent-foreground: oklch(0.28 0.045 162);
+  --destructive: oklch(0.56 0.22 26);
+  --destructive-foreground: oklch(0.985 0 0);
+  --border: oklch(0.89 0.01 95);
+  --input: oklch(0.86 0.012 95);
+  --ring: oklch(0.53 0.12 162);
+  --sidebar: oklch(0.965 0.008 95);
+  --sidebar-foreground: oklch(0.205 0.015 255);
+  --sidebar-accent: oklch(0.925 0.015 95);
+  --sidebar-border: oklch(0.875 0.012 95);
+  --radius: 0.625rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: oklch(0.17 0.012 255);
+    --foreground: oklch(0.94 0.008 95);
+    --card: oklch(0.205 0.014 255);
+    --card-foreground: oklch(0.94 0.008 95);
+    --popover: oklch(0.205 0.014 255);
+    --popover-foreground: oklch(0.94 0.008 95);
+    --primary: oklch(0.68 0.14 162);
+    --primary-foreground: oklch(0.15 0.02 162);
+    --secondary: oklch(0.26 0.018 255);
+    --secondary-foreground: oklch(0.94 0.008 95);
+    --muted: oklch(0.235 0.014 255);
+    --muted-foreground: oklch(0.67 0.02 255);
+    --accent: oklch(0.28 0.035 162);
+    --accent-foreground: oklch(0.89 0.04 162);
+    --destructive: oklch(0.62 0.2 26);
+    --destructive-foreground: oklch(0.98 0 0);
+    --border: oklch(0.31 0.015 255);
+    --input: oklch(0.34 0.015 255);
+    --ring: oklch(0.63 0.12 162);
+    --sidebar: oklch(0.19 0.014 255);
+    --sidebar-foreground: oklch(0.94 0.008 95);
+    --sidebar-accent: oklch(0.255 0.018 255);
+    --sidebar-border: oklch(0.29 0.015 255);
+  }
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-border: var(--sidebar-border);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --font-sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+* {
+  border-color: var(--border);
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  text-rendering: optimizeLegibility;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+::selection {
+  background: color-mix(in oklab, var(--primary) 28%, transparent);
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}

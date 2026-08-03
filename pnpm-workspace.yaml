@@ -1,0 +1,8 @@
+allowBuilds:
+  esbuild: true
+minimumReleaseAgeExclude:
+  - '@assistant-ui/core@0.3.3'
+  - '@assistant-ui/react@0.15.2'
+  - '@assistant-ui/tap@0.9.9'
+  - fastify@5.11.2
+  - tsx@4.23.5

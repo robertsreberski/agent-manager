@@ -1,0 +1,942 @@
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { get as httpGet } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+
+import type { SessionView } from "../core/types.ts";
+import type {
+  PanePreviewAdapter,
+  ProviderControlAdapter,
+  SessionAction,
+} from "./contracts.ts";
+import { createAgentManagerServer } from "./server.ts";
+import {
+  requestAttachAuthorizeSpawnFromControlSocket,
+  requestAttachExitedFromControlSocket,
+  requestAttachFailedFromControlSocket,
+  requestAttachFromControlSocket,
+  requestAttachStartedFromControlSocket,
+} from "./control-socket.ts";
+import { ManagerDatabase, type OperationalAuditInput } from "./persistence.ts";
+
+const host = "127.0.0.1:43127";
+const origin = "http://127.0.0.1:43127";
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
+}
+
+function temporaryControlSocket() {
+  const root = mkdtempSync(join(tmpdir(), "agent-manager-handoff-test-"));
+  return { root, socketPath: join(root, "runtime", "control.sock") };
+}
+
+function session(overrides: Partial<SessionView> = {}): SessionView {
+  return {
+    id: "codex:thread-1",
+    provider: "codex",
+    sessionId: "thread-1",
+    parentSessionId: null,
+    rootSessionId: "thread-1",
+    depth: 0,
+    name: "Test session",
+    cwd: "/tmp/workspace",
+    kind: "interactive",
+    lifecycle: "live",
+    status: "idle",
+    providerStatus: "idle",
+    waitingReason: null,
+    pid: 123,
+    runtimePid: 123,
+    startedAt: "2026-08-03T00:00:00.000Z",
+    updatedAt: "2026-08-03T00:00:00.000Z",
+    childSummary: {
+      total: 0,
+      running: 0,
+      waiting: 0,
+      idle: 0,
+      completed: 0,
+      failed: 0,
+      interrupted: 0,
+      unknown: 0,
+    },
+    statusSource: "provider-cli",
+    source: "fixture",
+    ownership: "manager",
+    runtimeAlive: true,
+    mode: {
+      value: "execution",
+      providerValue: "default",
+      source: "provider-api",
+      confidence: "exact",
+    },
+    activity: "idle",
+    attention: [],
+    effectiveAccess: {
+      permissionMode: "default",
+      sandboxMode: "workspace-write",
+      fullHostAccess: false,
+    },
+    terminal: {
+      attachAvailable: true,
+      socketName: "fixture",
+      socketPath: null,
+      session: "fixture",
+      window: "main",
+      windowIndex: 0,
+      paneIndex: 0,
+      paneId: "%1",
+      tty: "ttys001",
+      attachedClients: 0,
+    },
+    control: {
+      plane: "codex-app-server",
+      capabilities: ["queue", "steer", "interrupt", "respond", "set-mode", "preview", "attach"],
+      managerOwned: true,
+      writableLease: false,
+    },
+    generation: 0,
+    ...overrides,
+  };
+}
+
+async function authenticatedHeaders(backend: Awaited<ReturnType<typeof createAgentManagerServer>>) {
+  const response = await backend.app.inject({
+    method: "POST",
+    url: "/api/v1/auth/bootstrap",
+    headers: { host, origin, "content-type": "application/json" },
+    payload: { secret: backend.auth.bootstrapSecret },
+  });
+  assert.equal(response.statusCode, 200, response.body);
+  const body = response.json<{ csrfToken: string }>();
+  const cookieHeader = response.headers["set-cookie"];
+  const cookie = (Array.isArray(cookieHeader) ? cookieHeader[0] : cookieHeader)?.split(";", 1)[0];
+  assert.ok(cookie);
+  return {
+    host,
+    origin,
+    cookie,
+    "content-type": "application/json",
+    "x-csrf-token": body.csrfToken,
+  };
+}
+
+test("publishes the active managed run ID in session snapshots", async (t) => {
+  const backend = await createAgentManagerServer({
+    discovery: false,
+    staticDir: false,
+    initialSessions: [session({
+      status: "running",
+      providerStatus: "running",
+      activity: "running",
+      runId: "turn-active",
+    })],
+  });
+  t.after(() => backend.close());
+  await backend.app.ready();
+  const headers = await authenticatedHeaders(backend);
+
+  const response = await backend.app.inject({
+    method: "GET",
+    url: "/api/v1/sessions",
+    headers: { host, cookie: headers.cookie },
+  });
+
+  assert.equal(response.statusCode, 200, response.body);
+  assert.equal(
+    response.json<{ sessions: Array<{ runId?: string | null }> }>().sessions[0]?.runId,
+    "turn-active",
+  );
+});
+
+test("returns bounded transcript only from the authenticated session detail route", async (t) => {
+  const privateText = "selected-session transcript detail";
+  let reads = 0;
+  const backend = await createAgentManagerServer({
+    discovery: false,
+    staticDir: false,
+    transcriptReader: {
+      read(selected) {
+        reads += 1;
+        assert.equal(selected.sessionId, "thread-1");
+        return {
+          messages: [{
+            id: "message-1",
+            role: "assistant",
+            text: privateText,
+            createdAt: "2026-08-03T00:00:01.000Z",
+            status: "complete",
+            label: null,
+          }],
+          transcript: {
+            state: "available",
+            truncated: false,
+            source: "codex-rollout",
+            messageCount: 1,
+            reason: null,
+          },
+        };
+      },
+    },
+    initialSessions: [session()],
+  });
+  t.after(() => backend.close());
+  await backend.app.ready();
+  const headers = await authenticatedHeaders(backend);
+
+  const collection = await backend.app.inject({
+    method: "GET",
+    url: "/api/v1/sessions",
+    headers: { host, cookie: headers.cookie },
+  });
+  assert.equal(collection.statusCode, 200, collection.body);
+  assert.equal(collection.body.includes(privateText), false);
+  assert.equal(collection.body.includes('"messages"'), false);
+  assert.equal(collection.body.includes('"transcript"'), false);
+  assert.equal(reads, 0);
+
+  const detail = await backend.app.inject({
+    method: "GET",
+    url: "/api/v1/sessions/codex:thread-1",
+    headers: { host, cookie: headers.cookie },
+  });
+  assert.equal(detail.statusCode, 200, detail.body);
+  const selected = detail.json<{ session: SessionView }>().session;
+  assert.equal(selected.messages?.[0]?.text, privateText);
+  assert.equal(selected.transcript?.state, "available");
+  assert.equal(reads, 1);
+});
+
+test("sanitizes transcript reader failures", async (t) => {
+  const backend = await createAgentManagerServer({
+    discovery: false,
+    staticDir: false,
+    transcriptReader: {
+      read() {
+        throw new Error("/private/path/that-must-not-leak");
+      },
+    },
+    initialSessions: [session()],
+  });
+  t.after(() => backend.close());
+  await backend.app.ready();
+  const headers = await authenticatedHeaders(backend);
+
+  const detail = await backend.app.inject({
+    method: "GET",
+    url: "/api/v1/sessions/codex:thread-1",
+    headers: { host, cookie: headers.cookie },
+  });
+  assert.equal(detail.statusCode, 200, detail.body);
+  assert.equal(detail.body.includes("/private/path"), false);
+  assert.deepEqual(detail.json<{ session: SessionView }>().session.transcript, {
+    state: "unavailable",
+    truncated: false,
+    source: null,
+    messageCount: 0,
+    reason: "unreadable",
+  });
+});
+
+test("enforces bootstrap, CSRF, leases, stale generations and idempotency", async (t) => {
+  const actions: SessionAction[] = [];
+  const adapter: ProviderControlAdapter = {
+    async createSession() {
+      return session();
+    },
+    async performAction(_view, action) {
+      actions.push(action);
+      return { status: "succeeded", result: { accepted: true } };
+    },
+  };
+  const backend = await createAgentManagerServer({
+    discovery: false,
+    staticDir: false,
+    adapters: { codex: adapter },
+    initialSessions: [session()],
+  });
+  t.after(() => backend.close());
+  await backend.app.ready();
+
+  const badHost = await backend.app.inject({ method: "GET", url: "/api/v1/healthz", headers: { host: "evil.invalid" } });
+  assert.equal(badHost.statusCode, 400);
+
+  const headers = await authenticatedHeaders(backend);
+  const repeatedBootstrap = await backend.app.inject({
+    method: "POST",
+    url: "/api/v1/auth/bootstrap",
+    headers: { host, origin, "content-type": "application/json" },
+    payload: { secret: backend.auth.bootstrapSecret },
+  });
+  assert.equal(repeatedBootstrap.statusCode, 401);
+
+  const withoutCsrf = await backend.app.inject({
+    method: "POST",
+    url: "/api/v1/sessions/codex:thread-1/control-lease",
+    headers: { host, origin, cookie: headers.cookie, "content-type": "application/json" },
+    payload: { clientId: "browser-client" },
+  });
+  assert.equal(withoutCsrf.statusCode, 403);
+
+  const leaseResponse = await backend.app.inject({
+    method: "POST",
+    url: "/api/v1/sessions/codex:thread-1/control-lease",
+    headers,
+    payload: { clientId: "browser-client" },
+  });
+  assert.equal(leaseResponse.statusCode, 200, leaseResponse.body);
+  const lease = leaseResponse.json<{ lease: { token: string } }>().lease;
+  const generation = backend.state.get("codex:thread-1")!.generation;
+  const actionHeaders = { ...headers, "x-control-lease": lease.token };
+  const payload = {
+    type: "send" as const,
+    delivery: "queue" as const,
+    text: "Do the work",
+    expectedGeneration: generation,
+    idempotencyKey: "idem-key-0001",
+  };
+  const first = await backend.app.inject({
+    method: "POST",
+    url: "/api/v1/sessions/codex:thread-1/actions",
+    headers: actionHeaders,
+    payload,
+  });
+  assert.equal(first.statusCode, 200, first.body);
+  const firstAction = first.json<{ action: { status: string; result?: unknown } }>().action;
+  assert.equal(firstAction.status, "succeeded");
+  assert.equal("result" in firstAction, false);
+
+  const duplicate = await backend.app.inject({
+    method: "POST",
+    url: "/api/v1/sessions/codex:thread-1/actions",
+    headers: actionHeaders,
+    payload,
+  });
+  assert.equal(duplicate.statusCode, 200, duplicate.body);
+  assert.equal(actions.length, 1);
+
+  const conflict = await backend.app.inject({
+    method: "POST",
+    url: "/api/v1/sessions/codex:thread-1/actions",
+    headers: actionHeaders,
+    payload: { ...payload, text: "Different" },
+  });
+  assert.equal(conflict.statusCode, 409);
+
+  const stale = await backend.app.inject({
+    method: "POST",
+    url: "/api/v1/sessions/codex:thread-1/actions",
+    headers: actionHeaders,
+    payload: { ...payload, expectedGeneration: generation + 1, idempotencyKey: "idem-key-0002" },
+  });
+  assert.equal(stale.statusCode, 409);
+  assert.equal(stale.json<{ error: { code: string } }>().error.code, "STALE_GENERATION");
+});
+
+test("bounds pane previews and never accepts browser-supplied tmux targets", async (t) => {
+  const captured: Array<{ maxLines: number; maxBytes: number; paneId: string }> = [];
+  const previewAdapter: PanePreviewAdapter = {
+    async capture(terminal, limits) {
+      captured.push({ ...limits, paneId: terminal.paneId });
+      return { content: "safe output", truncated: false, lineCount: 1, byteCount: 11 };
+    },
+  };
+  const backend = await createAgentManagerServer({
+    discovery: false,
+    staticDir: false,
+    previewAdapter,
+    initialSessions: [session()],
+  });
+  t.after(() => backend.close());
+  await backend.app.ready();
+  const headers = await authenticatedHeaders(backend);
+  const response = await backend.app.inject({
+    method: "GET",
+    url: "/api/v1/sessions/codex:thread-1/preview?lines=999&bytes=999999&paneId=%2599",
+    headers: { host, cookie: headers.cookie },
+  });
+  assert.equal(response.statusCode, 400, response.body);
+
+  const bounded = await backend.app.inject({
+    method: "GET",
+    url: "/api/v1/sessions/codex:thread-1/preview?lines=200&bytes=65536&paneId=%2599",
+    headers: { host, cookie: headers.cookie },
+  });
+  assert.equal(bounded.statusCode, 200, bounded.body);
+  assert.deepEqual(captured, [{ maxLines: 200, maxBytes: 65_536, paneId: "%1" }]);
+});
+
+test("browser attach exposes only the guarded manager CLI wrapper", async (t) => {
+  let rawInstructionRequests = 0;
+  const backend = await createAgentManagerServer({
+    discovery: false,
+    staticDir: false,
+    adapters: {
+      codex: {
+        async createSession() { return session(); },
+        async performAction() { return { status: "succeeded" }; },
+        async getAttachInstruction() {
+          rawInstructionRequests += 1;
+          return {
+            kind: "codex-remote",
+            argv: ["codex", "resume", "thread-1", "--remote", "unix:///private/tmp/private.sock"],
+            cwd: "/tmp/workspace",
+            warning: null,
+          };
+        },
+      },
+    },
+    initialSessions: [session()],
+  });
+  t.after(() => backend.close());
+  await backend.app.ready();
+  const headers = await authenticatedHeaders(backend);
+
+  const response = await backend.app.inject({
+    method: "GET",
+    url: "/api/v1/sessions/codex:thread-1/attach",
+    headers: { host, cookie: headers.cookie },
+  });
+
+  assert.equal(response.statusCode, 200, response.body);
+  assert.deepEqual(response.json<{ instruction: { kind: string; argv: string[] } }>().instruction, {
+    kind: "manager-cli",
+    argv: ["agent-manager", "attach", "codex:thread-1"],
+    cwd: "/tmp/workspace",
+    warning: "Run this command locally to perform a guarded ownership handoff through Agent Manager.",
+  });
+  assert.equal(rawInstructionRequests, 0);
+});
+
+test("pre-spawn authorization leaves ownership fail-closed when its wrapper dies before reporting a child", async (t) => {
+  const temporary = temporaryControlSocket();
+  let reclaimCalls = 0;
+  const backend = await createAgentManagerServer({
+    discovery: false,
+    staticDir: false,
+    controlSocketPath: temporary.socketPath,
+    adapters: {
+      codex: {
+        async createSession() { return session(); },
+        async performAction() { return { status: "succeeded" }; },
+        async getAttachInstruction() {
+          return {
+            kind: "codex-remote",
+            argv: ["codex", "resume", "thread-1", "--remote", "unix:///tmp/codex.sock"],
+            cwd: "/tmp/workspace",
+            warning: null,
+          };
+        },
+        async reclaimFromCli() {
+          reclaimCalls += 1;
+          return session();
+        },
+      },
+    },
+    initialSessions: [session()],
+  });
+  t.after(async () => {
+    await backend.close().catch(() => undefined);
+    rmSync(temporary.root, { recursive: true, force: true });
+  });
+
+  const reply = await requestAttachFromControlSocket(temporary.socketPath, "codex:thread-1");
+  assert.ok(reply.instruction.handoffId);
+  assert.ok(reply.instruction.spawnNonce);
+  const wrapper = spawn(process.execPath, ["-e", "setTimeout(() => {}, 250)"], {
+    stdio: "ignore",
+  });
+  await once(wrapper, "spawn");
+  await requestAttachAuthorizeSpawnFromControlSocket(
+    temporary.socketPath,
+    "codex:thread-1",
+    reply.instruction.handoffId!,
+    reply.instruction.spawnNonce!,
+    wrapper.pid!,
+  );
+  await once(wrapper, "exit");
+  await delay(1_100);
+
+  assert.equal(reclaimCalls, 0);
+  await assert.rejects(
+    requestAttachFromControlSocket(temporary.socketPath, "codex:thread-1"),
+    /attach-unavailable/,
+  );
+  assert.equal(
+    backend.state.snapshot().diagnostics.some((item) =>
+      item.message.includes("wrapper died before reporting the provider child")
+    ),
+    true,
+  );
+});
+
+test("provider-attached state survives audit failure and classifies a later failure as an exit", async (t) => {
+  const temporary = temporaryControlSocket();
+  const database = new ManagerDatabase();
+  const originalAudit = database.auditOperation.bind(database);
+  database.auditOperation = ((input: OperationalAuditInput) => {
+    if (input.operation === "native.handoff" && input.outcome === "attached") {
+      throw new Error("injected attached audit failure");
+    }
+    originalAudit(input);
+  }) as ManagerDatabase["auditOperation"];
+  let attachedCalls = 0;
+  let exitedCalls = 0;
+  let failedCalls = 0;
+  const backend = await createAgentManagerServer({
+    discovery: false,
+    staticDir: false,
+    database,
+    controlSocketPath: temporary.socketPath,
+    adapters: {
+      codex: {
+        async createSession() { return session(); },
+        async performAction() { return { status: "succeeded" }; },
+        async getAttachInstruction() {
+          return {
+            kind: "codex-remote",
+            argv: ["codex", "resume", "thread-1", "--remote", "unix:///tmp/codex.sock"],
+            cwd: "/tmp/workspace",
+            warning: null,
+          };
+        },
+        markCliAttached() { attachedCalls += 1; },
+        markCliExited() { exitedCalls += 1; },
+        markCliAttachFailed() { failedCalls += 1; },
+        async reclaimFromCli() { return session(); },
+      },
+    },
+    initialSessions: [session()],
+  });
+  t.after(async () => {
+    await backend.close().catch(() => undefined);
+    rmSync(temporary.root, { recursive: true, force: true });
+  });
+
+  const reply = await requestAttachFromControlSocket(temporary.socketPath, "codex:thread-1");
+  const handoffId = reply.instruction.handoffId!;
+  const spawnNonce = reply.instruction.spawnNonce!;
+  await requestAttachAuthorizeSpawnFromControlSocket(
+    temporary.socketPath,
+    "codex:thread-1",
+    handoffId,
+    spawnNonce,
+    process.pid,
+  );
+  await requestAttachStartedFromControlSocket(
+    temporary.socketPath,
+    "codex:thread-1",
+    handoffId,
+    spawnNonce,
+    process.pid,
+  );
+  await requestAttachFailedFromControlSocket(
+    temporary.socketPath,
+    "codex:thread-1",
+    handoffId,
+    "lost wrapper acknowledgement",
+  );
+
+  assert.equal(attachedCalls, 1);
+  assert.equal(exitedCalls, 1);
+  assert.equal(failedCalls, 0);
+});
+
+test("timed-out native reclaim observes one shared provider transition until eventual success", async (t) => {
+  const temporary = temporaryControlSocket();
+  let resolveReclaim!: (view: SessionView) => void;
+  const pendingReclaim = new Promise<SessionView>((resolve) => {
+    resolveReclaim = resolve;
+  });
+  let reclaimCalls = 0;
+  const backend = await createAgentManagerServer({
+    discovery: false,
+    staticDir: false,
+    shutdownTimeoutMs: 250,
+    controlSocketPath: temporary.socketPath,
+    adapters: {
+      codex: {
+        async createSession() { return session(); },
+        async performAction() { return { status: "succeeded" }; },
+        async getAttachInstruction() {
+          return {
+            kind: "codex-remote",
+            argv: ["codex", "resume", "thread-1", "--remote", "unix:///tmp/codex.sock"],
+            cwd: "/tmp/workspace",
+            warning: null,
+          };
+        },
+        async reclaimFromCli() {
+          reclaimCalls += 1;
+          return await pendingReclaim;
+        },
+      },
+    },
+    initialSessions: [session()],
+  });
+  t.after(async () => {
+    resolveReclaim(session());
+    await backend.close().catch(() => undefined);
+    rmSync(temporary.root, { recursive: true, force: true });
+  });
+
+  const reply = await requestAttachFromControlSocket(temporary.socketPath, "codex:thread-1");
+  const handoffId = reply.instruction.handoffId!;
+  const spawnNonce = reply.instruction.spawnNonce!;
+  await requestAttachAuthorizeSpawnFromControlSocket(
+    temporary.socketPath,
+    "codex:thread-1",
+    handoffId,
+    spawnNonce,
+    process.pid,
+  );
+  await requestAttachStartedFromControlSocket(
+    temporary.socketPath,
+    "codex:thread-1",
+    handoffId,
+    spawnNonce,
+    process.pid,
+  );
+  await assert.rejects(
+    requestAttachExitedFromControlSocket(
+      temporary.socketPath,
+      "codex:thread-1",
+      handoffId,
+      0,
+    ),
+    /attach-lifecycle-failed/,
+  );
+  assert.equal(reclaimCalls, 1);
+  await assert.rejects(
+    requestAttachFromControlSocket(temporary.socketPath, "codex:thread-1"),
+    /attach-unavailable/,
+  );
+
+  resolveReclaim(session());
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(reclaimCalls, 1);
+  const next = await requestAttachFromControlSocket(temporary.socketPath, "codex:thread-1");
+  assert.ok(next.instruction.spawnNonce);
+});
+
+test("session creation reserves a durable idempotency intent before provider dispatch", async (t) => {
+  let calls = 0;
+  let managerRequestId: string | undefined;
+  const backend = await createAgentManagerServer({
+    discovery: false,
+    staticDir: false,
+    adapters: {
+      codex: {
+        async createSession(_input, context) {
+          calls += 1;
+          managerRequestId = context.managerSessionId;
+          return session();
+        },
+        async performAction() { return { status: "succeeded" }; },
+      },
+    },
+  });
+  t.after(() => backend.close());
+  backend.database.addWorkspace({ id: "workspace-one", label: "One", path: "/tmp/workspace" });
+  await backend.app.ready();
+  const headers = await authenticatedHeaders(backend);
+  const payload = {
+    provider: "codex" as const,
+    workspaceId: "workspace-one",
+    initialMessage: "Private initial task",
+    mode: "planning" as const,
+    permissionPreset: "standard" as const,
+    idempotencyKey: "create-idempotency-one",
+  };
+  const first = await backend.app.inject({
+    method: "POST",
+    url: "/api/v1/sessions",
+    headers,
+    payload,
+  });
+  assert.equal(first.statusCode, 201, first.body);
+  assert.match(managerRequestId ?? "", /^manager-request:/);
+
+  const duplicate = await backend.app.inject({
+    method: "POST",
+    url: "/api/v1/sessions",
+    headers,
+    payload,
+  });
+  assert.equal(duplicate.statusCode, 200, duplicate.body);
+  assert.equal(calls, 1);
+
+  const conflict = await backend.app.inject({
+    method: "POST",
+    url: "/api/v1/sessions",
+    headers,
+    payload: { ...payload, initialMessage: "Different task" },
+  });
+  assert.equal(conflict.statusCode, 409, conflict.body);
+  assert.equal(conflict.json<{ error: { code: string } }>().error.code, "IDEMPOTENCY_CONFLICT");
+  assert.equal(calls, 1);
+});
+
+test("requires explicit full-host arming on the exclusive control lease", async (t) => {
+  let calls = 0;
+  const backend = await createAgentManagerServer({
+    discovery: false,
+    staticDir: false,
+    adapters: {
+      codex: {
+        async createSession() { return session(); },
+        async performAction() { calls += 1; return { status: "succeeded" }; },
+      },
+    },
+    initialSessions: [session({
+      effectiveAccess: {
+        permissionMode: "never",
+        sandboxMode: "danger-full-access",
+        fullHostAccess: true,
+      },
+    })],
+  });
+  t.after(() => backend.close());
+  await backend.app.ready();
+  const headers = await authenticatedHeaders(backend);
+  const leaseResponse = await backend.app.inject({
+    method: "POST",
+    url: "/api/v1/sessions/codex:thread-1/control-lease",
+    headers,
+    payload: { clientId: "browser-client", armFullHost: false },
+  });
+  const lease = leaseResponse.json<{ lease: { token: string } }>().lease;
+  const response = await backend.app.inject({
+    method: "POST",
+    url: "/api/v1/sessions/codex:thread-1/actions",
+    headers: { ...headers, "x-control-lease": lease.token },
+    payload: {
+      type: "interrupt",
+      expectedGeneration: backend.state.get("codex:thread-1")!.generation,
+      idempotencyKey: "idem-key-armed",
+    },
+  });
+  assert.equal(response.statusCode, 428, response.body);
+  assert.equal(calls, 0);
+
+  const missingCurrentToken = await backend.app.inject({
+    method: "POST",
+    url: "/api/v1/sessions/codex:thread-1/control-lease",
+    headers,
+    payload: { clientId: "browser-client", armFullHost: true },
+  });
+  assert.equal(missingCurrentToken.statusCode, 409, missingCurrentToken.body);
+
+  const armedResponse = await backend.app.inject({
+    method: "POST",
+    url: "/api/v1/sessions/codex:thread-1/control-lease",
+    headers: { ...headers, "x-control-lease": lease.token },
+    payload: { clientId: "browser-client", armFullHost: true },
+  });
+  assert.equal(armedResponse.statusCode, 200, armedResponse.body);
+  const armed = armedResponse.json<{ lease: { token: string } }>().lease;
+  assert.notEqual(armed.token, lease.token);
+
+  const oldToken = await backend.app.inject({
+    method: "POST",
+    url: "/api/v1/sessions/codex:thread-1/actions",
+    headers: { ...headers, "x-control-lease": lease.token },
+    payload: {
+      type: "interrupt",
+      expectedGeneration: backend.state.get("codex:thread-1")!.generation,
+      idempotencyKey: "idem-key-old-token",
+    },
+  });
+  assert.equal(oldToken.statusCode, 409, oldToken.body);
+
+  const armedAction = await backend.app.inject({
+    method: "POST",
+    url: "/api/v1/sessions/codex:thread-1/actions",
+    headers: { ...headers, "x-control-lease": armed.token },
+    payload: {
+      type: "interrupt",
+      expectedGeneration: backend.state.get("codex:thread-1")!.generation,
+      idempotencyKey: "idem-key-armed-success",
+    },
+  });
+  assert.equal(armedAction.statusCode, 200, armedAction.body);
+  assert.equal(calls, 1);
+});
+
+test("serves the production SPA fallback without weakening Host checks", async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-manager-static-"));
+  writeFileSync(join(directory, "index.html"), "<!doctype html><title>Agent Manager Fixture</title>");
+  const backend = await createAgentManagerServer({
+    discovery: false,
+    staticDir: directory,
+  });
+  t.after(async () => {
+    await backend.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  await backend.app.ready();
+  const response = await backend.app.inject({
+    method: "GET",
+    url: "/sessions/thread",
+    headers: { host, accept: "text/html" },
+  });
+  assert.equal(response.statusCode, 200, response.body);
+  assert.match(response.body, /Agent Manager Fixture/);
+  const rejected = await backend.app.inject({
+    method: "GET",
+    url: "/sessions/thread",
+    headers: { host: "evil.invalid", accept: "text/html" },
+  });
+  assert.equal(rejected.statusCode, 400);
+});
+
+test("serves SSE with EventSource-compatible headers over a real HTTP response", async (t) => {
+  const backend = await createAgentManagerServer({
+    host: "127.0.0.1",
+    port: 0,
+    allowedHosts: [host],
+    allowedOrigins: [origin],
+    discovery: false,
+    staticDir: false,
+    initialSessions: [session()],
+  });
+  t.after(() => backend.close());
+  const address = new URL(await backend.listen());
+  const headers = await authenticatedHeaders(backend);
+
+  const response = await new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
+    const request = httpGet({
+      hostname: address.hostname,
+      port: Number(address.port),
+      path: "/api/v1/events",
+      headers: {
+        host,
+        cookie: headers.cookie,
+        accept: "text/event-stream",
+      },
+    }, resolve);
+    request.once("error", reject);
+  });
+  t.after(() => response.destroy());
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.headers["content-type"], "text/event-stream; charset=utf-8");
+  assert.equal(response.headers["cache-control"], "no-store");
+  assert.equal(response.headers["x-accel-buffering"], "no");
+
+  const firstChunk = await new Promise<string>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("timed out waiting for the SSE snapshot")), 1_000);
+    timer.unref();
+    response.once("data", (chunk: Buffer) => {
+      clearTimeout(timer);
+      resolve(chunk.toString("utf8"));
+    });
+    response.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+  response.destroy();
+
+  assert.match(firstChunk, /^id: \d+\nevent: snapshot\ndata: /);
+});
+
+test("replaces a stale SSE stream from the same authenticated browser client", async (t) => {
+  const backend = await createAgentManagerServer({
+    host: "127.0.0.1",
+    port: 0,
+    allowedHosts: [host],
+    allowedOrigins: [origin],
+    maxSseClientsPerAuthSession: 1,
+    discovery: false,
+    staticDir: false,
+    initialSessions: [session()],
+  });
+  t.after(() => backend.close());
+  const address = new URL(await backend.listen());
+  const headers = await authenticatedHeaders(backend);
+  const openStream = () => new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
+    const request = httpGet({
+      hostname: address.hostname,
+      port: Number(address.port),
+      path: "/api/v1/events?clientId=web-reconnect-test",
+      headers: {
+        host,
+        cookie: headers.cookie,
+        accept: "text/event-stream",
+      },
+    }, resolve);
+    request.once("error", reject);
+  });
+
+  const first = await openStream();
+  t.after(() => first.destroy());
+  assert.equal(first.statusCode, 200);
+  await once(first, "data");
+  const firstClosed = new Promise<void>((resolve) => {
+    first.once("close", resolve);
+    first.once("aborted", resolve);
+    first.once("error", resolve);
+  });
+
+  const second = await openStream();
+  t.after(() => second.destroy());
+  assert.equal(second.statusCode, 200);
+  await Promise.race([
+    firstClosed,
+    delay(1_000).then(() => { throw new Error("replaced SSE stream did not close"); }),
+  ]);
+});
+
+test("durable idempotency receipts prevent replay after a server restart", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-manager-receipt-"));
+  const databasePath = join(directory, "state.sqlite");
+  let calls = 0;
+  const adapter: ProviderControlAdapter = {
+    async createSession() { return session(); },
+    async performAction() { calls += 1; return { status: "succeeded" }; },
+  };
+  const payload = {
+    type: "send" as const,
+    delivery: "queue" as const,
+    text: "Only once",
+    expectedGeneration: 1,
+    idempotencyKey: "idempotency-restart",
+  };
+  try {
+    for (let run = 0; run < 2; run += 1) {
+      const backend = await createAgentManagerServer({
+        databasePath,
+        discovery: false,
+        staticDir: false,
+        adapters: { codex: adapter },
+        initialSessions: [session()],
+      });
+      await backend.app.ready();
+      const headers = await authenticatedHeaders(backend);
+      const leaseResponse = await backend.app.inject({
+        method: "POST",
+        url: "/api/v1/sessions/codex:thread-1/control-lease",
+        headers,
+        payload: { clientId: `browser-${run}` },
+      });
+      const lease = leaseResponse.json<{ lease: { token: string } }>().lease;
+      const response = await backend.app.inject({
+        method: "POST",
+        url: "/api/v1/sessions/codex:thread-1/actions",
+        headers: { ...headers, "x-control-lease": lease.token },
+        payload,
+      });
+      assert.equal(response.statusCode, 200, response.body);
+      assert.equal(response.json<{ action: { status: string } }>().action.status, "succeeded");
+      await backend.close();
+    }
+    assert.equal(calls, 1);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
