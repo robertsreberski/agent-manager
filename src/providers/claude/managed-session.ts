@@ -488,7 +488,7 @@ export class ClaudeManagedSession {
     const environment = {
       ...process.env,
       ...this.#config.environment,
-      CLAUDE_AGENT_SDK_CLIENT_APP: "agent-manager/0.2.0",
+      CLAUDE_AGENT_SDK_CLIENT_APP: "agent-manager/0.2.1",
     };
     try {
       const query = this.#runtime.createQuery({

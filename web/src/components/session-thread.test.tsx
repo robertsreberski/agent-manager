@@ -179,8 +179,14 @@ describe("SessionThread transcript states", () => {
       },
     }));
 
-    expect(screen.getByRole("heading", { name: "Result", level: 2 })).toBeInTheDocument();
+    const heading = screen.getByRole("heading", { name: "Result", level: 2 });
+    const markdown = heading.closest(".aui-md");
+    expect(heading).toBeInTheDocument();
     expect(screen.getByText("first").closest("ul")).not.toBeNull();
+    expect(markdown).toHaveClass("whitespace-normal");
+    expect(markdown).toHaveClass("[&_ul]:my-1");
+    expect(markdown).toHaveClass("[&_li]:my-0.5");
+    expect(markdown).toHaveClass("[&_li_p]:my-0");
   });
 });
 
