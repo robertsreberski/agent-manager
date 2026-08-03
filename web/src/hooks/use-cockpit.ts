@@ -72,7 +72,7 @@ function currentTabStorage(): SessionStorageLike | null {
 
 // sessionStorage survives navigation/reload within one tab while remaining
 // partitioned from independently opened tabs.
-const CLIENT_ID = getOrCreateBrowserClientId(currentTabStorage());
+export const BROWSER_CLIENT_ID = getOrCreateBrowserClientId(currentTabStorage());
 
 function payloadRecord(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -249,7 +249,7 @@ export function useCockpit() {
     }
 
     const disconnect = connectCockpitEvents({
-      clientId: CLIENT_ID,
+      clientId: BROWSER_CLIENT_ID,
       onEvent,
       onConnection: setConnection,
       onReconnect: () => void refresh().catch(() => undefined),
@@ -330,7 +330,7 @@ export function useCockpit() {
       return acquireLeaseInStages(
         api,
         session,
-        CLIENT_ID,
+        BROWSER_CLIENT_ID,
         leases[session.id],
         (retained) => setLeases((value) => ({ ...value, [session.id]: retained })),
       );

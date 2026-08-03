@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AssistantRuntimeProvider,
   ComposerPrimitive,
@@ -29,6 +29,12 @@ import {
 import { AccessSheet } from "./access-sheet";
 import { PendingRequests } from "./pending-requests";
 import {
+  ActivityExpansionProvider,
+  ActivityMessageParts,
+  activityToThreadMessage,
+  type ExpansionCommand,
+} from "./session-activity";
+import {
   ActivityBadge,
   AttentionBadge,
   FullAccessBadge,
@@ -46,7 +52,10 @@ import {
   DialogTitle,
 } from "./ui/dialog";
 import { cn, truncateMiddle } from "../lib/utils";
+import { useSessionActivity } from "../hooks/use-session-activity";
 import type {
+  ActivityItem,
+  AttentionRequest,
   AttachInstruction,
   ControlLease,
   ConversationMessage,
@@ -85,10 +94,43 @@ function convertMessage(message: ConversationMessage): ThreadMessageLike {
   };
 }
 
+type TimelineMessage = ConversationMessage | ActivityItem;
+
+function convertTimelineMessage(message: TimelineMessage): ThreadMessageLike {
+  return "kind" in message ? activityToThreadMessage(message) : convertMessage(message);
+}
+
+export function activityAttentionRequests(items: ActivityItem[]): AttentionRequest[] {
+  return items.flatMap((item) => {
+    if (item.kind !== "attention" || item.resolved) return [];
+    return [{
+      id: item.requestId || null,
+      kind: item.attentionKind,
+      summary: item.summary,
+      ...(item.title ? { title: item.title } : {}),
+      respondable: item.respondable,
+      isSecret: item.isSecret,
+      source: item.source,
+      confidence: item.confidence,
+      questions: item.questions.map((question) => ({
+        id: question.id,
+        text: question.text,
+        options: question.options.map((option) => ({
+          label: option.label,
+          ...(option.description ? { description: option.description } : {}),
+        })),
+        multiSelect: question.multiSelect,
+        allowFreeText: question.allowFreeText,
+        isSecret: question.isSecret,
+      })),
+    }];
+  });
+}
+
 function UserMessage() {
   return (
-    <MessagePrimitive.Root className="mx-auto flex w-full max-w-3xl justify-end px-4 py-2 md:px-6">
-      <div className="min-w-0 max-w-[88%] whitespace-pre-wrap break-words rounded-2xl rounded-br-md bg-primary px-4 py-2.5 text-sm leading-6 text-primary-foreground shadow-sm [overflow-wrap:anywhere] md:max-w-[78%]">
+    <MessagePrimitive.Root className="mx-auto flex w-full max-w-3xl justify-end px-3 py-2 sm:px-4 md:px-6">
+      <div className="min-w-0 max-w-[92%] whitespace-pre-wrap break-words rounded-2xl rounded-br-md bg-primary px-3 py-2.5 text-sm leading-6 text-primary-foreground shadow-sm [overflow-wrap:anywhere] sm:px-4 md:max-w-[78%]">
         <MessagePrimitive.Parts />
       </div>
     </MessagePrimitive.Root>
@@ -97,15 +139,43 @@ function UserMessage() {
 
 function AssistantMessage() {
   return (
-    <MessagePrimitive.Root className="mx-auto flex w-full max-w-3xl items-start gap-3 px-4 py-3 md:px-6">
+    <MessagePrimitive.Root className="mx-auto flex w-full max-w-3xl items-start gap-2 px-3 py-3 sm:gap-3 sm:px-4 md:px-6">
       <div className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-md border bg-background text-primary shadow-sm">
         <Bot className="size-4" />
       </div>
-      <div className="min-w-0 max-w-[calc(100%-2.5rem)] whitespace-pre-wrap break-words text-sm leading-6 text-foreground [overflow-wrap:anywhere]">
-        <MessagePrimitive.Parts />
+      <div className="min-w-0 flex-1 whitespace-pre-wrap break-words text-sm leading-6 text-foreground [overflow-wrap:anywhere]">
+        <ActivityMessageParts />
       </div>
     </MessagePrimitive.Root>
   );
+}
+
+function ActivityEmptyState() {
+  return (
+    <div className="mx-auto flex min-h-[45dvh] max-w-lg flex-col items-center justify-center px-5 py-8 text-center md:px-6">
+      <div className="mb-4 flex size-12 items-center justify-center rounded-xl border bg-muted/40 text-primary shadow-sm">
+        <Sparkles className="size-5" />
+      </div>
+      <h3 className="text-base font-semibold">No activity yet</h3>
+      <p className="mt-2 text-sm leading-6 text-muted-foreground">
+        Live reasoning, tool calls, plans, and messages will appear here as the provider reports them.
+      </p>
+    </div>
+  );
+}
+
+function nearBottom(node: HTMLElement): boolean {
+  return node.scrollHeight - node.scrollTop - node.clientHeight <= 96;
+}
+
+function scrollToBottom(node: HTMLElement): void {
+  const reducedMotion = typeof window.matchMedia === "function"
+    && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (typeof node.scrollTo === "function") {
+    node.scrollTo({ top: node.scrollHeight, behavior: reducedMotion ? "auto" : "smooth" });
+  } else {
+    node.scrollTop = node.scrollHeight;
+  }
 }
 
 function transcriptReason(reason: SessionTranscript["reason"]): string {
@@ -194,7 +264,7 @@ function AgentComposer({
 }) {
   const disabled = !writable || (!canQueue && !canSteer);
   return (
-    <div className="border-t bg-background/95 px-4 py-3 backdrop-blur md:px-6">
+    <div className="border-t bg-background/95 px-3 pt-3 [padding-bottom:max(0.75rem,env(safe-area-inset-bottom))] backdrop-blur sm:px-4 md:px-6">
       <ComposerPrimitive.Root className="mx-auto grid w-full max-w-3xl gap-2 rounded-xl border bg-background p-2 shadow-sm focus-within:ring-2 focus-within:ring-ring/30">
         <ComposerPrimitive.Input
           disabled={disabled}
@@ -447,8 +517,23 @@ export function SessionThread({
   loadAttach: (session: SessionView) => Promise<AttachInstruction>;
 }) {
   const [accessOpen, setAccessOpen] = useState(false);
+  const [expansion, setExpansion] = useState<ExpansionCommand>({ mode: "auto", revision: 0 });
+  const [unseenUpdates, setUnseenUpdates] = useState(0);
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const followingRef = useRef(true);
+  const lastFollowRevisionRef = useRef<{ source: "activity" | "transcript"; revision: number }>({
+    source: "transcript",
+    revision: 0,
+  });
   const writable = lease !== null;
   const transcript = session.transcript ?? NOT_LOADED_TRANSCRIPT;
+  const activity = useSessionActivity(session.id);
+  const hasLiveActivity = activity.hasSnapshot;
+  const timelineMessages: TimelineMessage[] = hasLiveActivity ? activity.items : session.messages;
+  const pendingRequests = useMemo(
+    () => hasLiveActivity ? activityAttentionRequests(activity.items) : session.attention,
+    [activity.items, hasLiveActivity, session.attention],
+  );
   const canQueue = session.control.capabilities.includes("queue");
   const canSteer = session.control.capabilities.includes("steer");
   const queueAdapter = useMemo(() => ({
@@ -461,14 +546,12 @@ export function SessionThread({
     remove: () => undefined,
     clear: () => undefined,
   }), [onSend, session.queue]);
-  const runtime = useExternalStoreRuntime<ConversationMessage>({
-    messages: session.messages,
-    convertMessage,
-    // assistant-ui renders a synthetic in-progress assistant bubble when this
-    // is true. Do not show that phantom dot before transcript detail loads.
-    isRunning: transcript.state === "available"
-      && session.messages.length > 0
-      && session.activity === "running",
+  const runtime = useExternalStoreRuntime<TimelineMessage>({
+    messages: timelineMessages,
+    convertMessage: convertTimelineMessage,
+    // Item-level statuses carry live state. Keeping the thread itself false
+    // prevents assistant-ui from inventing an empty running message.
+    isRunning: false,
     isDisabled: !writable || (!canQueue && !canSteer),
     onNew: async (message) => {
       const text = messageText(message);
@@ -476,6 +559,38 @@ export function SessionThread({
     },
     queue: canQueue || canSteer ? queueAdapter : undefined,
   });
+
+  const followSource = hasLiveActivity ? "activity" : "transcript";
+  const followRevision = hasLiveActivity ? activity.updateCount : session.messages.length;
+  useEffect(() => {
+    const previous = lastFollowRevisionRef.current;
+    const delta = previous.source === followSource
+      ? Math.max(0, followRevision - previous.revision)
+      : Math.max(1, followRevision);
+    lastFollowRevisionRef.current = { source: followSource, revision: followRevision };
+    if (delta === 0) return;
+    if (!followingRef.current) {
+      setUnseenUpdates((count) => count + delta);
+      return;
+    }
+    const animationFrame = window.requestAnimationFrame(() => {
+      const node = viewportRef.current;
+      if (node) scrollToBottom(node);
+      setUnseenUpdates(0);
+    });
+    return () => window.cancelAnimationFrame(animationFrame);
+  }, [followRevision, followSource]);
+
+  const issueExpansion = (mode: ExpansionCommand["mode"]) => {
+    setExpansion((current) => ({ mode, revision: current.revision + 1 }));
+  };
+
+  const jumpToLive = () => {
+    const node = viewportRef.current;
+    if (node) scrollToBottom(node);
+    followingRef.current = true;
+    setUnseenUpdates(0);
+  };
 
   return (
     <div className="flex h-dvh min-w-0 flex-1 flex-col bg-background">
@@ -489,34 +604,69 @@ export function SessionThread({
         onSetMode={onSetMode}
         onInterrupt={onInterrupt}
       />
-      <PendingRequests session={session} writable={writable} busy={busy} onRespond={onRespond} />
+      <PendingRequests
+        session={session}
+        requests={pendingRequests}
+        writable={writable}
+        busy={busy}
+        onRespond={onRespond}
+      />
 
       <AssistantRuntimeProvider runtime={runtime}>
         <ThreadPrimitive.Root className="flex min-h-0 flex-1 flex-col">
           <ThreadPrimitive.Viewport
-            className="min-h-0 flex-1 overflow-y-auto scroll-smooth py-3"
-            role="region"
-            aria-label="Session activity"
+            ref={viewportRef}
+            className="min-h-0 flex-1 overflow-y-auto scroll-smooth py-3 motion-reduce:scroll-auto"
+            role="log"
+            aria-label={hasLiveActivity ? "Live session activity" : "Session transcript"}
+            aria-live="polite"
+            aria-relevant="additions text"
             tabIndex={0}
+            onScroll={(event) => {
+              const follows = nearBottom(event.currentTarget);
+              followingRef.current = follows;
+              if (follows) setUnseenUpdates(0);
+            }}
           >
-            {transcript.state === "available" && transcript.truncated && (
+            {hasLiveActivity && (
+              <div className="mx-auto mb-2 flex w-full max-w-3xl flex-wrap items-center gap-1.5 px-3 text-[11px] text-muted-foreground sm:px-4 md:px-6">
+                <span className="mr-auto inline-flex items-center gap-1.5">
+                  <span className={cn(
+                    "size-1.5 rounded-full",
+                    activity.connection === "open" ? "bg-primary" : "bg-amber-500",
+                  )} />
+                  Live activity · {activity.connection}
+                </span>
+                <Button type="button" variant="ghost" size="sm" className="h-7 px-2 text-[11px]" onClick={() => issueExpansion("expand")}>Expand all</Button>
+                <Button type="button" variant="ghost" size="sm" className="h-7 px-2 text-[11px]" onClick={() => issueExpansion("collapse")}>Collapse all</Button>
+              </div>
+            )}
+            {((hasLiveActivity && activity.truncated) || (!hasLiveActivity && transcript.state === "available" && transcript.truncated)) && (
               <div className="mx-auto mb-2 w-[calc(100%-2rem)] max-w-3xl rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-900 dark:text-amber-100 md:w-[calc(100%-3rem)]">
-                Earlier transcript content is omitted. Showing the latest {transcript.messageCount} messages.
+                {hasLiveActivity
+                  ? "Earlier activity is omitted. Showing the latest available events."
+                  : `Earlier transcript content is omitted. Showing the latest ${transcript.messageCount} messages.`}
               </div>
             )}
             <ThreadPrimitive.Empty>
-              <TranscriptEmptyState session={session} transcript={transcript} />
+              {hasLiveActivity
+                ? <ActivityEmptyState />
+                : <TranscriptEmptyState session={session} transcript={transcript} />}
             </ThreadPrimitive.Empty>
-            <ThreadPrimitive.Messages components={{ UserMessage, AssistantMessage }} />
-            <ThreadPrimitive.ScrollToBottom
-              className={cn(
-                buttonVariants({ variant: "outline", size: "icon" }),
-                "sticky bottom-3 ml-auto mr-4 size-8 rounded-full bg-background shadow-md disabled:hidden",
-              )}
-            >
-              <ArrowDown />
-              <span className="sr-only">Scroll to latest message</span>
-            </ThreadPrimitive.ScrollToBottom>
+            <ActivityExpansionProvider command={expansion}>
+              <ThreadPrimitive.Messages components={{ UserMessage, AssistantMessage }} />
+            </ActivityExpansionProvider>
+            {unseenUpdates > 0 && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="sticky bottom-3 mx-auto mt-3 flex rounded-full bg-background shadow-md"
+                onClick={jumpToLive}
+              >
+                <ArrowDown /> {unseenUpdates} new update{unseenUpdates === 1 ? "" : "s"} · Jump to live
+              </Button>
+            )}
           </ThreadPrimitive.Viewport>
           {(canQueue || canSteer) && (
             <AgentComposer canQueue={canQueue} canSteer={canSteer} writable={writable} queueCount={session.queue.length} />

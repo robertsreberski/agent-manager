@@ -1,0 +1,183 @@
+import { act, renderHook } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ActivityFrame, ActivityMessageItem } from "../types";
+import { useSessionActivity } from "./use-session-activity";
+
+const SESSION_ID = "codex:live/thread with spaces";
+const EPOCH = "epoch-1";
+
+function message(overrides: Partial<ActivityMessageItem> = {}): ActivityMessageItem {
+  return {
+    schemaVersion: 1,
+    id: "message-1",
+    sessionId: SESSION_ID,
+    provider: "codex",
+    turnId: "turn-1",
+    parentId: null,
+    seq: 1,
+    revision: 1,
+    state: "running",
+    startedAt: "2026-08-03T12:00:00.000Z",
+    updatedAt: "2026-08-03T12:00:00.000Z",
+    completedAt: null,
+    source: "provider-api",
+    confidence: "exact",
+    exposure: "provider-exposed",
+    truncated: false,
+    kind: "message",
+    role: "assistant",
+    phase: "commentary",
+    text: "Streaming",
+    label: null,
+    ...overrides,
+  };
+}
+
+function frame(value: { type: ActivityFrame["type"]; seq: number; [key: string]: unknown }): ActivityFrame {
+  return {
+    schemaVersion: 1,
+    streamEpoch: EPOCH,
+    sessionId: SESSION_ID,
+    provider: "codex",
+    cursor: `${EPOCH}:${value.seq}`,
+    at: "2026-08-03T12:00:01.000Z",
+    ...value,
+  } as ActivityFrame;
+}
+
+class TestEventSource {
+  static readonly CONNECTING = 0;
+  static readonly OPEN = 1;
+  static readonly CLOSED = 2;
+  static instances: TestEventSource[] = [];
+
+  onopen: ((event: Event) => void) | null = null;
+  onerror: ((event: Event) => void) | null = null;
+  onmessage: ((event: MessageEvent<string>) => void) | null = null;
+  readyState = TestEventSource.CONNECTING;
+  readonly close = vi.fn(() => {
+    this.readyState = TestEventSource.CLOSED;
+  });
+  private readonly listeners = new Map<string, Array<(event: MessageEvent<string>) => void>>();
+
+  constructor(
+    readonly url: string | URL,
+    readonly init?: EventSourceInit,
+  ) {
+    TestEventSource.instances.push(this);
+  }
+
+  addEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
+    const callback = typeof listener === "function"
+      ? listener as (event: MessageEvent<string>) => void
+      : (event: MessageEvent<string>) => listener.handleEvent(event);
+    this.listeners.set(type, [...(this.listeners.get(type) ?? []), callback]);
+  }
+
+  emit(type: ActivityFrame["type"], value: ActivityFrame): void {
+    const event = new MessageEvent<string>(type, { data: JSON.stringify(value) });
+    for (const listener of this.listeners.get(type) ?? []) listener(event);
+  }
+}
+
+describe("useSessionActivity", () => {
+  const scheduled = new Map<number, FrameRequestCallback>();
+  let nextFrame = 1;
+
+  beforeEach(() => {
+    TestEventSource.instances = [];
+    scheduled.clear();
+    nextFrame = 1;
+    vi.stubGlobal("EventSource", TestEventSource);
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      const id = nextFrame++;
+      scheduled.set(id, callback);
+      return id;
+    });
+    vi.spyOn(window, "cancelAnimationFrame").mockImplementation((id) => {
+      scheduled.delete(id);
+    });
+  });
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("opens a credentialed selected-session stream and batches frames into one commit", () => {
+    const { result } = renderHook(() => useSessionActivity(SESSION_ID));
+    const source = TestEventSource.instances[0]!;
+    const url = new URL(String(source.url));
+    expect(url.pathname).toBe(`/api/v1/sessions/${encodeURIComponent(SESSION_ID)}/activity/events`);
+    expect(url.searchParams.get("clientId")).toMatch(/^web-/u);
+    expect(source.init).toEqual({ withCredentials: true });
+
+    act(() => {
+      source.emit("activity.snapshot", frame({
+        type: "activity.snapshot",
+        seq: 2,
+        items: [message()],
+        truncated: false,
+      }));
+      source.emit("activity.upsert", frame({
+        type: "activity.upsert",
+        seq: 3,
+        item: message({ revision: 2, state: "complete", text: "Complete" }),
+      }));
+    });
+    expect(result.current.hasSnapshot).toBe(false);
+    expect(scheduled).toHaveLength(1);
+
+    act(() => scheduled.values().next().value?.(16));
+    expect(result.current.hasSnapshot).toBe(true);
+    expect(result.current.items[0]).toMatchObject({ text: "Complete", state: "complete" });
+    expect(result.current.updateCount).toBe(2);
+  });
+
+  it("retains activity while the browser reconnects and clears on a terminal auth failure", () => {
+    const { result } = renderHook(() => useSessionActivity(SESSION_ID));
+    const source = TestEventSource.instances[0]!;
+    act(() => {
+      source.readyState = TestEventSource.OPEN;
+      source.onopen?.(new Event("open"));
+      source.emit("activity.snapshot", frame({
+        type: "activity.snapshot",
+        seq: 1,
+        items: [message()],
+        truncated: false,
+      }));
+      scheduled.values().next().value?.(16);
+    });
+    expect(result.current.connection).toBe("open");
+    expect(result.current.items).toHaveLength(1);
+
+    act(() => {
+      source.readyState = TestEventSource.CONNECTING;
+      source.onerror?.(new Event("error"));
+    });
+    expect(result.current.connection).toBe("retrying");
+    expect(result.current.items).toHaveLength(1);
+
+    act(() => {
+      source.readyState = TestEventSource.CLOSED;
+      source.onerror?.(new Event("error"));
+    });
+    expect(result.current).toMatchObject({ connection: "offline", hasSnapshot: false, items: [] });
+  });
+
+  it("closes and clears the old stream on deselect or session change", () => {
+    const { result, rerender, unmount } = renderHook(
+      ({ selectedId }) => useSessionActivity(selectedId),
+      { initialProps: { selectedId: SESSION_ID as string | null } },
+    );
+    const first = TestEventSource.instances[0]!;
+
+    rerender({ selectedId: null });
+    expect(first.close).toHaveBeenCalledOnce();
+    expect(result.current).toMatchObject({ sessionId: null, items: [], hasSnapshot: false });
+
+    rerender({ selectedId: "claude:new" });
+    expect(TestEventSource.instances).toHaveLength(2);
+    expect(result.current).toMatchObject({ sessionId: "claude:new", items: [], hasSnapshot: false });
+    const second = TestEventSource.instances[1]!;
+    unmount();
+    expect(second.close).toHaveBeenCalledOnce();
+  });
+});

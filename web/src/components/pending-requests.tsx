@@ -146,6 +146,9 @@ function PendingRequestCard({
                     )}
                     {(item.allowFreeText || item.options.length === 0) && (
                       <Input
+                        type={item.isSecret || request.isSecret ? "password" : "text"}
+                        autoComplete={item.isSecret || request.isSecret ? "new-password" : undefined}
+                        aria-label={`${item.text} answer`}
                         value={answers[item.id] ?? ""}
                         onChange={(event) => setAnswers((current) => ({ ...current, [item.id]: event.target.value }))}
                         disabled={!canRespond}
@@ -214,19 +217,21 @@ function PendingRequestCard({
 
 export function PendingRequests({
   session,
+  requests = session.attention,
   writable,
   busy,
   onRespond,
 }: {
   session: SessionView;
+  requests?: AttentionRequest[];
   writable: boolean;
   busy: boolean;
   onRespond: (requestId: string, response: RequestResponse) => Promise<void>;
 }) {
-  if (session.attention.length === 0) return null;
+  if (requests.length === 0) return null;
   return (
     <section className="grid gap-2 border-b bg-muted/20 px-4 py-3 md:px-6" aria-label="Pending requests">
-      {session.attention.map((request, index) => (
+      {requests.map((request, index) => (
         <PendingRequestCard
           key={request.id ?? `${request.kind}-${index}`}
           request={request}
