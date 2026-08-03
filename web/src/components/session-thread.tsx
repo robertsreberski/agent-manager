@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  AuiIf,
   AssistantRuntimeProvider,
   ComposerPrimitive,
   MessagePrimitive,
@@ -712,11 +713,11 @@ export function SessionThread({
                   : `Earlier transcript content is omitted. Showing the latest ${transcript.messageCount} messages.`}
               </div>
             )}
-            <ThreadPrimitive.Empty>
+            <AuiIf condition={(state) => state.thread.isEmpty}>
               {hasLiveActivity
                 ? <ActivityEmptyState />
                 : <TranscriptEmptyState session={session} transcript={transcript} />}
-            </ThreadPrimitive.Empty>
+            </AuiIf>
             <ActivityExpansionProvider command={expansion}>
               <ThreadPrimitive.Messages>
                 {({ message }) => message.role === "user" ? <UserMessage /> : <AssistantMessage />}
