@@ -274,6 +274,7 @@ export class ClaudeActivityProjector {
   #legacySequence = 0;
   #lastSnapshotActivity: ClaudeManagedSessionSnapshot["activity"] | null = null;
   #lastSnapshotError: string | null = null;
+  #requestStatusActive = false;
 
   projectMessage(message: ClaudeSdkMessage): ActivityMutation[] {
     switch (message.type) {
@@ -910,7 +911,27 @@ export class ClaudeActivityProjector {
       ? message.user_message_uuid ?? this.#currentTurnId ?? message.uuid
       : this.#currentTurnId ?? message.uuid;
     const failed = message.subtype !== "success";
-    const mutations: ActivityMutation[] = [{
+    const mutations: ActivityMutation[] = [];
+    if (this.#requestStatusActive) {
+      mutations.push({
+        type: "upsert",
+        item: {
+          id: "claude:lifecycle:request-status",
+          kind: "lifecycle",
+          event: "status",
+          level: "info",
+          title: "Claude request status cleared",
+          details: null,
+          state: "complete",
+          turnId,
+          source: "provider-api",
+          confidence: "exact",
+          exposure: "provider-exposed",
+        },
+      });
+      this.#requestStatusActive = false;
+    }
+    mutations.push({
       type: "upsert",
       item: {
         id: itemId("turn", turnId),
@@ -925,7 +946,7 @@ export class ClaudeActivityProjector {
         confidence: "exact",
         exposure: "provider-exposed",
       },
-    }];
+    });
     const usage = this.#usageDraft(
       itemId("usage:turn", turnId),
       turnId,
@@ -1073,6 +1094,8 @@ export class ClaudeActivityProjector {
         break;
       case "status": {
         const compacting = message.status === "compacting";
+        if (message.status === "requesting") this.#requestStatusActive = true;
+        else if (message.status === null) this.#requestStatusActive = false;
         mutations.push({
           type: "upsert",
           item: {
@@ -1802,5 +1825,6 @@ export class ClaudeActivityProjector {
     this.#currentTurnId = null;
     this.#lastSnapshotActivity = null;
     this.#lastSnapshotError = null;
+    this.#requestStatusActive = false;
   }
 }

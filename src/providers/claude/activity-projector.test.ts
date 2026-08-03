@@ -399,6 +399,93 @@ test("projects tool progress, summaries, structured results, and replace-style u
   assert.equal(usage?.costUsd, 0.01);
 });
 
+test("settles an active request status when a terminal result omits the status clear", () => {
+  const projector = new ClaudeActivityProjector();
+  const hub = new ActivityHub({ streamEpoch: "claude-request-status" });
+  const ingest = (mutations: readonly ActivityMutation[]) => {
+    for (const mutation of mutations) hub.ingest("managed-claude", "claude", mutation);
+  };
+
+  ingest(projector.projectMessage(sdk({
+    ...baseMessage("system", "requesting-1"),
+    subtype: "status",
+    status: "requesting",
+  })));
+  assert.equal(
+    hub.snapshot("managed-claude")?.items.find(
+      (item) => item.id === "claude:lifecycle:request-status",
+    )?.state,
+    "running",
+  );
+
+  ingest(projector.projectMessage(sdk({
+    ...baseMessage("rate_limit_event", "rate-limit-terminal"),
+    rate_limit_info: {
+      status: "rejected",
+      resetsAt: 1_785_542_400,
+    },
+  })));
+  const terminal = projector.projectMessage(sdk({
+    ...baseMessage("result", "result-after-rate-limit"),
+    subtype: "success",
+    duration_ms: 100,
+    duration_api_ms: 80,
+    is_error: false,
+    num_turns: 1,
+    result: "Request failed due to the rate limit.",
+    stop_reason: "end_turn",
+    total_cost_usd: 0,
+    usage: {
+      input_tokens: 1,
+      output_tokens: 1,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+    },
+    modelUsage: {},
+    permission_denials: [],
+    user_message_uuid: "user-turn",
+  }));
+  ingest(terminal);
+
+  const requestStatus = hub.snapshot("managed-claude")?.items.find(
+    (item) => item.id === "claude:lifecycle:request-status",
+  );
+  assert.equal(requestStatus?.state, "complete");
+  assert.equal(
+    requestStatus?.kind === "lifecycle" ? requestStatus.title : null,
+    "Claude request status cleared",
+  );
+  assert.equal(
+    hub.snapshot("managed-claude")?.items.some((item) => item.state === "running"),
+    false,
+  );
+
+  const repeated = projector.projectMessage(sdk({
+    ...baseMessage("result", "repeated-result"),
+    subtype: "success",
+    duration_ms: 100,
+    duration_api_ms: 80,
+    is_error: false,
+    num_turns: 1,
+    result: "Complete",
+    stop_reason: "end_turn",
+    total_cost_usd: 0,
+    usage: {
+      input_tokens: 1,
+      output_tokens: 1,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+    },
+    modelUsage: {},
+    permission_denials: [],
+    user_message_uuid: "user-turn",
+  }));
+  assert.equal(
+    upserts(repeated).some((item) => item.id === "claude:lifecycle:request-status"),
+    false,
+  );
+});
+
 test("projects tasks, hooks, errors, supersedes, retractions, and provider reset", () => {
   const projector = new ClaudeActivityProjector();
   const started = projector.projectMessage(sdk({
