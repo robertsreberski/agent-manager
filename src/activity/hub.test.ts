@@ -20,7 +20,7 @@ test("creates an atomic empty snapshot and clones all public values", () => {
   hub.ensureSession("session-a", "codex");
 
   const empty = hub.snapshot("session-a")!;
-  assert.equal(empty.cursor, "epoch-one:0");
+  assert.equal(empty.cursor, "epoch-one:session-a:0");
   assert.deepEqual(empty.items, []);
   assert.doesNotThrow(() => JSON.stringify(empty));
 
@@ -134,6 +134,57 @@ test("validates UTF-8 append offsets and streams only the accepted delta", () =>
   assert.equal(stored?.kind === "message" ? stored.text : null, "é!");
 });
 
+test("emits browser offsets for redacted deltas while validating provider offsets", () => {
+  const hub = new ActivityHub({ streamEpoch: "redacted-append" });
+  hub.ingest("session-a", "codex", { type: "upsert", item: message("message-1", "") });
+  const rawSecret = "Bearer abcdefghijklmnop";
+  const first = hub.ingest("session-a", "codex", {
+    type: "append",
+    id: "message-1",
+    channel: "text",
+    offset: 0,
+    text: rawSecret,
+  });
+  assert.equal(first.type, "activity.append");
+  if (first.type !== "activity.append") return;
+  assert.equal(first.offset, 0);
+  assert.equal(first.text, "[REDACTED]");
+
+  const second = hub.ingest("session-a", "codex", {
+    type: "append",
+    id: "message-1",
+    channel: "text",
+    offset: Buffer.byteLength(rawSecret, "utf8"),
+    text: " remains live",
+  });
+  assert.equal(second.type, "activity.append");
+  if (second.type !== "activity.append") return;
+  assert.equal(second.offset, Buffer.byteLength("[REDACTED]", "utf8"));
+  assert.equal(second.text, " remains live");
+  const stored = hub.snapshot("session-a")!.items[0];
+  assert.equal(stored?.kind === "message" ? stored.text : null, "[REDACTED] remains live");
+
+  hub.ingest("session-a", "codex", {
+    type: "upsert",
+    item: message("message-2", rawSecret),
+  });
+  const afterRedactedUpsert = hub.ingest("session-a", "codex", {
+    type: "append",
+    id: "message-2",
+    channel: "text",
+    offset: Buffer.byteLength(rawSecret, "utf8"),
+    text: " after upsert",
+  });
+  assert.equal(afterRedactedUpsert.type, "activity.append");
+  if (afterRedactedUpsert.type !== "activity.append") return;
+  assert.equal(afterRedactedUpsert.offset, Buffer.byteLength("[REDACTED]", "utf8"));
+  const secondStored = hub.snapshot("session-a")!.items.find((item) => item.id === "message-2");
+  assert.equal(
+    secondStored?.kind === "message" ? secondStored.text : null,
+    "[REDACTED] after upsert",
+  );
+});
+
 test("bounds the materialized view and exposes eviction as an atomic reset", () => {
   const hub = new ActivityHub({
     streamEpoch: "view-test",
@@ -166,6 +217,10 @@ test("replays valid cursors and resets stale or cross-epoch cursors", () => {
   const wrongEpoch = hub.replay("session-a", "other:3");
   assert.equal(wrongEpoch.gap, true);
   assert.equal(wrongEpoch.frames[0]?.type, "activity.reset");
+
+  hub.ensureSession("session-b", "codex");
+  hub.ingest("session-b", "codex", { type: "upsert", item: message("other", "other") });
+  assert.equal(hub.replay("session-b", firstCursor).gap, true);
 });
 
 test("isolates subscribers by session and clears sensitive material", () => {

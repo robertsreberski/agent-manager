@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ActivityFrame, ActivityMessageItem } from "../types";
 import {
+  encodeActivityCursor,
   emptySessionActivity,
   parseActivityFrame,
   reduceSessionActivity,
@@ -44,7 +45,7 @@ function frame(
     streamEpoch: EPOCH,
     sessionId: SESSION_ID,
     provider: "codex",
-    cursor: `${EPOCH}:${value.seq}`,
+    cursor: encodeActivityCursor(EPOCH, SESSION_ID, value.seq),
     at: "2026-08-03T12:00:01.000Z",
     ...value,
   } as ActivityFrame;
@@ -73,7 +74,14 @@ describe("parseActivityFrame", () => {
     const event = (value: unknown) => new MessageEvent<string>("message", { data: JSON.stringify(value) });
 
     expect(parseActivityFrame(event(snapshot), "activity.reset")).toBeNull();
-    expect(parseActivityFrame(event({ ...snapshot, cursor: `${EPOCH}:99` }))).toBeNull();
+    expect(parseActivityFrame(event({
+      ...snapshot,
+      cursor: encodeActivityCursor(EPOCH, SESSION_ID, 99),
+    }))).toBeNull();
+    expect(parseActivityFrame(event({
+      ...snapshot,
+      cursor: encodeActivityCursor(EPOCH, "codex:other", snapshot.seq),
+    }))).toBeNull();
     expect(parseActivityFrame(event({
       ...snapshot,
       items: [message({ sessionId: "codex:other" })],
@@ -120,6 +128,34 @@ describe("reduceSessionActivity", () => {
     expect(state.items).toEqual([]);
   });
 
+  it("requests a fresh snapshot when an append cannot match the rendered bytes", () => {
+    const snapshot = frame({
+      type: "activity.snapshot",
+      seq: 1,
+      items: [message({ text: "[REDACTED]" })],
+      truncated: false,
+    });
+    const current = reduceSessionActivity(
+      emptySessionActivity(SESSION_ID),
+      SESSION_ID,
+      snapshot,
+    ).state;
+    const result = reduceSessionActivity(current, SESSION_ID, frame({
+      type: "activity.append",
+      seq: 2,
+      id: "message-1",
+      revision: 2,
+      channel: "text",
+      offset: 99,
+      text: "must not silently disappear",
+      truncated: false,
+    }));
+
+    expect(result.accepted).toBe(false);
+    expect(result.requiresReset).toBe(true);
+    expect(result.state).toBe(current);
+  });
+
   it("rejects pre-baseline, prior-session, duplicate, and old-epoch frames", () => {
     const initial = emptySessionActivity(SESSION_ID);
     const upsert = frame({ type: "activity.upsert", seq: 1, item: message() });
@@ -137,7 +173,7 @@ describe("reduceSessionActivity", () => {
     expect(reduceSessionActivity(current, SESSION_ID, {
       ...upsert,
       streamEpoch: "new-epoch",
-      cursor: "new-epoch:3",
+      cursor: encodeActivityCursor("new-epoch", SESSION_ID, 3),
       seq: 3,
     }).accepted).toBe(false);
   });
@@ -159,7 +195,7 @@ describe("reduceSessionActivity", () => {
         truncated: true,
       }),
       streamEpoch: "replacement-epoch",
-      cursor: "replacement-epoch:1",
+      cursor: encodeActivityCursor("replacement-epoch", SESSION_ID, 1),
     } as ActivityFrame;
 
     const result = reduceSessionActivity(current, SESSION_ID, reset);

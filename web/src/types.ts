@@ -445,6 +445,7 @@ interface ActivityFrameBase {
   sessionId: string;
   provider: Provider;
   seq: number;
+  /** Opaque replay cursor bound to streamEpoch and sessionId. */
   cursor: string;
   at: string;
 }
@@ -465,6 +466,7 @@ export interface ActivityAppendFrame extends ActivityFrameBase {
   id: string;
   revision: number;
   channel: ActivityAppendChannel;
+  /** UTF-8 byte offset in the already-redacted field rendered by the client. */
   offset: number;
   text: string;
   truncated: boolean;

@@ -89,9 +89,11 @@ export function useSessionActivity(selectedId: string | null): SessionActivityVi
     viewRef.current = initial;
     setView(initial);
     if (!selectedId) return;
+    const sessionId = selectedId;
 
     let pending: ActivityFrame[] = [];
     let animationFrame: number | null = null;
+    let disconnectActivity = (): void => undefined;
     const scheduleFrame: ScheduleFrame = requestBrowserFrame;
     const cancelFrame: CancelFrame = cancelBrowserFrame;
 
@@ -99,7 +101,13 @@ export function useSessionActivity(selectedId: string | null): SessionActivityVi
       animationFrame = null;
       let next = viewRef.current;
       for (const frame of pending) {
-        next = reduceSessionActivity(next, selectedId, frame).state;
+        const reduction = reduceSessionActivity(next, sessionId, frame);
+        if (reduction.requiresReset) {
+          pending = [];
+          restartFromSnapshot();
+          return;
+        }
+        next = reduction.state;
       }
       pending = [];
       if (next !== viewRef.current) {
@@ -113,7 +121,7 @@ export function useSessionActivity(selectedId: string | null): SessionActivityVi
       setView(next);
     };
     const clearAfterTerminalError = () => {
-      const next = { ...emptySessionActivity(selectedId), connection: "offline" as const };
+      const next = { ...emptySessionActivity(sessionId), connection: "offline" as const };
       viewRef.current = next;
       pending = [];
       if (animationFrame !== null) {
@@ -123,18 +131,29 @@ export function useSessionActivity(selectedId: string | null): SessionActivityVi
       setView(next);
     };
 
-    const disconnect = connectSessionActivityEvents({
-      sessionId: selectedId,
-      clientId: BROWSER_CLIENT_ID,
-      onFrame: (frame) => {
-        pending.push(frame);
-        if (animationFrame === null) animationFrame = scheduleFrame(commit);
-      },
-      onConnection: updateConnection,
-      onTerminalError: clearAfterTerminalError,
-    });
+    function startConnection(): void {
+      disconnectActivity = connectSessionActivityEvents({
+        sessionId,
+        clientId: BROWSER_CLIENT_ID,
+        onFrame: (frame) => {
+          pending.push(frame);
+          if (animationFrame === null) animationFrame = scheduleFrame(commit);
+        },
+        onConnection: updateConnection,
+        onTerminalError: clearAfterTerminalError,
+      });
+    }
+    function restartFromSnapshot(): void {
+      disconnectActivity();
+      const next = { ...emptySessionActivity(sessionId), connection: "connecting" as const };
+      viewRef.current = next;
+      setView(next);
+      startConnection();
+    }
+
+    startConnection();
     return () => {
-      disconnect();
+      disconnectActivity();
       pending = [];
       if (animationFrame !== null) cancelFrame(animationFrame);
       viewRef.current = emptySessionActivity(null);

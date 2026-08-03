@@ -14,6 +14,8 @@ import { ZodError, z } from "zod";
 
 import {
   ActivityHub,
+  encodeActivityCursor,
+  parseActivityCursor,
   type ActivityFrame,
 } from "../activity/index.ts";
 import type { Diagnostic, Provider, SessionRecord, SessionView } from "../core/types.ts";
@@ -162,13 +164,6 @@ function encodeActivitySse(frame: ActivityFrame): string {
   return `id: ${frame.cursor}\nevent: ${frame.type}\ndata: ${JSON.stringify(frame)}\n\n`;
 }
 
-function activityCursorSequence(cursor: string, streamEpoch: string): number | null {
-  const separator = cursor.lastIndexOf(":");
-  if (separator < 1 || cursor.slice(0, separator) !== streamEpoch) return null;
-  const sequence = Number(cursor.slice(separator + 1));
-  return Number.isSafeInteger(sequence) && sequence >= 0 ? sequence : null;
-}
-
 function activityRequestIsSecret(activityHub: ActivityHub, sessionId: string, requestId: string): boolean {
   const snapshot = activityHub.snapshot(sessionId);
   if (!snapshot) return false;
@@ -283,16 +278,6 @@ export async function createAgentManagerServer(
     channel: string;
     close: () => void;
   }>();
-  const activityCursorOwners = new Map<string, string>();
-  const rememberActivityCursor = (cursor: string, sessionId: string): void => {
-    activityCursorOwners.delete(cursor);
-    activityCursorOwners.set(cursor, sessionId);
-    while (activityCursorOwners.size > 2_048) {
-      const oldest = activityCursorOwners.keys().next().value as string | undefined;
-      if (oldest === undefined) break;
-      activityCursorOwners.delete(oldest);
-    }
-  };
   interface NativeHandoff {
     handoffId: string;
     spawnNonce: string;
@@ -551,7 +536,7 @@ export async function createAgentManagerServer(
     }
     const beforeSequence = before === undefined
       ? null
-      : activityCursorSequence(before, activityHub.streamEpoch);
+      : parseActivityCursor(before, activityHub.streamEpoch, id);
     if (before !== undefined && beforeSequence === null) {
       throw new ApiError(409, "ACTIVITY_CURSOR_STALE", "activity history cursor is invalid or expired");
     }
@@ -571,7 +556,7 @@ export async function createAgentManagerServer(
       truncated: snapshot.truncated,
       hasMore,
       nextBefore: hasMore && first
-        ? `${snapshot.streamEpoch}:${first.seq}`
+        ? encodeActivityCursor(snapshot.streamEpoch, id, first.seq)
         : null,
     };
   });
@@ -792,7 +777,6 @@ export async function createAgentManagerServer(
       }
       try {
         reply.raw.write(chunk);
-        rememberActivityCursor(frame.cursor, id);
         return true;
       } catch {
         close();
@@ -814,11 +798,7 @@ export async function createAgentManagerServer(
 
     const supplied = request.headers["last-event-id"];
     const requestedCursor = Array.isArray(supplied) ? supplied[0] : supplied;
-    const knownOwner = requestedCursor ? activityCursorOwners.get(requestedCursor) : undefined;
-    const cursor = knownOwner !== undefined && knownOwner !== id
-      ? "cross-session-cursor"
-      : requestedCursor ?? null;
-    const replay = activityHub.replay(id, cursor);
+    const replay = activityHub.replay(id, requestedCursor ?? null);
     let highWater = -1;
     for (const frame of replay.frames) {
       highWater = Math.max(highWater, frame.seq);

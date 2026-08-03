@@ -72,7 +72,7 @@ function liveActivity(items: ActivityItem[], updateCount = 1): SessionActivityVi
     hasSnapshot: true,
     truncated: false,
     streamEpoch: "epoch-1",
-    cursor: `epoch-1:${updateCount}`,
+    cursor: `epoch-1:${encodeURIComponent("codex:thread")}:${updateCount}`,
     seq: updateCount,
     connection: "open",
     updateCount,

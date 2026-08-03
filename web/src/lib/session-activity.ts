@@ -145,10 +145,15 @@ function hasActivityFrameBase(value: Record<string, unknown>): boolean {
     || typeof value.cursor !== "string"
     || typeof value.at !== "string"
   ) return false;
-  const separator = value.cursor.lastIndexOf(":");
-  return separator > 0
-    && value.cursor.slice(0, separator) === value.streamEpoch
-    && Number(value.cursor.slice(separator + 1)) === value.seq;
+  return value.cursor === encodeActivityCursor(value.streamEpoch, value.sessionId, value.seq);
+}
+
+export function encodeActivityCursor(
+  streamEpoch: string,
+  sessionId: string,
+  sequence: number,
+): string {
+  return `${streamEpoch}:${encodeURIComponent(sessionId)}:${sequence}`;
 }
 
 export function parseActivityFrame(
@@ -263,6 +268,8 @@ function applyAppend(item: ActivityItem, frame: ActivityAppendFrame): ActivityIt
 export interface ActivityReduction {
   state: SessionActivityView;
   accepted: boolean;
+  /** The client view cannot safely apply this frame and needs a fresh snapshot. */
+  requiresReset?: boolean;
 }
 
 /**
@@ -310,12 +317,12 @@ export function reduceSessionActivity(
     }
     case "activity.append": {
       const index = items.findIndex((item) => item.id === frame.id);
-      if (index >= 0) {
-        const item = applyAppend(items[index]!, frame);
-        if (item && item !== items[index]) {
-          items = items.map((value, itemIndex) => itemIndex === index ? item : value);
-          changed = true;
-        }
+      if (index < 0) return { state, accepted: false, requiresReset: true };
+      const item = applyAppend(items[index]!, frame);
+      if (!item) return { state, accepted: false, requiresReset: true };
+      if (item !== items[index]) {
+        items = items.map((value, itemIndex) => itemIndex === index ? item : value);
+        changed = true;
       }
       break;
     }

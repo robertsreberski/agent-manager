@@ -1,6 +1,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActivityFrame, ActivityMessageItem } from "../types";
+import { encodeActivityCursor } from "../lib/session-activity";
 import { useSessionActivity } from "./use-session-activity";
 
 const SESSION_ID = "codex:live/thread with spaces";
@@ -39,7 +40,7 @@ function frame(value: { type: ActivityFrame["type"]; seq: number; [key: string]:
     streamEpoch: EPOCH,
     sessionId: SESSION_ID,
     provider: "codex",
-    cursor: `${EPOCH}:${value.seq}`,
+    cursor: encodeActivityCursor(EPOCH, SESSION_ID, value.seq),
     at: "2026-08-03T12:00:01.000Z",
     ...value,
   } as ActivityFrame;
@@ -160,6 +161,39 @@ describe("useSessionActivity", () => {
       source.onerror?.(new Event("error"));
     });
     expect(result.current).toMatchObject({ connection: "offline", hasSnapshot: false, items: [] });
+  });
+
+  it("reconnects without a cursor when an append exposes a protocol gap", () => {
+    const { result } = renderHook(() => useSessionActivity(SESSION_ID));
+    const source = TestEventSource.instances[0]!;
+    act(() => {
+      source.emit("activity.snapshot", frame({
+        type: "activity.snapshot",
+        seq: 1,
+        items: [message({ text: "visible" })],
+        truncated: false,
+      }));
+      scheduled.values().next().value?.(16);
+    });
+    expect(result.current.hasSnapshot).toBe(true);
+
+    act(() => {
+      source.emit("activity.append", frame({
+        type: "activity.append",
+        seq: 2,
+        id: "message-1",
+        revision: 2,
+        channel: "text",
+        offset: 99,
+        text: "gap",
+        truncated: false,
+      }));
+      scheduled.values().next().value?.(32);
+    });
+
+    expect(source.close).toHaveBeenCalledOnce();
+    expect(TestEventSource.instances).toHaveLength(2);
+    expect(result.current).toMatchObject({ connection: "connecting", hasSnapshot: false, items: [] });
   });
 
   it("closes and clears the old stream on deselect or session change", () => {

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 
+import { encodeActivityCursor, parseActivityCursor } from "./cursor.ts";
 import {
   ACTIVITY_SCHEMA_VERSION,
   type ActivityAppendChannel,
@@ -70,13 +71,6 @@ function finite(value: number | null | undefined): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
-function parseCursor(cursor: string, epoch: string): number | null {
-  const separator = cursor.lastIndexOf(":");
-  if (separator <= 0 || cursor.slice(0, separator) !== epoch) return null;
-  const sequence = Number(cursor.slice(separator + 1));
-  return Number.isSafeInteger(sequence) && sequence >= 0 ? sequence : null;
-}
-
 export class ActivityHub {
   readonly streamEpoch: string;
   readonly #limits: ActivityHubLimits;
@@ -134,7 +128,12 @@ export class ActivityHub {
           at,
         );
         session.items.set(item.id, item);
-        this.#syncAppendOffsets(session, item);
+        this.#syncAppendOffsets(
+          session,
+          item,
+          mutation.item,
+          !existing || existing.kind !== mutation.item.kind,
+        );
         const evicted = this.#trimView(session);
         frame = evicted
           ? this.#resetFrame(sessionId, session, seq, at, "truncation")
@@ -144,7 +143,7 @@ export class ActivityHub {
               sessionId,
               provider,
               seq,
-              cursor: this.#cursor(seq),
+              cursor: this.#cursor(sessionId, seq),
               at,
               type: "activity.upsert",
               item: clone(item),
@@ -160,6 +159,11 @@ export class ActivityHub {
           break;
         }
         const rawBytes = Buffer.byteLength(mutation.text, "utf8");
+        const displayOffset = this.#displayOffset(item, mutation.channel);
+        if (displayOffset === null) {
+          frame = this.#resetFrame(sessionId, session, seq, at, "replay-gap");
+          break;
+        }
         session.appendOffsets.set(key, expected + rawBytes);
         const appended = this.#appendToItem(item, mutation.channel, mutation.text, at);
         if (!appended) {
@@ -176,13 +180,15 @@ export class ActivityHub {
               sessionId,
               provider,
               seq,
-              cursor: this.#cursor(seq),
+              cursor: this.#cursor(sessionId, seq),
               at,
               type: "activity.append",
               id: item.id,
               revision: appended.item.revision,
               channel: mutation.channel,
-              offset: mutation.offset,
+              // Provider offsets validate the unredacted source stream. Wire
+              // offsets describe the redacted field the browser has rendered.
+              offset: displayOffset,
               text: appended.delta,
               truncated: appended.truncated,
             };
@@ -199,7 +205,7 @@ export class ActivityHub {
           sessionId,
           provider,
           seq,
-          cursor: this.#cursor(seq),
+          cursor: this.#cursor(sessionId, seq),
           at,
           type: "activity.remove",
           id: mutation.id,
@@ -222,7 +228,7 @@ export class ActivityHub {
             at,
           );
           session.items.set(item.id, item);
-          this.#syncAppendOffsets(session, item);
+          this.#syncAppendOffsets(session, item, draft, true);
         }
         this.#trimView(session);
         frame = this.#resetFrame(sessionId, session, seq, at, mutation.reason);
@@ -251,7 +257,7 @@ export class ActivityHub {
       sessionId,
       provider: session.provider,
       seq: session.seq,
-      cursor: this.#cursor(session.seq),
+      cursor: this.#cursor(sessionId, session.seq),
       at,
       type: "activity.snapshot",
       items: this.#items(session),
@@ -267,7 +273,7 @@ export class ActivityHub {
       const snapshot = this.snapshot(sessionId)!;
       return { gap: false, cursor: snapshot.cursor, frames: [snapshot] };
     }
-    const sequence = parseCursor(cursor, this.streamEpoch);
+    const sequence = parseActivityCursor(cursor, this.streamEpoch, sessionId);
     const oldest = session.replay[0]?.frame.seq ?? session.seq + 1;
     const gap = sequence === null || sequence > session.seq || sequence < oldest - 1;
     if (gap) {
@@ -280,7 +286,7 @@ export class ActivityHub {
       .map((entry) => clone(entry.frame));
     return {
       gap: false,
-      cursor: frames.at(-1)?.cursor ?? this.#cursor(session.seq),
+      cursor: frames.at(-1)?.cursor ?? this.#cursor(sessionId, session.seq),
       frames,
     };
   }
@@ -317,8 +323,8 @@ export class ActivityHub {
     this.#sessions.clear();
   }
 
-  #cursor(seq: number): string {
-    return `${this.streamEpoch}:${seq}`;
+  #cursor(sessionId: string, seq: number): string {
+    return encodeActivityCursor(this.streamEpoch, sessionId, seq);
   }
 
   #items(session: ActivitySession): ActivityItem[] {
@@ -340,7 +346,7 @@ export class ActivityHub {
       sessionId,
       provider: session.provider,
       seq,
-      cursor: this.#cursor(seq),
+      cursor: this.#cursor(sessionId, seq),
       at,
       type: "activity.reset",
       reason,
@@ -534,19 +540,77 @@ export class ActivityHub {
     return { item: next, delta: emitted.delta, truncated: emitted.truncated };
   }
 
-  #syncAppendOffsets(session: ActivitySession, item: ActivityItem): void {
-    const set = (channel: ActivityAppendChannel, value: string): void => {
-      session.appendOffsets.set(appendKey(item.id, channel), Buffer.byteLength(value, "utf8"));
-    };
-    if (item.kind === "message" || item.kind === "reasoning" || item.kind === "plan") set("text", item.text);
-    if (item.kind === "tool") {
-      set("arguments", typeof item.arguments === "string" ? item.arguments : item.arguments === null ? "" : JSON.stringify(item.arguments));
-      set("result", typeof item.result === "string" ? item.result : item.result === null ? "" : JSON.stringify(item.result));
-      set("output", item.output);
+  #displayOffset(item: ActivityItem, channel: ActivityAppendChannel): number | null {
+    let value: string | null = null;
+    if (channel === "text" && (item.kind === "message" || item.kind === "reasoning" || item.kind === "plan")) {
+      value = item.text;
+    } else if (channel === "arguments" && item.kind === "tool") {
+      value = typeof item.arguments === "string"
+        ? item.arguments
+        : item.arguments === null ? "" : JSON.stringify(item.arguments);
+    } else if (channel === "result" && item.kind === "tool") {
+      value = typeof item.result === "string"
+        ? item.result
+        : item.result === null ? "" : JSON.stringify(item.result);
+    } else if (channel === "output" && (item.kind === "tool" || item.kind === "subagent")) {
+      value = item.output;
+    } else if (channel === "details" && item.kind === "lifecycle") {
+      value = item.details ?? "";
+    } else if (channel === "diff" && item.kind === "file-change") {
+      value = item.changes.at(-1)?.diff ?? "";
     }
-    if (item.kind === "subagent") set("output", item.output);
-    if (item.kind === "lifecycle") set("details", item.details ?? "");
-    if (item.kind === "file-change") set("diff", item.changes.at(-1)?.diff ?? "");
+    return value === null ? null : Buffer.byteLength(value, "utf8");
+  }
+
+  #syncAppendOffsets(
+    session: ActivitySession,
+    item: ActivityItem,
+    draft: ActivityItemDraft,
+    replace: boolean,
+  ): void {
+    if (replace) {
+      for (const key of session.appendOffsets.keys()) {
+        if (key.startsWith(`${item.id}\u0000`)) session.appendOffsets.delete(key);
+      }
+    }
+    const set = (channel: ActivityAppendChannel, displayValue: string, sourceValue?: string): void => {
+      const key = appendKey(item.id, channel);
+      if (!replace && sourceValue === undefined && session.appendOffsets.has(key)) return;
+      session.appendOffsets.set(
+        key,
+        Buffer.byteLength(sourceValue ?? displayValue, "utf8"),
+      );
+    };
+    const serialized = (value: ActivityJsonValue | string | null): string =>
+      typeof value === "string" ? value : value === null ? "" : JSON.stringify(value);
+    if (
+      (item.kind === "message" || item.kind === "reasoning" || item.kind === "plan")
+      && (draft.kind === "message" || draft.kind === "reasoning" || draft.kind === "plan")
+    ) {
+      set("text", item.text, draft.text);
+    }
+    if (item.kind === "tool" && draft.kind === "tool") {
+      set(
+        "arguments",
+        serialized(item.arguments),
+        draft.arguments === undefined ? undefined : serialized(draft.arguments),
+      );
+      set(
+        "result",
+        serialized(item.result),
+        draft.result === undefined ? undefined : serialized(draft.result),
+      );
+      set("output", item.output, draft.output);
+    }
+    if (item.kind === "subagent" && draft.kind === "subagent") {
+      set("output", item.output, draft.output);
+    }
+    if (item.kind === "lifecycle" && draft.kind === "lifecycle") {
+      set("details", item.details ?? "", draft.details === undefined ? undefined : draft.details ?? "");
+    }
+    if (item.kind === "file-change" && draft.kind === "file-change") {
+      set("diff", item.changes.at(-1)?.diff ?? "", draft.changes?.at(-1)?.diff);
+    }
   }
 }
 
