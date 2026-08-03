@@ -634,7 +634,11 @@ export class ClaudeManagedSession {
         this.#providerActivity = "failed";
         this.#abortAllPending();
       } else if (this.#pending.size === 0) {
-        this.#providerActivity = "idle";
+        // A result closes one user message but is not an authoritative queue
+        // boundary. In particular, session_state_changed(idle) can race ahead
+        // of the result. Stay non-idle until a later provider idle event proves
+        // the completed message and queued input have both been flushed.
+        this.#providerActivity = "running";
       }
       this.#touch();
     }

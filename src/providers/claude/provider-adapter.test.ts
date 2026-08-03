@@ -602,6 +602,12 @@ test("withdraws writable controls after stream close while preserving native res
     user_message_uuid: query.input[0]?.uuid,
     session_id: "managed-claude-1",
   });
+  query.emit({
+    type: "system",
+    subtype: "session_state_changed",
+    state: "idle",
+    session_id: "managed-claude-1",
+  });
   await eventually(() => changes.at(-1)?.activity === "idle");
 
   query.close();

@@ -454,7 +454,7 @@ test("hands off only an idle, drained session and reclaims after wrapper exit", 
   session.dispose();
 });
 
-test("blocks handoff while queued work remains", async () => {
+test("requires an authoritative idle event after a result before handoff", async () => {
   const runtime = new FakeRuntime();
   const session = await ClaudeManagedSession.start(runtime, {
     cwd: "/workspace",
@@ -486,6 +486,16 @@ test("blocks handoff while queued work remains", async () => {
     session_id: "session-1",
   });
   await eventually(() => session.snapshot.outstandingMessageIds.length === 0);
+  assert.equal(session.snapshot.activity, "running");
+  assert.throws(() => session.prepareCliHandoff(), /idle session/);
+
+  query.emit({
+    type: "system",
+    subtype: "session_state_changed",
+    state: "idle",
+    session_id: "session-1",
+  });
+  await eventually(() => session.snapshot.activity === "idle");
   assert.doesNotThrow(() => session.prepareCliHandoff());
   session.dispose();
 });

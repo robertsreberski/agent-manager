@@ -15,6 +15,7 @@ interface StreamBlock {
   id: string;
   kind: "text" | "thinking" | "tool" | "ignored";
   text: string;
+  textOffset: number;
   toolCallId: string | null;
   toolName: string | null;
   partialJson: string;
@@ -408,15 +409,12 @@ export class ClaudeActivityProjector {
     const lane = this.#lanes.get(laneKey) ?? this.#fallbackLane(message);
     if (event.type === "content_block_start") {
       const rawBlock = event.content_block;
-      const partialId = itemId(
-        "stream",
-        `${lane.parentToolUseId ?? "root"}:${lane.messageId}:${event.index}`,
-      );
       if (rawBlock.type === "text") {
         const block: StreamBlock = {
-          id: partialId,
+          id: itemId("message", `${lane.messageId}:${event.index}`),
           kind: "text",
           text: rawBlock.text,
+          textOffset: Buffer.byteLength(rawBlock.text, "utf8"),
           toolCallId: null,
           toolName: null,
           partialJson: "",
@@ -426,18 +424,19 @@ export class ClaudeActivityProjector {
         this.#linkChild(lane.parentToolUseId, block.id, mutations);
       } else if (rawBlock.type === "thinking") {
         const block: StreamBlock = {
-          id: partialId,
+          id: itemId("reasoning", `${lane.messageId}:${event.index}`),
           kind: "thinking",
           text: rawBlock.thinking,
+          textOffset: Buffer.byteLength(rawBlock.thinking, "utf8"),
           toolCallId: null,
           toolName: null,
           partialJson: "",
         };
         lane.blocks.set(event.index, block);
-        if (block.text.length > 0) {
-          mutations.push({ type: "upsert", item: this.#thinkingDraft(lane, block, "running") });
-          this.#linkChild(lane.parentToolUseId, block.id, mutations);
-        }
+        // Establish the stable block identity even when the thinking block
+        // starts empty so subsequent provider tokens can use append frames.
+        mutations.push({ type: "upsert", item: this.#thinkingDraft(lane, block, "running") });
+        this.#linkChild(lane.parentToolUseId, block.id, mutations);
       } else if (
         rawBlock.type === "tool_use"
         || rawBlock.type === "server_tool_use"
@@ -450,6 +449,7 @@ export class ClaudeActivityProjector {
           id: itemId("tool", toolCallId),
           kind: "tool",
           text: "",
+          textOffset: 0,
           toolCallId,
           toolName,
           partialJson: "",
@@ -469,9 +469,10 @@ export class ClaudeActivityProjector {
         this.#linkChild(lane.parentToolUseId, block.id, mutations);
       } else {
         lane.blocks.set(event.index, {
-          id: partialId,
+          id: itemId("stream", `${lane.messageId}:${event.index}`),
           kind: "ignored",
           text: "",
+          textOffset: 0,
           toolCallId: null,
           toolName: null,
           partialJson: "",
@@ -485,15 +486,27 @@ export class ClaudeActivityProjector {
       const block = lane.blocks.get(event.index);
       if (!block) return [];
       if (event.delta.type === "text_delta" && block.kind === "text") {
+        mutations.push({
+          type: "append",
+          id: block.id,
+          channel: "text",
+          offset: block.textOffset,
+          text: event.delta.text,
+        });
         block.text += event.delta.text;
-        mutations.push({ type: "upsert", item: this.#textDraft(lane, block, "running") });
+        block.textOffset += Buffer.byteLength(event.delta.text, "utf8");
       } else if (event.delta.type === "thinking_delta" && block.kind === "thinking") {
         // Only provider-returned displayable thinking is projected. Signature
         // deltas and redacted-thinking payloads never enter activity state.
+        mutations.push({
+          type: "append",
+          id: block.id,
+          channel: "text",
+          offset: block.textOffset,
+          text: event.delta.thinking,
+        });
         block.text += event.delta.thinking;
-        if (block.text.length > 0) {
-          mutations.push({ type: "upsert", item: this.#thinkingDraft(lane, block, "running") });
-        }
+        block.textOffset += Buffer.byteLength(event.delta.thinking, "utf8");
         if (event.delta.estimated_tokens !== null) {
           mutations.push({
             type: "upsert",
@@ -601,9 +614,8 @@ export class ClaudeActivityProjector {
       const content = rawContent as unknown as Record<string, unknown>;
       const type = stringValue(content.type);
       if (type === "text") {
-        const id = itemId("message", `${message.uuid}:${index}`);
-        const partial = this.#matchingPartial(lane, "text", matchedPartialIds);
-        if (partial && partial.id !== id) mutations.push({ type: "remove", id: partial.id });
+        const partial = this.#matchingPartial(lane, index, "text", matchedPartialIds);
+        const id = partial?.id ?? itemId("message", `${message.message.id}:${index}`);
         mutations.push({
           type: "upsert",
           item: {
@@ -629,9 +641,8 @@ export class ClaudeActivityProjector {
       } else if (type === "thinking") {
         const text = typeof content.thinking === "string" ? content.thinking : "";
         if (text.length === 0) continue;
-        const id = itemId("reasoning", `${message.uuid}:${index}`);
-        const partial = this.#matchingPartial(lane, "thinking", matchedPartialIds);
-        if (partial && partial.id !== id) mutations.push({ type: "remove", id: partial.id });
+        const partial = this.#matchingPartial(lane, index, "thinking", matchedPartialIds);
+        const id = partial?.id ?? itemId("reasoning", `${message.message.id}:${index}`);
         mutations.push({
           type: "upsert",
           item: {
@@ -1640,13 +1651,15 @@ export class ClaudeActivityProjector {
 
   #matchingPartial(
     lane: StreamLane | undefined,
+    index: number,
     kind: StreamBlock["kind"],
     claimed: Set<string>,
   ): StreamBlock | undefined {
     if (!lane) return undefined;
-    const block = [...lane.blocks.values()].find(
-      (candidate) => candidate.kind === kind && !claimed.has(candidate.id),
-    );
+    const candidate = lane.blocks.get(index);
+    const block = candidate?.kind === kind && !claimed.has(candidate.id)
+      ? candidate
+      : undefined;
     if (block) claimed.add(block.id);
     return block;
   }

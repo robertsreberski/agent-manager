@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { ActivityMutation } from "../../activity/index.ts";
+import { ActivityHub } from "../../activity/hub.ts";
 import { ClaudeActivityProjector } from "./activity-projector.ts";
 import type {
   ClaudeManagedSessionSnapshot,
@@ -15,6 +16,12 @@ function sdk(value: Record<string, unknown>): ClaudeSdkMessage {
 function upserts(mutations: readonly ActivityMutation[]) {
   return mutations.flatMap((mutation) =>
     mutation.type === "upsert" ? [mutation.item] : []
+  );
+}
+
+function appends(mutations: readonly ActivityMutation[]) {
+  return mutations.flatMap((mutation) =>
+    mutation.type === "append" ? [mutation] : []
   );
 }
 
@@ -51,7 +58,7 @@ test("folds partial text, displayable thinking, and tool JSON into authoritative
     },
   }));
 
-  projector.projectMessage(sdk({
+  const textStart = projector.projectMessage(sdk({
     ...baseMessage("stream_event", "stream-text-start"),
     parent_tool_use_id: null,
     event: {
@@ -60,6 +67,8 @@ test("folds partial text, displayable thinking, and tool JSON into authoritative
       content_block: { type: "text", text: "", citations: null },
     },
   }));
+  const streamedTextId = upserts(textStart).find((item) => item.kind === "message")?.id;
+  assert.ok(streamedTextId);
   const textDelta = projector.projectMessage(sdk({
     ...baseMessage("stream_event", "stream-text-delta"),
     parent_tool_use_id: null,
@@ -69,12 +78,15 @@ test("folds partial text, displayable thinking, and tool JSON into authoritative
       delta: { type: "text_delta", text: "Hello" },
     },
   }));
-  assert.equal(
-    upserts(textDelta).find((item) => item.kind === "message")?.text,
-    "Hello",
-  );
+  assert.deepEqual(appends(textDelta), [{
+    type: "append",
+    id: streamedTextId,
+    channel: "text",
+    offset: 0,
+    text: "Hello",
+  }]);
 
-  projector.projectMessage(sdk({
+  const thinkingStart = projector.projectMessage(sdk({
     ...baseMessage("stream_event", "stream-thinking-start"),
     parent_tool_use_id: null,
     event: {
@@ -83,6 +95,10 @@ test("folds partial text, displayable thinking, and tool JSON into authoritative
       content_block: { type: "thinking", thinking: "", signature: "never-project" },
     },
   }));
+  const streamedThinkingId = upserts(thinkingStart).find(
+    (item) => item.kind === "reasoning",
+  )?.id;
+  assert.ok(streamedThinkingId);
   const thinkingDelta = projector.projectMessage(sdk({
     ...baseMessage("stream_event", "stream-thinking-delta"),
     parent_tool_use_id: null,
@@ -93,7 +109,7 @@ test("folds partial text, displayable thinking, and tool JSON into authoritative
     },
   }));
   assert.equal(
-    upserts(thinkingDelta).find((item) => item.kind === "reasoning")?.text,
+    appends(thinkingDelta).find((mutation) => mutation.id === streamedThinkingId)?.text,
     "Check the files",
   );
   const signature = projector.projectMessage(sdk({
@@ -168,16 +184,150 @@ test("folds partial text, displayable thinking, and tool JSON into authoritative
       },
     },
   }));
-  assert.ok(final.some((mutation) => mutation.type === "remove"));
-  assert.equal(
-    upserts(final).find((item) => item.kind === "message")?.phase,
-    "commentary",
-  );
+  assert.equal(final.some((mutation) => mutation.type === "remove"), false);
+  const finalText = upserts(final).find((item) => item.kind === "message");
+  const finalThinking = upserts(final).find((item) => item.kind === "reasoning");
+  assert.equal(finalText?.id, streamedTextId);
+  assert.equal(finalText?.text, "Hello");
+  assert.equal(finalText?.phase, "commentary");
+  assert.equal(finalThinking?.id, streamedThinkingId);
+  assert.equal(finalThinking?.text, "Check the files");
   assert.equal(JSON.stringify(final).includes("final-secret"), false);
   assert.deepEqual(
     upserts(final).find((item) => item.kind === "tool")?.arguments,
     { command: "pwd" },
   );
+});
+
+test("keeps 1,250 streamed tokens linear and preserves text-tool-final identity order", () => {
+  const projector = new ClaudeActivityProjector();
+  const hub = new ActivityHub({
+    streamEpoch: "claude-stress",
+    replayMaxFrames: 2_000,
+    replayMaxBytes: 4 * 1_024 * 1_024,
+  });
+  const ingest = (mutations: readonly ActivityMutation[]) =>
+    mutations.map((mutation) => hub.ingest("managed-claude", "claude", mutation));
+
+  ingest(projector.projectMessage(sdk({
+    ...baseMessage("stream_event", "linear-start"),
+    parent_tool_use_id: null,
+    event: {
+      type: "message_start",
+      message: {
+        id: "linear-api-message",
+        role: "assistant",
+        content: [],
+        model: "claude-test",
+        stop_reason: null,
+        stop_sequence: null,
+        type: "message",
+        usage: { input_tokens: 1, output_tokens: 0 },
+      },
+    },
+  })));
+  const started = projector.projectMessage(sdk({
+    ...baseMessage("stream_event", "linear-block-start"),
+    parent_tool_use_id: null,
+    event: {
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "text", text: "", citations: null },
+    },
+  }));
+  ingest(started);
+  const id = upserts(started).find((item) => item.kind === "message")?.id;
+  assert.ok(id);
+
+  const deltaCount = 1_250;
+  let appendFrameCount = 0;
+  let serializedMutationBytes = 0;
+  let serializedFrameBytes = 0;
+  for (let index = 0; index < deltaCount; index += 1) {
+    const delta = projector.projectMessage(sdk({
+      ...baseMessage("stream_event", `linear-delta-${index}`),
+      parent_tool_use_id: null,
+      event: {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: "é" },
+      },
+    }));
+    assert.deepEqual(delta, [{
+      type: "append",
+      id,
+      channel: "text",
+      offset: index * 2,
+      text: "é",
+    }]);
+    serializedMutationBytes += Buffer.byteLength(JSON.stringify(delta), "utf8");
+    for (const frame of ingest(delta)) {
+      if (frame.type === "activity.append") appendFrameCount += 1;
+      serializedFrameBytes += Buffer.byteLength(JSON.stringify(frame), "utf8");
+    }
+  }
+  assert.equal(appendFrameCount, deltaCount);
+  // Both producer payload and actual wire frames stay bounded per token. A
+  // cumulative full-text upsert would instead grow quadratically.
+  assert.ok(serializedMutationBytes < deltaCount * 160);
+  assert.ok(serializedFrameBytes < deltaCount * 640);
+
+  const toolStarted = projector.projectMessage(sdk({
+    ...baseMessage("stream_event", "linear-tool-start"),
+    parent_tool_use_id: null,
+    event: {
+      type: "content_block_start",
+      index: 1,
+      content_block: {
+        type: "tool_use",
+        id: "linear-tool",
+        name: "Bash",
+        input: { command: "pwd" },
+      },
+    },
+  }));
+  ingest(toolStarted);
+  const toolId = upserts(toolStarted).find((item) => item.kind === "tool")?.id;
+  assert.ok(toolId);
+  assert.deepEqual(
+    hub.snapshot("managed-claude")?.items
+      .filter((item) => item.id === id || item.id === toolId)
+      .map((item) => item.id),
+    [id, toolId],
+  );
+
+  const final = projector.projectMessage(sdk({
+    ...baseMessage("assistant", "linear-final"),
+    parent_tool_use_id: null,
+    message: {
+      // Even if an SDK release reports a different wrapper message id on the
+      // authoritative event, the already-rendered content block keeps its id.
+      id: "linear-api-message-final",
+      role: "assistant",
+      model: "claude-test",
+      stop_reason: "end_turn",
+      stop_sequence: null,
+      type: "message",
+      content: [
+        { type: "text", text: "é".repeat(deltaCount), citations: null },
+        { type: "tool_use", id: "linear-tool", name: "Bash", input: { command: "pwd" } },
+      ],
+      usage: { input_tokens: 1, output_tokens: deltaCount },
+    },
+  }));
+  assert.equal(final.some((mutation) => mutation.type === "remove"), false);
+  const finalText = upserts(final).find((item) => item.kind === "message");
+  assert.equal(finalText?.id, id);
+  assert.equal(finalText?.text, "é".repeat(deltaCount));
+  assert.equal(finalText?.state, "complete");
+  ingest(final);
+  const ordered = hub.snapshot("managed-claude")?.items.filter(
+    (item) => item.id === id || item.id === toolId,
+  );
+  assert.deepEqual(ordered?.map((item) => item.id), [id, toolId]);
+  assert.equal(ordered?.[0]?.kind, "message");
+  assert.equal(ordered?.[0]?.kind === "message" ? ordered[0].text : null, "é".repeat(deltaCount));
+  assert.equal(ordered?.[1]?.kind, "tool");
 });
 
 test("projects tool progress, summaries, structured results, and replace-style usage", () => {
