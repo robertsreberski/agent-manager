@@ -12,7 +12,11 @@ import type {
   RequestContext,
   SessionAction,
 } from "../../server/contracts.ts";
-import type { CodexManagedAdapter } from "./adapter.ts";
+import {
+  CodexManagedCreationError,
+  type CodexManagedAdapter,
+  type CodexManagedCreationIssue,
+} from "./adapter.ts";
 import { jsonRpcIdKey } from "./rpc.ts";
 import type {
   CodexPendingRequest,
@@ -25,6 +29,7 @@ interface ManagedMetadata {
   name: string | null;
   permissionPreset: "standard" | "full-host";
   createdAt: string;
+  creationIssue: CodexManagedCreationIssue | null;
 }
 
 export interface CodexProviderBridgeOptions {
@@ -197,9 +202,26 @@ function emptyChildren(): SessionView["childSummary"] {
   };
 }
 
-function mappedCapabilities(adapter: CodexManagedAdapter): SessionView["control"]["capabilities"] {
+function mappedCapabilities(
+  adapter: CodexManagedAdapter,
+  state: CodexThreadState,
+  creationIssue: CodexManagedCreationIssue | null,
+): SessionView["control"]["capabilities"] {
   const controls = new Set(adapter.capabilities.controls);
   const result: SessionView["control"]["capabilities"] = [];
+  if (creationIssue) {
+    // Do not permit another prompt or mode mutation until a human has inspected
+    // the provider thread. Exact pending-request responses and interruption are
+    // safe because both are bound to provider-issued IDs.
+    if (state.pendingRequests.some((request) =>
+      request.respondable && request.kind !== "elicitation"
+    ) && controls.has("request.respond")) {
+      result.push("respond");
+    }
+    if (state.activeTurnId && controls.has("turn.interrupt")) result.push("interrupt");
+    if (controls.has("native.attach")) result.push("attach", "resume");
+    return result;
+  }
   if (controls.has("turn.queue")) result.push("queue");
   if (controls.has("turn.steer")) result.push("steer");
   if (controls.has("turn.interrupt")) result.push("interrupt");
@@ -407,17 +429,29 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     if (!cwd) throw new Error(`Unknown or unauthorized workspace ${input.workspaceId}`);
     context.signal.throwIfAborted();
     const fullHost = input.permissionPreset === "full-host";
-    const state = await this.adapter.startThread({
-      cwd,
-      mode: input.mode,
-      initialMessage: input.initialMessage,
-      approvalPolicy: fullHost ? "never" : "on-request",
-      sandbox: fullHost ? "danger-full-access" : "workspace-write",
-    });
+    let state: CodexThreadState;
+    let creationIssue: CodexManagedCreationIssue | null = null;
+    try {
+      state = await this.adapter.startThread({
+        cwd,
+        mode: input.mode,
+        initialMessage: input.initialMessage,
+        approvalPolicy: fullHost ? "never" : "on-request",
+        sandbox: fullHost ? "danger-full-access" : "workspace-write",
+      });
+    } catch (error) {
+      if (!(error instanceof CodexManagedCreationError)) throw error;
+      // `thread/start` succeeded, so returning this handle is the only safe
+      // creation outcome: the server can durably bind the idempotency receipt
+      // to the real provider thread instead of losing it as an unknown create.
+      state = error.threadState;
+      creationIssue = error.issue;
+    }
     this.#metadata.set(state.threadId, {
       name: input.name ?? null,
       permissionPreset: input.permissionPreset,
       createdAt: this.#now().toISOString(),
+      creationIssue,
     });
     this.#flushBufferedActivity(state.threadId);
     return this.toSessionView(state);
@@ -437,6 +471,12 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     }
     const state = this.adapter.getThreadState(session.sessionId);
     if (!state) throw new Error("Manager-owned Codex thread is not loaded");
+    const creationIssue = this.#metadata.get(session.sessionId)?.creationIssue ?? null;
+    if (creationIssue && action.type !== "respond" && action.type !== "interrupt") {
+      throw new Error(
+        "Codex session creation needs native recovery before messages or mode changes can be dispatched",
+      );
+    }
 
     switch (action.type) {
       case "send":
@@ -503,14 +543,49 @@ export class CodexProviderBridge implements ProviderControlAdapter {
   }
 
   toSessionView(state: CodexThreadState): SessionView {
-    const status = sessionStatus(state);
     const metadata = this.#metadata.get(state.threadId) ?? {
       name: null,
       permissionPreset: "standard" as const,
       createdAt: this.#now().toISOString(),
+      creationIssue: null,
     };
     const fullHost = metadata.permissionPreset === "full-host";
     const updatedAt = this.#now().toISOString();
+    const recoveryAttention: SessionView["attention"] = metadata.creationIssue
+      ? [{
+          id: "creation-recovery",
+          kind: "blocked",
+          summary: metadata.creationIssue.stage === "mode"
+            ? "The provider thread exists, but its requested mode was not confirmed. The initial message was not sent."
+            : metadata.creationIssue.outcome === "uncertain"
+            ? "The provider thread exists, but the initial-message acknowledgement is uncertain. It will not be sent again automatically."
+            : "The provider thread exists, but Codex rejected the initial message. It will not be sent again automatically.",
+          source: "provider-api",
+          confidence: "exact",
+          details: {
+            title: "Managed Codex session needs recovery",
+            toolName: "Native Codex attach",
+            inputSummary: boundedText(metadata.creationIssue.message, 500),
+            respondable: false,
+          },
+        }]
+      : [];
+    const normalizedStatus = metadata.creationIssue && !state.activeTurnId
+      ? "waiting"
+      : sessionStatus(state);
+    const pendingAttention: SessionView["attention"] = state.pendingRequests.map(
+      (request) => {
+        const details = attentionDetails(request);
+        return {
+          id: encodeCodexRequestId(request.id),
+          kind: pendingKind(request),
+          summary: requestSummary(request),
+          source: "provider-api",
+          confidence: "exact",
+          ...(details ? { details } : {}),
+        };
+      },
+    );
     return {
       id: `codex:${state.threadId}`,
       provider: "codex",
@@ -522,7 +597,7 @@ export class CodexProviderBridge implements ProviderControlAdapter {
       cwd: state.cwd,
       kind: "interactive",
       lifecycle: "live",
-      status,
+      status: normalizedStatus,
       providerStatus: state.status,
       waitingReason: state.pendingRequests.some((request) => request.kind === "user-input")
         ? "user-input"
@@ -530,6 +605,8 @@ export class CodexProviderBridge implements ProviderControlAdapter {
         ? "blocked"
         : state.pendingRequests.length > 0
         ? "approval"
+        : metadata.creationIssue
+        ? "blocked"
         : null,
       pid: null,
       runtimePid: null,
@@ -546,18 +623,8 @@ export class CodexProviderBridge implements ProviderControlAdapter {
         source: "provider-api",
         confidence: state.mode === "unknown" ? "heuristic" : "exact",
       },
-      activity: status,
-      attention: state.pendingRequests.map((request) => {
-        const details = attentionDetails(request);
-        return {
-          id: encodeCodexRequestId(request.id),
-          kind: pendingKind(request),
-          summary: requestSummary(request),
-          source: "provider-api",
-          confidence: "exact",
-          ...(details ? { details } : {}),
-        };
-      }),
+      activity: normalizedStatus,
+      attention: [...recoveryAttention, ...pendingAttention],
       effectiveAccess: {
         permissionMode: fullHost ? "never" : "on-request",
         sandboxMode: fullHost ? "danger-full-access" : "workspace-write",
@@ -566,7 +633,7 @@ export class CodexProviderBridge implements ProviderControlAdapter {
       terminal: null,
       control: {
         plane: "codex-app-server",
-        capabilities: mappedCapabilities(this.adapter),
+        capabilities: mappedCapabilities(this.adapter, state, metadata.creationIssue),
         managerOwned: true,
         writableLease: false,
       },

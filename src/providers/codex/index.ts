@@ -1,7 +1,11 @@
 export {
   CodexManagedAdapter,
+  CodexManagedCreationError,
   isSupportedCodexVersion,
   type CodexManagedAdapterOptions,
+  type CodexManagedCreationFailureOutcome,
+  type CodexManagedCreationFailureStage,
+  type CodexManagedCreationIssue,
 } from "./adapter.ts";
 export {
   codexActivityOffset,

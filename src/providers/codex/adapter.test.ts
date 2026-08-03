@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { ActivityMutation } from "../../activity/index.ts";
-import { CodexManagedAdapter } from "./adapter.ts";
+import {
+  CodexManagedAdapter,
+  CodexManagedCreationError,
+} from "./adapter.ts";
 import {
   CodexProviderBridge,
   codexRequestResponse,
@@ -155,10 +158,12 @@ async function eventually(assertion: () => void, timeoutMs = 1_000): Promise<voi
 
 async function initializedAdapter(
   transport = new FakeCodexTransport(),
+  requestTimeoutMs = 30_000,
 ): Promise<{ adapter: CodexManagedAdapter; transport: FakeCodexTransport }> {
   const adapter = new CodexManagedAdapter({
     transport,
     socketPath: "/tmp/agent-manager-test/codex.sock",
+    requestTimeoutMs,
     createId: (() => {
       let id = 0;
       return () => `message-${++id}`;
@@ -196,6 +201,19 @@ test("fails closed to read-only when the App Server version drifts", async () =>
     adapter.startThread({ cwd: "/workspace" }),
     /outside supported range/u,
   );
+  await adapter.dispose();
+});
+
+test("validates the initial message before creating a provider thread", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("thread/start", () => threadResult());
+
+  await assert.rejects(
+    adapter.startThread({ cwd: "/workspace", initialMessage: "   " }),
+    /must not be empty/u,
+  );
+  assert.equal(methodMessages(transport, "thread/start").length, 0);
+  assert.deepEqual(adapter.listThreadStates(), []);
   await adapter.dispose();
 });
 
@@ -281,10 +299,17 @@ test("fails managed creation when initial input dispatch fails", async () => {
 
   await assert.rejects(
     adapter.startThread({ cwd: "/workspace", initialMessage: "Must dispatch" }),
-    /simulated initial dispatch failure/u,
+    (error: unknown) => {
+      assert.ok(error instanceof CodexManagedCreationError);
+      assert.equal(error.threadState.threadId, "thread-1");
+      assert.equal(error.issue.stage, "initial-message");
+      assert.equal(error.issue.outcome, "rejected");
+      assert.equal(error.issue.initialMessageDisposition, "rejected");
+      return true;
+    },
   );
   assert.equal(methodMessages(transport, "turn/start").length, 1);
-  assert.equal(adapter.getThreadState("thread-1")?.queue[0]?.status, "queued");
+  assert.deepEqual(adapter.getThreadState("thread-1")?.queue, []);
   await adapter.dispose();
 });
 
@@ -300,10 +325,50 @@ test("fails managed creation when turn/start omits its acknowledgement turn ID",
 
   await assert.rejects(
     adapter.startThread({ cwd: "/workspace", initialMessage: "Must acknowledge" }),
-    /turn\/start response omitted the turn ID/u,
+    (error: unknown) => {
+      assert.ok(error instanceof CodexManagedCreationError);
+      assert.equal(error.threadState.threadId, "thread-1");
+      assert.equal(error.issue.stage, "initial-message");
+      assert.equal(error.issue.outcome, "uncertain");
+      assert.equal(error.issue.initialMessageDisposition, "uncertain");
+      assert.match(error.message, /turn\/start response omitted the turn ID/u);
+      return true;
+    },
   );
   assert.equal(methodMessages(transport, "turn/start").length, 1);
-  assert.equal(adapter.getThreadState("thread-1")?.queue[0]?.status, "queued");
+  assert.deepEqual(adapter.getThreadState("thread-1")?.queue, []);
+  await adapter.dispose();
+});
+
+test("treats an initial turn/start timeout as uncertain and never leaves the prompt replayable", async () => {
+  const { adapter, transport } = await initializedAdapter(
+    new FakeCodexTransport(),
+    10,
+  );
+  transport.handlers.set("thread/start", () => threadResult());
+  transport.handlers.set("turn/start", () => new Promise<JsonValue>(() => undefined));
+
+  await assert.rejects(
+    adapter.startThread({ cwd: "/workspace", initialMessage: "Run at most once" }),
+    (error: unknown) => {
+      assert.ok(error instanceof CodexManagedCreationError);
+      assert.equal(error.issue.outcome, "uncertain");
+      assert.equal(error.issue.initialMessageDisposition, "uncertain");
+      assert.match(error.message, /timed out: turn\/start/u);
+      return true;
+    },
+  );
+  assert.equal(methodMessages(transport, "turn/start").length, 1);
+  assert.equal(adapter.getThreadState("thread-1")?.status, "unknown");
+  assert.deepEqual(adapter.getThreadState("thread-1")?.queue, []);
+
+  const later = await adapter.queueMessage("thread-1", "A separate later message");
+  assert.equal(later.status, "queued");
+  assert.equal(methodMessages(transport, "turn/start").length, 1);
+  assert.deepEqual(
+    adapter.getThreadState("thread-1")?.queue.map((message) => message.text),
+    ["A separate later message"],
+  );
   await adapter.dispose();
 });
 
@@ -742,6 +807,151 @@ test("ProviderControlAdapter bridge creates normalized sessions and streams chan
   });
   assert.equal(attach?.kind, "codex-remote");
   assert.deepEqual(attach?.argv.slice(0, 3), ["codex", "resume", "thread-1"]);
+  bridge.dispose();
+  await adapter.dispose();
+});
+
+test("ProviderControlAdapter surfaces an addressable recovery handle after mode setup fails", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("thread/start", () => threadResult());
+  transport.handlers.set("thread/settings/update", () => {
+    throw new Error("mode setup rejected");
+  });
+  const activity: Array<{ managerSessionId: string; mutation: ActivityMutation }> = [];
+  const bridge = new CodexProviderBridge({
+    adapter,
+    resolveWorkspace: () => "/workspace",
+    onActivity: (managerSessionId, mutation) => {
+      activity.push({ managerSessionId, mutation });
+    },
+  });
+  const context = {
+    actor: { id: "local", kind: "local" as const, displayName: "Local user" },
+    requestId: "mode-recovery",
+    signal: new AbortController().signal,
+    workspace: { id: "workspace", label: "Workspace", path: "/workspace" },
+  };
+
+  const view = await bridge.createSession({
+    provider: "codex",
+    workspaceId: "workspace",
+    initialMessage: "This must not be sent before mode is confirmed",
+    mode: "planning",
+    permissionPreset: "standard",
+    idempotencyKey: "mode-recovery",
+  }, context);
+
+  assert.equal(view.id, "codex:thread-1");
+  assert.equal(view.status, "waiting");
+  assert.equal(view.waitingReason, "blocked");
+  assert.equal(view.attention[0]?.id, "creation-recovery");
+  assert.match(view.attention[0]?.summary ?? "", /initial message was not sent/u);
+  assert.deepEqual(view.control.capabilities, ["attach", "resume"]);
+  assert.equal(methodMessages(transport, "turn/start").length, 0);
+  assert.deepEqual(adapter.getThreadState("thread-1")?.queue, []);
+  assert.ok(activity.some((entry) =>
+    entry.managerSessionId === "codex:thread-1" &&
+    entry.mutation.type === "upsert" &&
+    entry.mutation.item.kind === "lifecycle" &&
+    entry.mutation.item.state === "failed"
+  ));
+  const attach = await bridge.getAttachInstruction(view, context);
+  assert.deepEqual(attach?.argv.slice(0, 3), ["codex", "resume", "thread-1"]);
+  await assert.rejects(
+    bridge.performAction(view, {
+      type: "send",
+      delivery: "queue",
+      text: "Do not auto-recover",
+      expectedGeneration: view.generation,
+      idempotencyKey: "unsafe-retry",
+    }, context),
+    /needs native recovery/u,
+  );
+  assert.equal(methodMessages(transport, "turn/start").length, 0);
+
+  bridge.dispose();
+  await adapter.dispose();
+});
+
+test("ProviderControlAdapter retains buffered live activity when turn acknowledgement is uncertain", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("thread/start", () => threadResult());
+  transport.handlers.set("thread/settings/update", () => null);
+  const activity: Array<{ managerSessionId: string; mutation: ActivityMutation }> = [];
+  let callbackCountInsideTurnStart = -1;
+  transport.handlers.set("turn/start", () => {
+    transport.notify("turn/started", {
+      threadId: "thread-1",
+      turn: { id: "turn-provider-confirmed", status: "inProgress", items: [] },
+    });
+    transport.notify("item/started", {
+      threadId: "thread-1",
+      turnId: "turn-provider-confirmed",
+      item: { type: "agentMessage", id: "answer-uncertain", text: "", phase: "commentary" },
+    });
+    transport.notify("item/agentMessage/delta", {
+      threadId: "thread-1",
+      turnId: "turn-provider-confirmed",
+      itemId: "answer-uncertain",
+      delta: "The provider is already producing output",
+    });
+    callbackCountInsideTurnStart = activity.length;
+    // The request succeeded but its direct acknowledgement is malformed. A
+    // retry could duplicate the running prompt, so creation must recover the
+    // provider thread without replaying it.
+    return { turn: { status: "inProgress", items: [] } };
+  });
+  const bridge = new CodexProviderBridge({
+    adapter,
+    resolveWorkspace: () => "/workspace",
+    onActivity: (managerSessionId, mutation) => {
+      activity.push({ managerSessionId, mutation });
+    },
+  });
+  const context = {
+    actor: { id: "local", kind: "local" as const, displayName: "Local user" },
+    requestId: "uncertain-ack",
+    signal: new AbortController().signal,
+    workspace: { id: "workspace", label: "Workspace", path: "/workspace" },
+  };
+
+  const view = await bridge.createSession({
+    provider: "codex",
+    workspaceId: "workspace",
+    initialMessage: "Run exactly once",
+    mode: "execution",
+    permissionPreset: "standard",
+    idempotencyKey: "uncertain-ack",
+  }, context);
+
+  assert.equal(callbackCountInsideTurnStart, 0);
+  assert.equal(view.id, "codex:thread-1");
+  assert.equal(view.status, "running");
+  assert.equal(view.runId, "turn-provider-confirmed");
+  assert.equal(view.waitingReason, "blocked");
+  assert.match(view.attention[0]?.summary ?? "", /will not be sent again automatically/u);
+  assert.deepEqual(view.control.capabilities, ["interrupt", "attach", "resume"]);
+  assert.deepEqual(adapter.getThreadState("thread-1")?.queue, []);
+  assert.equal(methodMessages(transport, "turn/start").length, 1);
+  assert.ok(activity.every((entry) => entry.managerSessionId === "codex:thread-1"));
+  assert.ok(activity.some((entry) =>
+    entry.mutation.type === "append" &&
+    entry.mutation.id.endsWith("/answer-uncertain") &&
+    entry.mutation.text === "The provider is already producing output"
+  ));
+
+  await assert.rejects(
+    bridge.performAction(view, {
+      type: "send",
+      delivery: "queue",
+      text: "Do not duplicate",
+      expectedGeneration: view.generation,
+      idempotencyKey: "do-not-duplicate",
+    }, context),
+    /needs native recovery/u,
+  );
+  assert.equal(methodMessages(transport, "turn/start").length, 1);
+
   bridge.dispose();
   await adapter.dispose();
 });

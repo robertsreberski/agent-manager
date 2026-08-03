@@ -79,6 +79,34 @@ export interface CodexManagedAdapterOptions {
   createId?: () => string;
 }
 
+export type CodexManagedCreationFailureStage = "mode" | "initial-message";
+export type CodexManagedCreationFailureOutcome = "rejected" | "uncertain";
+
+export interface CodexManagedCreationIssue {
+  stage: CodexManagedCreationFailureStage;
+  outcome: CodexManagedCreationFailureOutcome;
+  message: string;
+  /** Whether the initial prompt is known not to have run or may be running. */
+  initialMessageDisposition: "not-sent" | "rejected" | "uncertain";
+}
+
+/**
+ * `thread/start` is the point of no return: the provider thread already
+ * exists. Callers must retain this state as a recoverable managed handle
+ * instead of treating the whole create operation as if nothing happened.
+ */
+export class CodexManagedCreationError extends Error {
+  readonly threadState: CodexThreadState;
+  readonly issue: CodexManagedCreationIssue;
+
+  constructor(threadState: CodexThreadState, issue: CodexManagedCreationIssue) {
+    super(issue.message);
+    this.name = "CodexManagedCreationError";
+    this.threadState = threadState;
+    this.issue = Object.freeze({ ...issue });
+  }
+}
+
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -163,6 +191,19 @@ function extractThreadId(params: Record<string, unknown>): string | null {
 
 function assertText(text: string): void {
   if (text.trim().length === 0) throw new Error("Codex message must not be empty");
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error && error.message.trim()
+    ? error.message
+    : String(error);
+}
+
+function failureOutcome(error: unknown): CodexManagedCreationFailureOutcome {
+  // A JSON-RPC error is an explicit provider rejection. Timeouts, transport
+  // failures, and malformed success payloads cannot prove that the request did
+  // not take effect, so they remain uncertain and must never be replayed.
+  return error instanceof CodexRpcError ? "rejected" : "uncertain";
 }
 
 function assertStartOptions(
@@ -357,6 +398,9 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
   async startThread(options: StartCodexThreadOptions): Promise<CodexThreadState> {
     this.#assertControl("thread.start");
     assertStartOptions(options);
+    // Validate all caller-controlled input before `thread/start`, after which a
+    // provider resource exists and every failure needs a recovery handle.
+    if (options.initialMessage !== undefined) assertText(options.initialMessage);
     const result = asJsonObject(await this.#call(
       "thread.start",
       "thread/start",
@@ -371,25 +415,58 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
       }),
     ), "thread/start result");
     const state = this.#mergeThreadResponse(result);
+    const thread = this.#requireThread(state.threadId);
 
-    if (options.mode) await this.setMode(state.threadId, options.mode);
-    if (options.initialMessage !== undefined) {
-      this.#assertControl("turn.queue");
-      assertText(options.initialMessage);
-      // New App Server versions may omit or extend the creation status. Only
-      // the managed thread's initial input may bypass that unknown-status gate.
-      const queued = await this.#enqueueMessage(
-        this.#requireThread(state.threadId),
-        options.initialMessage,
-        true,
-      );
-      if (queued.status !== "dispatched" || !queued.turnId) {
-        throw new Error(
-          "Codex did not acknowledge the initial message with a turn ID",
-        );
+    if (options.mode) {
+      try {
+        await this.setMode(state.threadId, options.mode);
+      } catch (error) {
+        throw this.#managedCreationError(thread, {
+          stage: "mode",
+          outcome: failureOutcome(error),
+          message: `Codex thread ${state.threadId} was created, but its requested mode could not be confirmed: ${errorMessage(error)}`,
+          initialMessageDisposition: "not-sent",
+        });
       }
     }
-    return this.#snapshot(this.#requireThread(state.threadId));
+    if (options.initialMessage !== undefined) {
+      // New App Server versions may omit or extend the creation status. Only
+      // the managed thread's initial input may bypass that unknown-status gate.
+      let queued: CodexQueuedMessage;
+      let dispatchMayHaveStarted = false;
+      try {
+        this.#assertControl("turn.queue");
+        dispatchMayHaveStarted = true;
+        queued = await this.#enqueueMessage(thread, options.initialMessage, true);
+      } catch (error) {
+        const outcome = dispatchMayHaveStarted ? failureOutcome(error) : "rejected";
+        const disposition = dispatchMayHaveStarted ? outcome : "not-sent";
+        this.#discardUnacknowledgedInitialMessage(thread);
+        if (outcome === "uncertain" && !thread.activeTurnId) {
+          thread.status = "unknown";
+        }
+        throw this.#managedCreationError(thread, {
+          stage: "initial-message",
+          outcome,
+          message: outcome === "uncertain"
+            ? `Codex thread ${state.threadId} was created, but the initial message acknowledgement is uncertain: ${errorMessage(error)}`
+            : disposition === "not-sent"
+            ? `Codex thread ${state.threadId} was created, but the initial message was not sent: ${errorMessage(error)}`
+            : `Codex thread ${state.threadId} was created, but Codex rejected the initial message: ${errorMessage(error)}`,
+          initialMessageDisposition: disposition,
+        });
+      }
+      if (queued.status !== "dispatched" || !queued.turnId) {
+        this.#discardUnacknowledgedInitialMessage(thread);
+        throw this.#managedCreationError(thread, {
+          stage: "initial-message",
+          outcome: "rejected",
+          message: `Codex thread ${state.threadId} was created, but the initial message was not dispatched`,
+          initialMessageDisposition: "not-sent",
+        });
+      }
+    }
+    return this.#snapshot(thread);
   }
 
   async resumeThread(
@@ -681,6 +758,36 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     const state = this.#threads.get(threadId);
     if (!state) throw new Error(`Unknown manager-owned Codex thread: ${threadId}`);
     return state;
+  }
+
+  #discardUnacknowledgedInitialMessage(state: InternalThreadState): void {
+    if (state.queue.length === 0) return;
+    // A failed or ambiguous initial dispatch must never remain in the ordinary
+    // FIFO: adding a later message could otherwise replay the original prompt
+    // without an explicit recovery decision.
+    state.queue.shift();
+    this.#touch(state, true);
+  }
+
+  #managedCreationError(
+    state: InternalThreadState,
+    issue: CodexManagedCreationIssue,
+  ): CodexManagedCreationError {
+    this.#touch(state);
+    this.#emit({
+      type: "diagnostic",
+      level: "error",
+      code: "codex.creation.recovery_required",
+      message: issue.message,
+      threadId: state.threadId,
+    });
+    this.#emitActivityProjection(projectCodexDiagnostic(
+      state.threadId,
+      "codex.creation.recovery_required",
+      issue.message,
+      this.#now().toISOString(),
+    ));
+    return new CodexManagedCreationError(this.#snapshot(state), issue);
   }
 
   #mergeThreadResponse(response: JsonObject): CodexThreadState {
