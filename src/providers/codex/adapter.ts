@@ -276,7 +276,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     this.socketPath = options.socketPath;
     this.codexExecutable = options.codexExecutable ?? "codex";
     this.#clientName = options.clientName ?? "agent-manager";
-    this.#clientVersion = options.clientVersion ?? "0.1.0";
+    this.#clientVersion = options.clientVersion ?? "0.2.0";
     this.#now = options.now ?? (() => new Date());
     this.#createId = options.createId ?? randomUUID;
     this.rpc = new CodexRpcClient(

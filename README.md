@@ -7,9 +7,8 @@ control plane for sessions launched by the manager.
 The original dependency-free listing script remains available as
 `agent-sessions.ts`. The service adds a responsive browser UI, live SSE state,
 mode and attention detection, safe tmux preview/attach, and manager-owned
-Codex/Claude controls. Selecting a session loads a bounded, read-only window of
-its local Codex or Claude conversation without placing transcript content in
-the global session feed.
+Codex/Claude controls. Selecting a session opens a private live activity stream
+without placing conversation content in the global session feed.
 
 ## What it can control
 
@@ -34,6 +33,40 @@ semantic steering API.
 For managed sessions, planning/execution mode is independent from activity
 (`running`, `waiting`, or `idle`). Exact pending questions—including atomic
 multi-question forms—and approval requests appear in the cockpit.
+
+## Live activity
+
+The selected session updates while a provider turn is running. The timeline can
+show user and assistant messages, provider-exposed reasoning, plans, tool calls,
+arguments and results, command output, file diffs, subagents, queue state,
+approvals, warnings, lifecycle events, and usage. Active work stays expanded;
+completed details collapse, failures stay open, and scrolling away from the
+bottom pauses auto-follow without pausing ingestion.
+
+“Provider-exposed reasoning” means only reasoning text or summaries explicitly
+returned by Codex or Claude. Agent Manager never exposes hidden prompts,
+encrypted/redacted thinking, signatures, raw protocol envelopes, environment
+values, or terminal stdin. It does not enable extra model-generated progress
+summaries merely to populate the UI.
+
+Managed sessions use their live App Server or Agent SDK stream. External,
+rediscovered, and native-handoff sessions use selected-only bounded transcript
+observation and are labeled transcript-derived. The selected activity window is
+volatile: provider transcripts remain the durable history, while Agent Manager
+keeps only a bounded in-memory materialization and replay ring.
+
+The selected-session API is deliberately separate from global state:
+
+```text
+GET /api/v1/sessions/:id/activity/events  # private selected-session SSE
+GET /api/v1/sessions/:id/activity         # bounded history page
+GET /api/v1/events                        # metadata only
+```
+
+The default materialized window is at most 400 semantic items or 1 MiB. Large
+fields are capped at 128 KiB, and replay is capped at 512 frames, 2 MiB, or 15
+minutes. Truncation is visible in the UI; native attach remains the verbose
+escape hatch.
 
 ## Requirements
 
@@ -217,11 +250,11 @@ Scans never overlap; failures retain the last snapshot and mark it stale.
   transcript files lag live in-memory state. The UI shows source/confidence.
 - Tailscale identity headers rely on the loopback proxy boundary and assume the
   local macOS user account is trusted.
-- The browser renders only the newest bounded conversation window for the
-  selected session. It omits reasoning, tool traffic, terminal output, and
-  earlier content beyond its safety limits. Use
-  `agent-manager attach <session-id>` for the normal verbose Codex or Claude
-  interface while preserving the guarded ownership handoff.
+- The browser renders only a bounded activity window for the selected session.
+  It includes safe provider-exposed reasoning and tool traffic, but clips large
+  fields and omits hidden/internal data. Use `agent-manager attach <session-id>`
+  for the provider's native interface while preserving the guarded ownership
+  handoff.
 
 See [SECURITY.md](./SECURITY.md) for the complete trust model.
 

@@ -58,15 +58,29 @@ replayed automatically. Audit rows store action metadata, a SHA-256 payload
 digest, character count, and a fixed structural summary—not message text,
 answers, denial reasons, or arbitrary provider results.
 
-Pane previews, provider request summaries, and conversation messages can still
-contain sensitive project data. Conversation text is read on demand only for
-the authenticated selected-session detail route, with bounded source,
-per-message, aggregate-byte, and message-count limits. It is never stored in
-the session state store, collection response, SSE stream/replay ring, action
-audit, or service logs. Transcript paths and reader errors are not returned to
-the browser. These responses are marked `Cache-Control: no-store`; users should
-avoid exposing the cockpit through any proxy other than the exact private
-Tailscale Serve route.
+Pane previews, provider requests, messages, reasoning, tool arguments/results,
+command output, and diffs can contain sensitive project data. They are allowed
+only in the authenticated selected-session detail/activity routes. The global
+session collection, global SSE feed and replay ring retain metadata only;
+attention records there omit exact questions, options, summaries, and tool
+input. Selected activity is bounded and volatile in memory and is never written
+to SQLite, action audit rows, or service logs.
+
+Before selected activity reaches the browser, secret-shaped object fields and
+recognized bearer/OpenAI/GitHub/Slack/AWS/private-key forms are redacted and
+unsafe terminal/bidirectional control characters are stripped. Provider HTML is
+never interpreted. Hidden system/developer prompts, signatures,
+encrypted/redacted thinking, raw protocol envelopes, environment values,
+terminal stdin, and internal stack traces are excluded structurally rather than
+depending only on token-pattern scanning.
+
+Provider-marked secret answers use an ephemeral dispatch path. Their values are
+not stored in the durable action outbox, idempotency receipts, or audit details;
+if acknowledgement is lost, the outcome becomes unknown instead of replaying
+the answer. Transcript paths and reader errors are not returned to the browser.
+Activity/detail responses use `Cache-Control: no-store`; users should avoid
+exposing the cockpit through any proxy other than the exact private Tailscale
+Serve route.
 
 ## Panic lock
 
