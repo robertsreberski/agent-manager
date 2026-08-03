@@ -51,6 +51,25 @@ function sessionWithQuestions(): SessionView {
 }
 
 describe("PendingRequests", () => {
+  it("bounds pending forms in their own mobile-scrollable tray", () => {
+    render(
+      <PendingRequests
+        session={sessionWithQuestions()}
+        writable
+        busy={false}
+        onRespond={vi.fn(async () => undefined)}
+      />,
+    );
+
+    expect(screen.getByRole("region", { name: "Pending requests" })).toHaveClass(
+      "max-h-[min(34dvh,18rem)]",
+      "shrink-0",
+      "overflow-y-auto",
+      "overscroll-contain",
+    );
+    expect(screen.getByText("1 waiting")).toBeInTheDocument();
+  });
+
   it("submits every exact provider question atomically", async () => {
     const onRespond = vi.fn(async () => undefined);
     render(

@@ -230,16 +230,25 @@ export function PendingRequests({
 }) {
   if (requests.length === 0) return null;
   return (
-    <section className="grid gap-2 border-b bg-muted/20 px-4 py-3 md:px-6" aria-label="Pending requests">
-      {requests.map((request, index) => (
-        <PendingRequestCard
-          key={request.id ?? `${request.kind}-${index}`}
-          request={request}
-          disabled={!writable || !session.control.capabilities.includes("respond")}
-          busy={busy}
-          onRespond={onRespond}
-        />
-      ))}
+    <section
+      className="max-h-[min(34dvh,18rem)] shrink-0 overflow-y-auto overscroll-contain border-b bg-muted/20 [scrollbar-gutter:stable] sm:max-h-[min(42dvh,22rem)] md:max-h-[min(36dvh,28rem)]"
+      aria-label="Pending requests"
+    >
+      <div className="sticky top-0 z-10 flex items-center justify-between gap-3 border-b bg-background/95 px-4 py-2 backdrop-blur md:px-6">
+        <h3 className="text-xs font-semibold">Pending requests</h3>
+        <span className="text-[11px] text-muted-foreground">{requests.length} waiting</span>
+      </div>
+      <div className="grid gap-2 px-3 py-3 sm:px-4 md:px-6">
+        {requests.map((request, index) => (
+          <PendingRequestCard
+            key={request.id ?? `${request.kind}-${index}`}
+            request={request}
+            disabled={!writable || !session.control.capabilities.includes("respond")}
+            busy={busy}
+            onRespond={onRespond}
+          />
+        ))}
+      </div>
     </section>
   );
 }

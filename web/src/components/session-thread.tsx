@@ -127,6 +127,43 @@ export function activityAttentionRequests(items: ActivityItem[]): AttentionReque
   });
 }
 
+export function mergePendingAttentionRequests(
+  items: ActivityItem[],
+  metadataRequests: AttentionRequest[],
+): AttentionRequest[] {
+  const activityRequests = activityAttentionRequests(items);
+  const resolvedRequestIds = new Set(
+    items.flatMap((item) => item.kind === "attention" && item.resolved && item.requestId
+      ? [item.requestId]
+      : []),
+  );
+  const metadataById = new Map(
+    metadataRequests.flatMap((request) => request.id ? [[request.id, request] as const] : []),
+  );
+  const activityRequestIds = new Set(
+    activityRequests.flatMap((request) => request.id ? [request.id] : []),
+  );
+
+  const mergedActivityRequests = activityRequests.map((request) => {
+    const fallback = request.id ? metadataById.get(request.id) : undefined;
+    if (!fallback) return request;
+    return {
+      ...fallback,
+      ...request,
+      summary: request.summary ?? fallback.summary ?? null,
+      questions: request.questions && request.questions.length > 0
+        ? request.questions
+        : fallback.questions ?? [],
+      isSecret: Boolean(request.isSecret || fallback.isSecret),
+    };
+  });
+
+  const metadataFallbacks = metadataRequests.filter((request) =>
+    !request.id || (!activityRequestIds.has(request.id) && !resolvedRequestIds.has(request.id)),
+  );
+  return [...mergedActivityRequests, ...metadataFallbacks];
+}
+
 function UserMessage() {
   return (
     <MessagePrimitive.Root className="mx-auto flex w-full max-w-3xl justify-end px-3 py-2 sm:px-4 md:px-6">
@@ -271,6 +308,15 @@ function AgentComposer({
           rows={2}
           maxLength={100_000}
           submitMode="enter"
+          onKeyDown={(event) => {
+            if (event.key !== "Enter" || event.nativeEvent.isComposing) return;
+            const steerShortcut = event.shiftKey && (event.ctrlKey || event.metaKey);
+            if ((steerShortcut && !canSteer) || (!event.shiftKey && !canQueue)) {
+              // assistant-ui clears the composer before calling its queue adapter.
+              // Stop unsupported delivery modes here so the draft remains intact.
+              event.preventDefault();
+            }
+          }}
           placeholder={
             !writable
               ? "Take control to send a message"
@@ -283,7 +329,11 @@ function AgentComposer({
         <div className="flex flex-col-reverse items-stretch justify-between gap-2 sm:flex-row sm:items-center">
           <p className="px-1 text-[11px] text-muted-foreground">
             {queueCount > 0 ? `${queueCount} queued · ` : ""}
-            Enter queues · Ctrl/⌘+Shift+Enter steers
+            {canQueue && canSteer
+              ? "Enter queues · Ctrl/⌘+Shift+Enter steers"
+              : canQueue
+                ? "Enter queues · Steering unavailable"
+                : "Ctrl/⌘+Shift+Enter steers · Queueing unavailable"}
           </p>
           <div className="flex items-center justify-end gap-2">
             <SteerButton enabled={writable && canSteer} />
@@ -531,7 +581,9 @@ export function SessionThread({
   const hasLiveActivity = activity.hasSnapshot;
   const timelineMessages: TimelineMessage[] = hasLiveActivity ? activity.items : session.messages;
   const pendingRequests = useMemo(
-    () => hasLiveActivity ? activityAttentionRequests(activity.items) : session.attention,
+    () => hasLiveActivity
+      ? mergePendingAttentionRequests(activity.items, session.attention)
+      : session.attention,
     [activity.items, hasLiveActivity, session.attention],
   );
   const canQueue = session.control.capabilities.includes("queue");
@@ -540,12 +592,14 @@ export function SessionThread({
     items: session.queue,
     enqueue: (message: AppendMessage, options: { steer: boolean }) => {
       const text = messageText(message);
-      if (text) void onSend(text, options.steer ? "steer" : "queue").catch(() => undefined);
+      const delivery = options.steer ? "steer" : "queue";
+      const supported = options.steer ? canSteer : canQueue;
+      if (text && supported) void onSend(text, delivery).catch(() => undefined);
     },
     steer: () => undefined,
     remove: () => undefined,
     clear: () => undefined,
-  }), [onSend, session.queue]);
+  }), [canQueue, canSteer, onSend, session.queue]);
   const runtime = useExternalStoreRuntime<TimelineMessage>({
     messages: timelineMessages,
     convertMessage: convertTimelineMessage,
@@ -555,7 +609,7 @@ export function SessionThread({
     isDisabled: !writable || (!canQueue && !canSteer),
     onNew: async (message) => {
       const text = messageText(message);
-      if (text) await onSend(text, "queue");
+      if (text && canQueue) await onSend(text, "queue");
     },
     queue: canQueue || canSteer ? queueAdapter : undefined,
   });

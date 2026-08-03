@@ -44,6 +44,34 @@ function renderThread(session: SessionView) {
   );
 }
 
+const WRITABLE_LEASE = {
+  token: "lease-token",
+  clientId: "web-test",
+  expiresAt: "2099-01-01T00:00:00.000Z",
+  fullHostArmedUntil: null,
+};
+
+function renderWritableThread(session: SessionView, onSend = vi.fn(async () => undefined)) {
+  return {
+    onSend,
+    ...render(
+      <SessionThread
+        session={session}
+        lease={WRITABLE_LEASE}
+        busy={false}
+        onAcquire={vi.fn()}
+        onRelease={vi.fn()}
+        onSend={onSend}
+        onRespond={vi.fn()}
+        onInterrupt={vi.fn()}
+        onSetMode={vi.fn()}
+        loadPreview={vi.fn()}
+        loadAttach={vi.fn()}
+      />,
+    ),
+  };
+}
+
 function activityBase(id: string, seq: number, state: ActivityItem["state"] = "complete") {
   return {
     schemaVersion: 1 as const,
@@ -369,12 +397,7 @@ describe("SessionThread live activity", () => {
     render(
       <SessionThread
         session={session}
-        lease={{
-          token: "lease-token",
-          clientId: "web-test",
-          expiresAt: "2099-01-01T00:00:00.000Z",
-          fullHostArmedUntil: null,
-        }}
+        lease={WRITABLE_LEASE}
         busy={false}
         onAcquire={vi.fn()}
         onRelease={vi.fn()}
@@ -400,5 +423,123 @@ describe("SessionThread live activity", () => {
       value: "",
       selectedOptions: ["Staging"],
     }));
+  });
+
+  it("keeps metadata-only attention after a snapshot, enriches matching live requests, and suppresses resolved ids", () => {
+    const unresolved: ActivityItem = {
+      ...activityBase("live-request", 1, "waiting"),
+      kind: "attention",
+      requestId: "request-live",
+      attentionKind: "approval",
+      title: "Live approval",
+      summary: "Approve the provider action",
+      questions: [],
+      respondable: true,
+      resolved: false,
+      isSecret: false,
+    };
+    const resolved: ActivityItem = {
+      ...activityBase("resolved-request", 2),
+      kind: "attention",
+      requestId: "request-resolved",
+      attentionKind: "question",
+      title: "Resolved live request",
+      summary: null,
+      questions: [],
+      respondable: true,
+      resolved: true,
+      isSecret: false,
+    };
+    useSessionActivityMock.mockReturnValue(liveActivity([unresolved, resolved]));
+
+    renderThread(rawSession({
+      ownership: "external",
+      attention: [
+        {
+          id: "request-live",
+          kind: "approval",
+          summary: "Metadata summary",
+          details: { toolName: "shell", inputSummary: "pnpm check" },
+          source: "provider-api",
+          confidence: "exact",
+        },
+        {
+          id: "request-metadata-only",
+          kind: "question",
+          summary: "Answer in the provider session",
+          details: { title: "External session question" },
+          source: "heuristic",
+          confidence: "heuristic",
+        },
+        {
+          id: "request-resolved",
+          kind: "question",
+          summary: "Should remain hidden",
+          details: { title: "Stale metadata request" },
+          source: "provider-api",
+          confidence: "exact",
+        },
+      ],
+      transcript: { state: "available", source: "codex-rollout", messageCount: 0 },
+    }));
+
+    const pending = screen.getByRole("region", { name: "Pending requests" });
+    expect(within(pending).getByText("Live approval")).toBeInTheDocument();
+    expect(within(pending).getByText("shell")).toBeInTheDocument();
+    expect(within(pending).getByText("External session question")).toBeInTheDocument();
+    expect(within(pending).queryByText("Stale metadata request")).not.toBeInTheDocument();
+  });
+});
+
+describe("SessionThread asymmetric composer capabilities", () => {
+  it("does not dispatch or clear a queue-only draft when the steer hotkey is pressed", () => {
+    const { onSend } = renderWritableThread(rawSession({
+      control: { capabilities: ["queue"] },
+      transcript: { state: "available", source: "provider-api", messageCount: 0 },
+    }));
+    const input = screen.getByPlaceholderText("Send work to this session…");
+
+    fireEvent.change(input, { target: { value: "Keep this queue draft" } });
+    fireEvent.keyDown(input, { key: "Enter", ctrlKey: true, shiftKey: true });
+
+    expect(onSend).not.toHaveBeenCalled();
+    expect(input).toHaveValue("Keep this queue draft");
+  });
+
+  it("does not dispatch or clear a steer-only draft on plain Enter", () => {
+    const { onSend } = renderWritableThread(rawSession({
+      control: { capabilities: ["steer"] },
+      transcript: { state: "available", source: "provider-api", messageCount: 0 },
+    }));
+    const input = screen.getByPlaceholderText("Steer the current turn…");
+
+    fireEvent.change(input, { target: { value: "Keep this steer draft" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(onSend).not.toHaveBeenCalled();
+    expect(input).toHaveValue("Keep this steer draft");
+  });
+
+  it("still delivers each supported asymmetric keyboard action", async () => {
+    const queueSend = vi.fn(async () => undefined);
+    const queued = renderWritableThread(rawSession({
+      control: { capabilities: ["queue"] },
+      transcript: { state: "available", source: "provider-api", messageCount: 0 },
+    }), queueSend);
+    const queueInput = screen.getByPlaceholderText("Send work to this session…");
+    fireEvent.change(queueInput, { target: { value: "Queue this" } });
+    fireEvent.keyDown(queueInput, { key: "Enter" });
+    await waitFor(() => expect(queueSend).toHaveBeenCalledWith("Queue this", "queue"));
+    queued.unmount();
+
+    const steerSend = vi.fn(async () => undefined);
+    renderWritableThread(rawSession({
+      control: { capabilities: ["steer"] },
+      transcript: { state: "available", source: "provider-api", messageCount: 0 },
+    }), steerSend);
+    const steerInput = screen.getByPlaceholderText("Steer the current turn…");
+    fireEvent.change(steerInput, { target: { value: "Steer this" } });
+    fireEvent.keyDown(steerInput, { key: "Enter", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(steerSend).toHaveBeenCalledWith("Steer this", "steer"));
   });
 });
