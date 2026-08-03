@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import type { ActivityMutation } from "../../activity/index.ts";
 import { CodexManagedAdapter } from "./adapter.ts";
 import {
   CodexProviderBridge,
@@ -87,8 +88,13 @@ class FakeCodexTransport implements MessageTransport {
     return () => this.#closeListeners.delete(listener);
   }
 
-  notify(method: string, params: JsonObject): void {
-    this.#emit({ jsonrpc: "2.0", method, params });
+  notify(method: string, params: JsonObject, emittedAtMs?: number): void {
+    this.#emit({
+      jsonrpc: "2.0",
+      method,
+      params,
+      ...(emittedAtMs === undefined ? {} : { emittedAtMs }),
+    });
   }
 
   request(id: JsonRpcId, method: string, params: JsonObject): void {
@@ -736,6 +742,78 @@ test("ProviderControlAdapter bridge creates normalized sessions and streams chan
   });
   assert.equal(attach?.kind, "codex-remote");
   assert.deepEqual(attach?.argv.slice(0, 3), ["codex", "resume", "thread-1"]);
+  bridge.dispose();
+  await adapter.dispose();
+});
+
+test("ProviderControlAdapter buffers first-turn activity until the manager session mapping exists", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("thread/start", () => threadResult());
+  transport.handlers.set("thread/settings/update", () => null);
+  const activity: Array<{ managerSessionId: string; mutation: ActivityMutation }> = [];
+  let callbackCountInsideTurnStart = -1;
+  transport.handlers.set("turn/start", () => {
+    transport.notify("item/started", {
+      threadId: "thread-1",
+      turnId: "turn-first",
+      startedAtMs: 1_775_212_800_000,
+      item: { type: "agentMessage", id: "answer-first", text: "", phase: "commentary" },
+    }, 1_775_212_800_010);
+    transport.notify("item/agentMessage/delta", {
+      threadId: "thread-1",
+      turnId: "turn-first",
+      itemId: "answer-first",
+      delta: "First live output",
+    }, 1_775_212_800_020);
+    callbackCountInsideTurnStart = activity.length;
+    return { turn: { id: "turn-first", status: "inProgress", items: [] } };
+  });
+
+  const bridge = new CodexProviderBridge({
+    adapter,
+    resolveWorkspace: () => "/workspace",
+    onActivity: (managerSessionId, mutation) => {
+      activity.push({ managerSessionId, mutation });
+    },
+  });
+  await bridge.createSession({
+    provider: "codex",
+    workspaceId: "workspace",
+    initialMessage: "Start immediately",
+    mode: "execution",
+    permissionPreset: "standard",
+    idempotencyKey: "first-activity-race",
+  }, {
+    actor: { id: "local", kind: "local", displayName: "Local user" },
+    requestId: "first-activity-race",
+    signal: new AbortController().signal,
+    workspace: { id: "workspace", label: "Workspace", path: "/workspace" },
+  });
+
+  assert.equal(callbackCountInsideTurnStart, 0);
+  assert.ok(activity.length >= 4, "queue and assistant mutations should flush after mapping");
+  assert.ok(activity.every((entry) => entry.managerSessionId === "codex:thread-1"));
+  const assistantUpsert = activity.find((entry) =>
+    entry.mutation.type === "upsert" &&
+    entry.mutation.item.kind === "message" &&
+    entry.mutation.item.id.endsWith("/answer-first")
+  );
+  assert.ok(assistantUpsert);
+  if (assistantUpsert.mutation.type === "upsert") {
+    assert.equal(assistantUpsert.mutation.item.updatedAt, "2026-04-03T10:40:00.010Z");
+  }
+  const assistantDelta = activity.find((entry) =>
+    entry.mutation.type === "append" &&
+    entry.mutation.id.endsWith("/answer-first")
+  );
+  assert.deepEqual(assistantDelta?.mutation, {
+    type: "append",
+    id: "codex/item/thread-1/turn-first/answer-first",
+    channel: "text",
+    offset: 0,
+    text: "First live output",
+  });
+
   bridge.dispose();
   await adapter.dispose();
 });

@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { get as httpGet } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { ActivityHub, type ActivityFrame } from "../activity/index.ts";
 import type { SessionView } from "../core/types.ts";
 import type {
   PanePreviewAdapter,
@@ -28,6 +29,30 @@ const origin = "http://127.0.0.1:43127";
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
+}
+
+async function nextSseChunk(
+  response: import("node:http").IncomingMessage,
+  label: string,
+): Promise<string> {
+  return await new Promise<string>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), 1_500);
+    timer.unref();
+    response.once("data", (chunk: Buffer) => {
+      clearTimeout(timer);
+      resolve(chunk.toString("utf8"));
+    });
+    response.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+}
+
+function sseFrame(chunk: string): ActivityFrame {
+  const data = chunk.match(/(?:^|\n)data: ([^\n]+)\n/);
+  assert.ok(data?.[1], `SSE chunk did not contain JSON data: ${chunk}`);
+  return JSON.parse(data[1]) as ActivityFrame;
 }
 
 function temporaryControlSocket() {
@@ -335,6 +360,102 @@ test("enforces bootstrap, CSRF, leases, stale generations and idempotency", asyn
   });
   assert.equal(stale.statusCode, 409);
   assert.equal(stale.json<{ error: { code: string } }>().error.code, "STALE_GENERATION");
+});
+
+test("dispatches provider-marked secret answers without retaining them in SQLite", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-manager-secret-answer-"));
+  const databasePath = join(directory, "state.sqlite");
+  const secret = "correct-horse-secret-answer-needle";
+  const requestId = "secret-question-request";
+  const activityHub = new ActivityHub({ streamEpoch: "secret-answer-test" });
+  activityHub.ingest("codex:thread-1", "codex", {
+    type: "upsert",
+    item: {
+      id: "secret-attention",
+      kind: "attention",
+      requestId,
+      attentionKind: "question",
+      title: "Credential",
+      summary: "Enter the credential",
+      questions: [{
+        id: "credential",
+        text: "Credential",
+        options: [],
+        multiSelect: false,
+        allowFreeText: true,
+        isSecret: true,
+      }],
+      respondable: true,
+      resolved: false,
+      isSecret: true,
+      state: "waiting",
+      source: "provider-api",
+      confidence: "exact",
+      exposure: "provider-exposed",
+    },
+  });
+  const dispatched: SessionAction[] = [];
+  const adapter: ProviderControlAdapter = {
+    async createSession() { return session(); },
+    async performAction(_session, action) {
+      dispatched.push(action);
+      return { status: "succeeded" };
+    },
+  };
+  const backend = await createAgentManagerServer({
+    databasePath,
+    discovery: false,
+    staticDir: false,
+    activityHub,
+    adapters: { codex: adapter },
+    initialSessions: [session({
+      attention: [{
+        id: requestId,
+        kind: "question",
+        summary: "Enter the credential",
+        source: "provider-api",
+        confidence: "exact",
+        details: { respondable: true },
+      }],
+    })],
+  });
+  try {
+    await backend.app.ready();
+    const headers = await authenticatedHeaders(backend);
+    const leaseResponse = await backend.app.inject({
+      method: "POST",
+      url: "/api/v1/sessions/codex:thread-1/control-lease",
+      headers,
+      payload: { clientId: "secret-answer-client" },
+    });
+    assert.equal(leaseResponse.statusCode, 200, leaseResponse.body);
+    const lease = leaseResponse.json<{ lease: { token: string } }>().lease;
+    const idempotencyKey = "secret-answer-idempotency";
+    const response = await backend.app.inject({
+      method: "POST",
+      url: "/api/v1/sessions/codex:thread-1/actions",
+      headers: { ...headers, "x-control-lease": lease.token },
+      payload: {
+        type: "respond",
+        requestId,
+        response: { kind: "answer", value: secret, selectedOptions: [] },
+        expectedGeneration: backend.state.get("codex:thread-1")!.generation,
+        idempotencyKey,
+      },
+    });
+    assert.equal(response.statusCode, 200, response.body);
+    assert.equal(response.json<{ action: { status: string } }>().action.status, "succeeded");
+    assert.equal(dispatched[0]?.type, "respond");
+    assert.equal(backend.database.getPersistedActionStatus("codex:thread-1", idempotencyKey), null);
+    assert.equal(backend.database.getActionReceipt("codex:thread-1", idempotencyKey), null);
+  } finally {
+    await backend.close().catch(() => undefined);
+  }
+  try {
+    assert.equal(readFileSync(databasePath).includes(Buffer.from(secret)), false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("bounds pane previews and never accepts browser-supplied tmux targets", async (t) => {
@@ -890,6 +1011,309 @@ test("replaces a stale SSE stream from the same authenticated browser client", a
     firstClosed,
     delay(1_000).then(() => { throw new Error("replaced SSE stream did not close"); }),
   ]);
+});
+
+test("serves bounded authenticated activity history without crossing session boundaries", async (t) => {
+  const activityHub = new ActivityHub({ streamEpoch: "activity-history-test" });
+  activityHub.ingest("codex:thread-1", "codex", {
+    type: "upsert",
+    item: {
+      id: "message-a",
+      kind: "message",
+      role: "assistant",
+      phase: "final",
+      text: "selected-session-a-private",
+      state: "complete",
+      source: "provider-api",
+      confidence: "exact",
+      exposure: "provider-exposed",
+    },
+  });
+  activityHub.ingest("claude:thread-2", "claude", {
+    type: "upsert",
+    item: {
+      id: "message-b",
+      kind: "message",
+      role: "assistant",
+      phase: "final",
+      text: "other-session-b-private",
+      state: "complete",
+      source: "provider-api",
+      confidence: "exact",
+      exposure: "provider-exposed",
+    },
+  });
+  const backend = await createAgentManagerServer({
+    discovery: false,
+    staticDir: false,
+    activityHub,
+    initialSessions: [
+      session(),
+      session({
+        id: "claude:thread-2",
+        provider: "claude",
+        sessionId: "thread-2",
+        rootSessionId: "thread-2",
+        control: {
+          plane: "claude-sdk",
+          capabilities: [],
+          managerOwned: true,
+          writableLease: false,
+        },
+      }),
+    ],
+  });
+  t.after(() => backend.close());
+  await backend.app.ready();
+
+  const rejected = await backend.app.inject({
+    method: "GET",
+    url: "/api/v1/sessions/codex:thread-1/activity",
+    headers: { host },
+  });
+  assert.equal(rejected.statusCode, 401);
+
+  const headers = await authenticatedHeaders(backend);
+  const response = await backend.app.inject({
+    method: "GET",
+    url: "/api/v1/sessions/codex:thread-1/activity?limit=1",
+    headers: { host, cookie: headers.cookie },
+  });
+  assert.equal(response.statusCode, 200, response.body);
+  assert.match(response.body, /selected-session-a-private/);
+  assert.doesNotMatch(response.body, /other-session-b-private/);
+
+  const staleCursor = await backend.app.inject({
+    method: "GET",
+    url: "/api/v1/sessions/codex:thread-1/activity?before=old-epoch:1",
+    headers: { host, cookie: headers.cookie },
+  });
+  assert.equal(staleCursor.statusCode, 409);
+  assert.equal(
+    staleCursor.json<{ error: { code: string } }>().error.code,
+    "ACTIVITY_CURSOR_STALE",
+  );
+
+  const collection = await backend.app.inject({
+    method: "GET",
+    url: "/api/v1/sessions",
+    headers: { host, cookie: headers.cookie },
+  });
+  assert.doesNotMatch(collection.body, /selected-session-a-private|other-session-b-private/);
+
+  const missing = await backend.app.inject({
+    method: "GET",
+    url: "/api/v1/sessions/codex:missing/activity",
+    headers: { host, cookie: headers.cookie },
+  });
+  assert.equal(missing.statusCode, 404);
+});
+
+test("seeds selected external-session activity from its bounded transcript", async (t) => {
+  const privateText = "external-selected-transcript-live";
+  let reads = 0;
+  const backend = await createAgentManagerServer({
+    discovery: false,
+    staticDir: false,
+    transcriptReader: {
+      read() {
+        reads += 1;
+        return {
+          messages: [{
+            id: "external-message",
+            role: "assistant",
+            text: privateText,
+            createdAt: "2026-08-03T00:00:01.000Z",
+            status: "complete",
+            label: null,
+          }],
+          transcript: {
+            state: "available",
+            truncated: false,
+            source: "codex-rollout",
+            messageCount: 1,
+            reason: null,
+          },
+        };
+      },
+    },
+    initialSessions: [session({
+      ownership: "external",
+      control: {
+        plane: "observe-only",
+        capabilities: [],
+        managerOwned: false,
+        writableLease: false,
+      },
+    })],
+  });
+  t.after(() => backend.close());
+  await backend.app.ready();
+  const headers = await authenticatedHeaders(backend);
+
+  const collection = await backend.app.inject({
+    method: "GET",
+    url: "/api/v1/sessions",
+    headers: { host, cookie: headers.cookie },
+  });
+  assert.equal(reads, 0);
+  assert.doesNotMatch(collection.body, new RegExp(privateText));
+
+  const activity = await backend.app.inject({
+    method: "GET",
+    url: "/api/v1/sessions/codex:thread-1/activity",
+    headers: { host, cookie: headers.cookie },
+  });
+  assert.equal(activity.statusCode, 200, activity.body);
+  assert.equal(reads, 1);
+  assert.match(activity.body, new RegExp(privateText));
+  assert.match(activity.body, /"source":"transcript"/);
+});
+
+test("streams selected activity live while retaining a separate global stream", async (t) => {
+  const activityHub = new ActivityHub({ streamEpoch: "activity-stream-test" });
+  const backend = await createAgentManagerServer({
+    host: "127.0.0.1",
+    port: 0,
+    allowedHosts: [host],
+    allowedOrigins: [origin],
+    maxSseClientsPerAuthSession: 2,
+    discovery: false,
+    staticDir: false,
+    activityHub,
+    initialSessions: [session()],
+  });
+  t.after(() => backend.close());
+  const address = new URL(await backend.listen());
+  const headers = await authenticatedHeaders(backend);
+  const openStream = (path: string, extraHeaders: Record<string, string> = {}) =>
+    new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
+      const request = httpGet({
+        hostname: address.hostname,
+        port: Number(address.port),
+        path,
+        headers: {
+          host,
+          cookie: headers.cookie,
+          accept: "text/event-stream",
+          ...extraHeaders,
+        },
+      }, resolve);
+      request.once("error", reject);
+    });
+
+  const global = await openStream("/api/v1/events?clientId=dual-stream-client");
+  t.after(() => global.destroy());
+  await nextSseChunk(global, "global snapshot");
+
+  const activity = await openStream(
+    "/api/v1/sessions/codex:thread-1/activity/events?clientId=dual-stream-client",
+  );
+  t.after(() => activity.destroy());
+  assert.equal(activity.statusCode, 200);
+  assert.equal(activity.headers["content-type"], "text/event-stream; charset=utf-8");
+  assert.equal(activity.headers["cache-control"], "no-store");
+  const initial = sseFrame(await nextSseChunk(activity, "activity snapshot"));
+  assert.equal(initial.type, "activity.snapshot");
+  assert.equal(initial.sessionId, "codex:thread-1");
+
+  const liveFrame = nextSseChunk(activity, "live activity upsert");
+  activityHub.ingest("codex:thread-1", "codex", {
+    type: "upsert",
+    item: {
+      id: "live-message",
+      kind: "message",
+      role: "assistant",
+      phase: "commentary",
+      text: "arrived-before-turn-complete",
+      state: "running",
+      source: "provider-api",
+      confidence: "exact",
+      exposure: "provider-exposed",
+    },
+  });
+  const streamed = sseFrame(await liveFrame);
+  assert.equal(streamed.type, "activity.upsert");
+  assert.equal(streamed.sessionId, "codex:thread-1");
+  assert.equal(streamed.type === "activity.upsert" ? streamed.item.id : null, "live-message");
+
+  activity.destroy();
+  activityHub.ingest("codex:thread-1", "codex", {
+    type: "upsert",
+    item: {
+      id: "replayed-message",
+      kind: "message",
+      role: "assistant",
+      phase: "commentary",
+      text: "replayed-after-reconnect",
+      state: "running",
+      source: "provider-api",
+      confidence: "exact",
+      exposure: "provider-exposed",
+    },
+  });
+  const resumed = await openStream(
+    "/api/v1/sessions/codex:thread-1/activity/events?clientId=dual-stream-client",
+    { "last-event-id": streamed.cursor },
+  );
+  t.after(() => resumed.destroy());
+  const replayed = sseFrame(await nextSseChunk(resumed, "activity replay"));
+  assert.equal(replayed.type, "activity.upsert");
+  assert.equal(
+    replayed.type === "activity.upsert" ? replayed.item.id : null,
+    "replayed-message",
+  );
+
+  // The activity stream must not displace the metadata stream using the same
+  // browser client id. A state update still arrives on the global channel.
+  const globalUpdate = nextSseChunk(global, "global metadata update");
+  backend.state.setWritableLease("codex:thread-1", true);
+  assert.match(await globalUpdate, /event: session\.upsert/);
+});
+
+test("rejects cross-session activity cursors with an atomic reset", async (t) => {
+  const activityHub = new ActivityHub({ streamEpoch: "activity-cursor-test" });
+  const backend = await createAgentManagerServer({
+    host: "127.0.0.1",
+    port: 0,
+    allowedHosts: [host],
+    allowedOrigins: [origin],
+    discovery: false,
+    staticDir: false,
+    activityHub,
+    initialSessions: [
+      session(),
+      session({ id: "codex:thread-2", sessionId: "thread-2", rootSessionId: "thread-2" }),
+    ],
+  });
+  t.after(() => backend.close());
+  const address = new URL(await backend.listen());
+  const headers = await authenticatedHeaders(backend);
+  const open = (sessionId: string, lastEventId?: string) =>
+    new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
+      const request = httpGet({
+        hostname: address.hostname,
+        port: Number(address.port),
+        path: `/api/v1/sessions/${sessionId}/activity/events?clientId=cursor-client`,
+        headers: {
+          host,
+          cookie: headers.cookie,
+          accept: "text/event-stream",
+          ...(lastEventId ? { "last-event-id": lastEventId } : {}),
+        },
+      }, resolve);
+      request.once("error", reject);
+    });
+
+  const first = await open("codex:thread-1");
+  const firstFrame = sseFrame(await nextSseChunk(first, "first activity snapshot"));
+  first.destroy();
+
+  const second = await open("codex:thread-2", firstFrame.cursor);
+  t.after(() => second.destroy());
+  const reset = sseFrame(await nextSseChunk(second, "cross-session reset"));
+  assert.equal(reset.type, "activity.reset");
+  assert.equal(reset.sessionId, "codex:thread-2");
 });
 
 test("durable idempotency receipts prevent replay after a server restart", async () => {

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { SessionView } from "../../core/types.ts";
+import type { ActivityMutation } from "../../activity/index.ts";
 import type { RequestContext } from "../../server/contracts.ts";
 import { AsyncInbox } from "./async-inbox.ts";
 import { ClaudeProviderControlAdapter } from "./provider-adapter.ts";
@@ -11,13 +12,14 @@ import {
   type ClaudePermissionMode,
   type ClaudeSdkQuery,
   type ClaudeSdkQueryParams,
+  type ClaudeSdkMessage,
   type ClaudeSdkRuntime,
   type ClaudeSdkUserMessage,
 } from "./types.ts";
 
-class BridgeQuery implements ClaudeSdkQuery, AsyncIterator<Record<string, unknown>> {
+class BridgeQuery implements ClaudeSdkQuery, AsyncIterator<ClaudeSdkMessage> {
   readonly params: ClaudeSdkQueryParams;
-  readonly output = new AsyncInbox<Record<string, unknown>>();
+  readonly output = new AsyncInbox<ClaudeSdkMessage>();
   readonly input: ClaudeSdkUserMessage[] = [];
   readonly modes: ClaudePermissionMode[] = [];
 
@@ -27,7 +29,7 @@ class BridgeQuery implements ClaudeSdkQuery, AsyncIterator<Record<string, unknow
   }
 
   emit(message: Record<string, unknown>): void {
-    this.output.push(message);
+    this.output.push(message as unknown as ClaudeSdkMessage);
   }
 
   interrupt(): Promise<ClaudeInterruptReceipt> {
@@ -43,11 +45,11 @@ class BridgeQuery implements ClaudeSdkQuery, AsyncIterator<Record<string, unknow
     this.output.close();
   }
 
-  next(): Promise<IteratorResult<Record<string, unknown>>> {
+  next(): Promise<IteratorResult<ClaudeSdkMessage>> {
     return this.output.next();
   }
 
-  [Symbol.asyncIterator](): AsyncIterator<Record<string, unknown>> {
+  [Symbol.asyncIterator](): AsyncIterator<ClaudeSdkMessage> {
     return this;
   }
 
@@ -247,6 +249,63 @@ test("bridges manager-owned Claude state and normalized backend actions", async 
     result: { mode: "default" },
   });
   assert.deepEqual(query.modes, ["default"]);
+  adapter.dispose();
+});
+
+test("publishes buffered SDK messages and callback attention as activity", async () => {
+  const runtime = new BridgeRuntime();
+  const activity: Array<{ sessionId: string; mutation: ActivityMutation }> = [];
+  const adapter = new ClaudeProviderControlAdapter({
+    runtime,
+    resolveWorkspace: () => "/workspace",
+    onActivity: (sessionId, mutation) => activity.push({ sessionId, mutation }),
+  });
+  await adapter.createSession(
+    {
+      provider: "claude",
+      workspaceId: "workspace",
+      initialMessage: "Begin",
+      mode: "execution",
+      permissionPreset: "standard",
+      idempotencyKey: "activity-managed-claude",
+    },
+    context(),
+  );
+
+  assert.ok(activity.some(({ sessionId, mutation }) =>
+    sessionId === "claude:managed-claude-1"
+    && mutation.type === "upsert"
+    && mutation.item.kind === "lifecycle"
+    && mutation.item.title === "Claude session initialized"
+  ));
+
+  const query = runtime.queries[0];
+  assert.ok(query);
+  const abort = new AbortController();
+  const pending = query.params.options.canUseTool(
+    "Bash",
+    { command: "pwd" },
+    {
+      signal: abort.signal,
+      requestId: "activity-permission",
+      toolUseID: "activity-tool",
+      title: "Run pwd",
+    },
+  );
+  await eventually(() => activity.some(({ mutation }) =>
+    mutation.type === "upsert"
+    && mutation.item.kind === "attention"
+    && mutation.item.requestId === "activity-permission"
+    && mutation.item.resolved === false
+  ));
+  abort.abort();
+  await pending;
+  await eventually(() => activity.some(({ mutation }) =>
+    mutation.type === "upsert"
+    && mutation.item.kind === "attention"
+    && mutation.item.requestId === "activity-permission"
+    && mutation.item.resolved === true
+  ));
   adapter.dispose();
 });
 

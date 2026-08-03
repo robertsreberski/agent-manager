@@ -3,6 +3,7 @@ import type {
   AttentionQuestion,
   SessionView,
 } from "../../core/types.ts";
+import type { ActivityMutation } from "../../activity/index.ts";
 import type {
   ActionDispatchResult,
   AttachInstruction,
@@ -34,7 +35,10 @@ export interface CodexProviderBridgeOptions {
   ): Promise<string | null> | string | null;
   now?: () => Date;
   onSessionChanged?: (session: SessionView) => void;
+  onActivity?: (managerSessionId: string, mutation: ActivityMutation) => void;
 }
+
+const MAX_BUFFERED_ACTIVITY_MUTATIONS = 4_096;
 
 function pendingKind(request: CodexPendingRequest): SessionView["attention"][number]["kind"] {
   switch (request.kind) {
@@ -367,19 +371,28 @@ export class CodexProviderBridge implements ProviderControlAdapter {
   readonly adapter: CodexManagedAdapter;
   #resolveWorkspace: CodexProviderBridgeOptions["resolveWorkspace"];
   #now: () => Date;
+  #onActivity: CodexProviderBridgeOptions["onActivity"];
   #metadata = new Map<string, ManagedMetadata>();
+  #bufferedActivity = new Map<string, ActivityMutation[]>();
+  #overflowedActivity = new Set<string>();
   #unsubscribe: () => void;
 
   constructor(options: CodexProviderBridgeOptions) {
     this.adapter = options.adapter;
     this.#resolveWorkspace = options.resolveWorkspace;
     this.#now = options.now ?? (() => new Date());
+    this.#onActivity = options.onActivity;
     this.#unsubscribe = this.adapter.subscribe((event) => {
-      if (event.type !== "state.changed" || !this.#metadata.has(event.threadId)) return;
-      try {
-        options.onSessionChanged?.(this.toSessionView(event.state));
-      } catch {
-        // State consumers cannot be allowed to tear down the provider pump.
+      if (event.type === "activity") {
+        this.#forwardOrBufferActivity(event.threadId, event.mutation);
+        return;
+      }
+      if (event.type === "state.changed" && this.#metadata.has(event.threadId)) {
+        try {
+          options.onSessionChanged?.(this.toSessionView(event.state));
+        } catch {
+          // State consumers cannot be allowed to tear down the provider pump.
+        }
       }
     });
   }
@@ -406,6 +419,7 @@ export class CodexProviderBridge implements ProviderControlAdapter {
       permissionPreset: input.permissionPreset,
       createdAt: this.#now().toISOString(),
     });
+    this.#flushBufferedActivity(state.threadId);
     return this.toSessionView(state);
   }
 
@@ -568,6 +582,45 @@ export class CodexProviderBridge implements ProviderControlAdapter {
 
   dispose(): void {
     this.#unsubscribe();
+    this.#bufferedActivity.clear();
+    this.#overflowedActivity.clear();
+  }
+
+  #forwardOrBufferActivity(threadId: string, mutation: ActivityMutation): void {
+    if (!this.#onActivity) return;
+    if (this.#metadata.has(threadId)) {
+      this.#publishActivity(threadId, mutation);
+      return;
+    }
+
+    let buffered = this.#bufferedActivity.get(threadId);
+    if (!buffered) {
+      buffered = [];
+      this.#bufferedActivity.set(threadId, buffered);
+    }
+    if (buffered.length >= MAX_BUFFERED_ACTIVITY_MUTATIONS) {
+      buffered.length = 0;
+      buffered.push({ type: "reset", reason: "truncation" });
+      this.#overflowedActivity.add(threadId);
+    }
+    if (this.#overflowedActivity.has(threadId) && mutation.type === "append") return;
+    buffered.push(mutation);
+  }
+
+  #flushBufferedActivity(threadId: string): void {
+    const buffered = this.#bufferedActivity.get(threadId);
+    this.#bufferedActivity.delete(threadId);
+    this.#overflowedActivity.delete(threadId);
+    if (!buffered) return;
+    for (const mutation of buffered) this.#publishActivity(threadId, mutation);
+  }
+
+  #publishActivity(threadId: string, mutation: ActivityMutation): void {
+    try {
+      this.#onActivity?.(`codex:${threadId}`, mutation);
+    } catch {
+      // Activity consumers cannot be allowed to tear down the provider pump.
+    }
   }
 }
 

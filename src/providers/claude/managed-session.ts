@@ -17,6 +17,7 @@ import {
   type ClaudePermissionResult,
   type ClaudeRequestResponse,
   type ClaudeSdkQuery,
+  type ClaudeSdkMessage,
   type ClaudeSdkRuntime,
   type ClaudeSdkUserMessage,
   type ClaudeSessionListener,
@@ -65,38 +66,6 @@ function nonEmptyText(text: string, field: string): string {
   return text;
 }
 
-function stringField(
-  value: Record<string, unknown>,
-  key: string,
-): string | null {
-  const field = value[key];
-  return typeof field === "string" && field.length > 0 ? field : null;
-}
-
-function stringArrayField(
-  value: Record<string, unknown>,
-  key: string,
-): string[] {
-  const field = value[key];
-  return Array.isArray(field)
-    ? field.filter((item): item is string => typeof item === "string")
-    : [];
-}
-
-function permissionModeField(
-  value: Record<string, unknown>,
-): ClaudePermissionMode | null {
-  const mode = value.permissionMode;
-  return mode === "default" ||
-    mode === "acceptEdits" ||
-    mode === "bypassPermissions" ||
-    mode === "plan" ||
-    mode === "dontAsk" ||
-    mode === "auto"
-    ? mode
-    : null;
-}
-
 function cloneHandoff(handoff: ClaudeCliHandoff | null): ClaudeCliHandoff | null {
   if (!handoff) return null;
   return {
@@ -120,6 +89,7 @@ export class ClaudeManagedSession {
   readonly #startedAt: string;
   readonly #listeners = new Set<ClaudeSessionListener>();
   readonly #messageListeners = new Set<ClaudeMessageListener>();
+  readonly #unobservedMessages: ClaudeSdkMessage[] = [];
   readonly #pending = new Map<string, InternalPending>();
   readonly #resolvedRequests = new Map<
     string,
@@ -147,6 +117,7 @@ export class ClaudeManagedSession {
   #lastError: string | null = null;
   #updatedAt: string;
   #disposed = false;
+  #messageObservationStarted = false;
 
   private constructor(
     runtime: ClaudeSdkRuntime,
@@ -234,7 +205,15 @@ export class ClaudeManagedSession {
   }
 
   onMessage(listener: ClaudeMessageListener): () => void {
+    this.#messageObservationStarted = true;
     this.#messageListeners.add(listener);
+    for (const message of this.#unobservedMessages.splice(0)) {
+      try {
+        listener(message);
+      } catch {
+        // Replay observers have the same isolation as live observers.
+      }
+    }
     return () => this.#messageListeners.delete(listener);
   }
 
@@ -516,6 +495,8 @@ export class ClaudeManagedSession {
           cwd: this.#config.cwd,
           persistSession: true,
           includePartialMessages: true,
+          includeHookEvents: true,
+          forwardSubagentText: true,
           permissionMode: this.#desiredMode,
           allowDangerouslySkipPermissions:
             this.#config.allowDangerouslySkipPermissions ?? false,
@@ -551,6 +532,13 @@ export class ClaudeManagedSession {
       for await (const message of query) {
         if (epoch !== this.#epoch) return;
         await this.#handleMessage(message, query, epoch);
+        if (!this.#messageObservationStarted) {
+          // start() returns after init, so a fast provider can emit content
+          // before the adapter has learned the manager session id. Retain that
+          // short in-memory prefix and replay it to the first observer.
+          this.#unobservedMessages.push(message);
+          continue;
+        }
         for (const listener of this.#messageListeners) {
           try {
             listener(message);
@@ -585,19 +573,13 @@ export class ClaudeManagedSession {
   }
 
   async #handleMessage(
-    message: Record<string, unknown>,
+    message: ClaudeSdkMessage,
     query: ClaudeSdkQuery,
     epoch: number,
   ): Promise<void> {
-    const type = stringField(message, "type");
-    const subtype = stringField(message, "subtype");
-
-    if (type === "system" && subtype === "init") {
-      const sessionId = stringField(message, "session_id");
-      const codeVersion = stringField(message, "claude_code_version");
-      if (!sessionId || !codeVersion) {
-        throw new Error("Claude SDK init omitted session id or version");
-      }
+    if (message.type === "system" && message.subtype === "init") {
+      const sessionId = message.session_id;
+      const codeVersion = message.claude_code_version;
       if (this.#resumedFrom && sessionId !== this.#resumedFrom) {
         throw new Error(
           `Claude resumed unexpected session ${sessionId}; expected ${this.#resumedFrom}`,
@@ -605,12 +587,11 @@ export class ClaudeManagedSession {
       }
       this.#sessionId = sessionId;
       this.#claudeCodeVersion = codeVersion;
-      this.#capabilities = stringArrayField(message, "capabilities");
+      this.#capabilities = [...(message.capabilities ?? [])];
       this.#canSteer =
         this.#runtime.sdkVersion === CLAUDE_AGENT_SDK_VERSION &&
         codeVersion === CLAUDE_CODE_VERSION;
-      const providerMode = permissionModeField(message);
-      if (providerMode) this.#mode = providerMode;
+      this.#mode = message.permissionMode;
       this.#lastError = null;
       this.#touch();
       this.#ready.resolve();
@@ -621,37 +602,34 @@ export class ClaudeManagedSession {
       return;
     }
 
-    if (type === "system" && subtype === "session_state_changed") {
-      const state = stringField(message, "state");
-      if (state === "idle" || state === "running" || state === "requires_action") {
-        this.#providerActivity = state;
-        if (state === "idle" && this.#outstandingMessageIds.size === 0) {
-          this.#queueKnowledge = "known";
-          this.#stillQueuedMessageIds.clear();
-        }
+    if (message.type === "system" && message.subtype === "session_state_changed") {
+      this.#providerActivity = message.state;
+      if (message.state === "idle" && this.#outstandingMessageIds.size === 0) {
+        this.#queueKnowledge = "known";
+        this.#stillQueuedMessageIds.clear();
+      }
+      this.#touch();
+      return;
+    }
+
+    if (message.type === "system" && message.subtype === "status") {
+      if (message.permissionMode) {
+        this.#mode = message.permissionMode;
         this.#touch();
       }
       return;
     }
 
-    if (type === "system" && subtype === "status") {
-      const mode = permissionModeField(message);
-      if (mode) {
-        this.#mode = mode;
-        this.#touch();
-      }
-      return;
-    }
-
-    if (type === "result") {
-      const completedMessage = stringField(message, "user_message_uuid");
+    if (message.type === "result") {
+      const completedMessage = message.subtype === "success"
+        ? message.user_message_uuid
+        : undefined;
       if (completedMessage) {
         this.#outstandingMessageIds.delete(completedMessage);
         this.#stillQueuedMessageIds.delete(completedMessage);
       }
-      if (subtype && subtype !== "success") {
-        const errors = stringArrayField(message, "errors");
-        this.#lastError = errors.join("; ") || subtype;
+      if (message.subtype !== "success") {
+        this.#lastError = message.errors.join("; ") || message.subtype;
         this.#deactivateConsumer(query, epoch);
         this.#providerActivity = "failed";
         this.#abortAllPending();
@@ -733,6 +711,14 @@ export class ClaudeManagedSession {
           ? { decisionReason: options.decisionReason }
           : {}),
         ...(options.description ? { description: options.description } : {}),
+        ...(options.displayName ? { displayName: options.displayName } : {}),
+        ...(options.agentID ? { agentId: options.agentID } : {}),
+        ...(options.suggestions
+          ? { suggestions: structuredClone(options.suggestions) }
+          : {}),
+        ...(options.matchedAskRule
+          ? { matchedAskRule: structuredClone(options.matchedAskRule) }
+          : {}),
       },
       createdAt: this.#runtime.now().toISOString(),
     };
@@ -811,11 +797,14 @@ export class ClaudeManagedSession {
       public: {
         id,
         kind: "elicitation",
-        title: request.message,
+        title: request.title ?? request.message,
         toolName: null,
         toolUseId: null,
         payload: {
           serverName: request.serverName,
+          message: request.message,
+          ...(request.displayName ? { displayName: request.displayName } : {}),
+          ...(request.description ? { description: request.description } : {}),
           ...(request.mode ? { mode: request.mode } : {}),
           ...(request.url ? { url: request.url } : {}),
           ...(request.elicitationId

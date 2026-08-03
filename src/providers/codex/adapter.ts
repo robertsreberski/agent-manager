@@ -1,6 +1,17 @@
 import { randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
 
+import type { ActivityMutation } from "../../activity/index.ts";
+import {
+  codexActivityOffset,
+  projectCodexDiagnostic,
+  projectCodexNotification,
+  projectCodexQueue,
+  projectCodexRequestResolved,
+  projectCodexServerRequest,
+  recordCodexActivityOffsets,
+  type CodexActivityProjection,
+} from "./activity-projector.ts";
 import {
   CodexRpcClient,
   CodexRpcError,
@@ -256,6 +267,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
   #threads = new Map<string, InternalThreadState>();
   #listeners = new Set<CodexAdapterEventListener>();
   #removeRpcListeners: Array<() => void> = [];
+  #activityOffsets = new Map<string, number>();
 
   constructor(options: CodexManagedAdapterOptions) {
     if (!isAbsolute(options.socketPath)) {
@@ -509,6 +521,12 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
       threadId,
       requestId: request.id,
     });
+    this.#emitActivityProjection(projectCodexRequestResolved(
+      threadId,
+      request.id,
+      this.#now().getTime(),
+      request,
+    ));
   }
 
   async setMode(threadId: string, mode: CodexMode): Promise<void> {
@@ -577,6 +595,16 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
           requestId: request.id,
         });
       }
+      const mutations: ActivityMutation[] = [
+        { type: "reset", reason: "provider-reset" },
+        ...projectCodexDiagnostic(
+          state.threadId,
+          "codex.connection.closed",
+          this.#runtimeFailure,
+          this.#now().toISOString(),
+        ).mutations,
+      ];
+      this.#emitActivityProjection({ threadId: state.threadId, mutations });
     }
 
     this.#emit({
@@ -594,6 +622,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     for (const remove of this.#removeRpcListeners.splice(0)) remove();
     await this.rpc.close();
     this.#listeners.clear();
+    this.#activityOffsets.clear();
   }
 
   async #call(
@@ -704,6 +733,11 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
         threadId: state.threadId,
         queue: snapshot.queue,
       });
+      this.#emitActivityProjection(projectCodexQueue(
+        state.threadId,
+        snapshot.queue,
+        this.#now().toISOString(),
+      ));
     }
   }
 
@@ -757,6 +791,37 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
   }
 
   #onNotification(notification: JsonRpcNotification): void {
+    let resolvedRequest: CodexPendingRequest | undefined;
+    if (notification.method === "serverRequest/resolved") {
+      const threadId = extractThreadId(notification.params);
+      const requestId = notification.params.requestId;
+      if (threadId && (typeof requestId === "string" || typeof requestId === "number")) {
+        resolvedRequest = this.#threads.get(threadId)?.pendingRequests.get(
+          jsonRpcIdKey(requestId),
+        );
+      }
+    }
+
+    this.#applyNotification(notification);
+
+    const threadId = extractThreadId(notification.params);
+    const requestId = notification.params.requestId;
+    const projection = notification.method === "serverRequest/resolved" && threadId &&
+        (typeof requestId === "string" || typeof requestId === "number")
+      ? projectCodexRequestResolved(
+          threadId,
+          requestId,
+          notification.emittedAtMs,
+          resolvedRequest,
+        )
+      : projectCodexNotification(
+          notification,
+          (id, channel) => codexActivityOffset(this.#activityOffsets, id, channel),
+        );
+    this.#emitActivityProjection(projection);
+  }
+
+  #applyNotification(notification: JsonRpcNotification): void {
     const params = notification.params;
     if (notification.method === "thread/started") {
       try {
@@ -870,16 +935,38 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
       threadId,
       request: cloneRequest(pending),
     });
+    this.#emitActivityProjection(projectCodexServerRequest(request));
   }
 
   #diagnostic(code: string, error: unknown, threadId?: string): void {
+    const message = error instanceof Error ? error.message : String(error);
     this.#emit({
       type: "diagnostic",
       level: "error",
       code,
-      message: error instanceof Error ? error.message : String(error),
+      message,
       ...(threadId ? { threadId } : {}),
     });
+    if (threadId) {
+      this.#emitActivityProjection(projectCodexDiagnostic(
+        threadId,
+        code,
+        message,
+        this.#now().toISOString(),
+      ));
+    }
+  }
+
+  #emitActivityProjection(projection: CodexActivityProjection | null): void {
+    if (!projection) return;
+    for (const mutation of projection.mutations) {
+      recordCodexActivityOffsets(this.#activityOffsets, mutation);
+      this.#emit({
+        type: "activity",
+        threadId: projection.threadId,
+        mutation,
+      });
+    }
   }
 
   #emit(event: CodexAdapterEvent): void {

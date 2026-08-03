@@ -1,3 +1,5 @@
+import type { ActivityMutation } from "../../activity/index.ts";
+
 export type JsonRpcId = string | number;
 
 export type JsonValue =
@@ -133,6 +135,11 @@ export type CodexAdapterEvent =
       type: "queue.changed";
       threadId: string;
       queue: readonly CodexQueuedMessage[];
+    }
+  | {
+      type: "activity";
+      threadId: string;
+      mutation: ActivityMutation;
     }
   | {
       type: "diagnostic";

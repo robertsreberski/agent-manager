@@ -1,4 +1,9 @@
-import type { Diagnostic, SessionRecord, SessionView } from "../core/types.ts";
+import type {
+  Diagnostic,
+  SessionAttention,
+  SessionRecord,
+  SessionView,
+} from "../core/types.ts";
 import type { StateEvent, StateEventType, StateSnapshot } from "./contracts.ts";
 
 type StateListener = (event: StateEvent) => void;
@@ -17,6 +22,19 @@ function metadataOnly(record: SessionRecord | SessionView): SessionRecord | Sess
   const copy = clone(record);
   if ("messages" in copy) delete copy.messages;
   if ("transcript" in copy) delete copy.transcript;
+  copy.attention = copy.attention.map((attention): SessionAttention => ({
+    id: attention.id,
+    kind: attention.kind,
+    // Provider summaries can contain the exact question or command input.
+    // The global collection and its replay ring carry metadata only; selected
+    // clients hydrate exact request content from the activity stream.
+    summary: null,
+    source: attention.source,
+    confidence: attention.confidence,
+    ...(typeof attention.details?.respondable === "boolean"
+      ? { details: { respondable: attention.details.respondable } }
+      : {}),
+  }));
   return copy;
 }
 

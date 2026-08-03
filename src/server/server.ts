@@ -12,6 +12,10 @@ import Fastify, {
 } from "fastify";
 import { ZodError, z } from "zod";
 
+import {
+  ActivityHub,
+  type ActivityFrame,
+} from "../activity/index.ts";
 import type { Diagnostic, Provider, SessionRecord, SessionView } from "../core/types.ts";
 import {
   DiscoveryReconciler,
@@ -50,6 +54,7 @@ import {
 } from "./preview.ts";
 import { SessionStateStore } from "./state.ts";
 import type { SessionTranscriptReader, TranscriptReadResult } from "./transcript.ts";
+import { SelectedTranscriptActivityObserver } from "./activity-observer.ts";
 
 const previewQuerySchema = z.object({
   lines: z.coerce.number().int().min(1).max(200).default(200),
@@ -57,6 +62,10 @@ const previewQuerySchema = z.object({
 });
 const eventsQuerySchema = z.object({
   clientId: z.string().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/).optional(),
+}).strict();
+const activityHistoryQuerySchema = z.object({
+  before: z.string().min(1).max(256).optional(),
+  limit: z.coerce.number().int().min(1).max(400).default(200),
 }).strict();
 const bootstrapSchema = z.object({ secret: z.string().min(32).max(256) }).strict();
 
@@ -86,6 +95,8 @@ export interface AgentManagerServerOptions {
   tailscaleAllowedLogins?: readonly string[];
   auth?: Partial<Omit<AuthManagerOptions, "allowedHosts" | "allowedOrigins">>;
   state?: SessionStateStore;
+  /** Volatile selected-session activity projection. Never persisted. */
+  activityHub?: ActivityHub;
   database?: ManagerDatabase;
   adapters?: ProviderControlAdapters;
   previewAdapter?: PanePreviewAdapter;
@@ -111,6 +122,7 @@ export interface AgentManagerServerOptions {
 export interface AgentManagerBackend {
   app: FastifyInstance;
   state: SessionStateStore;
+  activityHub: ActivityHub;
   auth: AuthManager;
   database: ManagerDatabase;
   controlSocketPath: string | null;
@@ -144,6 +156,27 @@ function requestAbortSignal(request: FastifyRequest): AbortSignal {
 
 function encodeSse(event: StateEvent): string {
   return `id: ${event.seq}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+}
+
+function encodeActivitySse(frame: ActivityFrame): string {
+  return `id: ${frame.cursor}\nevent: ${frame.type}\ndata: ${JSON.stringify(frame)}\n\n`;
+}
+
+function activityCursorSequence(cursor: string, streamEpoch: string): number | null {
+  const separator = cursor.lastIndexOf(":");
+  if (separator < 1 || cursor.slice(0, separator) !== streamEpoch) return null;
+  const sequence = Number(cursor.slice(separator + 1));
+  return Number.isSafeInteger(sequence) && sequence >= 0 ? sequence : null;
+}
+
+function activityRequestIsSecret(activityHub: ActivityHub, sessionId: string, requestId: string): boolean {
+  const snapshot = activityHub.snapshot(sessionId);
+  if (!snapshot) return false;
+  return snapshot.items.some((item) =>
+    item.kind === "attention"
+    && item.requestId === requestId
+    && (item.isSecret || item.questions.some((question) => question.isSecret))
+  );
 }
 
 function bounded<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
@@ -210,6 +243,7 @@ export async function createAgentManagerServer(
   const state = options.state ?? new SessionStateStore({
     replayCapacity: options.replayCapacity ?? 512,
   });
+  const activityHub = options.activityHub ?? new ActivityHub();
   const database = options.database ?? new ManagerDatabase(options.databasePath);
   const adapters = options.adapters ?? {};
   const previewAdapter = options.previewAdapter ?? new TmuxPanePreviewAdapter(
@@ -246,8 +280,19 @@ export async function createAgentManagerServer(
   const sseClients = new Map<FastifyReply, {
     authSessionId: string;
     clientId: string | null;
+    channel: string;
     close: () => void;
   }>();
+  const activityCursorOwners = new Map<string, string>();
+  const rememberActivityCursor = (cursor: string, sessionId: string): void => {
+    activityCursorOwners.delete(cursor);
+    activityCursorOwners.set(cursor, sessionId);
+    while (activityCursorOwners.size > 2_048) {
+      const oldest = activityCursorOwners.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      activityCursorOwners.delete(oldest);
+    }
+  };
   interface NativeHandoff {
     handoffId: string;
     spawnNonce: string;
@@ -269,6 +314,14 @@ export async function createAgentManagerServer(
     reclaimedView: SessionView | null;
   }
   const nativeHandoffs = new Map<string, NativeHandoff>();
+  const transcriptActivity = new SelectedTranscriptActivityObserver({
+    hub: activityHub,
+    ...(transcriptReader ? { reader: transcriptReader } : {}),
+    resolveSession: (id) => state.get(id),
+    eligible: (session) => !session.control.managerOwned || nativeHandoffs.has(session.id),
+  });
+  const shouldObserveTranscript = (session: SessionView): boolean =>
+    !session.control.managerOwned || nativeHandoffs.has(session.id);
   const localOwnerActor = {
     id: "owner-control-socket",
     kind: "local" as const,
@@ -473,6 +526,56 @@ export async function createAgentManagerServer(
     return { session: { ...session, ...detail } };
   });
 
+  app.get("/api/v1/sessions/:id/activity", {
+    config: { rateLimit: { max: 60, timeWindow: "1 minute" } },
+  }, async (request) => {
+    const id = routeSessionId(request);
+    const session = state.get(id);
+    if (!session) throw new ApiError(404, "SESSION_NOT_FOUND", "session was not found");
+    activityHub.ensureSession(id, session.provider);
+    if (shouldObserveTranscript(session)) transcriptActivity.seedOnce(session);
+    const { before, limit } = activityHistoryQuerySchema.parse(request.query);
+    const snapshot = activityHub.snapshot(id);
+    if (!snapshot) {
+      return {
+        schemaVersion: 1,
+        sessionId: id,
+        provider: session.provider,
+        streamEpoch: activityHub.streamEpoch,
+        cursor: null,
+        items: [],
+        truncated: false,
+        hasMore: false,
+        nextBefore: null,
+      };
+    }
+    const beforeSequence = before === undefined
+      ? null
+      : activityCursorSequence(before, activityHub.streamEpoch);
+    if (before !== undefined && beforeSequence === null) {
+      throw new ApiError(409, "ACTIVITY_CURSOR_STALE", "activity history cursor is invalid or expired");
+    }
+    const eligible = beforeSequence === null
+      ? snapshot.items
+      : snapshot.items.filter((item) => item.seq < beforeSequence);
+    const items = eligible.slice(-limit);
+    const hasMore = snapshot.truncated || eligible.length > items.length;
+    const first = items[0];
+    return {
+      schemaVersion: snapshot.schemaVersion,
+      sessionId: id,
+      provider: session.provider,
+      streamEpoch: snapshot.streamEpoch,
+      cursor: snapshot.cursor,
+      items,
+      truncated: snapshot.truncated,
+      hasMore,
+      nextBefore: hasMore && first
+        ? `${snapshot.streamEpoch}:${first.seq}`
+        : null,
+    };
+  });
+
   app.get("/api/v1/workspaces", async () => ({ workspaces: database.listWorkspaces() }));
 
   app.get("/api/v1/sessions/:id/preview", {
@@ -529,9 +632,14 @@ export async function createAgentManagerServer(
   }, async (request, reply) => {
     const authSession = requireSession(request);
     const { clientId = null } = eventsQuerySchema.parse(request.query);
+    const channel = "global";
     if (clientId) {
       for (const client of [...sseClients.values()]) {
-        if (client.authSessionId === authSession.id && client.clientId === clientId) {
+        if (
+          client.authSessionId === authSession.id
+          && client.clientId === clientId
+          && client.channel === channel
+        ) {
           client.close();
         }
       }
@@ -580,7 +688,7 @@ export async function createAgentManagerServer(
         return false;
       }
     };
-    sseClients.set(reply, { authSessionId: authSession.id, clientId, close });
+    sseClients.set(reply, { authSessionId: authSession.id, clientId, channel, close });
 
     const supplied = request.headers["last-event-id"];
     const value = Array.isArray(supplied) ? supplied[0] : supplied;
@@ -611,6 +719,128 @@ export async function createAgentManagerServer(
     if (closed) return;
     unsubscribe = state.subscribe((event) => void write(encodeSse(event)));
     heartbeat = setInterval(() => void write(": heartbeat\n\n"), 15_000);
+    heartbeat.unref();
+    expiry = setTimeout(close, Math.max(1, authSession.expiresAt - Date.now()));
+    expiry.unref();
+    reply.raw.once("close", close);
+    reply.raw.once("error", close);
+  });
+
+  app.get("/api/v1/sessions/:id/activity/events", {
+    config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
+  }, async (request, reply) => {
+    const id = routeSessionId(request);
+    const session = state.get(id);
+    if (!session) throw new ApiError(404, "SESSION_NOT_FOUND", "session was not found");
+    activityHub.ensureSession(id, session.provider);
+    const authSession = requireSession(request);
+    const { clientId = null } = eventsQuerySchema.parse(request.query);
+    const channel = "activity";
+    if (clientId) {
+      for (const client of [...sseClients.values()]) {
+        if (
+          client.authSessionId === authSession.id
+          && client.clientId === clientId
+          && client.channel === channel
+        ) {
+          client.close();
+        }
+      }
+    }
+    const actorStreams = [...sseClients.values()].filter((client) =>
+      client.authSessionId === authSession.id
+    ).length;
+    if (sseClients.size >= maxSseClients || actorStreams >= maxSseClientsPerAuthSession) {
+      throw new ApiError(429, "SSE_LIMIT_REACHED", "too many live event streams");
+    }
+    const releaseTranscript = shouldObserveTranscript(session)
+      ? transcriptActivity.acquire(session)
+      : () => undefined;
+
+    reply
+      .header("Content-Type", "text/event-stream; charset=utf-8")
+      .header("Connection", "keep-alive")
+      .header("X-Accel-Buffering", "no");
+    for (const [name, value] of Object.entries(reply.getHeaders())) {
+      if (value !== undefined) reply.raw.setHeader(name, value);
+    }
+    reply.hijack();
+    reply.raw.flushHeaders();
+
+    let closed = false;
+    let initialized = false;
+    let unsubscribe = (): void => undefined;
+    let heartbeat: NodeJS.Timeout | null = null;
+    let expiry: NodeJS.Timeout | null = null;
+    const pending: ActivityFrame[] = [];
+    const close = (): void => {
+      if (closed) return;
+      closed = true;
+      if (heartbeat) clearInterval(heartbeat);
+      if (expiry) clearTimeout(expiry);
+      unsubscribe();
+      releaseTranscript();
+      sseClients.delete(reply);
+      if (!reply.raw.destroyed) reply.raw.destroy();
+    };
+    const write = (frame: ActivityFrame): boolean => {
+      if (closed || reply.raw.destroyed || reply.raw.writableEnded) return false;
+      const chunk = encodeActivitySse(frame);
+      if (reply.raw.writableLength + Buffer.byteLength(chunk) > 256 * 1_024) {
+        close();
+        return false;
+      }
+      try {
+        reply.raw.write(chunk);
+        rememberActivityCursor(frame.cursor, id);
+        return true;
+      } catch {
+        close();
+        return false;
+      }
+    };
+    sseClients.set(reply, { authSessionId: authSession.id, clientId, channel, close });
+
+    // Subscribe before reading the snapshot/replay high-water. Frames that
+    // arrive during initialization are buffered, then de-duplicated by the
+    // hub's monotonic sequence after the atomic replay result is written.
+    unsubscribe = activityHub.subscribe(id, (frame) => {
+      if (!initialized) {
+        pending.push(frame);
+        return;
+      }
+      void write(frame);
+    });
+
+    const supplied = request.headers["last-event-id"];
+    const requestedCursor = Array.isArray(supplied) ? supplied[0] : supplied;
+    const knownOwner = requestedCursor ? activityCursorOwners.get(requestedCursor) : undefined;
+    const cursor = knownOwner !== undefined && knownOwner !== id
+      ? "cross-session-cursor"
+      : requestedCursor ?? null;
+    const replay = activityHub.replay(id, cursor);
+    let highWater = -1;
+    for (const frame of replay.frames) {
+      highWater = Math.max(highWater, frame.seq);
+      if (!write(frame)) break;
+    }
+    initialized = true;
+    for (const frame of pending.splice(0)) {
+      if (frame.seq <= highWater) continue;
+      highWater = frame.seq;
+      if (!write(frame)) break;
+    }
+
+    if (closed) return;
+    heartbeat = setInterval(() => {
+      if (closed || reply.raw.destroyed || reply.raw.writableEnded) return close();
+      if (reply.raw.writableLength + 13 > 256 * 1_024) return close();
+      try {
+        reply.raw.write(": heartbeat\n\n");
+      } catch {
+        close();
+      }
+    }, 15_000);
     heartbeat.unref();
     expiry = setTimeout(close, Math.max(1, authSession.expiresAt - Date.now()));
     expiry.unref();
@@ -1006,6 +1236,89 @@ export async function createAgentManagerServer(
         const actionId = randomUUID();
         const createdAt = new Date().toISOString();
         let record = actionRecord(actionId, id, action, "pending", createdAt);
+        const secretResponse = action.type === "respond"
+          && activityRequestIsSecret(activityHub, id, action.requestId);
+        if (secretResponse) {
+          // Provider-marked secret answers are deliberately dispatched from
+          // memory only. Persisting the ordinary outbox payload or request
+          // fingerprint would retain recoverable secret material. A restart
+          // therefore leaves the outcome unknown and requires the provider to
+          // advertise the still-pending request again before another answer.
+          try {
+            database.auditOperation({
+              actor: authSession.actor,
+              operation: "session.respond.secret",
+              targetId: action.requestId,
+              phase: "attempt",
+              outcome: "ephemeral-dispatching",
+              idempotencyKey: action.idempotencyKey,
+              details: { provider: session.provider },
+            });
+          } catch {
+            throw new ApiError(
+              500,
+              "SECRET_RESPONSE_AUDIT_FAILED",
+              "the secret response could not be dispatched safely",
+            );
+          }
+          state.publishAction(record);
+          record = actionRecord(actionId, id, action, "dispatching", createdAt);
+          state.publishAction(record);
+
+          let acknowledged = false;
+          try {
+            const result = await adapter.performAction(session, action, context(request));
+            acknowledged = result.status !== "unknown";
+            record = actionRecord(actionId, id, action, result.status, createdAt, {
+              ...(result.status === "queued" ? {} : { completedAt: new Date().toISOString() }),
+              ...(result.status === "failed"
+                ? {
+                    error: {
+                      code: "PROVIDER_REJECTED",
+                      message: "the provider rejected the requested action",
+                    },
+                  }
+                : result.status === "unknown"
+                ? {
+                    error: {
+                      code: "PROVIDER_OUTCOME_UNKNOWN",
+                      message: "provider acknowledgement was not received; this secret response was not persisted",
+                    },
+                  }
+                : {}),
+            });
+          } catch {
+            record = actionRecord(actionId, id, action, "unknown", createdAt, {
+              completedAt: new Date().toISOString(),
+              error: {
+                code: "PROVIDER_OUTCOME_UNKNOWN",
+                message: "provider acknowledgement was not received; this secret response was not persisted",
+              },
+            });
+          }
+          try {
+            database.auditOperation({
+              actor: authSession.actor,
+              operation: "session.respond.secret",
+              targetId: action.requestId,
+              phase: "outcome",
+              outcome: record.status,
+              idempotencyKey: action.idempotencyKey,
+              details: { provider: session.provider, acknowledged },
+            });
+          } catch {
+            acknowledged = false;
+            record = actionRecord(actionId, id, action, "unknown", createdAt, {
+              completedAt: record.completedAt ?? new Date().toISOString(),
+              error: {
+                code: "AUDIT_PERSISTENCE_FAILED",
+                message: "the provider may have acted, but the content-free audit outcome was not persisted",
+              },
+            });
+          }
+          state.publishAction(record);
+          return record;
+        }
         try {
           database.persistActionWithAudit({
             id: actionId,
@@ -1229,6 +1542,7 @@ export async function createAgentManagerServer(
           tasks.push(bounded(Promise.resolve(adapter.dispose()), shutdownTimeoutMs, "provider shutdown"));
         }
       }
+      transcriptActivity.dispose();
       if (options.onShutdown) {
         tasks.push(bounded(Promise.resolve(options.onShutdown()), shutdownTimeoutMs, "runtime shutdown"));
       }
@@ -1238,6 +1552,11 @@ export async function createAgentManagerServer(
           if (result.status === "rejected") errors.push(result.reason);
         }
       } finally {
+        try {
+          activityHub.dispose();
+        } catch (error) {
+          errors.push(error);
+        }
         if (!databaseClosed) {
           databaseClosed = true;
           try {
@@ -1721,6 +2040,7 @@ export async function createAgentManagerServer(
   const backend: AgentManagerBackend = {
     app,
     state,
+    activityHub,
     auth,
     database,
     controlSocketPath: options.controlSocketPath ?? null,

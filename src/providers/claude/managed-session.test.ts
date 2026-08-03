@@ -9,13 +9,14 @@ import {
   type ClaudePermissionMode,
   type ClaudeSdkQuery,
   type ClaudeSdkQueryParams,
+  type ClaudeSdkMessage,
   type ClaudeSdkRuntime,
   type ClaudeSdkUserMessage,
 } from "./types.ts";
 
-class FakeQuery implements ClaudeSdkQuery, AsyncIterator<Record<string, unknown>> {
+class FakeQuery implements ClaudeSdkQuery, AsyncIterator<ClaudeSdkMessage> {
   readonly params: ClaudeSdkQueryParams;
-  readonly output = new AsyncInbox<Record<string, unknown>>();
+  readonly output = new AsyncInbox<ClaudeSdkMessage>();
   readonly input: ClaudeSdkUserMessage[] = [];
   readonly modeChanges: ClaudePermissionMode[] = [];
   interruptResult: ClaudeInterruptReceipt | undefined = {
@@ -30,7 +31,7 @@ class FakeQuery implements ClaudeSdkQuery, AsyncIterator<Record<string, unknown>
   }
 
   emit(message: Record<string, unknown>): void {
-    this.output.push(message);
+    this.output.push(message as unknown as ClaudeSdkMessage);
   }
 
   interrupt(): Promise<ClaudeInterruptReceipt | undefined> {
@@ -48,11 +49,11 @@ class FakeQuery implements ClaudeSdkQuery, AsyncIterator<Record<string, unknown>
     this.output.close();
   }
 
-  next(): Promise<IteratorResult<Record<string, unknown>>> {
+  next(): Promise<IteratorResult<ClaudeSdkMessage>> {
     return this.output.next();
   }
 
-  [Symbol.asyncIterator](): AsyncIterator<Record<string, unknown>> {
+  [Symbol.asyncIterator](): AsyncIterator<ClaudeSdkMessage> {
     return this;
   }
 
@@ -120,6 +121,10 @@ test("keeps a streaming query and maps queue, steer, and mode controls", async (
   assert.equal(session.snapshot.sessionId, "session-1");
   assert.equal(session.snapshot.mode, "plan");
   assert.equal(session.snapshot.canSteer, true);
+  assert.equal(query.params.options.includePartialMessages, true);
+  assert.equal(query.params.options.includeHookEvents, true);
+  assert.equal(query.params.options.forwardSubagentText, true);
+  assert.equal("agentProgressSummaries" in query.params.options, false);
   assert.equal(query.input[0]?.priority, "later");
   assert.deepEqual(query.input[0]?.origin, { kind: "human" });
 
@@ -137,6 +142,38 @@ test("keeps a streaming query and maps queue, steer, and mode controls", async (
   await session.setMode("default");
   assert.deepEqual(query.modeChanges, ["default"]);
   assert.equal(session.snapshot.mode, "default");
+  session.dispose();
+});
+
+test("replays messages emitted before the first observer can register", async () => {
+  const runtime = new FakeRuntime();
+  const session = await ClaudeManagedSession.start(runtime, {
+    cwd: "/workspace",
+    mode: "default",
+  });
+  const query = runtime.queries[0];
+  assert.ok(query);
+  query.emit({
+    type: "system",
+    subtype: "informational",
+    content: "Early provider event",
+    level: "info",
+    uuid: "early-event",
+    session_id: "session-1",
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  const messages: ClaudeSdkMessage[] = [];
+  session.onMessage((message) => messages.push(message));
+  assert.ok(messages.some((message) =>
+    message.type === "system"
+    && message.subtype === "init"
+  ));
+  assert.ok(messages.some((message) =>
+    message.type === "system"
+    && message.subtype === "informational"
+    && message.content === "Early provider event"
+  ));
   session.dispose();
 });
 

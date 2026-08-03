@@ -4,6 +4,18 @@ export {
   type CodexManagedAdapterOptions,
 } from "./adapter.ts";
 export {
+  codexActivityOffset,
+  projectCodexDiagnostic,
+  projectCodexNotification,
+  projectCodexQueue,
+  projectCodexRequestResolved,
+  projectCodexServerRequest,
+  recordCodexActivityOffsets,
+  type CodexActivityAppendChannel,
+  type CodexActivityOffsetLookup,
+  type CodexActivityProjection,
+} from "./activity-projector.ts";
+export {
   CodexProviderBridge,
   CodexProviderControlAdapter,
   codexRequestResponse,

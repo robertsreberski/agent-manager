@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import type { SessionView } from "../core/types.ts";
 import { SessionStateStore } from "./state.ts";
 
 function transcriptBearingSession() {
@@ -61,6 +62,44 @@ test("never retains transcript content in snapshots or replay events", () => {
   assert.equal("transcript" in stored, false);
   const event = state.events.replayAfter(0).events[0]!;
   assert.equal(JSON.stringify(event).includes("must stay out of global state"), false);
+});
+
+test("global state and replay retain attention metadata without exact request content", () => {
+  const state = new SessionStateStore();
+  const exactQuestion = "Which production credential should I use?";
+  const exactOption = "The secret production token";
+  const record: SessionView = {
+    ...transcriptBearingSession(),
+    attention: [{
+      id: "request-sensitive-1",
+      kind: "question",
+      summary: exactQuestion,
+      source: "provider-api",
+      confidence: "exact",
+      details: {
+        title: "Sensitive choice",
+        inputSummary: "authorization=Bearer should-not-leak",
+        respondable: true,
+        questions: [{
+          id: "credential",
+          text: exactQuestion,
+          options: [{ label: exactOption, description: "Exact provider detail" }],
+          multiSelect: false,
+          allowFreeText: true,
+        }],
+      },
+    }],
+  };
+
+  state.upsert(record);
+
+  const snapshotText = JSON.stringify(state.snapshot());
+  const replayText = JSON.stringify(state.events.replayAfter(0));
+  for (const serialized of [snapshotText, replayText]) {
+    assert.doesNotMatch(serialized, /production credential|secret production token|Bearer|Sensitive choice/);
+    assert.match(serialized, /request-sensitive-1/);
+    assert.match(serialized, /"respondable":true/);
+  }
 });
 
 test("runtime diagnostics survive discovery diagnostic replacement", () => {

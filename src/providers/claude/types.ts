@@ -1,13 +1,14 @@
+import type {
+  CanUseTool,
+  ElicitationRequest,
+  PermissionMode,
+  SDKMessage,
+} from "@anthropic-ai/claude-agent-sdk";
+
 export const CLAUDE_AGENT_SDK_VERSION = "0.3.220";
 export const CLAUDE_CODE_VERSION = "2.1.220";
 
-export type ClaudePermissionMode =
-  | "default"
-  | "acceptEdits"
-  | "bypassPermissions"
-  | "plan"
-  | "dontAsk"
-  | "auto";
+export type ClaudePermissionMode = PermissionMode;
 
 export type ClaudeActivity =
   | "starting"
@@ -36,6 +37,7 @@ export interface ClaudeSdkUserMessage {
   uuid: string;
 }
 
+export type ClaudeSdkMessage = SDKMessage;
 export interface ClaudePermissionResultAllow {
   behavior: "allow";
   updatedInput: Record<string, unknown>;
@@ -54,29 +56,8 @@ export interface ClaudePermissionResultDeny {
 export type ClaudePermissionResult =
   | ClaudePermissionResultAllow
   | ClaudePermissionResultDeny;
-
-export interface ClaudeCanUseToolOptions {
-  signal: AbortSignal;
-  requestId: string;
-  toolUseID: string;
-  suggestions?: unknown[];
-  blockedPath?: string;
-  decisionReason?: string;
-  title?: string;
-  displayName?: string;
-  description?: string;
-  agentID?: string;
-}
-
-export interface ClaudeElicitationRequest {
-  serverName: string;
-  message: string;
-  mode?: "form" | "url";
-  url?: string;
-  elicitationId?: string;
-  requestedSchema?: Record<string, unknown>;
-}
-
+export type ClaudeCanUseToolOptions = Parameters<CanUseTool>[2];
+export type ClaudeElicitationRequest = ElicitationRequest;
 export type ClaudeElicitationResult =
   | { action: "accept"; content?: Record<string, unknown> }
   | { action: "decline" | "cancel" };
@@ -85,6 +66,8 @@ export interface ClaudeSdkQueryOptions {
   cwd: string;
   persistSession: true;
   includePartialMessages: true;
+  includeHookEvents: true;
+  forwardSubagentText: true;
   permissionMode: ClaudePermissionMode;
   allowDangerouslySkipPermissions: boolean;
   env: Record<string, string | undefined>;
@@ -111,7 +94,7 @@ export interface ClaudeInterruptReceipt {
   cancelled?: string[];
 }
 
-export interface ClaudeSdkQuery extends AsyncIterable<Record<string, unknown>> {
+export interface ClaudeSdkQuery extends AsyncIterable<ClaudeSdkMessage> {
   interrupt(): Promise<ClaudeInterruptReceipt | undefined>;
   setPermissionMode(mode: ClaudePermissionMode): Promise<void>;
   close(): void;
@@ -229,4 +212,4 @@ export type ClaudeSessionListener = (
   snapshot: ClaudeManagedSessionSnapshot,
 ) => void;
 
-export type ClaudeMessageListener = (message: Record<string, unknown>) => void;
+export type ClaudeMessageListener = (message: ClaudeSdkMessage) => void;

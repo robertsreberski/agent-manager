@@ -5,6 +5,7 @@ import {
   type SessionStatus,
   type SessionView,
 } from "../../core/types.ts";
+import type { ActivityMutation } from "../../activity/index.ts";
 import type {
   ActionDispatchResult,
   AttachInstruction,
@@ -14,6 +15,7 @@ import type {
   SessionAction,
 } from "../../server/contracts.ts";
 import { ClaudeManagedSession } from "./managed-session.ts";
+import { ClaudeActivityProjector } from "./activity-projector.ts";
 import { loadClaudeSdkRuntime } from "./runtime.ts";
 import type {
   ClaudeManagedSessionSnapshot,
@@ -37,6 +39,7 @@ export interface ClaudeProviderAdapterOptions {
   ): string | null | Promise<string | null>;
   runtime?: ClaudeSdkRuntime | (() => Promise<ClaudeSdkRuntime>);
   onSessionChanged?: (session: SessionView) => void;
+  onActivity?: (managerSessionId: string, mutation: ActivityMutation) => void;
 }
 
 function activityStatus(snapshot: ClaudeManagedSessionSnapshot): SessionStatus {
@@ -347,13 +350,32 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
       unsubscribe: () => undefined,
     };
     this.#entries.set(id, entry);
-    entry.unsubscribe = session.subscribe((snapshot) => {
+    const managerSessionId = `claude:${id}`;
+    const projector = new ClaudeActivityProjector();
+    const publishActivity = (mutations: readonly ActivityMutation[]): void => {
+      for (const mutation of mutations) {
+        try {
+          this.#options.onActivity?.(managerSessionId, mutation);
+        } catch {
+          // Activity consumers are observers and cannot stop the SDK pump.
+        }
+      }
+    };
+    const unsubscribeMessages = session.onMessage((message) => {
+      publishActivity(projector.projectMessage(message));
+    });
+    const unsubscribeSession = session.subscribe((snapshot) => {
+      publishActivity(projector.projectSnapshot(snapshot));
       try {
         this.#options.onSessionChanged?.(this.#toSessionView(entry, snapshot));
       } catch {
         // A state consumer cannot be allowed to tear down the provider pump.
       }
     });
+    entry.unsubscribe = () => {
+      unsubscribeMessages();
+      unsubscribeSession();
+    };
     return this.#toSessionView(entry, session.snapshot);
   }
 

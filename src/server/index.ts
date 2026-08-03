@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Worker } from "node:worker_threads";
 
+import { ActivityHub } from "../activity/index.ts";
 import {
   ClaudeProviderControlAdapter,
 } from "../providers/claude/index.ts";
@@ -24,6 +25,7 @@ import { SessionStateStore } from "./state.ts";
 import { LocalSessionTranscriptReader } from "./transcript.ts";
 
 export * from "./auth.ts";
+export * from "./activity-observer.ts";
 export * from "./contracts.ts";
 export * from "./control-socket.ts";
 export * from "./controls.ts";
@@ -118,6 +120,7 @@ export async function createAgentManagerServer(
   const state = serverOptions.state ?? new SessionStateStore({
     replayCapacity: serverOptions.replayCapacity ?? 512,
   });
+  const activityHub = serverOptions.activityHub ?? new ActivityHub();
   const database = serverOptions.database
     ?? new ManagerDatabase(serverOptions.databasePath ?? paths.databasePath);
   const adapters: ProviderControlAdapters = { ...(serverOptions.adapters ?? {}) };
@@ -128,6 +131,9 @@ export async function createAgentManagerServer(
   if (managedProviders && !adapters.claude) {
     adapters.claude = new ClaudeProviderControlAdapter({
       onSessionChanged: (session) => state.upsert(session),
+      onActivity: (managerSessionId, mutation) => {
+        activityHub.ingest(managerSessionId, "claude", mutation);
+      },
     });
   }
 
@@ -153,6 +159,9 @@ export async function createAgentManagerServer(
           return database.getWorkspace(workspaceId)?.path ?? null;
         },
         onSessionChanged: (session) => state.upsert(session),
+        onActivity: (managerSessionId, mutation) => {
+          activityHub.ingest(managerSessionId, "codex", mutation);
+        },
       });
     } catch (error) {
       diagnostics.push({
@@ -190,6 +199,7 @@ export async function createAgentManagerServer(
     return await createRawServer({
       ...serverOptions,
       state,
+      activityHub,
       database,
       adapters,
       transcriptReader,
@@ -205,6 +215,7 @@ export async function createAgentManagerServer(
     });
   } catch (error) {
     await codexSupervisor?.stop().catch(() => undefined);
+    activityHub.dispose();
     database.close();
     throw error;
   }
