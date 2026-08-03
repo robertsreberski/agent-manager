@@ -97,6 +97,7 @@ export class ClaudeManagedSession {
   >();
   readonly #outstandingMessageIds = new Set<string>();
   readonly #stillQueuedMessageIds = new Set<string>();
+  readonly #backgroundTaskIds = new Set<string>();
 
   #query: ClaudeSdkQuery | null = null;
   #inbox: AsyncInbox<ClaudeSdkUserMessage> | null = null;
@@ -470,6 +471,7 @@ export class ClaudeManagedSession {
     this.#providerActivity = "starting";
     this.#sessionId = resumeSessionId;
     this.#resumedFrom = resumeSessionId;
+    this.#backgroundTaskIds.clear();
 
     if (initialMessage !== undefined) {
       const id = this.#runtime.randomUUID();
@@ -603,11 +605,21 @@ export class ClaudeManagedSession {
     }
 
     if (message.type === "system" && message.subtype === "session_state_changed") {
-      this.#providerActivity = message.state;
       if (message.state === "idle" && this.#outstandingMessageIds.size === 0) {
         this.#queueKnowledge = "known";
         this.#stillQueuedMessageIds.clear();
       }
+      this.#providerActivity = message.state === "idle"
+        ? (this.#isManagerQueueDrained() ? "idle" : "running")
+        : message.state;
+      this.#touch();
+      return;
+    }
+
+    if (message.type === "system" && message.subtype === "background_tasks_changed") {
+      this.#backgroundTaskIds.clear();
+      for (const task of message.tasks) this.#backgroundTaskIds.add(task.task_id);
+      this.#providerActivity = this.#isManagerQueueDrained() ? "idle" : "running";
       this.#touch();
       return;
     }
@@ -621,9 +633,20 @@ export class ClaudeManagedSession {
     }
 
     if (message.type === "result") {
-      const completedMessage = message.subtype === "success"
+      let completedMessage = message.subtype === "success"
         ? message.user_message_uuid
         : undefined;
+      // The SDK declares user_message_uuid optional and 0.3.220 omits it for
+      // some successful streaming turns. A single tracked message is still
+      // unambiguous; without this fallback the session remains permanently
+      // running after an otherwise terminal result.
+      if (
+        message.subtype === "success"
+        && !completedMessage
+        && this.#outstandingMessageIds.size === 1
+      ) {
+        completedMessage = this.#outstandingMessageIds.values().next().value;
+      }
       if (completedMessage) {
         this.#outstandingMessageIds.delete(completedMessage);
         this.#stillQueuedMessageIds.delete(completedMessage);
@@ -634,11 +657,11 @@ export class ClaudeManagedSession {
         this.#providerActivity = "failed";
         this.#abortAllPending();
       } else if (this.#pending.size === 0) {
-        // A result closes one user message but is not an authoritative queue
-        // boundary. In particular, session_state_changed(idle) can race ahead
-        // of the result. Stay non-idle until a later provider idle event proves
-        // the completed message and queued input have both been flushed.
-        this.#providerActivity = "running";
+        // Long-lived streaming queries in SDK 0.3.220 do not consistently emit
+        // session_state_changed(idle) after a terminal result. Treat the result
+        // as an idle fallback only when every manager-tracked queue and
+        // background-work signal drained.
+        this.#providerActivity = this.#isManagerQueueDrained() ? "idle" : "running";
       }
       this.#touch();
     }
@@ -875,6 +898,15 @@ export class ClaudeManagedSession {
       throw new Error("Claude session has no live Agent SDK consumer");
     }
     return { query: this.#query, inbox: this.#inbox };
+  }
+
+  #isManagerQueueDrained(): boolean {
+    return this.#pending.size === 0
+      && this.#outstandingMessageIds.size === 0
+      && this.#stillQueuedMessageIds.size === 0
+      && (this.#inbox?.bufferedCount ?? 0) === 0
+      && this.#queueKnowledge === "known"
+      && this.#backgroundTaskIds.size === 0;
   }
 
   #requireHandoff(

@@ -552,3 +552,22 @@ test("turns exact SDK callbacks into resolvable attention activity", () => {
   assert.equal(resolvedAttention?.resolved, true);
   assert.equal(resolvedAttention?.state, "complete");
 });
+
+test("renders Claude rate-limit reset timestamps from Unix seconds", () => {
+  const projector = new ClaudeActivityProjector();
+  const mutations = projector.projectMessage(sdk({
+    ...baseMessage("rate_limit_event", "rate-limit-1"),
+    rate_limit_info: {
+      status: "allowed_warning",
+      resetsAt: 1_785_542_400,
+    },
+  }));
+  const warning = upserts(mutations).find((item) =>
+    item.id === "claude:lifecycle:rate-limit"
+  );
+  assert.equal(warning?.kind, "lifecycle");
+  assert.equal(
+    warning?.kind === "lifecycle" ? warning.details : null,
+    "Resets at 2026-08-01T00:00:00.000Z",
+  );
+});

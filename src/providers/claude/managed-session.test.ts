@@ -454,7 +454,7 @@ test("hands off only an idle, drained session and reclaims after wrapper exit", 
   session.dispose();
 });
 
-test("requires an authoritative idle event after a result before handoff", async () => {
+test("settles idle from a terminal result only after all tracked work drains", async () => {
   const runtime = new FakeRuntime();
   const session = await ClaudeManagedSession.start(runtime, {
     cwd: "/workspace",
@@ -469,33 +469,94 @@ test("requires an authoritative idle event after a result before handoff", async
     session_id: "session-1",
   });
   await eventually(() => session.snapshot.activity === "idle");
-  const id = session.send("queued", "queue");
+  const firstId = session.send("first", "queue");
+  const secondId = session.send("second", "queue");
   query.emit({
     type: "system",
     subtype: "session_state_changed",
     state: "idle",
     session_id: "session-1",
   });
-  await eventually(() => session.snapshot.activity === "idle");
-  assert.throws(() => session.prepareCliHandoff(), /known-empty input queue/);
+  await eventually(() => session.snapshot.activity === "running");
+  assert.throws(() => session.prepareCliHandoff(), /idle session/);
 
   query.emit({
     type: "result",
     subtype: "success",
-    user_message_uuid: id,
+    user_message_uuid: firstId,
     session_id: "session-1",
   });
-  await eventually(() => session.snapshot.outstandingMessageIds.length === 0);
+  await eventually(() => session.snapshot.outstandingMessageIds.length === 1);
   assert.equal(session.snapshot.activity, "running");
   assert.throws(() => session.prepareCliHandoff(), /idle session/);
 
+  // The installed streaming SDK does not consistently emit a later idle
+  // state. The terminal result is therefore the safe fallback once the final
+  // tracked message completes.
   query.emit({
-    type: "system",
-    subtype: "session_state_changed",
-    state: "idle",
+    type: "result",
+    subtype: "success",
+    user_message_uuid: secondId,
     session_id: "session-1",
   });
   await eventually(() => session.snapshot.activity === "idle");
   assert.doesNotThrow(() => session.prepareCliHandoff());
+  session.dispose();
+});
+
+test("correlates an id-less terminal result when exactly one message is outstanding", async () => {
+  const runtime = new FakeRuntime();
+  const session = await ClaudeManagedSession.start(runtime, {
+    cwd: "/workspace",
+    mode: "default",
+    initialMessage: "single turn",
+  });
+  const query = runtime.queries[0];
+  assert.ok(query);
+  await eventually(() => query.input.length === 1);
+
+  query.emit({
+    type: "result",
+    subtype: "success",
+    session_id: "session-1",
+  });
+  await eventually(() => session.snapshot.activity === "idle");
+  assert.deepEqual(session.snapshot.outstandingMessageIds, []);
+  session.dispose();
+});
+
+test("keeps a completed turn running until Claude background work drains", async () => {
+  const runtime = new FakeRuntime();
+  const session = await ClaudeManagedSession.start(runtime, {
+    cwd: "/workspace",
+    mode: "default",
+    initialMessage: "start background work",
+  });
+  const query = runtime.queries[0];
+  assert.ok(query);
+  await eventually(() => query.input.length === 1);
+
+  query.emit({
+    type: "system",
+    subtype: "background_tasks_changed",
+    tasks: [{ task_id: "task-1", task_type: "agent", description: "Working" }],
+    session_id: "session-1",
+  });
+  query.emit({
+    type: "result",
+    subtype: "success",
+    user_message_uuid: query.input[0]?.uuid,
+    session_id: "session-1",
+  });
+  await eventually(() => session.snapshot.outstandingMessageIds.length === 0);
+  assert.equal(session.snapshot.activity, "running");
+
+  query.emit({
+    type: "system",
+    subtype: "background_tasks_changed",
+    tasks: [],
+    session_id: "session-1",
+  });
+  await eventually(() => session.snapshot.activity === "idle");
   session.dispose();
 });

@@ -53,6 +53,15 @@ function stringValue(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
+function formatUnixTimestamp(value: number | undefined): string | null {
+  if (value === undefined || !Number.isFinite(value)) return null;
+  // Claude 0.3.220 reports rate-limit reset times in Unix seconds while other
+  // SDK timestamps use milliseconds. Accept both wire representations.
+  const milliseconds = value < 100_000_000_000 ? value * 1_000 : value;
+  const date = new Date(milliseconds);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
 function finiteNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
@@ -1514,6 +1523,7 @@ export class ClaudeActivityProjector {
     message: Extract<ClaudeSdkMessage, { type: "rate_limit_event" }>,
   ): ActivityMutation[] {
     const rejected = message.rate_limit_info.status === "rejected";
+    const resetsAt = formatUnixTimestamp(message.rate_limit_info.resetsAt);
     const mutation: ActivityMutation = {
       type: "upsert",
       item: {
@@ -1522,9 +1532,7 @@ export class ClaudeActivityProjector {
         event: rejected ? "error" : "warning",
         level: rejected ? "error" : "warning",
         title: rejected ? "Claude rate limit reached" : "Claude rate limit warning",
-        details: message.rate_limit_info.resetsAt
-          ? `Resets at ${new Date(message.rate_limit_info.resetsAt).toISOString()}`
-          : null,
+        details: resetsAt ? `Resets at ${resetsAt}` : null,
         state: rejected ? "failed" : "waiting",
         turnId: this.#currentTurnId,
         source: "provider-api",
