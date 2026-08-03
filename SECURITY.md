@@ -74,10 +74,11 @@ encrypted/redacted thinking, raw protocol envelopes, environment values,
 terminal stdin, and internal stack traces are excluded structurally rather than
 depending only on token-pattern scanning.
 
-Provider-marked secret answers use an ephemeral dispatch path. Their values are
-not stored in the durable action outbox, idempotency receipts, or audit details;
-if acknowledgement is lost, the outcome becomes unknown instead of replaying
-the answer. Transcript paths and reader errors are not returned to the browser.
+All provider responses use an ephemeral dispatch path, so safety never depends
+on a presentation-layer secret flag remaining available. Answer values and
+denial reasons are not stored in the durable action outbox, idempotency receipts,
+or audit details; if acknowledgement is lost, the outcome becomes unknown
+instead of replaying the response. Transcript paths and reader errors are not returned to the browser.
 Activity/detail responses use `Cache-Control: no-store`; users should avoid
 exposing the cockpit through any proxy other than the exact private Tailscale
 Serve route.

@@ -362,12 +362,12 @@ test("enforces bootstrap, CSRF, leases, stale generations and idempotency", asyn
   assert.equal(stale.json<{ error: { code: string } }>().error.code, "STALE_GENERATION");
 });
 
-test("dispatches provider-marked secret answers without retaining them in SQLite", async () => {
+test("dispatches every provider response without retaining answer bytes in SQLite", async () => {
   const directory = mkdtempSync(join(tmpdir(), "agent-manager-secret-answer-"));
   const databasePath = join(directory, "state.sqlite");
   const secret = "correct-horse-secret-answer-needle";
   const requestId = "secret-question-request";
-  const activityHub = new ActivityHub({ streamEpoch: "secret-answer-test" });
+  const activityHub = new ActivityHub({ streamEpoch: "secret-answer-test", maxItems: 1 });
   activityHub.ingest("codex:thread-1", "codex", {
     type: "upsert",
     item: {
@@ -394,6 +394,20 @@ test("dispatches provider-marked secret answers without retaining them in SQLite
       exposure: "provider-exposed",
     },
   });
+  activityHub.ingest("codex:thread-1", "codex", {
+    type: "upsert",
+    item: {
+      id: "newer-running-item",
+      kind: "message",
+      role: "assistant",
+      text: "newer activity evicts the bounded attention card",
+      state: "running",
+    },
+  });
+  assert.equal(
+    activityHub.snapshot("codex:thread-1")!.items.some((item) => item.kind === "attention"),
+    false,
+  );
   const dispatched: SessionAction[] = [];
   const adapter: ProviderControlAdapter = {
     async createSession() { return session(); },

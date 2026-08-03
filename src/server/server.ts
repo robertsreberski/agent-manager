@@ -164,16 +164,6 @@ function encodeActivitySse(frame: ActivityFrame): string {
   return `id: ${frame.cursor}\nevent: ${frame.type}\ndata: ${JSON.stringify(frame)}\n\n`;
 }
 
-function activityRequestIsSecret(activityHub: ActivityHub, sessionId: string, requestId: string): boolean {
-  const snapshot = activityHub.snapshot(sessionId);
-  if (!snapshot) return false;
-  return snapshot.items.some((item) =>
-    item.kind === "attention"
-    && item.requestId === requestId
-    && (item.isSecret || item.questions.some((question) => question.isSecret))
-  );
-}
-
 function bounded<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`${label} timed out`)), timeoutMs);
@@ -1216,18 +1206,17 @@ export async function createAgentManagerServer(
         const actionId = randomUUID();
         const createdAt = new Date().toISOString();
         let record = actionRecord(actionId, id, action, "pending", createdAt);
-        const secretResponse = action.type === "respond"
-          && activityRequestIsSecret(activityHub, id, action.requestId);
-        if (secretResponse) {
-          // Provider-marked secret answers are deliberately dispatched from
-          // memory only. Persisting the ordinary outbox payload or request
-          // fingerprint would retain recoverable secret material. A restart
-          // therefore leaves the outcome unknown and requires the provider to
-          // advertise the still-pending request again before another answer.
+        if (action.type === "respond") {
+          // Every provider response is deliberately dispatched from memory
+          // only. Secret classification is presentation metadata and can be
+          // missing, stale, or evicted; it must never decide whether an answer
+          // or denial reason is written to the durable outbox. A restart leaves
+          // an unacknowledged outcome unknown and the provider must advertise
+          // the still-pending request again before another response.
           try {
             database.auditOperation({
               actor: authSession.actor,
-              operation: "session.respond.secret",
+              operation: "session.respond.ephemeral",
               targetId: action.requestId,
               phase: "attempt",
               outcome: "ephemeral-dispatching",
@@ -1237,8 +1226,8 @@ export async function createAgentManagerServer(
           } catch {
             throw new ApiError(
               500,
-              "SECRET_RESPONSE_AUDIT_FAILED",
-              "the secret response could not be dispatched safely",
+              "RESPONSE_AUDIT_FAILED",
+              "the provider response could not be dispatched safely",
             );
           }
           state.publishAction(record);
@@ -1262,7 +1251,7 @@ export async function createAgentManagerServer(
                 ? {
                     error: {
                       code: "PROVIDER_OUTCOME_UNKNOWN",
-                      message: "provider acknowledgement was not received; this secret response was not persisted",
+                      message: "provider acknowledgement was not received; this response was not persisted",
                     },
                   }
                 : {}),
@@ -1272,14 +1261,14 @@ export async function createAgentManagerServer(
               completedAt: new Date().toISOString(),
               error: {
                 code: "PROVIDER_OUTCOME_UNKNOWN",
-                message: "provider acknowledgement was not received; this secret response was not persisted",
+                message: "provider acknowledgement was not received; this response was not persisted",
               },
             });
           }
           try {
             database.auditOperation({
               actor: authSession.actor,
-              operation: "session.respond.secret",
+              operation: "session.respond.ephemeral",
               targetId: action.requestId,
               phase: "outcome",
               outcome: record.status,
@@ -1315,9 +1304,7 @@ export async function createAgentManagerServer(
             sessionId: id,
             generation: action.expectedGeneration,
             action,
-            requestOrRunId: action.type === "respond"
-              ? action.requestId
-              : action.expectedRunId ?? null,
+            requestOrRunId: action.expectedRunId ?? null,
             outcome: "dispatch-attempt",
             providerAcknowledged: false,
             precondition: `generation=${action.expectedGeneration};capability=${capability}`,
@@ -1391,9 +1378,7 @@ export async function createAgentManagerServer(
             sessionId: id,
             generation: action.expectedGeneration,
             action,
-            requestOrRunId: action.type === "respond"
-              ? action.requestId
-              : action.expectedRunId ?? null,
+            requestOrRunId: action.expectedRunId ?? null,
             outcome: record.status,
             providerAcknowledged: acknowledged,
             precondition: `generation=${action.expectedGeneration};capability=${capability}`,
