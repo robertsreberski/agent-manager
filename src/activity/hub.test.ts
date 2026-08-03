@@ -15,6 +15,32 @@ function message(id: string, text: string, state: "running" | "complete" = "runn
   };
 }
 
+function applyMessageFrame(current: string, frame: ActivityFrame): string {
+  if (frame.type === "activity.append") {
+    assert.equal(frame.channel, "text");
+    assert.equal(frame.offset, Buffer.byteLength(current, "utf8"));
+    return current + frame.text;
+  }
+  if (frame.type === "activity.upsert") {
+    assert.equal(frame.item.kind, "message");
+    return frame.item.kind === "message" ? frame.item.text : current;
+  }
+  if (frame.type === "activity.reset") {
+    const item = frame.items.find((candidate) => candidate.id === "message-1");
+    return item?.kind === "message" ? item.text : current;
+  }
+  return current;
+}
+
+function allStrings(value: unknown): string[] {
+  if (typeof value === "string") return [value];
+  if (Array.isArray(value)) return value.flatMap(allStrings);
+  if (value !== null && typeof value === "object") {
+    return Object.values(value).flatMap(allStrings);
+  }
+  return [];
+}
+
 test("creates an atomic empty snapshot and clones all public values", () => {
   const hub = new ActivityHub({ streamEpoch: "epoch-one" });
   hub.ensureSession("session-a", "codex");
@@ -183,6 +209,192 @@ test("emits browser offsets for redacted deltas while validating provider offset
     secondStored?.kind === "message" ? secondStored.text : null,
     "[REDACTED] after upsert",
   );
+});
+
+test("atomically replaces text when a credential becomes recognizable across appends", () => {
+  const hub = new ActivityHub({ streamEpoch: "split-secret" });
+  hub.ingest("session-a", "codex", { type: "upsert", item: message("message-1", "") });
+
+  const prefix = "ghp_abc";
+  const suffix = "defghijklmnopqrstuvwxyz123456";
+  const first = hub.ingest("session-a", "codex", {
+    type: "append",
+    id: "message-1",
+    channel: "text",
+    offset: 0,
+    text: prefix,
+  });
+  assert.equal(first.type, "activity.append");
+  if (first.type !== "activity.append") return;
+  assert.equal(first.text, prefix);
+
+  const completed = hub.ingest("session-a", "codex", {
+    type: "append",
+    id: "message-1",
+    channel: "text",
+    offset: Buffer.byteLength(prefix, "utf8"),
+    text: suffix,
+  });
+  assert.equal(completed.type, "activity.upsert");
+  if (completed.type !== "activity.upsert" || completed.item.kind !== "message") return;
+  assert.equal(completed.item.text, "[REDACTED]");
+  assert.equal(JSON.stringify(completed).includes(suffix), false);
+
+  const continuation = hub.ingest("session-a", "codex", {
+    type: "append",
+    id: "message-1",
+    channel: "text",
+    offset: Buffer.byteLength(prefix + suffix, "utf8"),
+    text: " complete",
+  });
+  assert.equal(continuation.type, "activity.append");
+  if (continuation.type !== "activity.append") return;
+  assert.equal(continuation.offset, Buffer.byteLength("[REDACTED]", "utf8"));
+  assert.equal(continuation.text, " complete");
+  const stored = hub.snapshot("session-a")!.items[0];
+  assert.equal(stored?.kind === "message" ? stored.text : null, "[REDACTED] complete");
+});
+
+test("never appends split bearer or prefixed env credentials to the client", () => {
+  const hub = new ActivityHub({ streamEpoch: "split-labels" });
+  hub.ingest("session-a", "codex", { type: "upsert", item: message("bearer", "") });
+  const bearerPrefix = "Bearer abc";
+  const bearerFirst = hub.ingest("session-a", "codex", {
+    type: "append",
+    id: "bearer",
+    channel: "text",
+    offset: 0,
+    text: bearerPrefix,
+  });
+  assert.equal(JSON.stringify(bearerFirst).includes("Bearer abc"), false);
+  const bearerSecond = hub.ingest("session-a", "codex", {
+    type: "append",
+    id: "bearer",
+    channel: "text",
+    offset: Buffer.byteLength(bearerPrefix, "utf8"),
+    text: "defghijklmnop",
+  });
+  assert.equal(JSON.stringify(bearerSecond).includes("defghijklmnop"), false);
+
+  hub.ingest("session-a", "codex", { type: "upsert", item: message("env", "") });
+  const envPrefix = "AWS_SECRET_ACCESS";
+  const envFirst = hub.ingest("session-a", "codex", {
+    type: "append",
+    id: "env",
+    channel: "text",
+    offset: 0,
+    text: envPrefix,
+  });
+  assert.equal(envFirst.type, "activity.append");
+  const envSecond = hub.ingest("session-a", "codex", {
+    type: "append",
+    id: "env",
+    channel: "text",
+    offset: Buffer.byteLength(envPrefix, "utf8"),
+    text: "_KEY=super-secret-value",
+  });
+  assert.equal(envSecond.type, "activity.append");
+  assert.equal(JSON.stringify(envSecond).includes("super-secret-value"), false);
+
+  const serialized = JSON.stringify(hub.snapshot("session-a"));
+  assert.equal(serialized.includes("Bearer abcdefghijklmnop"), false);
+  assert.equal(serialized.includes("super-secret-value"), false);
+});
+
+test("redacts representative credentials at every append boundary", () => {
+  const credentials = [
+    "Bearer abcdefghijklmnop",
+    "sk-proj-abcdefghijklmnopqrstuv",
+    "ghp_abcdefghijklmnopqrstuvwxyz123456",
+    "AKIAABCDEFGHIJKLMNOP",
+    "x-api-key=vendor-secret-value",
+    "AWS_SECRET_ACCESS_KEY=aws-secret-value",
+    "OPENAI_API_KEY=openai-secret-value",
+    "MY_APP_REFRESH_TOKEN=refresh-secret-value",
+  ];
+
+  for (const credential of credentials) {
+    for (let boundary = 1; boundary < credential.length; boundary += 1) {
+      const hub = new ActivityHub({ streamEpoch: `split-${boundary}` });
+      hub.ingest("session-a", "codex", {
+        type: "upsert",
+        item: message("message-1", ""),
+      });
+      const prefix = credential.slice(0, boundary);
+      const suffix = credential.slice(boundary);
+      const first = hub.ingest("session-a", "codex", {
+        type: "append",
+        id: "message-1",
+        channel: "text",
+        offset: 0,
+        text: prefix,
+      });
+      const second = hub.ingest("session-a", "codex", {
+        type: "append",
+        id: "message-1",
+        channel: "text",
+        offset: Buffer.byteLength(prefix, "utf8"),
+        text: suffix,
+      });
+
+      let rendered = "";
+      rendered = applyMessageFrame(rendered, first);
+      assert.equal(rendered.includes(credential), false, `${credential} at ${boundary} after first`);
+      rendered = applyMessageFrame(rendered, second);
+      assert.equal(rendered.includes(credential), false, `${credential} at ${boundary} after second`);
+
+      const snapshot = hub.snapshot("session-a")!;
+      const snapshotItem = snapshot.items[0];
+      assert.equal(
+        snapshotItem?.kind === "message" ? snapshotItem.text.includes(credential) : false,
+        false,
+        `${credential} at ${boundary} in snapshot`,
+      );
+      assert.equal(
+        JSON.stringify([first, second, snapshot]).includes(credential),
+        false,
+        `${credential} at ${boundary} in payload`,
+      );
+      assert.equal(
+        allStrings([first, second]).join("").includes(credential),
+        false,
+        `${credential} at ${boundary} reconstructed from frames`,
+      );
+    }
+  }
+});
+
+test("stops rendering after bounded raw streaming state saturates", () => {
+  const hub = new ActivityHub({ streamEpoch: "bounded-source", maxFieldBytes: 8 });
+  hub.ingest("session-a", "codex", {
+    type: "upsert",
+    item: message("message-1", "12345678"),
+  });
+  const secret = "Bearer abcdefghijklmnop";
+  const saturated = hub.ingest("session-a", "codex", {
+    type: "append",
+    id: "message-1",
+    channel: "text",
+    offset: 8,
+    text: secret,
+  });
+  assert.equal(saturated.type, "activity.append");
+  if (saturated.type !== "activity.append") return;
+  assert.equal(saturated.text, "");
+  assert.equal(saturated.truncated, true);
+  assert.equal(JSON.stringify(saturated).includes(secret), false);
+
+  const acceptedAtSourceOffset = hub.ingest("session-a", "codex", {
+    type: "append",
+    id: "message-1",
+    channel: "text",
+    offset: 8 + Buffer.byteLength(secret, "utf8"),
+    text: "!",
+  });
+  assert.equal(acceptedAtSourceOffset.type, "activity.append");
+  const item = hub.snapshot("session-a")!.items[0];
+  assert.equal(item?.kind === "message" ? item.text : null, "12345678");
+  assert.equal(item?.truncated, true);
 });
 
 test("bounds the materialized view and exposes eviction as an atomic reset", () => {

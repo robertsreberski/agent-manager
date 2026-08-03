@@ -25,6 +25,28 @@ test("redacts secret-shaped object keys recursively without mutating input", () 
   assert.equal(input.authorization, "Bearer should-never-render");
 });
 
+test("redacts namespaced secret keys while leaving similarly named metadata visible", () => {
+  const output = redactActivityJson({
+    "x-api-key": "vendor-value",
+    AWS_SECRET_ACCESS_KEY: "aws-secret-value",
+    OPENAI_API_KEY: "openai-value",
+    teamRefreshToken: "refresh-value",
+    token_count: 42,
+    tokenizer: "safe",
+    public_key: "also-safe",
+  });
+
+  assert.deepEqual(output, {
+    "x-api-key": REDACTED_ACTIVITY_VALUE,
+    AWS_SECRET_ACCESS_KEY: REDACTED_ACTIVITY_VALUE,
+    OPENAI_API_KEY: REDACTED_ACTIVITY_VALUE,
+    teamRefreshToken: REDACTED_ACTIVITY_VALUE,
+    token_count: 42,
+    tokenizer: "safe",
+    public_key: "also-safe",
+  });
+});
+
 test("redacts common credential patterns from otherwise unstructured text", () => {
   const source = [
     "Authorization: Bearer abcdefghijklmnop",
@@ -50,6 +72,31 @@ test("redacts common credential patterns from otherwise unstructured text", () =
     assert.equal(redacted.includes(secret), false, secret);
   }
   assert.ok(redacted.includes(REDACTED_ACTIVITY_VALUE));
+});
+
+test("redacts prefixed secret assignments in headers, env output, and JSON text", () => {
+  const redacted = redactActivityText([
+    "x-api-key: vendor-secret-value",
+    "AWS_SECRET_ACCESS_KEY=aws-secret-value",
+    "MY_APP_REFRESH_TOKEN='refresh-secret-value' SAFE_FIELD=visible",
+    '{"vendorApiKey":"json-secret-value","token_count":2}',
+  ].join("\n"));
+
+  for (const secret of [
+    "vendor-secret-value",
+    "aws-secret-value",
+    "refresh-secret-value",
+    "json-secret-value",
+  ]) {
+    assert.equal(redacted.includes(secret), false, secret);
+  }
+  assert.match(redacted, /SAFE_FIELD=visible/);
+  assert.match(redacted, /"token_count":2/);
+  assert.equal(redactActivityText('TOKEN="hello PASSWORD=nested"'), 'TOKEN="[REDACTED]"');
+  assert.equal(
+    redactActivityText('SAFE="hello PASSWORD=nested"'),
+    'SAFE="hello PASSWORD=[REDACTED]"',
+  );
 });
 
 test("strips unsafe terminal controls and bidi overrides but keeps layout whitespace", () => {

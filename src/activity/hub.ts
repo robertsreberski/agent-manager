@@ -42,7 +42,15 @@ interface ActivitySession {
   replayBytes: number;
   listeners: Set<ActivityListener>;
   appendOffsets: Map<string, number>;
+  appendSources: Map<string, AppendSourceState>;
   truncated: boolean;
+}
+
+interface AppendSourceState {
+  /** Raw provider prefix retained only up to maxFieldBytes. */
+  raw: string;
+  /** Once saturated, later source bytes are accepted but never rendered. */
+  saturated: boolean;
 }
 
 function clone<T>(value: T): T {
@@ -104,6 +112,7 @@ export class ActivityHub {
       replayBytes: 0,
       listeners: new Set(),
       appendOffsets: new Map(),
+      appendSources: new Map(),
       truncated: false,
     });
   }
@@ -165,7 +174,14 @@ export class ActivityHub {
           break;
         }
         session.appendOffsets.set(key, expected + rawBytes);
-        const appended = this.#appendToItem(item, mutation.channel, mutation.text, at);
+        const appended = this.#appendToItem(
+          session,
+          key,
+          item,
+          mutation.channel,
+          mutation.text,
+          at,
+        );
         if (!appended) {
           frame = this.#resetFrame(sessionId, session, seq, at, "replay-gap");
           break;
@@ -174,6 +190,18 @@ export class ActivityHub {
         const evicted = this.#trimView(session);
         frame = evicted
           ? this.#resetFrame(sessionId, session, seq, at, "truncation")
+          : appended.replacement
+            ? {
+                schemaVersion: ACTIVITY_SCHEMA_VERSION,
+                streamEpoch: this.streamEpoch,
+                sessionId,
+                provider,
+                seq,
+                cursor: this.#cursor(sessionId, seq),
+                at,
+                type: "activity.upsert",
+                item: clone(appended.item),
+              }
           : {
               schemaVersion: ACTIVITY_SCHEMA_VERSION,
               streamEpoch: this.streamEpoch,
@@ -199,6 +227,9 @@ export class ActivityHub {
         for (const key of session.appendOffsets.keys()) {
           if (key.startsWith(`${mutation.id}\u0000`)) session.appendOffsets.delete(key);
         }
+        for (const key of session.appendSources.keys()) {
+          if (key.startsWith(`${mutation.id}\u0000`)) session.appendSources.delete(key);
+        }
         frame = {
           schemaVersion: ACTIVITY_SCHEMA_VERSION,
           streamEpoch: this.streamEpoch,
@@ -215,6 +246,7 @@ export class ActivityHub {
       case "reset": {
         session.items.clear();
         session.appendOffsets.clear();
+        session.appendSources.clear();
         session.truncated = false;
         for (const draft of mutation.items ?? []) {
           const existing = session.items.get(draft.id);
@@ -305,6 +337,7 @@ export class ActivityHub {
     const seq = ++session.seq;
     session.items.clear();
     session.appendOffsets.clear();
+    session.appendSources.clear();
     session.truncated = false;
     const frame = this.#resetFrame(
       sessionId,
@@ -392,6 +425,12 @@ export class ActivityHub {
       const oldest = ordered[0];
       if (!oldest) break;
       session.items.delete(oldest.id);
+      for (const key of session.appendOffsets.keys()) {
+        if (key.startsWith(`${oldest.id}\u0000`)) session.appendOffsets.delete(key);
+      }
+      for (const key of session.appendSources.keys()) {
+        if (key.startsWith(`${oldest.id}\u0000`)) session.appendSources.delete(key);
+      }
       evicted = true;
     }
     if (evicted || viewBytes() > this.#limits.maxViewBytes) session.truncated = true;
@@ -399,7 +438,15 @@ export class ActivityHub {
   }
 
   #boundedText(value: string): { value: string; truncated: boolean } {
-    return truncateUtf8(redactActivityText(value), this.#limits.maxFieldBytes);
+    const bounded = truncateUtf8(redactActivityText(value), this.#limits.maxFieldBytes);
+    return {
+      value: bounded.value,
+      // Bound retained unredacted streaming state too. A very large secret can
+      // redact to a tiny display value, but keeping it in memory indefinitely
+      // would defeat the hub's memory limits.
+      truncated: bounded.truncated
+        || Buffer.byteLength(value, "utf8") > this.#limits.maxFieldBytes,
+    };
   }
 
   #boundedJson(value: ActivityJsonValue | string | null | undefined): {
@@ -499,45 +546,103 @@ export class ActivityHub {
     }
   }
 
-  #appendToItem(item: ActivityItem, channel: ActivityAppendChannel, rawDelta: string, at: string): {
+  #appendToItem(
+    session: ActivitySession,
+    key: string,
+    item: ActivityItem,
+    channel: ActivityAppendChannel,
+    rawDelta: string,
+    at: string,
+  ): {
     item: ActivityItem;
     delta: string;
     truncated: boolean;
+    replacement: boolean;
   } | null {
-    const delta = redactActivityText(rawDelta);
-    const append = (current: string): { value: string; delta: string; truncated: boolean } => {
-      const remaining = Math.max(0, this.#limits.maxFieldBytes - Buffer.byteLength(current, "utf8"));
-      const bounded = truncateUtf8(delta, remaining);
-      return { value: current + bounded.value, delta: bounded.value, truncated: bounded.truncated };
-    };
+    const source = session.appendSources.get(key) ?? this.#appendSourceState("");
+    const combined = source.saturated
+      ? source
+      : this.#appendSourceDelta(source, rawDelta);
+    session.appendSources.set(key, combined);
+
+    const current = this.#channelValue(item, channel);
+    if (current === null) return null;
+    const rendered = source.saturated
+      ? { value: current, truncated: true }
+      : truncateUtf8(redactActivityText(combined.raw), this.#limits.maxFieldBytes);
+    const wasTruncated = source.saturated || combined.saturated || rendered.truncated;
+    const replacement = !rendered.value.startsWith(current);
+    const delta = replacement ? "" : rendered.value.slice(current.length);
+
     let next: ActivityItem | null = null;
-    let emitted = { value: "", delta: "", truncated: false };
     if (channel === "text" && (item.kind === "message" || item.kind === "reasoning" || item.kind === "plan")) {
-      emitted = append(item.text);
-      next = { ...item, text: emitted.value };
+      next = { ...item, text: rendered.value };
     } else if (channel === "arguments" && item.kind === "tool") {
-      emitted = append(typeof item.arguments === "string" ? item.arguments : item.arguments === null ? "" : JSON.stringify(item.arguments));
-      next = { ...item, arguments: emitted.value };
+      next = { ...item, arguments: rendered.value };
     } else if (channel === "result" && item.kind === "tool") {
-      emitted = append(typeof item.result === "string" ? item.result : item.result === null ? "" : JSON.stringify(item.result));
-      next = { ...item, result: emitted.value };
+      next = { ...item, result: rendered.value };
     } else if (channel === "output" && (item.kind === "tool" || item.kind === "subagent")) {
-      emitted = append(item.output);
-      next = { ...item, output: emitted.value };
+      next = { ...item, output: rendered.value };
     } else if (channel === "details" && item.kind === "lifecycle") {
-      emitted = append(item.details ?? "");
-      next = { ...item, details: emitted.value };
+      next = { ...item, details: rendered.value };
     } else if (channel === "diff" && item.kind === "file-change") {
       const changes = [...item.changes];
       const index = Math.max(0, changes.length - 1);
       const current = changes[index] ?? { path: "", operation: "update" as const, diff: "" };
-      emitted = append(current.diff);
-      changes[index] = { ...current, diff: emitted.value };
+      changes[index] = { ...current, diff: rendered.value };
       next = { ...item, changes };
     }
     if (!next) return null;
-    next = { ...next, revision: item.revision + 1, updatedAt: at, truncated: item.truncated || emitted.truncated };
-    return { item: next, delta: emitted.delta, truncated: emitted.truncated };
+    next = {
+      ...next,
+      revision: item.revision + 1,
+      updatedAt: at,
+      truncated: item.truncated || wasTruncated,
+    };
+    return { item: next, delta, truncated: wasTruncated, replacement };
+  }
+
+  #appendSourceState(raw: string): AppendSourceState {
+    const bounded = truncateUtf8(raw, this.#limits.maxFieldBytes);
+    return { raw: bounded.value, saturated: bounded.truncated };
+  }
+
+  #appendSourceDelta(source: AppendSourceState, delta: string): AppendSourceState {
+    const remaining = Math.max(
+      0,
+      this.#limits.maxFieldBytes - Buffer.byteLength(source.raw, "utf8"),
+    );
+    const boundedDelta = truncateUtf8(delta, remaining);
+    return {
+      raw: source.raw + boundedDelta.value,
+      saturated: boundedDelta.truncated,
+    };
+  }
+
+  #channelValue(item: ActivityItem, channel: ActivityAppendChannel): string | null {
+    if (channel === "text" && (item.kind === "message" || item.kind === "reasoning" || item.kind === "plan")) {
+      return item.text;
+    }
+    if (channel === "arguments" && item.kind === "tool") {
+      return typeof item.arguments === "string"
+        ? item.arguments
+        : item.arguments === null ? "" : JSON.stringify(item.arguments);
+    }
+    if (channel === "result" && item.kind === "tool") {
+      return typeof item.result === "string"
+        ? item.result
+        : item.result === null ? "" : JSON.stringify(item.result);
+    }
+    if (channel === "output" && (item.kind === "tool" || item.kind === "subagent")) {
+      return item.output;
+    }
+    if (channel === "details" && item.kind === "lifecycle") {
+      return item.details ?? "";
+    }
+    if (channel === "diff" && item.kind === "file-change") {
+      return item.changes.at(-1)?.diff ?? "";
+    }
+    return null;
   }
 
   #displayOffset(item: ActivityItem, channel: ActivityAppendChannel): number | null {
@@ -572,14 +677,19 @@ export class ActivityHub {
       for (const key of session.appendOffsets.keys()) {
         if (key.startsWith(`${item.id}\u0000`)) session.appendOffsets.delete(key);
       }
+      for (const key of session.appendSources.keys()) {
+        if (key.startsWith(`${item.id}\u0000`)) session.appendSources.delete(key);
+      }
     }
     const set = (channel: ActivityAppendChannel, displayValue: string, sourceValue?: string): void => {
       const key = appendKey(item.id, channel);
       if (!replace && sourceValue === undefined && session.appendOffsets.has(key)) return;
+      const source = sourceValue ?? displayValue;
       session.appendOffsets.set(
         key,
-        Buffer.byteLength(sourceValue ?? displayValue, "utf8"),
+        Buffer.byteLength(source, "utf8"),
       );
+      session.appendSources.set(key, this.#appendSourceState(source));
     };
     const serialized = (value: ActivityJsonValue | string | null): string =>
       typeof value === "string" ? value : value === null ? "" : JSON.stringify(value);
