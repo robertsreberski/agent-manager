@@ -71,6 +71,46 @@ const activityHistoryQuerySchema = z.object({
 }).strict();
 const bootstrapSchema = z.object({ secret: z.string().min(32).max(256) }).strict();
 
+const NO_STORE = "no-store";
+const REVALIDATE = "public, max-age=0, must-revalidate";
+const IMMUTABLE = "public, max-age=31536000, immutable";
+const CONTENT_SECURITY_POLICY = [
+  "default-src 'self'",
+  "base-uri 'none'",
+  "connect-src 'self'",
+  "frame-ancestors 'none'",
+  "form-action 'self'",
+  "manifest-src 'self'",
+  "object-src 'none'",
+  "worker-src 'self'",
+].join("; ");
+
+function pathOnly(url: string): string {
+  return url.split(/[?#]/u, 1)[0] ?? "/";
+}
+
+export function cacheControlForResponse(
+  url: string,
+  statusCode: number,
+  contentType: string | undefined,
+): string {
+  const path = pathOnly(url).toLowerCase();
+  if (
+    path === "/api"
+    || path.startsWith("/api/")
+    || /^\/(?:actions?|auth|events?|healthz|sse)(?:\/|$)/u.test(path)
+  ) return NO_STORE;
+  if (!((statusCode >= 200 && statusCode < 300) || statusCode === 304)) return NO_STORE;
+  if (path === "/sw.js" || path === "/service-worker.js") return "no-cache";
+  if (/^\/assets\/.+-[a-z0-9_-]{8,}\.[a-z0-9]+$/iu.test(path)) return IMMUTABLE;
+  if (
+    path.endsWith(".webmanifest")
+    || path === "/manifest.json"
+    || contentType?.toLowerCase().startsWith("text/html")
+  ) return REVALIDATE;
+  return NO_STORE;
+}
+
 export class ApiError extends Error {
   readonly statusCode: number;
   readonly code: string;
@@ -336,8 +376,8 @@ export async function createAgentManagerServer(
 
   app.addHook("onRequest", async (request, reply) => {
     reply
-      .header("Cache-Control", "no-store")
-      .header("Content-Security-Policy", "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; object-src 'none'")
+      .header("Cache-Control", NO_STORE)
+      .header("Content-Security-Policy", CONTENT_SECURITY_POLICY)
       .header("Permissions-Policy", "camera=(), microphone=(), geolocation=(), clipboard-write=(self)")
       .header("Referrer-Policy", "no-referrer")
       .header("X-Content-Type-Options", "nosniff")
@@ -372,6 +412,28 @@ export async function createAgentManagerServer(
     if (isMutation(request.method) && !auth.validateCsrf(session, request.headers["x-csrf-token"])) {
       throw new ApiError(403, "CSRF_INVALID", "CSRF token is missing or invalid");
     }
+  });
+
+  app.addHook("onSend", async (request, reply, payload) => {
+    const rawContentType = reply.getHeader("content-type");
+    const contentType = Array.isArray(rawContentType)
+      ? rawContentType[0]
+      : typeof rawContentType === "string"
+        ? rawContentType
+        : undefined;
+    reply.header(
+      "Cache-Control",
+      cacheControlForResponse(request.url, reply.statusCode, contentType),
+    );
+    const path = pathOnly(request.url).toLowerCase();
+    if (
+      (path === "/sw.js" || path === "/service-worker.js")
+      && reply.statusCode >= 200
+      && reply.statusCode < 300
+    ) {
+      reply.header("Service-Worker-Allowed", "/");
+    }
+    return payload;
   });
 
   const defaultStaticDir = fileURLToPath(new URL(

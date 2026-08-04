@@ -11,7 +11,9 @@ export default defineConfig({
   target: "node24",
   outDir: "dist",
   sourcemap: true,
-  clean: true,
+  // Keep the independently built Vite app when rebuilding only the server.
+  // tsup prepends `**/*`; this negation limits its cleanup to non-web output.
+  clean: ["!web/**"],
   removeNodeProtocol: false,
   esbuildOptions(options) {
     // esbuild's feature table predates node:sqlite. Without this override it
