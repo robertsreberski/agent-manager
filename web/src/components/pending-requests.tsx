@@ -15,12 +15,16 @@ function RequestIcon({ kind }: { kind: AttentionRequest["kind"] }) {
 
 function PendingRequestCard({
   request,
+  exactCurrent,
   disabled,
+  mutationsReady,
   busy,
   onRespond,
 }: {
   request: AttentionRequest;
+  exactCurrent: boolean;
   disabled: boolean;
+  mutationsReady: boolean;
   busy: boolean;
   onRespond: (requestId: string, response: RequestResponse) => Promise<void>;
 }) {
@@ -29,7 +33,8 @@ function PendingRequestCard({
   const [denyReason, setDenyReason] = useState("");
   const question = request.kind === "question";
   const providerRespondable = request.respondable !== false;
-  const canRespond = Boolean(request.id) && providerRespondable && !disabled && !busy;
+  const exactDetailsReady = exactCurrent && (!question || Boolean(request.questions?.length));
+  const canRespond = exactDetailsReady && Boolean(request.id) && providerRespondable && !disabled && !busy;
   const questions: AttentionQuestion[] = request.questions && request.questions.length > 0
     ? request.questions
     : question
@@ -110,7 +115,7 @@ function PendingRequestCard({
             {request.confidence} · {request.source}
           </p>
 
-          {question && request.kind !== "blocked" && providerRespondable && (
+          {question && request.kind !== "blocked" && exactDetailsReady && providerRespondable && (
             <div className="mt-3 grid gap-4">
               {questions.map((item, questionIndex) => {
                 const selectedOptions = selected[item.id] ?? [];
@@ -178,7 +183,7 @@ function PendingRequestCard({
             </div>
           )}
 
-          {!question && request.kind !== "blocked" && providerRespondable && (
+          {!question && request.kind !== "blocked" && exactDetailsReady && providerRespondable && (
             <div className="mt-3 grid gap-2">
               <Input
                 value={denyReason}
@@ -197,18 +202,20 @@ function PendingRequestCard({
             </div>
           )}
 
-          {!request.id && (
+          {(!exactCurrent || (providerRespondable && !exactDetailsReady)) && (
             <p className="mt-3 text-xs text-muted-foreground">
-              This is an inferred state. Open the provider session to respond safely.
+              Exact request details are still loading. Open the provider’s native interface to respond now.
             </p>
           )}
-          {request.id && !providerRespondable && (
+          {exactCurrent && !providerRespondable && (
             <p className="mt-3 text-xs text-muted-foreground">
               This provider request cannot be represented safely in the cockpit. Interrupt it or continue in the provider’s native interface.
             </p>
           )}
-          {disabled && request.id && providerRespondable && (
-            <p className="mt-3 text-xs text-muted-foreground">Take control to answer this request.</p>
+          {exactCurrent && disabled && providerRespondable && (
+            <p className="mt-3 text-xs text-muted-foreground">
+              {mutationsReady ? "Take control to answer this request." : "Reconnect to answer this request."}
+            </p>
           )}
         </div>
       </div>
@@ -219,13 +226,17 @@ function PendingRequestCard({
 export function PendingRequests({
   session,
   requests = session.attention,
+  exactRequestIds = new Set<string>(),
   writable,
+  mutationsReady = true,
   busy,
   onRespond,
 }: {
   session: SessionView;
   requests?: AttentionRequest[];
+  exactRequestIds?: ReadonlySet<string>;
   writable: boolean;
+  mutationsReady?: boolean;
   busy: boolean;
   onRespond: (requestId: string, response: RequestResponse) => Promise<void>;
 }) {
@@ -235,6 +246,15 @@ export function PendingRequests({
   const summary = requests.length === 1
     ? first?.title || first?.summary || "This session needs your input."
     : `${requests.length} requests are waiting.`;
+  const exactRespondableCount = requests.filter((request) =>
+    Boolean(
+      request.id
+        && exactRequestIds.has(request.id)
+        && request.kind !== "blocked"
+        && request.respondable !== false
+        && (request.kind !== "question" || request.questions?.length),
+    ),
+  ).length;
   return (
     <>
       <section className="shrink-0 border-b bg-amber-500/[0.06]" aria-label="Pending requests">
@@ -257,12 +277,16 @@ export function PendingRequests({
       <Sheet open={open} onOpenChange={setOpen}>
         <SheetContent
           side="bottom"
-          className="gap-0 overflow-hidden p-0 md:inset-y-0 md:left-auto md:right-0 md:h-full md:max-h-none md:w-[min(92vw,42rem)] md:border-l md:border-t-0"
+          className="gap-0 overflow-hidden p-0 [padding-bottom:env(safe-area-inset-bottom)] md:inset-y-0 md:left-auto md:right-0 md:h-full md:max-h-none md:w-[min(92vw,42rem)] md:border-l md:border-t-0 md:[padding-right:env(safe-area-inset-right)] md:[padding-top:env(safe-area-inset-top)]"
         >
           <SheetHeader className="border-b px-5 py-4">
             <SheetTitle>Needs you</SheetTitle>
             <SheetDescription>
-              {requests.length === 1 ? "Review and answer this request." : `Review and answer ${requests.length} waiting requests.`}
+              {exactRespondableCount > 0
+                ? requests.length === 1
+                  ? "Review and answer this request."
+                  : `Review ${requests.length} waiting requests and answer the verified provider requests.`
+                : "Review this pending attention. Exact response details are still loading."}
             </SheetDescription>
           </SheetHeader>
           <div className="grid min-h-0 flex-1 gap-3 overflow-y-auto overscroll-contain px-4 py-4 [scrollbar-gutter:stable] sm:px-5">
@@ -270,7 +294,9 @@ export function PendingRequests({
               <PendingRequestCard
                 key={request.id ?? `${request.kind}-${index}`}
                 request={request}
-                disabled={!writable || !session.control.capabilities.includes("respond")}
+                exactCurrent={Boolean(request.id && exactRequestIds.has(request.id))}
+                disabled={!mutationsReady || !writable || !session.control.capabilities.includes("respond")}
+                mutationsReady={mutationsReady}
                 busy={busy}
                 onRespond={onRespond}
               />

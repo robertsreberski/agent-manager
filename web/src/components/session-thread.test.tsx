@@ -408,11 +408,13 @@ describe("SessionThread live activity", () => {
     expect(liveTurn.open).toBe(true);
     expect(document.querySelectorAll("details")).toHaveLength(1);
 
-    const settled = items.map((item) => ({
-      ...item,
-      state: "complete" as const,
-      completedAt: "2026-08-03T12:00:03.000Z",
-    })) as ActivityItem[];
+    const settled = items
+      .filter((item) => item.kind !== "lifecycle" || item.event !== "turn-failed")
+      .map((item) => ({
+        ...item,
+        state: "complete" as const,
+        completedAt: "2026-08-03T12:00:03.000Z",
+      })) as ActivityItem[];
     activityView = liveActivity(settled, 2);
     rendered.rerender(
       <SessionThread
@@ -437,6 +439,20 @@ describe("SessionThread live activity", () => {
       expect(settledTurn).toHaveAttribute("data-activity-state", "complete");
       expect(settledTurn.open).toBe(false);
     });
+  });
+
+  it("keeps failed turn activity expanded for immediate inspection", () => {
+    const failed = items.map((item) => ({
+      ...item,
+      state: item.kind === "lifecycle" ? "failed" as const : "complete" as const,
+      completedAt: "2026-08-03T12:00:03.000Z",
+    })) as ActivityItem[];
+    useSessionActivityMock.mockReturnValue(liveActivity(failed));
+    renderThread(rawSession({ transcript: { state: "available", source: "provider-api", messageCount: 0 } }));
+
+    const failedTurn = document.querySelector("details[data-activity-turn='turn-1']") as HTMLDetailsElement;
+    expect(failedTurn).toHaveAttribute("data-activity-state", "failed");
+    expect(failedTurn.open).toBe(true);
   });
 
   it("does not follow while scrolled away and offers a counted jump back to live", () => {
@@ -560,7 +576,7 @@ describe("SessionThread live activity", () => {
     }));
   });
 
-  it("keeps metadata-only attention after a snapshot, enriches matching live requests, and suppresses resolved ids", () => {
+  it("keeps metadata-only attention read-only, enriches exact live requests, and suppresses resolved ids", async () => {
     const unresolved: ActivityItem = {
       ...activityBase("live-request", 1, "waiting"),
       kind: "attention",
@@ -586,8 +602,9 @@ describe("SessionThread live activity", () => {
       isSecret: false,
     };
     useSessionActivityMock.mockReturnValue(liveActivity([unresolved, resolved]));
+    const onRespond = vi.fn(async () => undefined);
 
-    renderThread(rawSession({
+    const session = rawSession({
       ownership: "external",
       attention: [
         {
@@ -615,8 +632,24 @@ describe("SessionThread live activity", () => {
           confidence: "exact",
         },
       ],
+      control: { capabilities: ["respond"] },
       transcript: { state: "available", source: "codex-rollout", messageCount: 0 },
-    }));
+    });
+    render(
+      <SessionThread
+        session={session}
+        lease={WRITABLE_LEASE}
+        busy={false}
+        onAcquire={vi.fn()}
+        onRelease={vi.fn()}
+        onSend={vi.fn()}
+        onRespond={onRespond}
+        onInterrupt={vi.fn()}
+        onSetMode={vi.fn()}
+        loadPreview={vi.fn()}
+        loadAttach={vi.fn()}
+      />,
+    );
 
     const pending = screen.getByRole("region", { name: "Pending requests" });
     fireEvent.click(within(pending).getByRole("button", { name: /Needs you/u }));
@@ -625,6 +658,169 @@ describe("SessionThread live activity", () => {
     expect(within(requestSheet).getByText("shell")).toBeInTheDocument();
     expect(within(requestSheet).getByText("External session question")).toBeInTheDocument();
     expect(within(requestSheet).queryByText("Stale metadata request")).not.toBeInTheDocument();
+    expect(within(requestSheet).getByText(/Exact request details are still loading/u)).toBeInTheDocument();
+    expect(within(requestSheet).queryByRole("group", { name: /Answer in the provider session/u })).not.toBeInTheDocument();
+    expect(within(requestSheet).getByRole("button", { name: "Allow once" })).toBeEnabled();
+    fireEvent.click(within(requestSheet).getByRole("button", { name: "Allow once" }));
+    await waitFor(() => expect(onRespond).toHaveBeenCalledWith("request-live", {
+      kind: "decision",
+      decision: "allow",
+    }));
+  });
+
+  it("does not expose response controls for non-exact activity-stream attention", () => {
+    const transcriptQuestion: ActivityItem = {
+      ...activityBase("transcript-question", 1, "waiting"),
+      kind: "attention",
+      requestId: "transcript-request-1",
+      attentionKind: "question",
+      title: "Transcript-derived question",
+      summary: "This request is not provider-current",
+      questions: [{
+        id: "target",
+        text: "Where should this deploy?",
+        options: [{ label: "Staging", description: null }],
+        multiSelect: false,
+        allowFreeText: false,
+        isSecret: false,
+      }],
+      respondable: true,
+      resolved: false,
+      isSecret: false,
+      source: "transcript",
+      confidence: "heuristic",
+      exposure: "transcript-derived",
+    };
+    useSessionActivityMock.mockReturnValue(liveActivity([transcriptQuestion]));
+    const onRespond = vi.fn(async () => undefined);
+    const session = rawSession({
+      control: { capabilities: ["respond"] },
+      transcript: { state: "available", source: "codex-rollout", messageCount: 0 },
+    });
+    render(
+      <SessionThread
+        session={session}
+        lease={WRITABLE_LEASE}
+        busy={false}
+        onAcquire={vi.fn()}
+        onRelease={vi.fn()}
+        onSend={vi.fn()}
+        onRespond={onRespond}
+        onInterrupt={vi.fn()}
+        onSetMode={vi.fn()}
+        loadPreview={vi.fn()}
+        loadAttach={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /Needs you/u }));
+    const requestSheet = screen.getByRole("dialog", { name: "Needs you" });
+    expect(within(requestSheet).getByText(/Exact request details are still loading/u)).toBeInTheDocument();
+    expect(within(requestSheet).queryByRole("group", { name: /Where should this deploy\?/u })).not.toBeInTheDocument();
+    expect(within(requestSheet).queryByRole("button", { name: "Staging" })).not.toBeInTheDocument();
+    expect(within(requestSheet).queryByRole("button", { name: "Send answer" })).not.toBeInTheDocument();
+    expect(onRespond).not.toHaveBeenCalled();
+  });
+
+  it("does not build exact response controls from metadata when the live question details are incomplete", () => {
+    const incompleteLiveQuestion: ActivityItem = {
+      ...activityBase("incomplete-live-question", 1, "waiting"),
+      kind: "attention",
+      requestId: "request-incomplete",
+      attentionKind: "question",
+      title: "Live request without answer details",
+      summary: "The provider request is current but its questions have not arrived",
+      questions: [],
+      respondable: true,
+      resolved: false,
+      isSecret: false,
+    };
+    useSessionActivityMock.mockReturnValue(liveActivity([incompleteLiveQuestion]));
+    const onRespond = vi.fn(async () => undefined);
+    const session = rawSession({
+      attention: [{
+        id: "request-incomplete",
+        kind: "question",
+        summary: "Metadata question",
+        details: {
+          questions: [{
+            id: "metadata-answer",
+            text: "Metadata-only question text",
+            options: [{ label: "Unsafe metadata option" }],
+          }],
+        },
+        source: "provider-api",
+        confidence: "exact",
+      }],
+      control: { capabilities: ["respond"] },
+      transcript: { state: "available", source: "provider-api", messageCount: 0 },
+    });
+    render(
+      <SessionThread
+        session={session}
+        lease={WRITABLE_LEASE}
+        busy={false}
+        onAcquire={vi.fn()}
+        onRelease={vi.fn()}
+        onSend={vi.fn()}
+        onRespond={onRespond}
+        onInterrupt={vi.fn()}
+        onSetMode={vi.fn()}
+        loadPreview={vi.fn()}
+        loadAttach={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /Needs you/u }));
+    const requestSheet = screen.getByRole("dialog", { name: "Needs you" });
+    expect(within(requestSheet).getByText(/Exact request details are still loading/u)).toBeInTheDocument();
+    expect(within(requestSheet).queryByText("Metadata-only question text")).not.toBeInTheDocument();
+    expect(within(requestSheet).queryByRole("button", { name: "Unsafe metadata option" })).not.toBeInTheDocument();
+    expect(within(requestSheet).queryByRole("button", { name: "Send answer" })).not.toBeInTheDocument();
+    expect(onRespond).not.toHaveBeenCalled();
+  });
+});
+
+describe("SessionThread status labels", () => {
+  it.each([
+    ["waiting", true, "Needs you"],
+    ["running", true, "Working"],
+    ["failed", true, "Failed"],
+    ["interrupted", true, "Stopped"],
+    ["completed", false, "Completed"],
+    ["unknown", true, "Unknown"],
+    ["idle", true, "Ready"],
+    ["idle", false, "Offline"],
+  ] as const)("maps %s with runtimeAlive=%s to %s", (status, runtimeAlive, expected) => {
+    renderThread(rawSession({
+      status,
+      runtimeAlive,
+      transcript: { state: "available", source: "provider-api", messageCount: 0 },
+    }));
+
+    const header = document.querySelector("header");
+    expect(header).not.toBeNull();
+    expect(within(header!).getByText(expected)).toBeInTheDocument();
+  });
+
+  it("prioritizes pending attention over a running status", () => {
+    renderThread(rawSession({
+      status: "running",
+      runtimeAlive: true,
+      attention: [{
+        id: "metadata-request",
+        kind: "approval",
+        summary: "Pending metadata attention",
+        source: "provider-api",
+        confidence: "exact",
+      }],
+      transcript: { state: "available", source: "provider-api", messageCount: 0 },
+    }));
+
+    const header = document.querySelector("header");
+    expect(header).not.toBeNull();
+    expect(within(header!).getByText("Needs you")).toBeInTheDocument();
+    expect(within(header!).queryByText("Working")).not.toBeInTheDocument();
   });
 });
 

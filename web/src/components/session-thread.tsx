@@ -125,15 +125,38 @@ export function activityAttentionRequests(items: ActivityItem[]): AttentionReque
   });
 }
 
-export function mergePendingAttentionRequests(
-  items: ActivityItem[],
-  metadataRequests: AttentionRequest[],
-): AttentionRequest[] {
-  const activityRequests = activityAttentionRequests(items);
+export function exactCurrentActivityRequestIds(items: ActivityItem[]): ReadonlySet<string> {
   const resolvedRequestIds = new Set(
     items.flatMap((item) => item.kind === "attention" && item.resolved && item.requestId
       ? [item.requestId]
       : []),
+  );
+  return new Set(
+    items.flatMap((item) => item.kind === "attention"
+        && !item.resolved
+        && item.state === "waiting"
+        && item.source === "provider-api"
+        && item.confidence === "exact"
+        && item.exposure === "provider-exposed"
+        && !item.truncated
+        && item.requestId
+        && !resolvedRequestIds.has(item.requestId)
+      ? [item.requestId]
+      : []),
+  );
+}
+
+export function mergePendingAttentionRequests(
+  items: ActivityItem[],
+  metadataRequests: AttentionRequest[],
+): AttentionRequest[] {
+  const resolvedRequestIds = new Set(
+    items.flatMap((item) => item.kind === "attention" && item.resolved && item.requestId
+      ? [item.requestId]
+      : []),
+  );
+  const activityRequests = activityAttentionRequests(items).filter((request) =>
+    !request.id || !resolvedRequestIds.has(request.id),
   );
   const metadataById = new Map(
     metadataRequests.flatMap((request) => request.id ? [[request.id, request] as const] : []),
@@ -149,16 +172,22 @@ export function mergePendingAttentionRequests(
       ...fallback,
       ...request,
       summary: request.summary ?? fallback.summary ?? null,
-      questions: request.questions && request.questions.length > 0
-        ? request.questions
-        : fallback.questions ?? [],
+      // Response shape must come from the current activity request. Metadata
+      // may enrich display-only context, but it is not authoritative enough to
+      // synthesize answer controls.
+      prompt: null,
+      options: [],
+      multiple: false,
+      questions: request.questions ?? [],
       isSecret: Boolean(request.isSecret || fallback.isSecret),
     };
   });
 
-  const metadataFallbacks = metadataRequests.filter((request) =>
-    !request.id || (!activityRequestIds.has(request.id) && !resolvedRequestIds.has(request.id)),
-  );
+  const metadataFallbacks = metadataRequests
+    .filter((request) =>
+      !request.id || (!activityRequestIds.has(request.id) && !resolvedRequestIds.has(request.id)),
+    )
+    .map((request) => ({ ...request, respondable: false }));
   return [...mergedActivityRequests, ...metadataFallbacks];
 }
 
@@ -515,11 +544,17 @@ function SessionHeader({
         ? { label: "Failed", variant: "danger" }
         : session.activity === "interrupted"
           ? { label: "Stopped", variant: "warning" }
-          : { label: "Ready", variant: "outline" };
+          : session.activity === "completed"
+            ? { label: "Completed", variant: "success" }
+            : session.activity === "unknown"
+              ? { label: "Unknown", variant: "outline" }
+              : session.runtimeAlive
+                ? { label: "Ready", variant: "outline" }
+                : { label: "Offline", variant: "secondary" };
   const targetMode = session.mode.value === "planning" ? "execution" : "planning";
   return (
     <>
-      <header className="flex h-14 shrink-0 items-center gap-2 border-b bg-background px-3 pl-14 sm:px-4 sm:pl-14 md:px-6 md:pl-6">
+      <header className="flex h-[calc(3.5rem+env(safe-area-inset-top))] shrink-0 items-center gap-2 border-b bg-background pl-[calc(3.5rem+env(safe-area-inset-left))] pr-[max(0.75rem,env(safe-area-inset-right))] pt-[env(safe-area-inset-top)] min-[640px]:pr-4 min-[901px]:h-14 min-[901px]:px-6 min-[901px]:pt-0">
         <div className="flex min-w-0 flex-1 items-center gap-1.5">
           <h2 className="mr-1 min-w-0 truncate text-sm font-semibold sm:text-base">
             {session.name || session.cwd?.split("/").filter(Boolean).at(-1) || `${session.provider} session`}
@@ -634,6 +669,10 @@ export function SessionThread({
       : session.attention,
     [activity.items, hasLiveActivity, session.attention],
   );
+  const exactRequestIds = useMemo(
+    () => hasLiveActivity ? exactCurrentActivityRequestIds(activity.items) : new Set<string>(),
+    [activity.items, hasLiveActivity],
+  );
   const canQueue = session.control.capabilities.includes("queue");
   const canSteer = session.control.capabilities.includes("steer");
   const queueAdapter = useMemo(() => ({
@@ -707,7 +746,9 @@ export function SessionThread({
       <PendingRequests
         session={session}
         requests={pendingRequests}
-        writable={writable && mutationsReady}
+        exactRequestIds={exactRequestIds}
+        writable={writable}
+        mutationsReady={mutationsReady}
         busy={busy}
         onRespond={onRespond}
       />

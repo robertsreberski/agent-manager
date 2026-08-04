@@ -59,6 +59,7 @@ describe("PendingRequests", () => {
     render(
       <PendingRequests
         session={sessionWithQuestions()}
+        exactRequestIds={new Set(["request-1"])}
         writable
         busy={false}
         onRespond={vi.fn(async () => undefined)}
@@ -80,6 +81,7 @@ describe("PendingRequests", () => {
     render(
       <PendingRequests
         session={sessionWithQuestions()}
+        exactRequestIds={new Set(["request-1"])}
         writable
         busy={false}
         onRespond={onRespond}
@@ -116,6 +118,7 @@ describe("PendingRequests", () => {
     render(
       <PendingRequests
         session={withContext}
+        exactRequestIds={new Set(["request-1"])}
         writable
         busy={false}
         onRespond={onRespond}
@@ -153,6 +156,7 @@ describe("PendingRequests", () => {
     render(
       <PendingRequests
         session={elicitation}
+        exactRequestIds={new Set(["elicitation-1"])}
         writable
         busy={false}
         onRespond={onRespond}
@@ -164,6 +168,81 @@ describe("PendingRequests", () => {
     expect(screen.getByText(/cannot be represented safely/i)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /allow once/i })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /send answer/i })).not.toBeInTheDocument();
+    expect(onRespond).not.toHaveBeenCalled();
+  });
+
+  it("keeps metadata-only requests read-only even when metadata has an exact source and request id", () => {
+    const onRespond = vi.fn(async () => undefined);
+    render(
+      <PendingRequests
+        session={sessionWithQuestions()}
+        writable
+        busy={false}
+        onRespond={onRespond}
+      />,
+    );
+
+    reviewRequests();
+
+    expect(screen.getByText(/Exact request details are still loading/u)).toBeInTheDocument();
+    expect(screen.getByText(/Open the provider’s native interface/u)).toBeInTheDocument();
+    expect(screen.queryByRole("group", { name: /Which database\?/u })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "SQLite" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Send .*answer/u })).not.toBeInTheDocument();
+    expect(onRespond).not.toHaveBeenCalled();
+  });
+
+  it("submits decisions only for exact current activity requests", async () => {
+    const approval = sessionWithQuestions();
+    approval.attention = [{
+      id: "approval-1",
+      kind: "approval",
+      summary: "Run pnpm check",
+      title: "Command approval",
+      respondable: true,
+      source: "provider-api",
+      confidence: "exact",
+    }];
+    const onRespond = vi.fn(async () => undefined);
+    render(
+      <PendingRequests
+        session={approval}
+        exactRequestIds={new Set(["approval-1"])}
+        writable
+        busy={false}
+        onRespond={onRespond}
+      />,
+    );
+
+    reviewRequests();
+    fireEvent.click(screen.getByRole("button", { name: "Allow once" }));
+
+    await waitFor(() => expect(onRespond).toHaveBeenCalledWith("approval-1", {
+      kind: "decision",
+      decision: "allow",
+    }));
+  });
+
+  it("keeps exact response controls disabled while mutations are offline", () => {
+    const onRespond = vi.fn(async () => undefined);
+    render(
+      <PendingRequests
+        session={sessionWithQuestions()}
+        exactRequestIds={new Set(["request-1"])}
+        writable
+        mutationsReady={false}
+        busy={false}
+        onRespond={onRespond}
+      />,
+    );
+
+    reviewRequests();
+
+    expect(screen.getByText("Reconnect to answer this request.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "SQLite" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Send 2 answers" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "SQLite" }));
+    fireEvent.click(screen.getByRole("button", { name: "Send 2 answers" }));
     expect(onRespond).not.toHaveBeenCalled();
   });
 });
