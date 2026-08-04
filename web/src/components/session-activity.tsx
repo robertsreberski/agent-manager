@@ -60,6 +60,16 @@ function isDirectProse(item: ActivityItem): boolean {
 }
 
 function groupState(items: ActivityItem[]): ActivityItemState {
+  // Provider lifecycle events are the authoritative end of a turn. A stream
+  // can retain a running child item after the terminal event arrives, so the
+  // child state must not mask a failed or interrupted outcome.
+  const terminal = [...items].reverse().find((item): item is ActivityLifecycleItem => (
+    item.kind === "lifecycle"
+    && (item.event === "turn-completed" || item.event === "turn-failed" || item.event === "turn-interrupted")
+  ));
+  if (terminal?.event === "turn-failed") return "failed";
+  if (terminal?.event === "turn-interrupted") return "interrupted";
+  if (terminal?.event === "turn-completed") return "complete";
   if (items.some((item) => item.state === "running" || item.state === "pending")) return "running";
   if (items.some((item) => item.state === "waiting")) return "waiting";
   if (items.some((item) => item.state === "failed")) return "failed";
@@ -508,11 +518,12 @@ function ActivityItemRow({ item }: { item: ActivityItem }) {
 
 function ActivityTurnDisclosure({ group }: { group: ActivityTurnGroup }) {
   const live = isActive(group.state);
+  const expanded = live || group.state === "failed" || group.state === "interrupted";
   const itemLabel = `${group.items.length} update${group.items.length === 1 ? "" : "s"}`;
   return (
     <details
       className="group/turn w-full min-w-0 rounded-xl border bg-muted/20 shadow-sm"
-      open={live ? true : undefined}
+      open={expanded ? true : undefined}
       data-activity-turn={group.turnId ?? group.id}
       data-activity-state={group.state}
     >

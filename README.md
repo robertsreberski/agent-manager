@@ -176,9 +176,11 @@ running.
 
 Only the versioned public app shell is precached. API, authentication, SSE,
 action, health, source-map, and session data responses are never placed in a
-service-worker cache. If the host is unreachable, the installed app can show an
-offline shell but cannot show or mutate session data. Moving the app into the
-background immediately covers the cockpit to reduce task-switcher leakage.
+service-worker cache. A cold offline launch can show only the public shell and
+cannot load or mutate session data. An already-open tab retains its in-memory
+snapshot as a stale, read-only view until it is closed or reconnects. Moving the
+app into the background immediately covers the cockpit to reduce task-switcher
+leakage.
 
 ## Private Tailscale access
 
