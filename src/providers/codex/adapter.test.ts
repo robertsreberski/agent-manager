@@ -553,6 +553,98 @@ test("provider-independent response envelopes map to exact Codex results", () =>
   assert.equal(decodeCodexRequestId("s:9"), "9");
 });
 
+test("Random pick choices preserve exact Codex labels and reject ambiguous answers", () => {
+  const question: CodexPendingRequest = {
+    id: "random-pick",
+    method: "item/tool/requestUserInput",
+    kind: "user-input",
+    threadId: "thread-1",
+    turnId: "turn-1",
+    params: {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      itemId: "item-random-pick",
+      questions: [{
+        id: "random_destination",
+        header: "Random pick",
+        question: "Which imaginary weekend destination would you choose?",
+        isOther: true,
+        options: [
+          {
+            label: "Moon cabin (Recommended)",
+            description: "Quiet views, low gravity, and maximum novelty.",
+          },
+          { label: "Undersea hotel", description: "Ocean life outside every window." },
+          { label: "Cloud city", description: "Endless sunsets and dramatic scenery." },
+        ],
+      }],
+    },
+    respondable: true,
+    receivedAt: "2026-08-04T07:04:18.242Z",
+  };
+
+  assert.deepEqual(codexRequestResponse(question, {
+    kind: "answer",
+    value: "",
+    selectedOptions: ["Moon cabin (Recommended)"],
+  }), {
+    answers: {
+      random_destination: { answers: ["Moon cabin (Recommended)"] },
+    },
+  });
+  assert.deepEqual(codexRequestResponse(question, {
+    kind: "answer",
+    value: "A library at the edge of time",
+    selectedOptions: [],
+  }), {
+    answers: {
+      random_destination: { answers: ["A library at the edge of time"] },
+    },
+  });
+
+  assert.throws(
+    () => codexRequestResponse(question, {
+      kind: "answer",
+      value: "",
+      selectedOptions: ["Moon cabin (Recommended)", "Cloud city"],
+    }),
+    /accepts only one option/u,
+  );
+  assert.throws(
+    () => codexRequestResponse(question, {
+      kind: "answer",
+      value: "A library at the edge of time",
+      selectedOptions: ["Moon cabin (Recommended)"],
+    }),
+    /cannot combine an option with a custom answer/u,
+  );
+  assert.throws(
+    () => codexRequestResponse(question, {
+      kind: "answer",
+      value: "",
+      selectedOptions: ["Mars resort"],
+    }),
+    /Unknown option/u,
+  );
+  assert.throws(
+    () => codexRequestResponse({
+      ...question,
+      params: {
+        ...question.params,
+        questions: [{
+          ...(question.params.questions as JsonObject[])[0],
+          isOther: false,
+        }],
+      },
+    }, {
+      kind: "answer",
+      value: "A library at the edge of time",
+      selectedOptions: [],
+    }),
+    /does not allow a custom answer/u,
+  );
+});
+
 test("Codex MCP elicitation fails closed across SessionView and action dispatch", async () => {
   const request: CodexPendingRequest = {
     id: "elicit-1",
@@ -656,7 +748,12 @@ test("multi-question envelopes map atomically by stable provider question ID", (
       itemId: "item-multi",
       questions: [
         { id: "surface", header: "Surface", question: "Which surface?" },
-        { id: "access", header: "Access", question: "Which access?" },
+        {
+          id: "access",
+          header: "Access",
+          question: "Which access?",
+          options: [{ label: "Loopback + Tailscale" }],
+        },
       ],
     },
     respondable: true,
@@ -1084,23 +1181,45 @@ test("Codex SessionView publishes exact questions and bounded approval details",
     questions: [
       {
         id: "surface",
-        text: "Surface: Where should the cockpit run?",
+        header: "Surface",
+        text: "Where should the cockpit run?",
         options: [
           { label: "Local web", description: "Runs on loopback" },
           { label: "Terminal", description: "Uses a TUI" },
         ],
         multiSelect: false,
-        allowFreeText: true,
+        allowFreeText: false,
       },
       {
         id: "access",
-        text: "Access: Who can connect?",
+        header: "Access",
+        text: "Who can connect?",
         options: [],
         multiSelect: false,
         allowFreeText: true,
       },
     ],
   });
+
+  transport.request("secret-question", "item/tool/requestUserInput", {
+    threadId: "thread-1",
+    turnId: "turn-details",
+    itemId: "item-secret-question",
+    questions: [{
+      id: "token",
+      header: "Credential",
+      question: "Enter the token",
+      isOther: true,
+      isSecret: true,
+      options: null,
+    }],
+  });
+  const secretQuestion = bridge.getManagedSession("thread-1")?.attention.find(
+    (attention) => attention.id === "s:secret-question",
+  );
+  assert.equal(secretQuestion?.details?.questions?.[0]?.header, "Credential");
+  assert.equal(secretQuestion?.details?.questions?.[0]?.text, "Enter the token");
+  assert.equal(secretQuestion?.details?.questions?.[0]?.isSecret, true);
 
   transport.request("approval", "item/commandExecution/requestApproval", {
     threadId: "thread-1",

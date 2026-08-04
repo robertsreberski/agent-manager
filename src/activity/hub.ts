@@ -529,7 +529,7 @@ export class ActivityHub {
       }
       case "attention": {
         const old = previous?.kind === "attention" ? previous : undefined;
-        const questions = (draft.questions ?? old?.questions ?? []).map((question) => ({ id: text(question.id), text: text(question.text), options: question.options.map((option) => ({ label: text(option.label), description: option.description === null ? null : text(option.description) })), multiSelect: question.multiSelect, allowFreeText: question.allowFreeText, isSecret: question.isSecret }));
+        const questions = (draft.questions ?? old?.questions ?? []).map((question) => ({ id: text(question.id), ...(question.header === undefined ? {} : { header: text(question.header) }), text: text(question.text), options: question.options.map((option) => ({ label: text(option.label), description: option.description === null ? null : text(option.description) })), multiSelect: question.multiSelect, allowFreeText: question.allowFreeText, isSecret: question.isSecret }));
         return { ...common, kind: "attention", requestId: text(draft.requestId), attentionKind: draft.attentionKind, title: draft.title === undefined ? old?.title ?? null : draft.title === null ? null : text(draft.title), summary: draft.summary === undefined ? old?.summary ?? null : draft.summary === null ? null : text(draft.summary), questions, respondable: draft.respondable ?? old?.respondable ?? false, resolved: draft.resolved ?? old?.resolved ?? false, isSecret: draft.isSecret ?? old?.isSecret ?? questions.some((question) => question.isSecret), truncated };
       }
       case "queue": {

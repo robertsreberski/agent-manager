@@ -108,6 +108,44 @@ test("upserts merge omitted fields, increment revisions, and preserve semantic o
   assert.deepEqual(hub.snapshot("session-a")!.items.map((item) => item.id), ["tool-1", "message-2"]);
 });
 
+test("preserves attention question headers separately from question text", () => {
+  const hub = new ActivityHub({ streamEpoch: "attention-header" });
+  hub.ingest("session-a", "codex", {
+    type: "upsert",
+    item: {
+      id: "question-1",
+      kind: "attention",
+      requestId: "s:random-pick",
+      attentionKind: "question",
+      title: "Codex needs your answer",
+      summary: null,
+      questions: [{
+        id: "random_destination",
+        header: "Random pick",
+        text: "Which imaginary weekend destination would you choose?",
+        options: [{ label: "Moon cabin", description: null }],
+        multiSelect: false,
+        allowFreeText: true,
+        isSecret: false,
+      }],
+      respondable: true,
+      resolved: false,
+      isSecret: false,
+    },
+  });
+
+  const item = hub.snapshot("session-a")?.items[0];
+  assert.equal(item?.kind, "attention");
+  if (item?.kind === "attention") {
+    assert.equal(item.summary, null);
+    assert.equal(item.questions[0]?.header, "Random pick");
+    assert.equal(
+      item.questions[0]?.text,
+      "Which imaginary weekend destination would you choose?",
+    );
+  }
+});
+
 test("redacts and bounds activity before snapshots, replay, and subscribers", () => {
   const hub = new ActivityHub({ streamEpoch: "safe", maxFieldBytes: 64 });
   const observed: ActivityFrame[] = [];

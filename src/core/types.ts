@@ -52,10 +52,12 @@ export interface AttentionOption {
 
 export interface AttentionQuestion {
   id: string;
+  header?: string;
   text: string;
   options: AttentionOption[];
   multiSelect: boolean;
   allowFreeText: boolean;
+  isSecret?: boolean;
 }
 
 export interface AttentionDetails {

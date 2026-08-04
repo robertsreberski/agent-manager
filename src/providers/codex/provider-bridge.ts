@@ -24,6 +24,10 @@ import type {
   JsonObject,
   JsonRpcId,
 } from "./types.ts";
+import {
+  normalizeCodexQuestions,
+  type NormalizedCodexQuestion,
+} from "./question-normalizer.ts";
 
 interface ManagedMetadata {
   name: string | null;
@@ -78,45 +82,19 @@ function boundedText(value: string, maxCodePoints = 1_000): string {
 }
 
 function attentionQuestions(request: CodexPendingRequest): AttentionQuestion[] {
-  if (request.kind !== "user-input" || !Array.isArray(request.params.questions)) {
-    return [];
-  }
-  return request.params.questions.flatMap((rawQuestion) => {
-    if (typeof rawQuestion !== "object" || rawQuestion === null ||
-        Array.isArray(rawQuestion) || typeof rawQuestion.id !== "string" ||
-        typeof rawQuestion.question !== "string") {
-      return [];
-    }
-    const header = typeof rawQuestion.header === "string"
-      ? rawQuestion.header.trim()
-      : "";
-    const options = Array.isArray(rawQuestion.options)
-      ? rawQuestion.options.flatMap((rawOption) => {
-          if (typeof rawOption !== "object" || rawOption === null ||
-              Array.isArray(rawOption) || typeof rawOption.label !== "string") {
-            return [];
-          }
-          return [{
-            label: boundedText(rawOption.label, 300),
-            ...(typeof rawOption.description === "string"
-              ? { description: boundedText(rawOption.description, 500) }
-              : {}),
-          }];
-        })
-      : [];
-    return [{
-      id: rawQuestion.id,
-      text: boundedText(
-        header ? `${header}: ${rawQuestion.question}` : rawQuestion.question,
-        1_000,
-      ),
-      options,
-      multiSelect: rawQuestion.multiSelect === true,
-      // Codex request_user_input permits the client-provided free-form Other
-      // answer even when it is not repeated in the provider options array.
-      allowFreeText: true,
-    }];
-  });
+  if (request.kind !== "user-input") return [];
+  return normalizeCodexQuestions(request.params.questions).map((question) => ({
+    id: question.id,
+    ...(question.header ? { header: question.header } : {}),
+    text: question.text,
+    options: question.options.map((option) => ({
+      label: option.label,
+      ...(option.description === null ? {} : { description: option.description }),
+    })),
+    multiSelect: question.multiSelect,
+    allowFreeText: question.allowFreeText,
+    ...(question.isSecret ? { isSecret: true } : {}),
+  }));
 }
 
 function approvalInputSummary(request: CodexPendingRequest): string | null {
@@ -251,21 +229,72 @@ function asJsonObject(value: unknown): JsonObject {
   return value as JsonObject;
 }
 
-function stringArray(value: unknown): string[] {
+function requestQuestions(request: CodexPendingRequest): NormalizedCodexQuestion[] {
+  const questions = normalizeCodexQuestions(request.params.questions);
+  const seen = new Set<string>();
+  for (const question of questions) {
+    if (seen.has(question.id)) {
+      throw new Error(`Duplicate Codex question ID ${question.id}`);
+    }
+    seen.add(question.id);
+  }
+  return questions;
+}
+
+function selectedOptionArray(value: unknown, questionId: string): string[] {
   if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string")) {
-    return [];
+    throw new Error(`Codex answer for ${questionId} is malformed`);
   }
   return value;
 }
 
-function questionIds(request: CodexPendingRequest): string[] {
-  if (!Array.isArray(request.params.questions)) return [];
-  return request.params.questions.flatMap((question) => {
-    if (typeof question !== "object" || question === null || Array.isArray(question)) {
-      return [];
-    }
-    return typeof question.id === "string" ? [question.id] : [];
-  });
+function questionAnswerValues(
+  question: NormalizedCodexQuestion,
+  value: string,
+  selectedOptions: string[],
+): string[] {
+  const selected = [...new Set(selectedOptions)];
+  const allowedOptions = new Set(question.options.map((option) => option.label));
+  const unknownOptions = selected.filter((option) => !allowedOptions.has(option));
+  if (unknownOptions.length > 0) {
+    throw new Error(
+      `Unknown option for Codex question ${question.id}: ${unknownOptions.join(", ")}`,
+    );
+  }
+
+  const customValue = value.trim() ? value : null;
+  if (!question.multiSelect && selected.length > 1) {
+    throw new Error(`Codex question ${question.id} accepts only one option`);
+  }
+  if (customValue !== null && !question.allowFreeText) {
+    throw new Error(`Codex question ${question.id} does not allow a custom answer`);
+  }
+  if (!question.multiSelect && customValue !== null && selected.length > 0) {
+    throw new Error(
+      `Codex question ${question.id} cannot combine an option with a custom answer`,
+    );
+  }
+
+  const values = customValue === null ? selected : [...selected, customValue];
+  if (values.length === 0) {
+    throw new Error(`Codex question ${question.id} requires an answer`);
+  }
+  return values;
+}
+
+function legacyQuestionAnswer(
+  question: NormalizedCodexQuestion,
+  value: unknown,
+): string[] {
+  if (typeof value === "string") {
+    const namedOption = question.options.some((option) => option.label === value);
+    return questionAnswerValues(question, namedOption ? "" : value, namedOption ? [value] : []);
+  }
+  return questionAnswerValues(
+    question,
+    "",
+    selectedOptionArray(value, question.id),
+  );
 }
 
 /** Translate the provider-independent cockpit envelope into the exact 0.146 RPC result. */
@@ -279,14 +308,15 @@ export function codexRequestResponse(
   if (response.kind === undefined) return response;
 
   if (request.kind === "user-input") {
-    const ids = questionIds(request);
-    if (ids.length === 0) throw new Error("Codex question has no stable question IDs");
+    const questions = requestQuestions(request);
+    if (questions.length === 0) throw new Error("Codex question has no stable question IDs");
+    const questionsById = new Map(questions.map((question) => [question.id, question]));
 
     if (response.kind === "answers") {
       if (!Array.isArray(response.answers)) {
         throw new Error("Codex multi-question response requires an answers array");
       }
-      const expected = new Set(ids);
+      const expected = new Set(questionsById.keys());
       const seen = new Set<string>();
       const answers: JsonObject = {};
       for (const entry of response.answers) {
@@ -300,20 +330,19 @@ export function codexRequestResponse(
         if (seen.has(entry.questionId)) {
           throw new Error(`Duplicate Codex answer for ${entry.questionId}`);
         }
-        if (typeof entry.value !== "string" || !Array.isArray(entry.selectedOptions) ||
-            !entry.selectedOptions.every((option) => typeof option === "string")) {
+        if (typeof entry.value !== "string") {
           throw new Error(`Codex answer for ${entry.questionId} is malformed`);
         }
-        const values = [...entry.selectedOptions];
-        if (entry.value.trim()) values.push(entry.value);
-        const unique = [...new Set(values)];
-        if (unique.length === 0) {
-          throw new Error(`Codex question ${entry.questionId} requires an answer`);
-        }
+        const question = questionsById.get(entry.questionId) as NormalizedCodexQuestion;
+        const values = questionAnswerValues(
+          question,
+          entry.value,
+          selectedOptionArray(entry.selectedOptions, entry.questionId),
+        );
         seen.add(entry.questionId);
-        answers[entry.questionId] = { answers: unique };
+        answers[entry.questionId] = { answers: values };
       }
-      const missing = ids.filter((id) => !seen.has(id));
+      const missing = questions.map((question) => question.id).filter((id) => !seen.has(id));
       if (missing.length > 0 || seen.size !== expected.size) {
         throw new Error(`Codex response is missing answers for: ${missing.join(", ")}`);
       }
@@ -323,31 +352,34 @@ export function codexRequestResponse(
     if (response.kind !== "answer") {
       throw new Error("Codex question response must use kind=answer or kind=answers");
     }
-    const selected = stringArray(response.selectedOptions);
     const answerValue = response.value;
     const answers: JsonObject = {};
 
     if (typeof answerValue === "object" && answerValue !== null &&
         !Array.isArray(answerValue)) {
-      for (const id of ids) {
+      const unknownIds = Object.keys(answerValue).filter((id) => !questionsById.has(id));
+      if (unknownIds.length > 0) {
+        throw new Error(`Unknown Codex question ID ${unknownIds.join(", ")}`);
+      }
+      for (const question of questions) {
+        const id = question.id;
         const item = (answerValue as Record<string, unknown>)[id];
-        const values = typeof item === "string" ? [item] : stringArray(item);
-        if (values.length === 0) {
-          throw new Error(`Codex question ${id} requires an answer`);
-        }
-        answers[id] = { answers: values };
+        answers[id] = { answers: legacyQuestionAnswer(question, item) };
       }
     } else {
-      if (ids.length !== 1) {
+      if (questions.length !== 1) {
         throw new Error("Multiple Codex questions require answers keyed by question ID");
       }
-      const values = [...selected];
-      if (typeof answerValue === "string" && answerValue.trim()) {
-        values.push(answerValue);
+      if (typeof answerValue !== "string") {
+        throw new Error(`Codex answer for ${questions[0]!.id} is malformed`);
       }
-      const unique = [...new Set(values)];
-      if (unique.length === 0) throw new Error("Codex question requires an answer");
-      answers[ids[0] as string] = { answers: unique };
+      answers[questions[0]!.id] = {
+        answers: questionAnswerValues(
+          questions[0]!,
+          answerValue,
+          selectedOptionArray(response.selectedOptions, questions[0]!.id),
+        ),
+      };
     }
     return { answers };
   }

@@ -18,6 +18,7 @@ import type {
   CodexQueuedMessage,
   JsonRpcId,
 } from "./types.ts";
+import { normalizeCodexQuestions } from "./question-normalizer.ts";
 
 export type CodexActivityAppendChannel = Extract<
   ActivityMutation,
@@ -919,32 +920,6 @@ export function projectCodexNotification(
   }
 }
 
-function requestQuestion(value: unknown): ActivityAttentionQuestion | null {
-  const question = record(value);
-  const id = stringValue(question?.id);
-  const text = stringValue(question?.question);
-  if (!question || !id || !text) return null;
-  const options = Array.isArray(question.options)
-    ? question.options.flatMap((rawOption) => {
-        const option = record(rawOption);
-        const label = stringValue(option?.label);
-        return label
-          ? [{ label, description: stringValue(option?.description) }]
-          : [];
-      })
-    : [];
-  return {
-    id,
-    text: stringValue(question.header)?.trim()
-      ? `${stringValue(question.header)}: ${text}`
-      : text,
-    options,
-    multiSelect: false,
-    allowFreeText: question.isOther === true || options.length === 0,
-    isSecret: question.isSecret === true,
-  };
-}
-
 export function projectCodexServerRequest(
   request: JsonRpcServerRequest,
 ): CodexActivityProjection | null {
@@ -952,12 +927,17 @@ export function projectCodexServerRequest(
     stringValue(request.params.conversationId);
   if (!threadId) return null;
   const turnId = stringValue(request.params.turnId);
-  const questions = Array.isArray(request.params.questions)
-    ? request.params.questions.flatMap((value) => {
-        const question = requestQuestion(value);
-        return question ? [question] : [];
-      })
-    : [];
+  const questions: ActivityAttentionQuestion[] = normalizeCodexQuestions(
+    request.params.questions,
+  ).map((question) => ({
+    id: question.id,
+    ...(question.header ? { header: question.header } : {}),
+    text: question.text,
+    options: question.options,
+    multiSelect: question.multiSelect,
+    allowFreeText: question.allowFreeText,
+    isSecret: question.isSecret,
+  }));
   const isSecret = questions.some((question) => question.isSecret === true);
   let attentionKind: Extract<
     ActivityItemDraft,
@@ -971,8 +951,7 @@ export function projectCodexServerRequest(
     case "item/tool/requestUserInput":
       attentionKind = "question";
       title = questions.length === 1 ? "Codex needs your answer" : "Codex needs your answers";
-      summary = questions.map((question) => question.text).join(" · ") ||
-        "Codex is waiting for input";
+      summary = questions.length > 0 ? null : "Codex is waiting for input";
       // Secret answers take the same live response path, while `isSecret`
       // instructs the server/UI to avoid durable storage and use password UI.
       respondable = questions.length > 0;

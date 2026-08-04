@@ -43,6 +43,7 @@ export interface ActivityAttentionOption {
 
 export interface ActivityAttentionQuestion {
   id: string;
+  header?: string;
   text: string;
   options: ActivityAttentionOption[];
   multiSelect: boolean;

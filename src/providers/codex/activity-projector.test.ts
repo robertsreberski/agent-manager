@@ -371,6 +371,7 @@ test("attention preserves provider IDs, marks secrets, resolves, and queue upser
         question: "Enter the token",
         isOther: true,
         isSecret: true,
+        multiSelect: true,
         options: null,
       }],
     },
@@ -384,6 +385,7 @@ test("attention preserves provider IDs, marks secrets, resolves, and queue upser
     assert.equal(attention.respondable, true);
     assert.equal(attention.isSecret, true);
     assert.equal(attention.questions?.[0]?.isSecret, true);
+    assert.equal(attention.questions?.[0]?.multiSelect, false);
   }
 
   const resolved = projectCodexRequestResolved("t", "ask-1", 1_787_500_001_000, {
@@ -418,6 +420,57 @@ test("attention preserves provider IDs, marks secrets, resolves, and queue upser
   assert.equal(firstQueue.id, secondQueue.id);
   assert.equal(firstQueue.state, "waiting");
   assert.equal(secondQueue.state, "complete");
+});
+
+test("Random pick projects one structured question without repeating its prompt", () => {
+  const projection = projectCodexServerRequest({
+    id: "random-pick",
+    method: "item/tool/requestUserInput",
+    emittedAtMs: 1_785_827_058_242,
+    params: {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      itemId: "item-random-pick",
+      questions: [{
+        id: "random_destination",
+        header: "Random pick",
+        question: "Which imaginary weekend destination would you choose?",
+        isOther: true,
+        isSecret: false,
+        options: [
+          {
+            label: "Moon cabin (Recommended)",
+            description: "Quiet views, low gravity, and maximum novelty.",
+          },
+          { label: "Undersea hotel", description: "Ocean life outside every window." },
+          { label: "Cloud city", description: "Endless sunsets and dramatic scenery." },
+        ],
+      }],
+    },
+  });
+  assert.ok(projection);
+  const attention = upsertItem(projection.mutations[0] as ActivityMutation);
+  assert.equal(attention.kind, "attention");
+  if (attention.kind === "attention") {
+    assert.equal(attention.title, "Codex needs your answer");
+    assert.equal(attention.summary, null);
+    assert.deepEqual(attention.questions, [{
+      id: "random_destination",
+      header: "Random pick",
+      text: "Which imaginary weekend destination would you choose?",
+      options: [
+        {
+          label: "Moon cabin (Recommended)",
+          description: "Quiet views, low gravity, and maximum novelty.",
+        },
+        { label: "Undersea hotel", description: "Ocean life outside every window." },
+        { label: "Cloud city", description: "Endless sunsets and dramatic scenery." },
+      ],
+      multiSelect: false,
+      allowFreeText: true,
+      isSecret: false,
+    }]);
+  }
 });
 
 test("terminal stdin, raw envelopes, and connection-scoped output never project", () => {
