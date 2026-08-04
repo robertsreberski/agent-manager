@@ -362,6 +362,167 @@ test("enforces bootstrap, CSRF, leases, stale generations and idempotency", asyn
   assert.equal(stale.json<{ error: { code: string } }>().error.code, "STALE_GENERATION");
 });
 
+test("retries a lost control-lease release response without accepting an active mismatched token", async (t) => {
+  const backend = await createAgentManagerServer({
+    discovery: false,
+    staticDir: false,
+    initialSessions: [session()],
+  });
+  t.after(() => backend.close());
+  await backend.app.ready();
+  const headers = await authenticatedHeaders(backend);
+  const acquired = await backend.app.inject({
+    method: "POST",
+    url: "/api/v1/sessions/codex:thread-1/control-lease",
+    headers,
+    payload: { clientId: "browser-client" },
+  });
+  assert.equal(acquired.statusCode, 200, acquired.body);
+  const lease = acquired.json<{ lease: { token: string } }>().lease;
+  const deleteHeaders = {
+    host,
+    origin,
+    cookie: headers.cookie,
+    "x-csrf-token": headers["x-csrf-token"],
+  };
+
+  const mismatched = await backend.app.inject({
+    method: "DELETE",
+    url: "/api/v1/sessions/codex:thread-1/control-lease",
+    headers: { ...deleteHeaders, "x-control-lease": "mismatched-token" },
+  });
+  assert.equal(mismatched.statusCode, 409, mismatched.body);
+  assert.equal(backend.state.get("codex:thread-1")?.control.writableLease, true);
+
+  const release = () => backend.app.inject({
+    method: "DELETE",
+    url: "/api/v1/sessions/codex:thread-1/control-lease",
+    headers: { ...deleteHeaders, "x-control-lease": lease.token },
+  });
+  const first = await release();
+  assert.equal(first.statusCode, 204, first.body);
+  const lostResponseRetry = await release();
+  assert.equal(lostResponseRetry.statusCode, 204, lostResponseRetry.body);
+  assert.equal(backend.state.get("codex:thread-1")?.control.writableLease, false);
+});
+
+test("browser-wide lease release is CSRF-protected, auth-session scoped and idempotent", async (t) => {
+  const database = new ManagerDatabase();
+  const audits: OperationalAuditInput[] = [];
+  const originalAudit = database.auditOperation.bind(database);
+  database.auditOperation = ((input: OperationalAuditInput) => {
+    audits.push(input);
+    originalAudit(input);
+  }) as ManagerDatabase["auditOperation"];
+  const backend = await createAgentManagerServer({
+    discovery: false,
+    staticDir: false,
+    database,
+    initialSessions: [
+      session(),
+      session({ id: "codex:thread-2", sessionId: "thread-2", rootSessionId: "thread-2" }),
+      session({ id: "codex:thread-3", sessionId: "thread-3", rootSessionId: "thread-3" }),
+    ],
+  });
+  t.after(() => backend.close());
+  await backend.app.ready();
+  const firstHeaders = await authenticatedHeaders(backend);
+  backend.auth.issueBootstrapToken();
+  const secondHeaders = await authenticatedHeaders(backend);
+  const acquire = async (id: string, headers: Awaited<ReturnType<typeof authenticatedHeaders>>) => {
+    const response = await backend.app.inject({
+      method: "POST",
+      url: `/api/v1/sessions/${id}/control-lease`,
+      headers,
+      payload: { clientId: `browser-${id}` },
+    });
+    assert.equal(response.statusCode, 200, response.body);
+  };
+  await acquire("codex:thread-1", firstHeaders);
+  await acquire("codex:thread-2", firstHeaders);
+  await acquire("codex:thread-3", secondHeaders);
+  const deleteHeaders = {
+    host,
+    origin,
+    cookie: firstHeaders.cookie,
+    "x-csrf-token": firstHeaders["x-csrf-token"],
+  };
+
+  const withoutCsrf = await backend.app.inject({
+    method: "DELETE",
+    url: "/api/v1/control-leases",
+    headers: { host, origin, cookie: firstHeaders.cookie },
+  });
+  assert.equal(withoutCsrf.statusCode, 403, withoutCsrf.body);
+  assert.equal(backend.state.get("codex:thread-1")?.control.writableLease, true);
+
+  const release = () => backend.app.inject({
+    method: "DELETE",
+    url: "/api/v1/control-leases",
+    headers: deleteHeaders,
+  });
+  const first = await release();
+  assert.equal(first.statusCode, 204, first.body);
+  assert.equal(backend.state.get("codex:thread-1")?.control.writableLease, false);
+  assert.equal(backend.state.get("codex:thread-2")?.control.writableLease, false);
+  assert.equal(backend.state.get("codex:thread-3")?.control.writableLease, true);
+
+  const retry = await release();
+  assert.equal(retry.statusCode, 204, retry.body);
+  const releaseAudits = audits.filter((audit) => audit.operation === "lease.release-all");
+  assert.deepEqual(releaseAudits.map((audit) => [audit.phase, audit.outcome]), [
+    ["attempt", "requested"],
+    ["outcome", "succeeded"],
+    ["attempt", "requested"],
+    ["outcome", "succeeded"],
+  ]);
+  assert.deepEqual(
+    releaseAudits.filter((audit) => audit.phase === "outcome").map((audit) => audit.details),
+    [{ releasedCount: 2 }, { releasedCount: 0 }],
+  );
+});
+
+test("browser-wide lease release does not mutate leases when its attempt audit fails", async (t) => {
+  const database = new ManagerDatabase();
+  const originalAudit = database.auditOperation.bind(database);
+  database.auditOperation = ((input: OperationalAuditInput) => {
+    if (input.operation === "lease.release-all" && input.phase === "attempt") {
+      throw new Error("injected lease release audit failure");
+    }
+    originalAudit(input);
+  }) as ManagerDatabase["auditOperation"];
+  const backend = await createAgentManagerServer({
+    discovery: false,
+    staticDir: false,
+    database,
+    initialSessions: [session()],
+  });
+  t.after(() => backend.close());
+  await backend.app.ready();
+  const headers = await authenticatedHeaders(backend);
+  const acquired = await backend.app.inject({
+    method: "POST",
+    url: "/api/v1/sessions/codex:thread-1/control-lease",
+    headers,
+    payload: { clientId: "browser-client" },
+  });
+  assert.equal(acquired.statusCode, 200, acquired.body);
+
+  const response = await backend.app.inject({
+    method: "DELETE",
+    url: "/api/v1/control-leases",
+    headers: {
+      host,
+      origin,
+      cookie: headers.cookie,
+      "x-csrf-token": headers["x-csrf-token"],
+    },
+  });
+  assert.equal(response.statusCode, 500, response.body);
+  assert.equal(response.json<{ error: { code: string } }>().error.code, "LEASE_AUDIT_FAILED");
+  assert.equal(backend.state.get("codex:thread-1")?.control.writableLease, true);
+});
+
 test("dispatches every provider response without retaining answer bytes in SQLite", async () => {
   const directory = mkdtempSync(join(tmpdir(), "agent-manager-secret-answer-"));
   const databasePath = join(directory, "state.sqlite");
@@ -902,7 +1063,7 @@ test("requires explicit full-host arming on the exclusive control lease", async 
   assert.equal(calls, 1);
 });
 
-test("serves the production SPA fallback without weakening Host checks", async (t) => {
+test("serves newly published static assets and the production SPA fallback without weakening Host checks", async (t) => {
   const directory = mkdtempSync(join(tmpdir(), "agent-manager-static-"));
   writeFileSync(join(directory, "index.html"), "<!doctype html><title>Agent Manager Fixture</title>");
   const backend = await createAgentManagerServer({
@@ -914,6 +1075,14 @@ test("serves the production SPA fallback without weakening Host checks", async (
     rmSync(directory, { recursive: true, force: true });
   });
   await backend.app.ready();
+  writeFileSync(join(directory, "published-after-start.js"), "globalThis.__publishedAfterStart = true;");
+  const publishedAsset = await backend.app.inject({
+    method: "GET",
+    url: "/published-after-start.js",
+    headers: { host },
+  });
+  assert.equal(publishedAsset.statusCode, 200, publishedAsset.body);
+  assert.match(publishedAsset.body, /__publishedAfterStart/);
   const response = await backend.app.inject({
     method: "GET",
     url: "/sessions/thread",

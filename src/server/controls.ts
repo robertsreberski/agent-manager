@@ -164,9 +164,18 @@ export class ControlLeaseBroker {
   }
 
   release(sessionId: string, suppliedToken: string | string[] | undefined, principal: LeasePrincipal): boolean {
-    if (!this.verify(sessionId, suppliedToken, principal)) return false;
+    this.#purge(sessionId);
     const active = this.#leases.get(sessionId);
-    if (active) clearTimeout(active.timer);
+    // A client can lose the successful DELETE response. Once no active lease
+    // remains, repeating that same release is safe and idempotent. An active
+    // lease still requires its current token and exact auth-session principal.
+    if (!active) return true;
+    if (
+      !tokenMatches(active.token, suppliedToken)
+      || active.actorId !== principal.actorId
+      || active.authSessionId !== principal.authSessionId
+    ) return false;
+    clearTimeout(active.timer);
     this.#leases.delete(sessionId);
     this.#onChange(sessionId, false);
     return true;
@@ -180,13 +189,16 @@ export class ControlLeaseBroker {
     this.#leases.clear();
   }
 
-  releaseForAuthSession(authSessionId: string): void {
+  releaseForAuthSession(authSessionId: string): string[] {
+    const releasedSessionIds: string[] = [];
     for (const [sessionId, lease] of this.#leases) {
       if (lease.authSessionId !== authSessionId) continue;
       clearTimeout(lease.timer);
       this.#leases.delete(sessionId);
       this.#onChange(sessionId, false);
+      releasedSessionIds.push(sessionId);
     }
+    return releasedSessionIds;
   }
 
   forceRelease(sessionId: string): void {

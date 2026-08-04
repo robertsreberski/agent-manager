@@ -54,6 +54,24 @@ describe("CockpitApi", () => {
     expect(JSON.parse(String(init.body))).toEqual(expect.objectContaining({ delivery: "queue", text: "Continue" }));
   });
 
+  it("releases every lease owned by the current browser auth session", async () => {
+    let captured: { input: RequestInfo | URL; init?: RequestInit } | null = null;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      captured = { input, ...(init === undefined ? {} : { init }) };
+      return new Response(null, { status: 204 });
+    }));
+    const api = new CockpitApi({ csrfToken: "csrf-token", actor: "Local" });
+
+    await api.releaseBrowserLeases();
+
+    expect(captured).not.toBeNull();
+    const request = captured as unknown as { input: RequestInfo | URL; init: RequestInit };
+    expect(request.input).toBe("/api/v1/control-leases");
+    expect(request.init.method).toBe("DELETE");
+    expect((request.init.headers as Headers).get("x-csrf-token")).toBe("csrf-token");
+    expect((request.init.headers as Headers).has("x-control-lease")).toBe(false);
+  });
+
   it("returns the server error message from the normalized error envelope", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
       error: { code: "stale_generation", message: "Session state changed." },

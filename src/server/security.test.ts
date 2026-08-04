@@ -113,8 +113,19 @@ test("leases are bound to one auth session and rotate on every renewal", () => {
     LeaseConflictError,
   );
 
-  broker.releaseForAuthSession(firstPrincipal.authSessionId);
+  assert.deepEqual(broker.releaseForAuthSession(firstPrincipal.authSessionId), ["codex:one"]);
   assert.equal(broker.has("codex:one"), false);
+});
+
+test("lease release retries are idempotent only after the active lease is gone", () => {
+  const broker = new ControlLeaseBroker();
+  const principal = { authSessionId: "auth-one", actorId: "actor-one" };
+  const lease = broker.acquire("codex:one", "browser", principal);
+
+  assert.equal(broker.release("codex:one", "mismatched-token", principal), false);
+  assert.equal(broker.has("codex:one"), true);
+  assert.equal(broker.release("codex:one", lease.token, principal), true);
+  assert.equal(broker.release("codex:one", lease.token, principal), true);
 });
 
 test("authentication caps evict the oldest session and report revocation", () => {

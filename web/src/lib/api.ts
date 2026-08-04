@@ -211,4 +211,8 @@ export class CockpitApi {
       headers: { "x-control-lease": leaseToken },
     });
   }
+
+  async releaseBrowserLeases(): Promise<void> {
+    await this.request("/api/v1/control-leases", { method: "DELETE" });
+  }
 }

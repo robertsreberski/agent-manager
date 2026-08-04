@@ -446,7 +446,7 @@ export async function createAgentManagerServer(
     await app.register(fastifyStatic, {
       root: staticDir,
       prefix: "/",
-      wildcard: false,
+      wildcard: true,
       decorateReply: true,
     });
   }
@@ -1124,6 +1124,39 @@ export async function createAgentManagerServer(
       throw new ApiError(500, "LEASE_AUDIT_FAILED", "lease outcome could not be recorded safely");
     }
     return { lease };
+  });
+
+  app.delete("/api/v1/control-leases", async (request, reply) => {
+    const authSession = requireSession(request);
+    try {
+      database.auditOperation({
+        actor: authSession.actor,
+        operation: "lease.release-all",
+        targetId: authSession.actor.id,
+        phase: "attempt",
+        outcome: "requested",
+      });
+    } catch {
+      throw new ApiError(500, "LEASE_AUDIT_FAILED", "lease release could not be recorded safely");
+    }
+    const releasedSessionIds = leases.releaseForAuthSession(authSession.id);
+    try {
+      database.auditOperation({
+        actor: authSession.actor,
+        operation: "lease.release-all",
+        targetId: authSession.actor.id,
+        phase: "outcome",
+        outcome: "succeeded",
+        details: { releasedCount: releasedSessionIds.length },
+      });
+    } catch {
+      state.addDiagnostic({
+        provider: "system",
+        level: "error",
+        message: `Browser lease release completed for ${releasedSessionIds.length} sessions without an outcome audit`,
+      });
+    }
+    void reply.status(204).send();
   });
 
   app.delete("/api/v1/sessions/:id/control-lease", async (request, reply) => {

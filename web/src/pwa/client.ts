@@ -22,9 +22,18 @@ interface DeferredInstallPrompt extends Event {
 const subscribers = new Set<() => void>();
 let deferredInstall: DeferredInstallPrompt | null = null;
 let initialized = false;
-let reloadRequired = false;
-let updateRequested = false;
-let updateServiceWorker: (() => Promise<void>) | null = null;
+let waitingServiceWorker: ServiceWorker | null = null;
+let updateServiceWorker: ((target: ServiceWorker) => void | Promise<void>) | null = null;
+
+const UPDATE_TAKEOVER_TIMEOUT_MS = 10_000;
+
+interface PendingUpdateTakeover {
+  target: ServiceWorker;
+  timeout: ReturnType<typeof setTimeout>;
+  resolve(applied: boolean): void;
+}
+
+let pendingUpdateTakeover: PendingUpdateTakeover | null = null;
 
 function isStandalone(): boolean {
   if (typeof window === "undefined" || typeof navigator === "undefined") return false;
@@ -68,23 +77,39 @@ export async function requestPwaInstall(): Promise<PwaInstallOutcome> {
   return (await prompt.userChoice).outcome;
 }
 
-/** Applies a waiting worker. A reload can only follow this explicit user action. */
-export async function applyPwaUpdate(): Promise<boolean> {
-  if (!snapshot.updateReady || !updateServiceWorker) return false;
-  updateRequested = true;
-  publish({ updateReady: false });
-  if (reloadRequired) {
-    window.location.reload();
-    return true;
-  }
-  try {
-    await updateServiceWorker();
-    return true;
-  } catch {
-    updateRequested = false;
+function finishPendingUpdate(pending: PendingUpdateTakeover, applied: boolean): void {
+  if (pendingUpdateTakeover !== pending) return;
+  clearTimeout(pending.timeout);
+  pendingUpdateTakeover = null;
+  if (applied) {
+    waitingServiceWorker = null;
+  } else if (waitingServiceWorker === pending.target) {
     publish({ updateReady: true });
-    return false;
   }
+  pending.resolve(applied);
+}
+
+/** Applies a waiting worker and resolves only after that worker takes control. */
+export async function applyPwaUpdate(): Promise<boolean> {
+  const target = waitingServiceWorker;
+  const requestTakeover = updateServiceWorker;
+  if (!snapshot.updateReady || !target || !requestTakeover || pendingUpdateTakeover) return false;
+  publish({ updateReady: false });
+  const outcome = new Promise<boolean>((resolve) => {
+    const pending: PendingUpdateTakeover = {
+      target,
+      timeout: setTimeout(() => finishPendingUpdate(pending, false), UPDATE_TAKEOVER_TIMEOUT_MS),
+      resolve,
+    };
+    pendingUpdateTakeover = pending;
+  });
+  void Promise.resolve()
+    .then(() => requestTakeover(target))
+    .catch(() => {
+      const pending = pendingUpdateTakeover;
+      if (pending?.target === target) finishPendingUpdate(pending, false);
+    });
+  return await outcome;
 }
 
 export function dismissPwaUpdate(): void {
@@ -102,9 +127,10 @@ export function usePwaClient(): PwaClientApi {
 }
 
 /** Installs passive browser listeners and registers the production worker once. */
-export function initializePwaClient(): void {
+export function initializePwaClient(options: { reload?: () => void } = {}): void {
   if (initialized || typeof window === "undefined") return;
   initialized = true;
+  const reload = options.reload ?? (() => window.location.reload());
 
   const displayMode = window.matchMedia?.("(display-mode: standalone)");
   const updateStandalone = (): void => publish({ standalone: isStandalone() });
@@ -126,23 +152,48 @@ export function initializePwaClient(): void {
   if (!import.meta.env.PROD || !("serviceWorker" in navigator)) return;
   void import("workbox-window").then(async ({ Workbox }) => {
     const worker = new Workbox("/sw.js", { scope: "/", type: "classic" });
-    worker.addEventListener("waiting", () => publish({ updateReady: true }));
+    // Install the takeover sender before registration. Workbox may report a
+    // pre-existing waiting worker from inside register(), and the UI must
+    // never advertise an update that applyPwaUpdate cannot yet request.
+    updateServiceWorker = async (target) => {
+      if (waitingServiceWorker !== target) throw new Error("the requested update is no longer waiting");
+      worker.messageSkipWaiting();
+    };
+    let controlled = navigator.serviceWorker.controller !== null;
+    worker.addEventListener("waiting", (event) => {
+      if (event.sw) waitingServiceWorker = event.sw;
+      if (controlled) publish({ updateReady: true });
+    });
     worker.addEventListener("installed", (event) => {
+      if (!controlled) return;
+      if (event.sw) waitingServiceWorker = event.sw;
       if (event.isUpdate || event.isExternal) publish({ updateReady: true });
     });
     worker.addEventListener("controlling", (event) => {
-      if (!event.isUpdate && !event.isExternal) return;
-      if (updateRequested) {
-        window.location.reload();
-        return;
+      const wasControlled = controlled;
+      controlled = true;
+      if (!wasControlled) return;
+      const activeWorker = navigator.serviceWorker.controller ?? event.sw ?? null;
+      const pending = pendingUpdateTakeover;
+      if (
+        pending
+        && (event.sw === pending.target || activeWorker === pending.target)
+      ) {
+        finishPendingUpdate(pending, true);
       }
-      reloadRequired = true;
-      publish({ updateReady: true });
+      // Every tab that was already controlled must adopt the new shell. The
+      // first install also emits `controlling` because the worker claims
+      // clients, but `wasControlled` is false in that case and does not reload.
+      reload();
     });
     const registration = await worker.register({ immediate: true });
-    if (registration?.waiting) publish({ updateReady: true });
-    updateServiceWorker = async () => worker.messageSkipWaiting();
+    if (registration?.waiting) {
+      waitingServiceWorker = registration.waiting;
+      if (controlled) publish({ updateReady: true });
+    }
   }).catch(() => {
-    updateRequested = false;
+    const pending = pendingUpdateTakeover;
+    if (pending) finishPendingUpdate(pending, false);
+    updateServiceWorker = null;
   });
 }
