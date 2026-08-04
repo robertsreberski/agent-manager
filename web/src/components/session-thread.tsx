@@ -20,7 +20,7 @@ import {
   Clock3,
   KeyRound,
   LoaderCircle,
-  Menu,
+  PanelRightOpen,
   Send,
   ShieldAlert,
   SlidersHorizontal,
@@ -527,7 +527,11 @@ function SessionHeader({
           <Badge variant={status.variant} title={attentionCount > 0 ? `${attentionCount} request${attentionCount === 1 ? "" : "s"} waiting` : undefined}>
             {status.label}
           </Badge>
-          {session.mode.value !== "unknown" && <ModeBadge mode={session.mode.value} />}
+          {session.mode.value !== "unknown" && (
+            <span className="hidden min-[360px]:contents">
+              <ModeBadge mode={session.mode.value} />
+            </span>
+          )}
           {session.effectiveAccess.fullHostAccess && <FullAccessBadge />}
         </div>
 
@@ -565,7 +569,7 @@ function SessionHeader({
             </Button>
           )}
           <Button variant="ghost" size="icon" className="size-8" onClick={onAccess} aria-label="Session details">
-            <Menu />
+            <PanelRightOpen />
           </Button>
         </div>
       </header>
