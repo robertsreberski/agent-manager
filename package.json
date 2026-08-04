@@ -67,9 +67,10 @@
     "generate:pwa-assets": "pwa-assets-generator --root web --config src/pwa/pwa-assets.config.ts",
     "build": "pnpm build:server && pnpm build:web",
     "build:server": "tsup --config tsup.config.ts",
-    "build:web": "vite build --config web/vite.config.ts",
-    "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "node --test --experimental-strip-types agent-sessions.test.ts $(find src -name '*.test.ts' -print)",
+    "build:web": "tsx scripts/build-web.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json && pnpm typecheck:build-web",
+    "typecheck:build-web": "tsc --ignoreConfig --noEmit --target ES2024 --module ESNext --moduleResolution Bundler --strict --noUncheckedIndexedAccess --exactOptionalPropertyTypes --allowImportingTsExtensions --skipLibCheck --types node scripts/build-web.ts scripts/build-web.test.ts",
+    "test": "node --test --experimental-strip-types agent-sessions.test.ts scripts/build-web.test.ts $(find src -name '*.test.ts' -print)",
     "test:web": "vitest run --config web/vitest.config.ts",
     "check": "pnpm typecheck && pnpm test && pnpm test:web && pnpm build"
   }

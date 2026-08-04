@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { fileURLToPath, URL } from "node:url";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
@@ -112,7 +113,13 @@ export default defineConfig({
     },
   },
   build: {
-    outDir: fileURLToPath(new URL("../dist/web", import.meta.url)),
+    // The package build command overrides this with its own mkdtemp directory.
+    // Keep direct Vite invocations safe as well: they may create unpublished
+    // staging output, but they must never empty the live dist/web directory.
+    outDir: fileURLToPath(new URL(
+      `../dist/.web-stage-unpublished-${process.pid}-${randomUUID()}`,
+      import.meta.url,
+    )),
     emptyOutDir: true,
     sourcemap: false,
   },
