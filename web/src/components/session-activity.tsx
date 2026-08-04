@@ -24,6 +24,7 @@ import {
   Wrench,
 } from "lucide-react";
 import { MarkdownText } from "./assistant-ui/markdown-text";
+import { QuestionRequestForm } from "./pending-requests";
 import { cn } from "../lib/utils";
 import { jsonForDisplay } from "../lib/session-activity";
 import type {
@@ -33,6 +34,8 @@ import type {
   ActivityJsonValue,
   ActivityLifecycleItem,
   ActivitySubagentItem,
+  AttentionRequest,
+  RequestResponse,
 } from "../types";
 
 const ACTIVITY_DATA_PART = "agent-manager.activity";
@@ -48,6 +51,16 @@ export interface ActivityTurnGroup {
 }
 
 export type ActivityTimelineItem = ActivityItem | ActivityTurnGroup;
+
+export interface ActivityAttentionControls {
+  exactRequestIds: ReadonlySet<string>;
+  writable: boolean;
+  mutationsReady: boolean;
+  canRespond: boolean;
+  busy: boolean;
+  onTakeControl: () => void;
+  onRespond: (requestId: string, response: RequestResponse) => Promise<void>;
+}
 
 function isActive(state: ActivityItemState): boolean {
   return state === "pending" || state === "running" || state === "waiting";
@@ -458,18 +471,103 @@ function SubagentRow({ item }: { item: ActivitySubagentItem }) {
   );
 }
 
-function AttentionRow({ item }: { item: Extract<ActivityItem, { kind: "attention" }> }) {
+function questionRequest(item: Extract<ActivityItem, { kind: "attention" }>): AttentionRequest {
+  return {
+    id: item.requestId || null,
+    kind: item.attentionKind,
+    summary: item.summary,
+    ...(item.title ? { title: item.title } : {}),
+    questions: item.questions.map((question) => ({
+      id: question.id,
+      ...(question.header ? { header: question.header } : {}),
+      text: question.text,
+      options: question.options.map((option) => ({
+        label: option.label,
+        ...(option.description ? { description: option.description } : {}),
+      })),
+      multiSelect: question.multiSelect,
+      allowFreeText: question.allowFreeText,
+      isSecret: question.isSecret,
+    })),
+    respondable: item.respondable,
+    isSecret: item.isSecret,
+    source: item.source,
+    confidence: item.confidence,
+  };
+}
+
+function normalizedPrompt(value: string): string {
+  return value.trim().replaceAll(/\s+/gu, " ").toLocaleLowerCase();
+}
+
+function summaryRepeatsQuestion(item: Extract<ActivityItem, { kind: "attention" }>): boolean {
+  if (!item.summary || item.questions.length === 0) return false;
+  const summary = normalizedPrompt(item.summary);
+  return item.questions.some((question) => {
+    const prompt = normalizedPrompt(question.text);
+    const headedPrompt = question.header
+      ? normalizedPrompt(`${question.header}: ${question.text}`)
+      : prompt;
+    return summary === prompt || summary === headedPrompt;
+  });
+}
+
+function isInlineQuestion(
+  item: Extract<ActivityItem, { kind: "attention" }>,
+  controls: ActivityAttentionControls | undefined,
+): controls is ActivityAttentionControls {
+  return Boolean(
+    controls
+      && item.requestId
+      && controls.exactRequestIds.has(item.requestId)
+      && item.attentionKind === "question"
+      && item.respondable
+      && !item.resolved
+      && item.questions.length > 0,
+  );
+}
+
+function AttentionRow({
+  item,
+  controls,
+}: {
+  item: Extract<ActivityItem, { kind: "attention" }>;
+  controls: ActivityAttentionControls | undefined;
+}) {
+  const interactive = isInlineQuestion(item, controls);
+  const showSummary = Boolean(item.summary) && !(item.attentionKind === "question" && summaryRepeatsQuestion(item));
   return (
-    <section className="w-full min-w-0 rounded-lg border border-amber-500/35 bg-amber-500/5 px-3 py-2.5 text-xs" data-activity-kind="attention">
+    <section
+      id={item.requestId ? `attention-request-${item.requestId}` : undefined}
+      className="w-full min-w-0 scroll-mt-4 rounded-lg border border-amber-500/35 bg-amber-500/5 px-3 py-2.5 text-xs focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      data-activity-kind="attention"
+      data-attention-request-id={item.requestId || undefined}
+      tabIndex={interactive ? -1 : undefined}
+    >
       <div className="flex items-center gap-2">
         <CircleAlert className="size-3.5 shrink-0 text-amber-700 dark:text-amber-300" />
         <span className="min-w-0 flex-1 break-words font-medium [overflow-wrap:anywhere]">{item.title ?? item.attentionKind.replaceAll("-", " ")}</span>
         <ActivityState state={item.state} />
       </div>
-      {item.summary && <p className="mt-2 whitespace-pre-wrap break-words leading-5 [overflow-wrap:anywhere]">{item.summary}</p>}
-      {item.questions.length > 0 && (
+      {showSummary && <p className="mt-2 whitespace-pre-wrap break-words leading-5 [overflow-wrap:anywhere]">{item.summary}</p>}
+      {interactive ? (
+        <QuestionRequestForm
+          request={questionRequest(item)}
+          writable={controls.writable}
+          mutationsReady={controls.mutationsReady}
+          canRespond={controls.canRespond}
+          busy={controls.busy}
+          onTakeControl={controls.onTakeControl}
+          onRespond={controls.onRespond}
+        />
+      ) : item.questions.length > 0 && (
         <ul className="mt-2 grid gap-1.5">
-          {item.questions.map((question) => <li key={question.id} className="break-words [overflow-wrap:anywhere]">{question.text}</li>)}
+          {item.questions.map((question) => (
+            <li key={question.id} className="break-words [overflow-wrap:anywhere]">
+              {question.header && <span className="mr-1 font-medium">{question.header}:</span>}
+              {question.text}
+            </li>
+          ))}
         </ul>
       )}
     </section>
@@ -494,7 +592,7 @@ function CommentaryRow({ item }: { item: Extract<ActivityItem, { kind: "message"
   );
 }
 
-function ActivityItemRow({ item }: { item: ActivityItem }) {
+function ActivityItemRow({ item, controls }: { item: ActivityItem; controls: ActivityAttentionControls | undefined }) {
   switch (item.kind) {
     case "message": return <CommentaryRow item={item} />;
     case "reasoning": return (
@@ -512,11 +610,17 @@ function ActivityItemRow({ item }: { item: ActivityItem }) {
     case "usage": return <UsageRow item={item} />;
     case "file-change": return <FileChangeRow item={item} />;
     case "subagent": return <SubagentRow item={item} />;
-    case "attention": return <AttentionRow item={item} />;
+    case "attention": return <AttentionRow item={item} controls={controls} />;
   }
 }
 
-function ActivityTurnDisclosure({ group }: { group: ActivityTurnGroup }) {
+function ActivityTurnDisclosure({
+  group,
+  controls,
+}: {
+  group: ActivityTurnGroup;
+  controls: ActivityAttentionControls | undefined;
+}) {
   const live = isActive(group.state);
   const expanded = live || group.state === "failed" || group.state === "interrupted";
   const itemLabel = `${group.items.length} update${group.items.length === 1 ? "" : "s"}`;
@@ -535,13 +639,16 @@ function ActivityTurnDisclosure({ group }: { group: ActivityTurnGroup }) {
         <span aria-hidden="true" className="text-muted-foreground transition-transform group-open/turn:rotate-90 motion-reduce:transition-none">›</span>
       </summary>
       <div className="grid min-w-0 gap-2 border-t p-2.5">
-        {group.items.map((item) => <ActivityItemRow key={item.id} item={item} />)}
+        {group.items.map((item) => <ActivityItemRow key={item.id} item={item} controls={controls} />)}
       </div>
     </details>
   );
 }
 
-function ActivityDataPart({ data }: DataMessagePartProps<ActivityItem>) {
+function ActivityDataPart({
+  data,
+  controls,
+}: DataMessagePartProps<ActivityItem> & { controls: ActivityAttentionControls | undefined }) {
   switch (data.kind) {
     case "plan": return <PlanRow item={data} />;
     case "lifecycle": return <LifecycleRow item={data} />;
@@ -549,12 +656,12 @@ function ActivityDataPart({ data }: DataMessagePartProps<ActivityItem>) {
     case "usage": return <UsageRow item={data} />;
     case "file-change": return <FileChangeRow item={data} />;
     case "subagent": return <SubagentRow item={data} />;
-    case "attention": return <AttentionRow item={data} />;
+    case "attention": return <AttentionRow item={data} controls={controls} />;
     default: return null;
   }
 }
 
-export function ActivityMessageParts() {
+export function ActivityMessageParts({ controls }: { controls: ActivityAttentionControls | undefined }) {
   return (
     <MessagePrimitive.Parts>
       {({ part }) => {
@@ -567,10 +674,10 @@ export function ActivityMessageParts() {
             return part.toolUI ?? <ActivityToolPart {...part} />;
           case "data":
             if (part.name === ACTIVITY_GROUP_DATA_PART) {
-              return <ActivityTurnDisclosure group={part.data as ActivityTurnGroup} />;
+              return <ActivityTurnDisclosure group={part.data as ActivityTurnGroup} controls={controls} />;
             }
             return part.name === ACTIVITY_DATA_PART
-              ? <ActivityDataPart {...part} data={part.data as ActivityItem} />
+              ? <ActivityDataPart {...part} data={part.data as ActivityItem} controls={controls} />
               : part.dataRendererUI;
           default:
             return null;

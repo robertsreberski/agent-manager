@@ -501,28 +501,31 @@ describe("SessionThread live activity", () => {
     expect(input.parentElement?.parentElement?.className).toContain("safe-area-inset-bottom");
   });
 
-  it("uses unresolved activity questions for exact responses and masks secret free text", async () => {
+  it("renders the exact Random pick once inline and submits the selected option", async () => {
+    const prompt = "Which imaginary weekend destination would you choose?";
     const activityQuestion: ActivityItem = {
       ...activityBase("activity-question", 1, "waiting"),
       kind: "attention",
       requestId: "activity-request-1",
       attentionKind: "question",
-      title: "Activity-only question",
-      summary: "Choose the deployment target",
+      title: "Codex needs your answer",
+      summary: `Random pick: ${prompt}`,
       questions: [{
-        id: "target",
-        text: "Where should this deploy?",
+        id: "random_destination",
+        header: "Random pick",
+        text: prompt,
         options: [
-          { label: "Staging", description: "Use the private staging environment." },
-          { label: "Production", description: null },
+          { label: "Moon cabin (Recommended)", description: "Low gravity, excellent views." },
+          { label: "Undersea hotel", description: "Quiet rooms below the waves." },
+          { label: "Cloud city", description: "A floating weekend above the weather." },
         ],
         multiSelect: false,
         allowFreeText: true,
-        isSecret: true,
+        isSecret: false,
       }],
       respondable: true,
       resolved: false,
-      isSecret: true,
+      isSecret: false,
     };
     const resolvedQuestion: ActivityItem = {
       ...activityBase("resolved-question", 2),
@@ -560,19 +563,26 @@ describe("SessionThread live activity", () => {
     );
 
     const pending = screen.getByRole("region", { name: "Pending requests" });
-    expect(within(pending).getByText("Activity-only question")).toBeInTheDocument();
+    expect(within(pending).getByText("Random pick")).toBeInTheDocument();
     expect(within(pending).queryByText("Already resolved")).not.toBeInTheDocument();
+    expect(screen.getAllByText(prompt)).toHaveLength(1);
+    expect(screen.getByRole("radio", { name: /Moon cabin.*Low gravity/u })).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /Undersea hotel/u })).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /Cloud city/u })).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /Other/u })).toBeInTheDocument();
+
     fireEvent.click(within(pending).getByRole("button", { name: /Needs you/u }));
-    const requestSheet = screen.getByRole("dialog", { name: "Needs you" });
-    const secretInput = within(requestSheet).getByLabelText("Where should this deploy? answer");
-    expect(secretInput).toHaveAttribute("type", "password");
-    fireEvent.click(within(requestSheet).getByRole("button", { name: /Staging/u }));
-    fireEvent.click(within(requestSheet).getByRole("button", { name: "Send answer" }));
+    const inlineRequest = document.querySelector<HTMLElement>("[data-attention-request-id='activity-request-1']");
+    expect(inlineRequest).toHaveFocus();
+    expect(screen.queryByRole("dialog", { name: "Needs you" })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("radio", { name: /Moon cabin/u }));
+    fireEvent.click(screen.getByRole("button", { name: "Send answer" }));
 
     await waitFor(() => expect(onRespond).toHaveBeenCalledWith("activity-request-1", {
       kind: "answer",
       value: "",
-      selectedOptions: ["Staging"],
+      selectedOptions: ["Moon cabin (Recommended)"],
     }));
   });
 

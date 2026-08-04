@@ -1,6 +1,6 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { PendingRequests } from "./pending-requests";
+import { PendingRequests, QuestionRequestForm } from "./pending-requests";
 import type { SessionView } from "../types";
 
 function sessionWithQuestions(): SessionView {
@@ -55,44 +55,45 @@ describe("PendingRequests", () => {
     fireEvent.click(screen.getByRole("button", { name: /Needs you/u }));
   }
 
-  it("keeps attention compact until its responsive sheet is opened", () => {
+  it("turns exact inline questions into a compact jump target instead of duplicating their form", () => {
+    const onJumpToRequest = vi.fn();
     render(
       <PendingRequests
         session={sessionWithQuestions()}
         exactRequestIds={new Set(["request-1"])}
         writable
         busy={false}
+        onJumpToRequest={onJumpToRequest}
         onRespond={vi.fn(async () => undefined)}
       />,
     );
 
     const bar = screen.getByRole("region", { name: "Pending requests" });
-    expect(bar).toHaveClass("shrink-0");
-    expect(screen.queryByText("Which database?")).not.toBeInTheDocument();
+    expect(bar).toHaveClass("shrink-0", "flex");
+    expect(within(bar).getByText("Which database?")).toBeInTheDocument();
 
     reviewRequests();
-    const sheet = screen.getByRole("dialog", { name: "Needs you" });
-    expect(sheet).toHaveClass("md:inset-y-0", "md:w-[min(92vw,42rem)]");
-    expect(screen.getByRole("group", { name: /Which database\?/u })).toBeInTheDocument();
+    expect(onJumpToRequest).toHaveBeenCalledWith("request-1");
+    expect(screen.queryByRole("dialog", { name: "Needs you" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("radio", { name: /SQLite/u })).not.toBeInTheDocument();
   });
 
-  it("submits every exact provider question atomically", async () => {
+  it("submits every provider question atomically with native radio and checkbox semantics", async () => {
     const onRespond = vi.fn(async () => undefined);
     render(
-      <PendingRequests
-        session={sessionWithQuestions()}
-        exactRequestIds={new Set(["request-1"])}
+      <QuestionRequestForm
+        request={sessionWithQuestions().attention[0]!}
         writable
+        mutationsReady
+        canRespond
         busy={false}
         onRespond={onRespond}
       />,
     );
 
-    reviewRequests();
-
-    fireEvent.click(screen.getByRole("button", { name: "SQLite" }));
-    fireEvent.click(screen.getByRole("button", { name: "Backups" }));
-    fireEvent.click(screen.getByRole("button", { name: "Encryption" }));
+    fireEvent.click(screen.getByRole("radio", { name: "SQLite" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Backups" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Encryption" }));
     fireEvent.click(screen.getByRole("button", { name: "Send 2 answers" }));
 
     await waitFor(() => expect(onRespond).toHaveBeenCalledTimes(1));
@@ -105,7 +106,7 @@ describe("PendingRequests", () => {
     });
   });
 
-  it("keeps a selected Claude option and its typed context in one response", async () => {
+  it("keeps single-select Other exclusive and never leaks its synthetic label", async () => {
     const withContext = sessionWithQuestions();
     withContext.attention[0]!.questions = [{
       id: "database",
@@ -116,27 +117,109 @@ describe("PendingRequests", () => {
     }];
     const onRespond = vi.fn(async () => undefined);
     render(
-      <PendingRequests
-        session={withContext}
-        exactRequestIds={new Set(["request-1"])}
+      <QuestionRequestForm
+        request={withContext.attention[0]!}
         writable
+        mutationsReady
+        canRespond
         busy={false}
         onRespond={onRespond}
       />,
     );
 
-    reviewRequests();
-
-    fireEvent.click(screen.getByRole("button", { name: "SQLite" }));
-    fireEvent.change(screen.getByPlaceholderText("Add context (optional)"), {
-      target: { value: "Enable WAL mode" },
+    fireEvent.click(screen.getByRole("radio", { name: /Other/u }));
+    fireEvent.change(screen.getByPlaceholderText("Enter another answer"), {
+      target: { value: "DuckDB" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Send answer" }));
 
     await waitFor(() => expect(onRespond).toHaveBeenCalledWith("request-1", {
       kind: "answer",
-      value: "Enable WAL mode",
+      value: "DuckDB",
+      selectedOptions: [],
+    }));
+  });
+
+  it("preserves a local draft while taking the writable lease", async () => {
+    const request = sessionWithQuestions().attention[0]!;
+    request.questions = [request.questions![0]!];
+    const onTakeControl = vi.fn();
+    const onRespond = vi.fn(async () => undefined);
+    const rendered = render(
+      <QuestionRequestForm
+        request={request}
+        writable={false}
+        mutationsReady
+        canRespond
+        busy={false}
+        onTakeControl={onTakeControl}
+        onRespond={onRespond}
+      />,
+    );
+
+    const sqlite = screen.getByRole("radio", { name: "SQLite" });
+    fireEvent.click(sqlite);
+    expect(sqlite).toBeChecked();
+    fireEvent.click(screen.getByRole("button", { name: "Take control to answer" }));
+    expect(onTakeControl).toHaveBeenCalledTimes(1);
+
+    rendered.rerender(
+      <QuestionRequestForm
+        request={request}
+        writable
+        mutationsReady
+        canRespond
+        busy={false}
+        onTakeControl={onTakeControl}
+        onRespond={onRespond}
+      />,
+    );
+    expect(screen.getByRole("radio", { name: "SQLite" })).toBeChecked();
+    fireEvent.click(screen.getByRole("button", { name: "Send answer" }));
+    await waitFor(() => expect(onRespond).toHaveBeenCalledWith("request-1", {
+      kind: "answer",
+      value: "",
       selectedOptions: ["SQLite"],
+    }));
+  });
+
+  it("does not leak a toggled-off multi-select Other draft and masks secret custom text", async () => {
+    const request = sessionWithQuestions().attention[0]!;
+    request.isSecret = true;
+    request.questions = [{
+      id: "features",
+      header: "Extras",
+      text: "Which features?",
+      options: [{ label: "Backups" }, { label: "Encryption" }],
+      multiSelect: true,
+      allowFreeText: true,
+      isSecret: true,
+    }];
+    const onRespond = vi.fn(async () => undefined);
+    render(
+      <QuestionRequestForm
+        request={request}
+        writable
+        mutationsReady
+        canRespond
+        busy={false}
+        onRespond={onRespond}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Backups" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /Other/u }));
+    const secret = screen.getByLabelText("Which features? answer");
+    expect(secret).toHaveAttribute("type", "password");
+    fireEvent.change(secret, { target: { value: "Audit log" } });
+    fireEvent.click(screen.getByRole("checkbox", { name: /Other/u }));
+    expect(screen.queryByLabelText("Which features? answer")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Send answer" }));
+
+    await waitFor(() => expect(onRespond).toHaveBeenCalledWith("request-1", {
+      kind: "answer",
+      value: "",
+      selectedOptions: ["Backups"],
     }));
   });
 
@@ -223,26 +306,22 @@ describe("PendingRequests", () => {
     }));
   });
 
-  it("keeps exact response controls disabled while mutations are offline", () => {
+  it("keeps response controls disabled while mutations are offline", () => {
     const onRespond = vi.fn(async () => undefined);
     render(
-      <PendingRequests
-        session={sessionWithQuestions()}
-        exactRequestIds={new Set(["request-1"])}
+      <QuestionRequestForm
+        request={sessionWithQuestions().attention[0]!}
         writable
         mutationsReady={false}
+        canRespond
         busy={false}
         onRespond={onRespond}
       />,
     );
 
-    reviewRequests();
-
-    expect(screen.getByText("Reconnect to answer this request.")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "SQLite" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Send 2 answers" })).toBeDisabled();
-    fireEvent.click(screen.getByRole("button", { name: "SQLite" }));
-    fireEvent.click(screen.getByRole("button", { name: "Send 2 answers" }));
+    expect(screen.getByRole("button", { name: "Reconnect to answer" })).toBeDisabled();
+    expect(screen.getByRole("radio", { name: "SQLite" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("radio", { name: "SQLite" }));
     expect(onRespond).not.toHaveBeenCalled();
   });
 });

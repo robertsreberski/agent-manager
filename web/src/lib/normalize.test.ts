@@ -101,6 +101,7 @@ describe("normalizeSession", () => {
           questions: [
             {
               id: "database",
+              header: "Storage",
               text: "Which database?",
               options: [{ label: "SQLite", description: "Local file" }, { label: "Postgres" }],
               multiSelect: false,
@@ -121,7 +122,7 @@ describe("normalizeSession", () => {
     expect(session.attention[0]).toEqual(expect.objectContaining({
       title: "Configure storage",
       questions: [
-        expect.objectContaining({ id: "database", text: "Which database?", allowFreeText: true }),
+        expect.objectContaining({ id: "database", header: "Storage", text: "Which database?", allowFreeText: true }),
         expect.objectContaining({ id: "features", multiSelect: true }),
       ],
     }));

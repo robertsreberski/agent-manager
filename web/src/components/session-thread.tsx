@@ -33,6 +33,7 @@ import {
   ActivityMessageParts,
   activityToThreadMessage,
   buildActivityTimeline,
+  type ActivityAttentionControls,
   type ActivityTimelineItem,
 } from "./session-activity";
 import {
@@ -112,6 +113,7 @@ export function activityAttentionRequests(items: ActivityItem[]): AttentionReque
       confidence: item.confidence,
       questions: item.questions.map((question) => ({
         id: question.id,
+        ...(question.header ? { header: question.header } : {}),
         text: question.text,
         options: question.options.map((option) => ({
           label: option.label,
@@ -201,14 +203,14 @@ function UserMessage() {
   );
 }
 
-function AssistantMessage() {
+function AssistantMessage({ controls }: { controls: ActivityAttentionControls }) {
   return (
     <MessagePrimitive.Root className="mx-auto flex w-full max-w-3xl items-start gap-2 px-3 py-3 sm:gap-3 sm:px-4 md:px-6">
       <div className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-md border bg-background text-primary shadow-sm">
         <Bot className="size-4" />
       </div>
       <div className="min-w-0 flex-1 whitespace-pre-wrap break-words text-sm leading-6 text-foreground [overflow-wrap:anywhere]">
-        <ActivityMessageParts />
+        <ActivityMessageParts controls={controls} />
       </div>
     </MessagePrimitive.Root>
   );
@@ -730,6 +732,28 @@ export function SessionThread({
     setUnseenUpdates(0);
   };
 
+  const jumpToAttentionRequest = (requestId: string) => {
+    const candidates = viewportRef.current?.querySelectorAll<HTMLElement>("[data-attention-request-id]");
+    const target = [...(candidates ?? [])].find((node) => node.dataset.attentionRequestId === requestId);
+    if (!target) return;
+    const reducedMotion = typeof window.matchMedia === "function"
+      && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    target.focus({ preventScroll: true });
+    if (typeof target.scrollIntoView === "function") {
+      target.scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth", block: "center" });
+    }
+  };
+
+  const attentionControls: ActivityAttentionControls = {
+    exactRequestIds,
+    writable,
+    mutationsReady,
+    canRespond: session.control.capabilities.includes("respond"),
+    busy,
+    onTakeControl: () => setLeaseDialog(true),
+    onRespond,
+  };
+
   return (
     <div className="flex h-dvh min-w-0 flex-1 flex-col bg-background">
       <SessionHeader
@@ -750,6 +774,7 @@ export function SessionThread({
         writable={writable}
         mutationsReady={mutationsReady}
         busy={busy}
+        onJumpToRequest={jumpToAttentionRequest}
         onRespond={onRespond}
       />
 
@@ -782,7 +807,7 @@ export function SessionThread({
                 : <TranscriptEmptyState session={session} transcript={transcript} />}
             </AuiIf>
             <ThreadPrimitive.Messages>
-              {({ message }) => message.role === "user" ? <UserMessage /> : <AssistantMessage />}
+              {({ message }) => message.role === "user" ? <UserMessage /> : <AssistantMessage controls={attentionControls} />}
             </ThreadPrimitive.Messages>
             {unseenUpdates > 0 && (
               <Button

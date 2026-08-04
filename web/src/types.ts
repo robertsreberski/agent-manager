@@ -57,6 +57,7 @@ export interface AttentionRequest {
 
 export interface AttentionQuestion {
   id: string;
+  header?: string;
   text: string;
   options: Array<{
     label: string;
@@ -290,6 +291,7 @@ export interface ActivityAttentionOption {
 
 export interface ActivityAttentionQuestion {
   id: string;
+  header?: string;
   text: string;
   options: ActivityAttentionOption[];
   multiSelect: boolean;

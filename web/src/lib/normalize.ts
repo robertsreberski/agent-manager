@@ -130,6 +130,7 @@ function normalizeAttention(value: unknown, fallbackReason: unknown): AttentionR
             : [];
           return [{
             id: text(question.id) ?? `question-${questionIndex + 1}`,
+            ...(text(question.header) ? { header: text(question.header)! } : {}),
             text: questionText,
             options: questionOptions,
             multiSelect: boolean(question.multiSelect),

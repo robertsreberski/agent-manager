@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { AlertTriangle, Check, ChevronRight, CircleHelp, ShieldQuestion, X } from "lucide-react";
+import { AlertTriangle, Check, ChevronRight, CircleHelp, KeyRound, ShieldQuestion, X } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "./ui/alert";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
@@ -11,6 +11,241 @@ function RequestIcon({ kind }: { kind: AttentionRequest["kind"] }) {
   if (kind === "question" || kind === "elicitation") return <CircleHelp className="size-4 text-blue-600" />;
   if (kind === "blocked") return <AlertTriangle className="size-4 text-amber-600" />;
   return <ShieldQuestion className="size-4 text-amber-600" />;
+}
+
+function isOtherOption(label: string): boolean {
+  const normalized = label.trim().toLocaleLowerCase().replace(/[.:…]+$/u, "");
+  return normalized === "other"
+    || normalized === "something else"
+    || normalized === "custom"
+    || normalized === "custom answer"
+    || normalized.startsWith("other (");
+}
+
+export function isCanonicalInlineQuestion(
+  request: AttentionRequest,
+  exactRequestIds: ReadonlySet<string>,
+): boolean {
+  return Boolean(
+    request.id
+      && exactRequestIds.has(request.id)
+      && request.kind === "question"
+      && request.respondable !== false
+      && request.questions?.length,
+  );
+}
+
+export function QuestionRequestForm({
+  request,
+  writable,
+  mutationsReady,
+  canRespond,
+  busy,
+  onTakeControl,
+  onRespond,
+}: {
+  request: AttentionRequest;
+  writable: boolean;
+  mutationsReady: boolean;
+  canRespond: boolean;
+  busy: boolean;
+  onTakeControl?: () => void;
+  onRespond: (requestId: string, response: RequestResponse) => Promise<void>;
+}) {
+  const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [selected, setSelected] = useState<Record<string, string[]>>({});
+  const [otherSelected, setOtherSelected] = useState<Record<string, boolean>>({});
+  const [submitting, setSubmitting] = useState(false);
+  const questions = request.questions ?? [];
+
+  const answerItems = questions.map((item) => {
+    const includesFreeText = item.options.length === 0 || Boolean(otherSelected[item.id]);
+    return {
+      questionId: item.id,
+      value: includesFreeText ? (answers[item.id] ?? "").trim() : "",
+      selectedOptions: selected[item.id] ?? [],
+    };
+  });
+  const allQuestionsAnswered = questions.length > 0 && questions.every((item) => {
+    const value = (answers[item.id] ?? "").trim();
+    const selectedOptions = selected[item.id] ?? [];
+    if (item.options.length === 0) return value.length > 0;
+    if (otherSelected[item.id]) return value.length > 0;
+    return selectedOptions.length > 0;
+  });
+  const draftDisabled = !mutationsReady || !canRespond || busy || submitting;
+  const canSubmit = writable && mutationsReady && canRespond && !busy && !submitting;
+
+  function selectNamedOption(question: AttentionQuestion, value: string) {
+    setSelected((current) => {
+      const existing = current[question.id] ?? [];
+      const next = question.multiSelect
+        ? existing.includes(value)
+          ? existing.filter((item) => item !== value)
+          : [...existing, value]
+        : [value];
+      return { ...current, [question.id]: next };
+    });
+    if (!question.multiSelect) {
+      setOtherSelected((current) => ({ ...current, [question.id]: false }));
+      setAnswers((current) => ({ ...current, [question.id]: "" }));
+    }
+  }
+
+  function selectOther(question: AttentionQuestion) {
+    setOtherSelected((current) => {
+      const next = !current[question.id];
+      return { ...current, [question.id]: next };
+    });
+    if (!question.multiSelect) {
+      setSelected((current) => ({ ...current, [question.id]: [] }));
+    }
+  }
+
+  async function submitAnswer() {
+    if (!request.id || !allQuestionsAnswered || !canSubmit) return;
+    const response: RequestResponse = answerItems.length === 1
+      ? {
+          kind: "answer",
+          value: answerItems[0]!.value,
+          selectedOptions: answerItems[0]!.selectedOptions,
+        }
+      : { kind: "answers", answers: answerItems };
+    setSubmitting(true);
+    try {
+      await onRespond(request.id, response);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="mt-2.5 grid gap-3">
+      {questions.map((item, questionIndex) => {
+        const selectedOptions = selected[item.id] ?? [];
+        const existingOther = item.allowFreeText
+          ? item.options.find((option) => isOtherOption(option.label))
+          : undefined;
+        const choices = item.options.map((option) => ({
+          ...option,
+          other: option === existingOther,
+        }));
+        if (item.allowFreeText && item.options.length > 0 && !existingOther) {
+          choices.push({ label: "Other", description: "Enter a different answer.", other: true });
+        }
+        const showOtherInput = item.options.length > 0 && Boolean(otherSelected[item.id]);
+        const inputId = `attention-${request.id}-${item.id}-other`;
+        const choiceName = `attention-${request.id}-${item.id}`;
+        return (
+          <fieldset
+            key={item.id}
+            className="min-w-0 rounded-lg border bg-background/75 p-2.5"
+            role={item.multiSelect ? "group" : "radiogroup"}
+            aria-describedby={`${choiceName}-hint`}
+          >
+            <legend className="max-w-full px-1 text-sm font-medium leading-5">
+              {item.header && (
+                <span className="mb-0.5 block text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  {item.header}
+                </span>
+              )}
+              <span>{questions.length > 1 ? `${questionIndex + 1}. ` : ""}{item.text}</span>
+            </legend>
+            {choices.length > 0 && (
+              <div className="mt-2 grid gap-1.5 sm:grid-cols-2">
+                {choices.map((option) => {
+                  const checked = option.other
+                    ? Boolean(otherSelected[item.id])
+                    : selectedOptions.includes(option.label);
+                  const optionId = `${choiceName}-${option.label.replaceAll(/[^a-zA-Z0-9_-]/gu, "-")}`;
+                  return (
+                    <label
+                      key={`${option.other ? "other" : "option"}:${option.label}`}
+                      htmlFor={optionId}
+                      className={cn(
+                        "flex min-h-11 cursor-pointer items-start gap-2.5 rounded-md border bg-background px-3 py-2 text-left text-sm outline-none transition-colors hover:bg-accent has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-ring",
+                        checked && "border-primary bg-primary/5",
+                        draftDisabled && "cursor-not-allowed opacity-50 hover:bg-background",
+                      )}
+                    >
+                      <input
+                        id={optionId}
+                        type={item.multiSelect ? "checkbox" : "radio"}
+                        name={choiceName}
+                        checked={checked}
+                        disabled={draftDisabled}
+                        onChange={() => option.other ? selectOther(item) : selectNamedOption(item, option.label)}
+                        className="peer sr-only"
+                      />
+                      <span
+                        aria-hidden="true"
+                        className={cn(
+                          "mt-0.5 flex size-4 shrink-0 items-center justify-center border border-muted-foreground/50",
+                          item.multiSelect ? "rounded" : "rounded-full",
+                          checked && "border-primary bg-primary text-primary-foreground",
+                        )}
+                      >
+                        {checked && <Check className="size-3" />}
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className="block break-words font-medium leading-5 [overflow-wrap:anywhere]">{option.label}</span>
+                        {option.description && (
+                          <span className="mt-0.5 block break-words text-xs leading-4 text-muted-foreground [overflow-wrap:anywhere]">
+                            {option.description}
+                          </span>
+                        )}
+                      </span>
+                    </label>
+                  );
+                })}
+              </div>
+            )}
+            {(item.options.length === 0 || showOtherInput) && (
+              <Input
+                id={inputId}
+                type={item.isSecret || request.isSecret ? "password" : "text"}
+                autoComplete={item.isSecret || request.isSecret ? "new-password" : undefined}
+                aria-label={`${item.text} answer`}
+                value={answers[item.id] ?? ""}
+                onChange={(event) => setAnswers((current) => ({ ...current, [item.id]: event.target.value }))}
+                disabled={draftDisabled}
+                className="mt-2 min-h-11"
+                placeholder={showOtherInput ? "Enter another answer" : "Type your answer"}
+                autoFocus={showOtherInput && !draftDisabled}
+              />
+            )}
+            <p id={`${choiceName}-hint`} className="mt-1.5 text-[11px] leading-4 text-muted-foreground">
+              {item.options.length > 0
+                ? item.multiSelect
+                  ? "Choose one or more options."
+                  : "Choose one option."
+                : "Enter an answer."}
+              {item.allowFreeText && item.options.length > 0 ? " Choose Other for a custom answer." : ""}
+            </p>
+          </fieldset>
+        );
+      })}
+      <div className="flex min-h-11 flex-wrap items-center justify-end gap-2">
+        {!mutationsReady ? (
+          <Button type="button" disabled>Reconnect to answer</Button>
+        ) : !canRespond ? (
+          <p className="text-xs text-muted-foreground">Continue in the provider’s native interface to answer.</p>
+        ) : !writable ? (
+          <Button type="button" disabled={busy} onClick={onTakeControl}>
+            <KeyRound /> {busy ? "Taking control…" : "Take control to answer"}
+          </Button>
+        ) : (
+          <Button
+            type="button"
+            onClick={() => void submitAnswer().catch(() => undefined)}
+            disabled={!canSubmit || !allQuestionsAnswered}
+          >
+            {submitting ? "Sending…" : `Send ${questions.length > 1 ? `${questions.length} answers` : "answer"}`}
+          </Button>
+        )}
+      </div>
+    </div>
+  );
 }
 
 function PendingRequestCard({
@@ -28,61 +263,11 @@ function PendingRequestCard({
   busy: boolean;
   onRespond: (requestId: string, response: RequestResponse) => Promise<void>;
 }) {
-  const [answers, setAnswers] = useState<Record<string, string>>({});
-  const [selected, setSelected] = useState<Record<string, string[]>>({});
   const [denyReason, setDenyReason] = useState("");
   const question = request.kind === "question";
   const providerRespondable = request.respondable !== false;
   const exactDetailsReady = exactCurrent && (!question || Boolean(request.questions?.length));
   const canRespond = exactDetailsReady && Boolean(request.id) && providerRespondable && !disabled && !busy;
-  const questions: AttentionQuestion[] = request.questions && request.questions.length > 0
-    ? request.questions
-    : question
-      ? [{
-          id: "answer",
-          text: request.prompt || request.summary || "What should the agent do?",
-          options: (request.options ?? []).map((option) => ({
-            label: option.label,
-            ...(option.description ? { description: option.description } : {}),
-          })),
-          multiSelect: request.multiple === true,
-          allowFreeText: true,
-        }]
-      : [];
-  const answerItems = questions.map((item) => ({
-    questionId: item.id,
-    value: (answers[item.id] ?? "").trim(),
-    selectedOptions: selected[item.id] ?? [],
-  }));
-  const allQuestionsAnswered = answerItems.length > 0 && answerItems.every((item) =>
-    item.value.length > 0 || item.selectedOptions.length > 0,
-  );
-
-  function toggleOption(question: AttentionQuestion, value: string) {
-    setSelected((current) => {
-      const existing = current[question.id] ?? [];
-      const next = question.multiSelect
-        ? existing.includes(value)
-          ? existing.filter((item) => item !== value)
-          : [...existing, value]
-        : [value];
-      return { ...current, [question.id]: next };
-    });
-  }
-
-  async function submitAnswer() {
-    if (!request.id) return;
-    if (!allQuestionsAnswered) return;
-    const response: RequestResponse = answerItems.length === 1
-      ? {
-          kind: "answer",
-          value: answerItems[0]!.value,
-          selectedOptions: answerItems[0]!.selectedOptions,
-        }
-      : { kind: "answers", answers: answerItems };
-    await onRespond(request.id, response);
-  }
-
   async function submitDecision(decision: "allow" | "deny") {
     if (!request.id) return;
     await onRespond(request.id, {
@@ -114,74 +299,6 @@ function PendingRequestCard({
           <p className="mt-1 text-[10px] uppercase tracking-wide text-muted-foreground">
             {request.confidence} · {request.source}
           </p>
-
-          {question && request.kind !== "blocked" && exactDetailsReady && providerRespondable && (
-            <div className="mt-3 grid gap-4">
-              {questions.map((item, questionIndex) => {
-                const selectedOptions = selected[item.id] ?? [];
-                return (
-                  <fieldset key={item.id} className="grid gap-2 rounded-lg border bg-background/70 p-3">
-                    <legend className="px-1 text-sm font-medium">
-                      {questions.length > 1 ? `${questionIndex + 1}. ` : ""}{item.text}
-                    </legend>
-                    {item.options.length > 0 && (
-                      <div className="grid gap-2 sm:grid-cols-2">
-                        {item.options.map((option) => {
-                          const checked = selectedOptions.includes(option.label);
-                          return (
-                            <button
-                              key={option.label}
-                              type="button"
-                              disabled={!canRespond}
-                              onClick={() => toggleOption(item, option.label)}
-                              aria-pressed={checked}
-                              className={cn(
-                                "rounded-md border bg-background p-2.5 text-left text-sm outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50",
-                                checked && "border-primary bg-primary/5",
-                              )}
-                            >
-                              <span className="flex items-center justify-between gap-2 font-medium">
-                                {option.label}
-                                {checked && <Check className="size-3.5 text-primary" />}
-                              </span>
-                              {option.description && <span className="mt-1 block text-xs text-muted-foreground">{option.description}</span>}
-                            </button>
-                          );
-                        })}
-                      </div>
-                    )}
-                    {(item.allowFreeText || item.options.length === 0) && (
-                      <Input
-                        type={item.isSecret || request.isSecret ? "password" : "text"}
-                        autoComplete={item.isSecret || request.isSecret ? "new-password" : undefined}
-                        aria-label={`${item.text} answer`}
-                        value={answers[item.id] ?? ""}
-                        onChange={(event) => setAnswers((current) => ({ ...current, [item.id]: event.target.value }))}
-                        disabled={!canRespond}
-                        placeholder={selectedOptions.length > 0 ? "Add context (optional)" : "Type your answer"}
-                      />
-                    )}
-                    <p className="text-[11px] text-muted-foreground">
-                      {item.options.length > 0
-                        ? item.multiSelect
-                          ? "Choose one or more options."
-                          : "Choose one option."
-                        : "Enter an answer."}
-                      {item.options.length > 0 && item.allowFreeText ? " A custom answer is also allowed." : ""}
-                    </p>
-                  </fieldset>
-                );
-              })}
-              <div className="flex justify-end">
-                <Button
-                  onClick={() => void submitAnswer().catch(() => undefined)}
-                  disabled={!canRespond || !allQuestionsAnswered}
-                >
-                  Send {questions.length > 1 ? `${questions.length} answers` : "answer"}
-                </Button>
-              </div>
-            </div>
-          )}
 
           {!question && request.kind !== "blocked" && exactDetailsReady && providerRespondable && (
             <div className="mt-3 grid gap-2">
@@ -230,6 +347,7 @@ export function PendingRequests({
   writable,
   mutationsReady = true,
   busy,
+  onJumpToRequest,
   onRespond,
 }: {
   session: SessionView;
@@ -238,15 +356,22 @@ export function PendingRequests({
   writable: boolean;
   mutationsReady?: boolean;
   busy: boolean;
+  onJumpToRequest?: (requestId: string) => void;
   onRespond: (requestId: string, response: RequestResponse) => Promise<void>;
 }) {
   const [open, setOpen] = useState(false);
   if (requests.length === 0) return null;
-  const first = requests[0];
+  const inlineQuestions = requests.filter((request) => isCanonicalInlineQuestion(request, exactRequestIds));
+  const fallbackRequests = requests.filter((request) => !isCanonicalInlineQuestion(request, exactRequestIds));
+  const first = inlineQuestions[0] ?? fallbackRequests[0];
   const summary = requests.length === 1
-    ? first?.title || first?.summary || "This session needs your input."
+    ? first?.questions?.[0]?.header
+      || first?.questions?.[0]?.text
+      || first?.summary
+      || first?.title
+      || "This session needs your input."
     : `${requests.length} requests are waiting.`;
-  const exactRespondableCount = requests.filter((request) =>
+  const exactRespondableCount = fallbackRequests.filter((request) =>
     Boolean(
       request.id
         && exactRequestIds.has(request.id)
@@ -255,14 +380,19 @@ export function PendingRequests({
         && (request.kind !== "question" || request.questions?.length),
     ),
   ).length;
+  const jumpRequestId = inlineQuestions[0]?.id ?? null;
+  const opensSheet = !jumpRequestId && fallbackRequests.length > 0;
   return (
     <>
-      <section className="shrink-0 border-b bg-amber-500/[0.06]" aria-label="Pending requests">
+      <section className="flex shrink-0 border-b bg-amber-500/[0.06]" aria-label="Pending requests">
         <button
           type="button"
-          className="flex min-h-11 w-full items-center gap-2.5 px-4 py-2 text-left outline-none hover:bg-amber-500/[0.08] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring md:px-6"
-          onClick={() => setOpen(true)}
-          aria-haspopup="dialog"
+          className="flex min-h-11 min-w-0 flex-1 items-center gap-2.5 px-4 py-2 text-left outline-none hover:bg-amber-500/[0.08] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring md:pl-6"
+          onClick={() => {
+            if (jumpRequestId) onJumpToRequest?.(jumpRequestId);
+            else if (opensSheet) setOpen(true);
+          }}
+          aria-haspopup={opensSheet ? "dialog" : undefined}
         >
           <AlertTriangle className="size-4 shrink-0 text-amber-700 dark:text-amber-300" />
           <span className="shrink-0 text-sm font-semibold">Needs you</span>
@@ -270,11 +400,21 @@ export function PendingRequests({
           <span className="shrink-0 rounded-full border border-amber-500/30 bg-background px-2 py-0.5 text-[11px] font-medium">
             {requests.length}
           </span>
-          <span className="hidden shrink-0 text-xs font-medium sm:inline">Review</span>
+          <span className="hidden shrink-0 text-xs font-medium sm:inline">{jumpRequestId ? "Jump" : "Review"}</span>
           <ChevronRight className="size-4 shrink-0 text-muted-foreground" />
         </button>
+        {jumpRequestId && fallbackRequests.length > 0 && (
+          <button
+            type="button"
+            className="min-h-11 shrink-0 border-l px-3 text-xs font-medium outline-none hover:bg-amber-500/[0.08] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring md:px-4"
+            onClick={() => setOpen(true)}
+            aria-haspopup="dialog"
+          >
+            Review {fallbackRequests.length} more
+          </button>
+        )}
       </section>
-      <Sheet open={open} onOpenChange={setOpen}>
+      {fallbackRequests.length > 0 && <Sheet open={open} onOpenChange={setOpen}>
         <SheetContent
           side="bottom"
           className="gap-0 overflow-hidden p-0 [padding-bottom:env(safe-area-inset-bottom)] md:inset-y-0 md:left-auto md:right-0 md:h-full md:max-h-none md:w-[min(92vw,42rem)] md:border-l md:border-t-0 md:[padding-right:env(safe-area-inset-right)] md:[padding-top:env(safe-area-inset-top)]"
@@ -283,14 +423,14 @@ export function PendingRequests({
             <SheetTitle>Needs you</SheetTitle>
             <SheetDescription>
               {exactRespondableCount > 0
-                ? requests.length === 1
+                ? fallbackRequests.length === 1
                   ? "Review and answer this request."
-                  : `Review ${requests.length} waiting requests and answer the verified provider requests.`
+                  : `Review ${fallbackRequests.length} waiting requests and answer the verified provider requests.`
                 : "Review this pending attention. Exact response details are still loading."}
             </SheetDescription>
           </SheetHeader>
           <div className="grid min-h-0 flex-1 gap-3 overflow-y-auto overscroll-contain px-4 py-4 [scrollbar-gutter:stable] sm:px-5">
-            {requests.map((request, index) => (
+            {fallbackRequests.map((request, index) => (
               <PendingRequestCard
                 key={request.id ?? `${request.kind}-${index}`}
                 request={request}
@@ -303,7 +443,7 @@ export function PendingRequests({
             ))}
           </div>
         </SheetContent>
-      </Sheet>
+      </Sheet>}
     </>
   );
 }
