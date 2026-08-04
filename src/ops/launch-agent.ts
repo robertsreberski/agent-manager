@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import {
   closeSync,
   constants,
@@ -20,6 +21,50 @@ import {
 
 export const LAUNCH_AGENT_LABEL = "local.agent-manager.cockpit";
 const CLEAN_ENV_EXECUTABLE = "/usr/bin/env";
+const LAUNCHCTL_EXECUTABLE = "/bin/launchctl";
+// launchd can keep the exact job record around briefly after bootout while the
+// process is already exiting. Five seconds is still a tight personal-tool
+// bound, but avoids turning an ordinary macOS handoff into a failed deploy.
+const JOB_DISAPPEARANCE_CHECKS = 101;
+const JOB_DISAPPEARANCE_POLL_MS = 50;
+const BOOTSTRAP_ATTEMPTS = 3;
+const BOOTSTRAP_RETRY_MS = 100;
+const sleepCell = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+
+export interface LaunchctlCommandResult {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+  error?: Error;
+}
+
+export interface LaunchctlRunner {
+  run(args: readonly string[]): LaunchctlCommandResult;
+}
+
+export interface ReloadLaunchAgentDependencies {
+  runner?: LaunchctlRunner;
+  sleep?: (milliseconds: number) => void;
+}
+
+const defaultLaunchctlRunner: LaunchctlRunner = {
+  run(args) {
+    const result = spawnSync(LAUNCHCTL_EXECUTABLE, args, {
+      encoding: "utf8",
+      shell: false,
+    });
+    return {
+      status: result.status,
+      stdout: result.stdout ?? "",
+      stderr: result.stderr ?? "",
+      ...(result.error ? { error: result.error } : {}),
+    };
+  },
+};
+
+function sleep(milliseconds: number): void {
+  Atomics.wait(sleepCell, 0, 0, milliseconds);
+}
 
 function xml(value: string): string {
   return value
@@ -34,7 +79,6 @@ export interface LaunchAgentOptions {
   executables: ServiceExecutables;
   cliEntrypoint: string;
   homeDirectory: string;
-  panicLockFile: string;
   label?: string;
   backendPort?: number;
   /** Test/preview override; the installed service normally uses the OS account name. */
@@ -101,13 +145,7 @@ export function renderLaunchAgent(options: LaunchAgentOptions): string {
 ${programArguments.map((argument) => `    <string>${xml(argument)}</string>`).join("\n")}
   </array>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key>
-  <dict>
-    <key>PathState</key>
-    <dict>
-      <key>${xml(options.panicLockFile)}</key><false/>
-    </dict>
-  </dict>
+  <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>10</integer>
   <key>ProcessType</key><string>Interactive</string>
   <key>StandardOutPath</key><string>${xml(join(logDirectory, "stdout.log"))}</string>
@@ -160,4 +198,154 @@ export function installLaunchAgentFile(options: LaunchAgentOptions): string {
     throw error;
   }
   return destination;
+}
+
+function commandSucceeded(result: LaunchctlCommandResult): boolean {
+  return !result.error && result.status === 0;
+}
+
+function commandFailure(result: LaunchctlCommandResult): string {
+  if (result.error) return result.error.message;
+  return result.stderr.trim()
+    || result.stdout.trim()
+    || `status ${String(result.status)}`;
+}
+
+function isAbsentBootout(result: LaunchctlCommandResult): boolean {
+  return !result.error
+    && result.status === 3
+    && /^Boot-out failed: 3: No such process\s*$/u.test(
+      `${result.stderr}\n${result.stdout}`.trim(),
+    );
+}
+
+function isAbsentPrint(
+  result: LaunchctlCommandResult,
+  label: string,
+  uid: number,
+): boolean {
+  const output = `${result.stderr}\n${result.stdout}`;
+  return !result.error
+    && result.status === 113
+    && output.includes(
+      `Could not find service "${label}" in domain for user gui: ${uid}`,
+    );
+}
+
+function isTransientBootstrapFailure(result: LaunchctlCommandResult): boolean {
+  return !result.error
+    && result.status === 5
+    && /^Bootstrap failed: 5: Input\/output error(?:\r?\n|$)/u.test(result.stderr);
+}
+
+function probeJob(
+  runner: LaunchctlRunner,
+  target: string,
+  label: string,
+  uid: number,
+): "present" | "absent" {
+  const result = runner.run(["print", target]);
+  if (commandSucceeded(result)) return "present";
+  if (isAbsentPrint(result, label, uid)) return "absent";
+  throw new Error(`launchctl print failed: ${commandFailure(result)}`);
+}
+
+function waitForJobToDisappear(
+  runner: LaunchctlRunner,
+  pause: (milliseconds: number) => void,
+  target: string,
+  label: string,
+  uid: number,
+): void {
+  for (let check = 0; check < JOB_DISAPPEARANCE_CHECKS; check += 1) {
+    if (probeJob(runner, target, label, uid) === "absent") return;
+    if (check + 1 < JOB_DISAPPEARANCE_CHECKS) {
+      pause(JOB_DISAPPEARANCE_POLL_MS);
+    }
+  }
+  throw new Error(
+    `launchctl bootout did not remove ${target} within ${String(
+      (JOB_DISAPPEARANCE_CHECKS - 1) * JOB_DISAPPEARANCE_POLL_MS,
+    )}ms`,
+  );
+}
+
+function bootstrapLaunchAgent(
+  runner: LaunchctlRunner,
+  pause: (milliseconds: number) => void,
+  domain: string,
+  target: string,
+  destination: string,
+  label: string,
+  uid: number,
+): void {
+  for (let attempt = 1; attempt <= BOOTSTRAP_ATTEMPTS; attempt += 1) {
+    const result = runner.run(["bootstrap", domain, destination]);
+    if (commandSucceeded(result)) return;
+    if (!isTransientBootstrapFailure(result)) {
+      throw new Error(`launchctl bootstrap failed: ${commandFailure(result)}`);
+    }
+
+    // launchctl can return error 5 even though it registered the job. The exact
+    // print target distinguishes that outcome from the short bootout race.
+    if (probeJob(runner, target, label, uid) === "present") return;
+    if (attempt === BOOTSTRAP_ATTEMPTS) {
+      throw new Error(
+        `launchctl bootstrap failed after ${String(BOOTSTRAP_ATTEMPTS)} attempts: ${commandFailure(result)}`,
+      );
+    }
+    pause(BOOTSTRAP_RETRY_MS);
+  }
+}
+
+function stopLaunchAgentJob(
+  runner: LaunchctlRunner,
+  pause: (milliseconds: number) => void,
+  label: string,
+  uid: number,
+): void {
+  const target = `gui/${uid}/${label}`;
+  const bootout = runner.run(["bootout", target]);
+  if (!commandSucceeded(bootout) && !isAbsentBootout(bootout)) {
+    throw new Error(`launchctl bootout failed: ${commandFailure(bootout)}`);
+  }
+  waitForJobToDisappear(runner, pause, target, label, uid);
+}
+
+/** Stop only the exact per-user Agent Manager LaunchAgent; absence is success. */
+export function stopLaunchAgent(
+  uid = typeof process.getuid === "function" ? process.getuid() : null,
+  dependencies: ReloadLaunchAgentDependencies = {},
+): void {
+  if (uid === null) throw new Error("Stopping Agent Manager requires a macOS user id");
+  stopLaunchAgentJob(
+    dependencies.runner ?? defaultLaunchctlRunner,
+    dependencies.sleep ?? sleep,
+    LAUNCH_AGENT_LABEL,
+    uid,
+  );
+}
+
+/** Reload the one per-user service installed by this personal tool. */
+export function reloadLaunchAgent(
+  destination: string,
+  label = LAUNCH_AGENT_LABEL,
+  uid = typeof process.getuid === "function" ? process.getuid() : null,
+  dependencies: ReloadLaunchAgentDependencies = {},
+): void {
+  if (uid === null) throw new Error("Reloading Agent Manager requires a macOS user id");
+  const domain = `gui/${uid}`;
+  const target = `${domain}/${label}`;
+  const runner = dependencies.runner ?? defaultLaunchctlRunner;
+  const pause = dependencies.sleep ?? sleep;
+
+  // An absent previous job is the normal first-install case.
+  stopLaunchAgentJob(runner, pause, label, uid);
+
+  bootstrapLaunchAgent(runner, pause, domain, target, destination, label, uid);
+
+  const kickstart = runner.run(["kickstart", "-k", target]);
+  if (!commandSucceeded(kickstart)) {
+    throw new Error(`launchctl kickstart failed: ${commandFailure(kickstart)}`);
+  }
 }

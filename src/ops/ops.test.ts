@@ -209,7 +209,6 @@ test("renders a loopback-only LaunchAgent with exact executables", () => {
     },
     cliEntrypoint: "/tmp/agent-manager/dist/cli/index.js",
     homeDirectory: "/Users/test",
-    panicLockFile: "/Users/test/Library/Application Support/agent-manager/panic.lock",
     userName: "test",
     shell: "/bin/zsh",
     temporaryDirectory: "/private/tmp/test/",
@@ -238,9 +237,8 @@ test("renders a loopback-only LaunchAgent with exact executables", () => {
     "43127",
   ]);
   assert.doesNotMatch(plist, /<key>EnvironmentVariables<\/key>/);
-  assert.doesNotMatch(plist, /<key>KeepAlive<\/key><true\/>/);
-  assert.match(plist, /<key>PathState<\/key>/);
-  assert.match(plist, /panic\.lock<\/key><false\/>/);
+  assert.match(plist, /<key>KeepAlive<\/key><true\/>/);
+  assert.doesNotMatch(plist, /<key>PathState<\/key>/);
   assert.match(plist, /<string>127\.0\.0\.1<\/string>/);
   assert.match(plist, /<string>43127<\/string>/);
 });
@@ -260,7 +258,6 @@ test("starts Node with a clean allowlisted environment", () => {
       },
       cliEntrypoint: probe,
       homeDirectory,
-      panicLockFile: join(homeDirectory, "panic.lock"),
       userName: "test-user",
       shell: "/bin/zsh",
       temporaryDirectory: "/private/tmp/test-user/",
@@ -313,7 +310,6 @@ test("installs the LaunchAgent atomically as an owner-only file", () => {
       },
       cliEntrypoint: "/tmp/agent-manager/dist/cli/index.js",
       homeDirectory,
-      panicLockFile: join(homeDirectory, "panic.lock"),
     });
 
     assert.equal(statSync(destination).mode & 0o777, 0o600);

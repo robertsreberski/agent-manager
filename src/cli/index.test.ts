@@ -3,7 +3,7 @@ import test from "node:test";
 
 import { defaultConfig, type AttachSpec } from "../ops/index.ts";
 import type { AttachInstruction } from "../server/contracts.ts";
-import { runCli, type CliDependencies } from "./index.ts";
+import { runCli, waitForStableService, type CliDependencies } from "./index.ts";
 
 const SERVICE_EXECUTABLES = {
   node: "/trusted/bin/node",
@@ -21,38 +21,37 @@ function output() {
   };
 }
 
-test("list preserves the original options and emits only the public JSON envelope", async () => {
-  const stdout = output();
-  const stderr = output();
-  let receivedSince = -1;
-  const exitCode = await runCli(["list", "--json", "--since", "2h", "--children"], {
-    stdout: stdout.writer,
-    stderr: stderr.writer,
-    buildListing(options) {
-      receivedSince = options.recentWindowSeconds;
-      assert.equal(options.includeChildren, true);
-      return {
-        version: 2,
-        generatedAt: "2026-08-03T12:00:00.000Z",
-        recentWindowSeconds: options.recentWindowSeconds,
-        sessions: [],
-        diagnostics: [],
-        selectedProviderCount: 2,
-        successfulProviderCount: 2,
-      };
+test("service health must remain stable after asynchronous startup work", async () => {
+  let now = 0;
+  let requests = 0;
+  await waitForStableService(43_127, {
+    now: () => now,
+    sleep: async (milliseconds) => { now += milliseconds; },
+    timeoutMs: 2_000,
+    stableMs: 300,
+    pollMs: 100,
+    request: async () => {
+      requests += 1;
+      if (requests === 2) throw new Error("startup worker crashed");
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
     },
   });
+  assert.equal(now, 500);
+  assert.equal(requests, 6);
+});
 
-  assert.equal(exitCode, 0);
-  assert.equal(receivedSince, 7_200);
-  assert.deepEqual(JSON.parse(stdout.read()), {
-    version: 2,
-    generatedAt: "2026-08-03T12:00:00.000Z",
-    recentWindowSeconds: 7_200,
-    sessions: [],
-    diagnostics: [],
+test("default health window tolerates one launchd throttle interval", async () => {
+  let now = 0;
+  await waitForStableService(43_127, {
+    now: () => now,
+    sleep: async (milliseconds) => { now += milliseconds; },
+    pollMs: 250,
+    request: async () => {
+      if (now < 11_000) throw new Error("launchd is throttling the replacement");
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
+    },
   });
-  assert.equal(stderr.read(), "");
+  assert.equal(now, 12_500);
 });
 
 test("open gets a fresh owner-socket URL and does not launch a browser with --no-browser", async () => {
@@ -267,13 +266,11 @@ test("attach rejects browser-only manager proxies before resolving or spawning e
   assert.match(stderr.read(), /browser-only/);
 });
 
-test("workspace, Tailscale, service, doctor, and panic commands use injected operations", async () => {
+test("workspace, Tailscale, service, and doctor commands use injected operations", async () => {
   const stdout = output();
   const config = defaultConfig();
   let saves = 0;
   const persistedWorkspaces: string[] = [];
-  let panic = false;
-  let panicPersisted = false;
   const common: Partial<CliDependencies> = {
     stdout: stdout.writer,
     loadConfig: () => config,
@@ -281,15 +278,8 @@ test("workspace, Tailscale, service, doctor, and panic commands use injected ope
       saves += 1;
       return mutator(config);
     },
+    prepareServiceState: () => {},
     serviceExecutables: () => SERVICE_EXECUTABLES,
-    engagePanicLock: () => {
-      panicPersisted = true;
-      return true;
-    },
-    releasePanicLock: () => {
-      panicPersisted = false;
-      return true;
-    },
     persistWorkspace: (workspace) => { persistedWorkspaces.push(workspace.id); },
     removePersistedWorkspace: () => true,
   };
@@ -336,25 +326,24 @@ test("workspace, Tailscale, service, doctor, and panic commands use injected ope
     renderService: () => "<plist/>\n",
   }), 0);
 
+  let reloaded = "";
+  let healthPort = 0;
+  assert.equal(await runCli(["service", "install"], {
+    ...common,
+    installService: () => "/tmp/agent-manager.plist",
+    reloadService: (destination) => { reloaded = destination; },
+    waitForService: async (port) => { healthPort = port; },
+  }), 0);
+  assert.equal(reloaded, "/tmp/agent-manager.plist");
+  assert.equal(healthPort, config.backend.port);
+
   assert.equal(await runCli(["doctor", "--json"], {
     ...common,
     doctor: async () => ({ ok: true, generatedAt: "now", checks: [] }),
   }), 0);
 
-  assert.equal(await runCli(["panic-lock"], {
-    ...common,
-    requestPanicLock: async () => {
-      panic = true;
-      return { ok: true };
-    },
-  }), 0);
-  assert.equal(panic, true);
-  assert.equal(panicPersisted, true);
-  assert.equal(await runCli(["panic-unlock"], common), 0);
-  assert.equal(panicPersisted, false);
   assert.match(stdout.read(), /workstation\.example\.ts\.net:9443/);
   assert.match(stdout.read(), /<plist\/>/);
-  assert.match(stdout.read(), /control plane locked/);
 });
 
 test("SSH host commands persist configuration, install the node, and remove live discovery data", async () => {
@@ -400,23 +389,162 @@ test("SSH host commands persist configuration, install the node, and remove live
   assert.match(stdout.read(), /Installed and started local\.agent-manager\.cockpit/);
 });
 
-test("panic-lock reports the durable lock when live cleanup is incomplete", async () => {
+test("Claude hook CLI uses the configured loopback endpoint, explicit consent, and live reload", async () => {
+  const stdout = output();
   const stderr = output();
-  let persisted = false;
-  const exitCode = await runCli(["panic-lock"], {
+  const config = defaultConfig();
+  config.backend.port = 45_678;
+  let reloaded = "";
+  let confirmed = false;
+  let received: unknown = null;
+  const exitCode = await runCli([
+    "hooks", "install", "--provider", "claude", "--scope", "project", "--yes",
+  ], {
+    stdout: stdout.writer,
     stderr: stderr.writer,
-    engagePanicLock: () => {
-      persisted = true;
-      return true;
+    loadConfig: () => config,
+    homeDirectory: "/Users/test",
+    currentDirectory: "/Users/test/project",
+    controlSocketPath: "/private/tmp/agent-manager-test/control.sock",
+    async operateClaudeHook(input, dependencies) {
+      received = input;
+      confirmed = await dependencies.confirm?.({} as never) ?? false;
+      return {
+        operation: "install",
+        outcome: "unchanged",
+        status: {
+          state: "installed-unseen",
+          settingsPath: "/Users/test/project/.claude/settings.local.json",
+          configuration: null,
+          lastSeenAt: null,
+        },
+        plan: null,
+      };
     },
-    requestPanicLock: async () => {
-      throw new Error("owner socket unavailable");
+    async reloadHookAuthorizations(path) {
+      reloaded = path;
+      return { ok: true };
     },
   });
 
-  assert.equal(exitCode, 1);
-  assert.equal(persisted, true);
-  assert.match(stderr.read(), /Persistent panic lock is engaged/);
-  assert.match(stderr.read(), /cleanup was incomplete/);
-  assert.match(stderr.read(), /owner socket unavailable/);
+  assert.equal(exitCode, 0);
+  assert.equal(confirmed, true);
+  assert.deepEqual(received, {
+    operation: "install",
+    scope: "project",
+    homeDirectory: "/Users/test",
+    projectDirectory: "/Users/test/project",
+    endpoint: "http://127.0.0.1:45678/api/v1/hooks/claude",
+  });
+  assert.equal(reloaded, "/private/tmp/agent-manager-test/control.sock");
+  assert.match(stdout.read(), /installed-unseen/);
+  assert.match(stderr.read(), /machine-local/);
+});
+
+test("Codex hook CLI installs the observation shim with explicit consent and live reload", async () => {
+  const stdout = output();
+  const config = defaultConfig();
+  config.backend.port = 45_679;
+  let reloaded = "";
+  let received: unknown = null;
+  let nodeExecutable = "";
+  let trustProbe: [string, string] | null = null;
+  const exitCode = await runCli([
+    "hooks", "install", "--provider", "codex", "--yes",
+  ], {
+    stdout: stdout.writer,
+    loadConfig: () => config,
+    homeDirectory: "/Users/test",
+    controlSocketPath: "/private/tmp/agent-manager-test/control.sock",
+    async codexHookStatus(settingsPath, expectedCommand) {
+      trustProbe = [settingsPath, expectedCommand];
+      return {
+        state: "awaiting-trust",
+        reason: "trust the hook",
+        installedEvents: [],
+      };
+    },
+    async operateCodexHook(input, dependencies) {
+      received = input;
+      nodeExecutable = dependencies.nodeExecutable ?? "";
+      assert.equal(
+        (await dependencies.trustStatus?.("/Users/test/.codex/hooks.json", "'shim'"))?.state,
+        "awaiting-trust",
+      );
+      assert.equal(await dependencies.confirm?.({} as never), true);
+      return {
+        operation: "install",
+        outcome: "applied",
+        status: {
+          state: "awaiting-trust",
+          settingsPath: "/Users/test/.codex/hooks.json",
+          shimPath: "/Users/test/Library/Application Support/agent-manager/hooks/codex-user-hook.mjs",
+          configuration: null,
+          trust: null,
+          lastSeenAt: null,
+        },
+        plan: null,
+      };
+    },
+    async reloadHookAuthorizations(path) {
+      reloaded = path;
+      return { ok: true };
+    },
+  });
+
+  assert.equal(exitCode, 0);
+  assert.equal(nodeExecutable, process.execPath);
+  assert.deepEqual(trustProbe, ["/Users/test/.codex/hooks.json", "'shim'"]);
+  assert.deepEqual(received, {
+    operation: "install",
+    scope: "user",
+    homeDirectory: "/Users/test",
+    endpoint: "http://127.0.0.1:45679/api/v1/hooks/codex",
+  });
+  assert.equal(reloaded, "/private/tmp/agent-manager-test/control.sock");
+  assert.match(stdout.read(), /awaiting-trust/);
+  assert.match(stdout.read(), /Open \/hooks in Codex/);
+});
+
+test("hook status without a provider reports both harnesses", async () => {
+  const stdout = output();
+  const providers: string[] = [];
+  const exitCode = await runCli(["hooks", "status"], {
+    stdout: stdout.writer,
+    async operateClaudeHook() {
+      providers.push("claude");
+      return {
+        operation: "status",
+        outcome: "inspected",
+        status: {
+          state: "absent",
+          settingsPath: "/Users/test/.claude/settings.json",
+          configuration: null,
+          lastSeenAt: null,
+        },
+        plan: null,
+      };
+    },
+    async operateCodexHook() {
+      providers.push("codex");
+      return {
+        operation: "status",
+        outcome: "inspected",
+        status: {
+          state: "absent",
+          settingsPath: "/Users/test/.codex/hooks.json",
+          shimPath: "/Users/test/Library/Application Support/agent-manager/hooks/codex-user-hook.mjs",
+          configuration: null,
+          trust: null,
+          lastSeenAt: null,
+        },
+        plan: null,
+      };
+    },
+  });
+
+  assert.equal(exitCode, 0);
+  assert.deepEqual(providers, ["claude", "codex"]);
+  assert.match(stdout.read(), /Claude hooks \(user\): absent/);
+  assert.match(stdout.read(), /Codex hooks \(user\): absent/);
 });

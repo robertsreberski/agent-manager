@@ -197,7 +197,7 @@ test("publishes unexpected death after withdrawing adapter controls", async () =
 
 test("never connects to or replaces a pre-existing socket path", async () => {
   const runtimeDir = await mkdtemp(join(tmpdir(), "am-codex-existing-"));
-  const socketPath = join(runtimeDir, "codex-app-server.sock");
+  const socketPath = join(runtimeDir, "codex-private.sock");
   const otherServer = createServer();
   await new Promise<void>((resolve, reject) => {
     otherServer.once("error", reject);

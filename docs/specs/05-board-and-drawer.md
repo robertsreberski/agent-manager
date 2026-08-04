@@ -1,6 +1,6 @@
 # 05 — Board, thread drawer, and the assistant-ui thread
 
-**Status:** Draft · **Depends on:** 04, 12 · **Blocks:** 06, 07, 08, 09, 10
+**Status:** Accepted · **Depends on:** 01, 04, 12 · **Blocks:** 06, 07, 08, 09, 10
 **Design frames:** `7a` (board), `4a` `4b` (drawer + thread), `11b` (subagent expanded)
 **Read from:** `docs/design/cockpit/Cockpit Prototype.dc.html` — turns 4 and 7 were truncated
 out of the redesign file (see `docs/design/cockpit/NOTES.md`).
@@ -77,7 +77,7 @@ Derive the four states from what already exists — do not add a parallel status
 lifecycle event over child states, deliberately so a lingering running child cannot mask a failed
 turn. Reuse that precedence rather than reimplementing it.
 
-### R5 — Heuristic attention must not look exact — **OPEN**
+### R5 — Heuristic attention is visibly inferred
 
 The design gives "wants you" one appearance. But an external session's attention can be a
 transcript inference with `id: null`, `confidence: "heuristic"`
@@ -85,15 +85,10 @@ transcript inference with `id: null`, `confidence: "heuristic"`
 a provider-issued request would be the exact unearned confidence this project exists to avoid,
 and would put a card in the lime "answer me" state that cannot be answered.
 
-**This needs a design decision before the board ships.** Proposal to take to the designer, in
-preference order:
-
-1. Heuristic wants-you uses the lime tick but a **hairline dashed** left edge and the muted body
-   colour, with the state line reading what the evidence actually is ("looks blocked — from the
-   transcript") rather than a question.
-2. Heuristic attention does not enter the "Wants you" scope at all; it stays Idle with a marker.
-
-Do not ship option "render them the same".
+Heuristic attention stays in the Wants You scope, but uses a **hairline dashed lime** left edge,
+muted body colour, and the exact state line `looks blocked — from transcript`. It never renders
+answer controls and never triggers an operating-system notification. Exact provider-issued
+attention retains the solid lime treatment.
 
 ### R6 — Ordering and interaction
 
@@ -121,14 +116,15 @@ the operator keeps their place.
 - Body: `overflow-y: auto`, 24px horizontal padding, **20px gap between turn parts**.
 - Composer pinned at the bottom (spec 06).
 
-### R8 — Backscroll
+### R8 — Honest retention boundary
 
-The drawer scrolls a thread against a materialised window of at most 400 items / 1 MiB
-(`README.md`). Wire `GET /api/v1/sessions/:id/activity?before=&limit=` — registered at
-`src/server/server.ts:640`, currently consumed by nothing (spec 13 §F2). Scrolling to the top
-of a truncated thread loads the previous page via `nextBefore`.
+The drawer scrolls the one selected-session materialisation, bounded to 400 semantic items or
+1 MiB. The existing REST activity route pages that already-truncated buffer and therefore is
+not real backscroll. Delete it and its tests. When older content has been evicted, render a
+retention-boundary banner and offer native attach/provider history as the durable source.
 
-If backscroll does not ship here, delete that endpoint rather than leaving it unused.
+Manager-owned, external, re-adopted, remote, unreadable, and not-found states all enter this
+same selected-session SSE/activity store; no `session.messages` fallback is permitted.
 
 ## Requirements — thread
 
@@ -200,8 +196,8 @@ Restated from `00-overview.md` because this spec is where they are most at risk:
 
 ## Removals (spec 13)
 
-`session-sidebar.tsx` (§B1) · the duplicate `session.messages` timeline path and everything
-behind it (§B2) · `session-badges.tsx` (§B3) · the sidebar layout tokens.
+`session-sidebar.tsx` · the duplicate `session.messages` timeline path and everything behind it
+· `session-badges.tsx` · the sidebar layout tokens. Spec 13 owns the exact cutover list.
 
 ## Acceptance criteria
 
@@ -213,14 +209,9 @@ behind it (§B2) · `session-badges.tsx` (§B3) · the sidebar layout tokens.
 5. A turn with 6 tool calls renders one "6 tool calls" disclosure, collapsed, expanding to the
    indented grammar; a failed turn is forced open.
 6. A subagent renders its spine, brief, steps and return footer; a nested subagent shows a count.
-7. Backscroll loads an earlier page at the top of a truncated thread — or the REST endpoint is
-   deleted.
+7. An evicted prefix shows the retention boundary; no UI or route claims to load content no
+   longer retained.
 8. Every test guarding R13 passes unmodified.
-9. R5 is resolved with the designer and implemented; heuristic attention is visually distinct.
-
-## Open questions
-
-- **Q1 (blocking, R5).** How should heuristic attention read on a card?
-- **Q2.** Mobile (`9a-1`) turns the board into one list in three bands (wants you / working /
-  idle), with wants-you rows carrying the actual question. Is that a separate component or the
-  same board at a breakpoint? Owned by spec 11, but the component boundary is decided here.
+9. Heuristic attention is visually distinct, non-actionable, and covered by a regression test.
+10. One board domain model feeds two presentations: desktop columns and the spec 11 mobile
+    bands. Session ordering/state derivation is shared; only layout components differ.

@@ -35,6 +35,12 @@ markup from the prototype; read everything from turn 8 upward from the redesign 
 Frame `8a` (approvals) sits at the truncation boundary and ends mid-element. Its content is
 also present in the prototype.
 
+There is no recoverable `8b` frame in either vendored file. Spec 11 uses the redesign's
+neighbouring system-state grammar to define connecting, offline, ended, and empty states. This
+is the only intentionally reconstructed frame: it must reuse the shipped tokens, typography,
+spacing, borders, and wording style rather than introduce a third visual language. Visual
+acceptance records this exception instead of pretending the source contains a frame it does not.
+
 ## Files deliberately not vendored
 
 - **`icons/`** — 70 Lucide SVGs. The handoff says explicitly: *"Use `lucide-react` in the app
@@ -42,8 +48,9 @@ also present in the prototype.
   no longer exists in Lucide; the revisions affordance uses `rotate-ccw`.
 - **`Cockpit Current.dc.html`** — the interface as it is today, rebuilt from `web/src`. It is a
   "before" picture for comparison, and `web/src` itself is a better source of that truth.
-- **`support.js`** — the design-canvas rendering runtime (`dc-runtime`). Carries no design
-  content; it is the machinery that makes the `.dc.html` files render standalone.
+- **`support.js`** — the design-canvas rendering runtime (`dc-runtime`). It was inspected and
+  deliberately not imported: it carries no product markup, tokens, interaction decisions, or
+  assets. It exists only to make the `.dc.html` canvas render standalone.
 - **`README.md` / `github.md`** — the handoff prose. Its decision-bearing content is distilled
   into `docs/specs/`, which is where it belongs: the specs are the thing implementers work from,
   and duplicating the handoff would create two sources of truth that drift. Fetch the originals

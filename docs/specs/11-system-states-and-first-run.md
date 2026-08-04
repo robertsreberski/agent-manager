@@ -1,6 +1,6 @@
 # 11 — System states, session panel, phone, first run
 
-**Status:** Draft · **Depends on:** all · **Design frames:** `8b` (system states), `9b` (session
+**Status:** Accepted · **Depends on:** all · **Design frames:** reconstructed `8b` (system states), `9b` (session
 panel), `13b` (header facts), `13c` (first run), `9a-1`…`9a-5` (phone)
 
 ## Purpose
@@ -9,6 +9,10 @@ The states the cockpit is in when it is not showing a healthy session, the panel
 "what is this session allowed to do", and the two viewports the design treats as first-class.
 
 ## Requirements — system states (`8b`)
+
+No `8b` frame survived or appears in the prototype. These states deliberately extrapolate the
+adjacent redesign grammar; `docs/design/cockpit/NOTES.md` records the exception. Do not claim a
+pixel comparison to a nonexistent frame.
 
 ### R1 — Connecting
 
@@ -34,15 +38,16 @@ Every action carries `expectedGeneration` and an `idempotencyKey`
 flush at N+5.
 
 Naively re-sending with a refreshed generation would deliver the operator's message into a
-conversation that has moved on — the agent may have finished the turn, changed mode, asked and
+conversation that has moved on — the agent may have finished the turn, changed profile, asked and
 been answered, or failed.
 
 At flush time, for each queued message:
 
 1. Re-read the session's current generation and capabilities.
-2. If the session is **materially unchanged** — same turn, same mode, still steerable — send with
+2. If the session is **materially unchanged** — same turn, same execution profile, still
+   deliverable — send with
    the refreshed generation and the original idempotency key.
-3. If it has **materially moved** — the turn ended, the mode changed, an attention request
+3. If it has **materially moved** — the turn ended, the profile changed, an attention request
    appeared or resolved, the capability is gone — **do not send.** Surface the message back in
    the composer with what changed, and let the operator decide.
 4. If the session no longer exists, or the plane no longer permits the action, say so and keep
@@ -56,9 +61,8 @@ operator does not remember writing must not appear in an agent's queue.
 
 ### R4 — Session ended
 
-Offers to continue in the same worktree carrying the history, **rather than going grey**. That is
-`thread/fork` or a resume with the same `worktreePath` — and where neither is available, the
-offer is absent rather than broken.
+Offers a new draft in the same worktree and, only where a provider advertises it, exact resume.
+It does not claim to fork/carry history through an unimplemented provider method.
 
 ### R5 — Empty
 
@@ -75,16 +79,17 @@ resolved workspaces (`GET /api/v1/workspaces`) and repos discovered from any ses
    `account/usage/read` / `account/rateLimits/read` (appendix §1.4).
 4. **How to attach from a terminal.**
 
-The access dropdown sits with (2) because it is changeable mid-session (spec 06 R2).
+The execution profile sits with (2); it is editable only where and when the plane advertises
+`set-profile` (spec 06).
 
-**No lease controls** (spec 06 R8).
+**No writer-lease controls** (spec 06).
 
 ### R7 — Capabilities are sentences, never provider strings
 
 > Capabilities are plain sentences with a tick / question mark / cross — **never provider strings
 > like `danger-full-access`.**
 
-This is where `SessionControl.withheld` (spec 01 R7) earns its place: a cross needs a reason, and
+This is where `SessionControl.withheld` (spec 01) earns its place: a cross needs a reason, and
 "the provider does not support changing the model mid-session" is a sentence while
 `set-model: false` is not.
 
@@ -120,12 +125,11 @@ The existing iOS PWA work — safe-area utilities, `overscroll-behavior: none`,
 black-translucent status bar, `--touch-target: 2.75rem` on coarse pointers — carries over from
 `web/src/styles.css` and `web/index.html`. Keep it; it is already correct.
 
-### R10 — One board component or two?
+### R10 — One model, two presentations
 
-Open (spec 05 Q2). The three-band phone list is a different information structure, not a
-narrower board — bands are not columns. **Recommend one `buildBoard` producing both groupings**
-(spec 04 R5) with two presentation components, so ordering and state derivation cannot drift
-between viewports.
+The three-band phone list is a different layout, not a narrower desktop column board. One pure
+board/state model feeds separate desktop-column and mobile-band components so ordering,
+attention exactness, and state derivation cannot drift.
 
 ## Requirements — first run (`13c`)
 
@@ -144,17 +148,17 @@ choosing rather than at the point of failing.
 
 ### R12 — The hook bridge belongs in first run
 
-Spec 03's installer writes to the operator's `~/.claude/settings.json` / `~/.codex/hooks.json`.
+Spec 03's CLI installer may edit the operator's provider settings.
 That is a consequential, consent-requiring action and first run is where it should be offered —
 with the diff shown, the benefit stated ("see and answer sessions you started in a terminal"),
-and declining fully supported.
+and the exact CLI command shown. Declining is fully supported.
 
 Never install as a side effect of setup completing.
 
 ## Removals (spec 13)
 
 `access-sheet.tsx` is rewritten into the session panel — its `AttachCommand` copy behaviour and
-terminal preview survive; the lease-adjacent surface does not (§C2).
+terminal preview survive; the writer-coordination affordance does not (spec 13).
 
 ## Acceptance criteria
 
@@ -172,9 +176,5 @@ terminal preview survive; the lease-adjacent surface does not (§C2).
 9. First run asks for a folder and offers nearby repos; the host step is skippable; a host
    missing a harness is reported without failing.
 10. The hook bridge is offered, never installed silently, and declining leaves settings untouched.
-
-## Open questions
-
-- **Q1.** "Lost the daemon 40s ago… a snapshot from 10:31" needs a server timestamp on the
-  snapshot. `StateSnapshot` carries `seq`; confirm it also carries a wall-clock time, or add one.
-- **Q2 (spec 05 Q2 / R10).** One board model, two presentations — confirm.
+11. Staleness uses the existing required `StateSnapshot.generatedAt` wall-clock value; it is not
+    inferred from sequence numbers or browser receipt time.

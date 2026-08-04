@@ -1,109 +1,105 @@
 # Security model
 
-Agent Manager is a single-user, local control plane for processes that may
-already have broad filesystem and command access. Treat access to its browser
-session or owner control socket as access to the underlying agents.
+Agent Manager is a single-user personal control plane for agents that may already have broad
+filesystem and command access. Treat access to an authenticated browser session or the private
+owner socket as access to those agents.
 
-## Trust boundaries
+## Network and browser boundary
 
-- The HTTP server binds only to `127.0.0.1`. It refuses other configured bind
-  addresses, unknown `Host` values, and mutation requests from unknown origins.
-- A local browser starts with a short-lived, single-use secret delivered in the
-  URL fragment. The fragment is exchanged for an HttpOnly, SameSite cookie and
-  immediately removed from browser history. Bootstrap secrets are held only in
-  memory and can be reissued only through the owner-only Unix socket.
-- Browser mutations require both the session cookie and a CSRF token. Session
-  controls additionally require a short, single-writer lease bound to the auth
-  session, actor, browser client ID, and rotating token. The shipped UI acquires
-  a 60-second lease only when an action is sent and renews it automatically as needed.
-  Lease state is not presented as an access switch. A competing browser gets an
-  explicit conflict and may deliberately take over subsequent writes.
-- Tailscale access is opt-in. The server accepts only the exact configured
-  device host and login identity relayed by a loopback Tailscale Serve proxy.
-  The design assumes the local macOS account and its processes are trusted;
-  loopback proxy headers are not a defense against a malicious process already
-  running as that local user.
-- The owner Unix socket and state directory are mode `0600`/`0700`. It exposes
-  a closed command set for bootstrap, panic lock, and native attach lifecycle;
-  it is not a shell or generic RPC bridge.
-- SSH hosts are selected only by configured stable IDs. Targets are validated,
-  OpenSSH runs without a local shell, and a persistent JSON-lines bridge
-  exchanges a remote owner-socket bootstrap entirely inside the SSH login. The
-  remote HTTP service remains loopback-only; its cookie and CSRF token are never
-  returned to the browser or stored by the controller.
+- HTTP binds to `127.0.0.1` only and rejects unknown Host/Origin values. Optional private remote
+  access is an exact Tailscale Serve HTTPS route back to loopback; Funnel is never used.
+- Browser bootstrap is a short-lived, single-use URL-fragment secret exchanged for an HttpOnly,
+  SameSite cookie and removed from history. The private owner socket is the only token issuer.
+- Browser mutations require session cookie, CSRF token, expected generation, idempotency key,
+  and a short principal/client-bound writer lease. The UI acquires/renews/releases the lease
+  automatically; a competing window receives an explicit conflict and may take over subsequent
+  writes. The losing action is not replayed.
+- Global session state/SSE is metadata-only. Exact prompts, options, messages, commands, diffs,
+  paths, and transcript snippets are available only through authenticated selected-session
+  routes with `Cache-Control: no-store`.
+- PWA cache contains only the versioned public shell/assets/fonts. API, auth, SSE, health,
+  source maps, and session data are never cached. Wire/build epoch mismatch fails closed and
+  forces a current shell/update.
 
-## Provider and terminal safety
+## Hook boundary
 
-- Existing Codex and Claude sessions are observation/attach targets only.
-  Attach is offered only for an unambiguous tmux target. Agent Manager does not
-  adopt external sessions into its semantic control plane.
-- Semantic queue, steer, interrupt, mode, and request-response actions are
-  available only for sessions created and owned by this manager process.
-- Codex uses a fresh private App Server Unix socket and refuses to connect to or
-  replace a pre-existing socket. Claude uses a pinned Agent SDK Query.
-- Native commands are a closed, validated argv union and are spawned with
-  `shell: false`. No browser-supplied executable, path, or shell fragment is
-  accepted.
-- Tmux support is read-only pane capture plus native attach. There is no
-  `send-keys`, browser terminal, or arbitrary command execution endpoint.
-- Claude native attach is allowed only after the managed query is idle and its
-  queue is drained. The CLI reports the native child lifecycle through the
-  owner socket so the manager can reclaim the session after exit.
-- Managed native attach is exclusive: preparation releases any browser lease,
-  the browser exposes only the guarded `agent-manager attach` wrapper, and
-  semantic writes stay disabled while the native controller owns the session.
-  An ambiguous child lifecycle or reclaim fails closed rather than allowing two
-  concurrent controllers.
+Claude hooks post to a provider-specific loopback route authenticated by a high-entropy
+per-install token. The route is exempt from browser cookie/CSRF because it is not a browser, but
+retains loopback/Host checks, constant-time token validation, body/time limits, no-store, and
+redaction. Tokens never enter browser state or logs.
 
-## Persistence and audit
+Codex hooks execute a pinned absolute command shim with `shell: false`; the shim posts stdin to a
+separate Codex route/token. Codex requires explicit trust of the exact hook hash. Claude and
+Codex payloads and return schemas are parsed separately.
 
-Configuration, SQLite state, and the owner socket live in private user-owned
-locations. Session creation and actions are idempotency-keyed before provider
-dispatch. Interrupted or ambiguous dispatches become `unknown` and are never
-replayed automatically. Audit rows store action metadata, a SHA-256 payload
-digest, character count, and a fixed structural summary—not message text,
-answers, denial reasons, or arbitrary provider results.
+Only an exact held provider request may become respondable. External Claude is limited to
+`PermissionRequest`; Codex is limited to request shapes verified against the pinned command-hook
+integration. Pending decisions are memory-only, single-resolution UUIDs. Timeout, shutdown, or
+error releases the hook with a provider-safe no-decision/empty successful result, so a terminal
+is never wedged waiting for the browser. Hooks do not grant queue, steer, settings, process
+ownership, or arbitrary message injection.
 
-Pane previews, provider requests, messages, reasoning, tool arguments/results,
-command output, and diffs can contain sensitive project data. They are allowed
-only in the authenticated selected-session detail/activity routes. The global
-session collection, global SSE feed and replay ring retain metadata only;
-attention records there omit exact questions, options, summaries, and tool
-input. Selected activity is bounded and volatile in memory and is never written
-to SQLite, action audit rows, or service logs.
+Installation is explicit from the CLI, shows the exact diff, requires confirmation, modifies
+only Agent Manager-owned entries, and never touches managed policy. Disposable integration tests
+use isolated settings overlays and do not alter global settings/trust or existing sessions.
 
-Before selected activity reaches the browser, secret-shaped object fields and
-recognized bearer/OpenAI/GitHub/Slack/AWS/private-key forms are redacted and
-unsafe terminal/bidirectional control characters are stripped. Provider HTML is
-never interpreted. Hidden system/developer prompts, signatures,
-encrypted/redacted thinking, raw protocol envelopes, environment values,
-terminal stdin, and internal stack traces are excluded structurally rather than
-depending only on token-pattern scanning.
+## Provider, controller, and terminal boundary
 
-All provider responses use an ephemeral dispatch path, so safety never depends
-on a presentation-layer secret flag remaining available. Answer values and
-denial reasons are not stored in the durable action outbox, idempotency receipts,
-or audit details; if acknowledgement is lost, the outcome becomes unknown
-instead of replaying the response. Transcript paths and reader errors are not returned to the browser.
-Activity/detail responses use `Cache-Control: no-store`; users should avoid
-exposing the cockpit through any proxy other than the exact private Tailscale
-Serve route.
+- Every action is gated by the session's live exact capability set. Ownership labels, withheld
+  prose, UI state, and capability ceilings never authorize an action.
+- Unknown or multiple foreign controllers withdraw semantic writes while observation continues.
+  Reclaim is explicit and fails closed; absence of a transition event is not proof of exclusive
+  ownership.
+- Shared Codex daemon attachment was rejected by the two-client safety gate. Agent Manager never
+  connects to, starts, restarts, stops, bootstraps, or enables remote control on the user's
+  daemon. `codex-private`, the single isolated manager-owned app-server path, is the only managed
+  Codex plane.
+- Manager-owned Claude uses the pinned Agent SDK Query. `Query.close()` is available only for a
+  query Agent Manager owns. External Claude has no semantic queue/steer/end channel.
+- Native attach commands are a closed validated argv union with pinned absolute executables and
+  `shell: false`. The browser receives only the Agent Manager wrapper, never raw provider argv.
+  Tmux is read-only capture/attach; there is no `send-keys` or browser terminal.
+- `Open in editor` is an authenticated CSRF-protected server action. The browser supplies only a
+  normalized session/file identity. The server enforces worktree containment/no symlink escape
+  and invokes one configured pinned editor executable with `shell: false`; unsupported remote or
+  deleted paths have no action.
 
-## Panic lock
+## Filesystem and persistence
 
-`agent-manager panic-lock` closes the control plane, releases leases, removes
-the owner socket, and stops manager-owned provider transports. It first writes
-a persistent owner-only sentinel, so startup remains blocked even if live
-cleanup is incomplete. It deliberately does not kill native children or type
-into unrelated existing agent or tmux sessions. After inspecting the host, the
-user must run `agent-manager panic-unlock` to permit startup again.
+The state directory and owner socket are private/current-user owned (`0700`/`0600`). This
+pre-prototype may cold-reset only its exact incompatible `config.json`, SQLite database and
+sidecars, and obsolete browser caches. It never resets provider transcripts/settings/hooks,
+credentials, repositories, worktrees, tmux state, or the user's daemon.
 
-## Operational trust limits
+Session creation/actions are idempotency-keyed before provider dispatch. Ambiguous outcomes are
+`unknown` and never replayed automatically. Audit records contain structural metadata, a payload
+digest, character count, and fixed summary—not prompt/answer/denial text or arbitrary provider
+results.
 
-The Tailscale installer requires its chosen HTTPS port to be unused and scopes
-removal to the owned `/` path. It rechecks the persisted device identity and
-route after mutation, but the Tailscale CLI does not provide a transactional
-compare-and-swap; another trusted local process editing Serve concurrently can
-race that operation. Executable paths persisted into the LaunchAgent are
-canonicalized and restricted to root/current-user ownership. Administrators
-and root remain trusted host principals.
+Selected activity is a bounded volatile materialization and replay ring, not durable history.
+Its prefix eviction is visible. Transcript/plan reads reuse a session-scoped hardened reader:
+allowed roots, current-user ownership, no symlink components/leaf, `O_NOFOLLOW`, bounded reads,
+and dev/inode verification after open. There is no general filesystem read or fake history
+endpoint.
+
+Before browser delivery, secret-shaped fields and recognized credential/private-key forms are
+redacted, unsafe terminal/bidirectional control characters are stripped, and provider HTML is
+never interpreted. Hidden system/developer prompts, encrypted/redacted thinking, signatures,
+raw protocol envelopes, environment values, terminal stdin, and internal stack traces are
+excluded structurally.
+
+## Remote and host trust
+
+SSH targets are configured stable IDs. OpenSSH is invoked without a local shell and a bounded
+JSON-lines bridge bootstraps the remote private owner socket; remote cookies/CSRF tokens never
+reach the browser/controller. Wire mismatch refuses the bridge until the explicitly named host
+is reinstalled.
+
+The Tailscale installer owns one exact route, requires the selected HTTPS port to be unused, and
+rechecks local login/device identity before removal. Tailscale does not provide transactional
+compare-and-swap, so another trusted local process can race a Serve edit. The local macOS user,
+administrators, and root remain trusted host principals.
+
+Notifications are local-only and have no Push transport. Default lock-screen content is generic;
+exact question, command, cwd, or answer text is never placed in a notification. Notification
+actions only focus/select the session and cannot mutate provider state.

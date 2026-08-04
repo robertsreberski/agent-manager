@@ -9,7 +9,7 @@ const EPOCH = "epoch-1";
 
 function message(overrides: Partial<ActivityMessageItem> = {}): ActivityMessageItem {
   return {
-    schemaVersion: 1,
+    schemaVersion: 3,
     id: "message-1",
     sessionId: SESSION_ID,
     provider: "codex",
@@ -36,7 +36,7 @@ function message(overrides: Partial<ActivityMessageItem> = {}): ActivityMessageI
 
 function frame(value: { type: ActivityFrame["type"]; seq: number; [key: string]: unknown }): ActivityFrame {
   return {
-    schemaVersion: 1,
+    schemaVersion: 3,
     streamEpoch: EPOCH,
     sessionId: SESSION_ID,
     provider: "codex",
@@ -123,11 +123,11 @@ describe("useSessionActivity", () => {
         item: message({ revision: 2, state: "complete", text: "Complete" }),
       }));
     });
-    expect(result.current.hasSnapshot).toBe(false);
+    expect(result.current.streamEpoch).toBeNull();
     expect(scheduled).toHaveLength(1);
 
     act(() => scheduled.values().next().value?.(16));
-    expect(result.current.hasSnapshot).toBe(true);
+    expect(result.current.streamEpoch).toBe(EPOCH);
     expect(result.current.items[0]).toMatchObject({ text: "Complete", state: "complete" });
     expect(result.current.updateCount).toBe(2);
   });
@@ -160,7 +160,7 @@ describe("useSessionActivity", () => {
       source.readyState = TestEventSource.CLOSED;
       source.onerror?.(new Event("error"));
     });
-    expect(result.current).toMatchObject({ connection: "offline", hasSnapshot: false, items: [] });
+    expect(result.current).toMatchObject({ connection: "offline", streamEpoch: null, items: [] });
   });
 
   it("reconnects without a cursor when an append exposes a protocol gap", () => {
@@ -175,7 +175,7 @@ describe("useSessionActivity", () => {
       }));
       scheduled.values().next().value?.(16);
     });
-    expect(result.current.hasSnapshot).toBe(true);
+    expect(result.current.streamEpoch).toBe(EPOCH);
 
     act(() => {
       source.emit("activity.append", frame({
@@ -193,7 +193,7 @@ describe("useSessionActivity", () => {
 
     expect(source.close).toHaveBeenCalledOnce();
     expect(TestEventSource.instances).toHaveLength(2);
-    expect(result.current).toMatchObject({ connection: "connecting", hasSnapshot: false, items: [] });
+    expect(result.current).toMatchObject({ connection: "connecting", streamEpoch: null, items: [] });
   });
 
   it("closes and clears the old stream on deselect or session change", () => {
@@ -205,11 +205,11 @@ describe("useSessionActivity", () => {
 
     rerender({ selectedId: null });
     expect(first.close).toHaveBeenCalledOnce();
-    expect(result.current).toMatchObject({ sessionId: null, items: [], hasSnapshot: false });
+    expect(result.current).toMatchObject({ sessionId: null, items: [], streamEpoch: null });
 
     rerender({ selectedId: "claude:new" });
     expect(TestEventSource.instances).toHaveLength(2);
-    expect(result.current).toMatchObject({ sessionId: "claude:new", items: [], hasSnapshot: false });
+    expect(result.current).toMatchObject({ sessionId: "claude:new", items: [], streamEpoch: null });
     const second = TestEventSource.instances[1]!;
     unmount();
     expect(second.close).toHaveBeenCalledOnce();

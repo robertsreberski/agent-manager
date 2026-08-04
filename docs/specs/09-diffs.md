@@ -1,6 +1,6 @@
 # 09 — Diff viewer
 
-**Status:** Draft · **Depends on:** 05 · **Design frames:** `10a` (inline), `10b` (review drawer),
+**Status:** Accepted · **Depends on:** 05 · **Design frames:** `10a` (inline), `10b` (review drawer),
 `13a` (phone)
 
 ## Purpose
@@ -13,12 +13,10 @@ the weakest surface in the current cockpit.
 
 `ActivityFileChangeItem` (`src/activity/types.ts:119-123`) carries
 `changes: { path, operation, diff }[]` where `operation` is `add | update | delete | rename` and
-`diff` is raw unified-diff text. Codex streams patch updates through
-`item/fileChange/patchUpdated` and `turn/diff/updated`; the `diff` append channel already exists
-(`ActivityAppendChannel` includes `"diff"`).
-
-Everything this spec needs is already in the payload. **The parsing is client-side; no new
-backend surface is required.**
+`diff` is raw unified-diff text. Current Codex emits changing full upserts plus a final aggregate
+turn diff, not a token append stream. Debounce parsing changing running upserts and always perform
+a final parse on completion. Claude gets a diff only from an actual file-change item; generic
+tool calls do not synthesize one.
 
 ## Requirements — inline (`10a`)
 
@@ -45,9 +43,10 @@ The diff is provider text. Treat it as untrusted input, not as something well-fo
 - Binary and "file too large" markers render as what they are, not as an empty diff.
 - The item may be `truncated: true` (`ActivityItemBase`) — say so at the boundary rather than
   presenting a partial patch as complete.
-- Diffs arrive incrementally via the `diff` append channel. Re-parsing on every append at token
-  frequency is wasteful — parse on a debounce or on completion, and keep the frame-coalescing
-  guarantee (`use-session-activity.ts:100-117`) intact.
+- Changing upserts can arrive frequently. Parse on a debounce while active, finalize on
+  completion, and keep the frame-coalescing guarantee intact.
+- Prefer the final `turn/diff` aggregate. Otherwise use the latest item-level file change. The
+  same patch must not render twice.
 
 ### R3 — `expand` only expands what the patch contains
 
@@ -80,13 +79,16 @@ Split view is two 50% columns divided by a 1px rule, lined up hunk for hunk.
 observes and steers agents; it is not a git client, and a write surface here would be a second
 way to change the working tree that the agent does not know about.
 
-`Open in editor` is a local process spawn with an editor argv. Reuse the pinned-executable
-discipline from `src/ops/attach.ts` (`assertPinnedExecutable`, absolute path only, no shell) —
-this is the same class of operation as attach and deserves the same handling.
+`Open in editor` is an authenticated, CSRF-protected server operation. The browser sends only a
+normalized session/file identity, never an executable or argv. The server resolves the path
+inside the session worktree with no symlink escape and spawns one configured pinned absolute
+editor executable with `shell: false`. Deleted paths and remote files without a configured
+remote editor do not offer the action.
 
 ### R6 — Read state
 
-Per-file `read` flags are client state, scoped to the session and the turn. A file that changes
+Per-file `read` flags are client state, keyed by session, turn, normalized file identity, and a
+hash of operation/path/diff. A file that changes
 again after being marked read becomes unread — the tick means "I have seen these lines", not "I
 have seen this filename".
 
@@ -120,5 +122,6 @@ correctness problem. If it is wanted later it layers on top of the parsed lines.
    from disk to produce context.
 7. Split view aligns hunk for hunk; toggling preserves scroll position and read state.
 8. On a 390px viewport, no diff scrolls the page horizontally.
-9. `Open in editor` spawns with an absolute pinned executable and no shell.
+9. `Open in editor` rejects browser executables, symlink/workspace escapes, deleted paths, and
+   unsupported remote paths; the valid path uses one pinned executable and no shell.
 10. Nothing in the review drawer mutates the working tree.

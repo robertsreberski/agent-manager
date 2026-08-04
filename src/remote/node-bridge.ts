@@ -1,39 +1,22 @@
 import { createInterface } from "node:readline";
+import { once } from "node:events";
 import type { Readable, Writable } from "node:stream";
 
 import { requestBootstrapFromControlSocket } from "../server/control-socket.ts";
-
-export interface NodeBridgeRequest {
-  id: string;
-  method: "GET" | "POST" | "DELETE";
-  path: string;
-  body?: unknown;
-  controlLease?: string;
-}
-
-export interface NodeBridgeResponse {
-  id: string;
-  status: number;
-  body: unknown;
-}
-
-function safeRequest(value: unknown): NodeBridgeRequest | null {
-  if (!value || typeof value !== "object") return null;
-  const input = value as Partial<NodeBridgeRequest>;
-  if (
-    typeof input.id !== "string"
-    || input.id.length < 1
-    || input.id.length > 128
-    || !/^[A-Za-z0-9._:-]+$/u.test(input.id)
-    || (input.method !== "GET" && input.method !== "POST" && input.method !== "DELETE")
-    || typeof input.path !== "string"
-    || input.path.length > 8_192
-    || !input.path.startsWith("/api/v1/")
-    || input.path.includes("\0")
-    || (input.controlLease !== undefined && typeof input.controlLease !== "string")
-  ) return null;
-  return input as NodeBridgeRequest;
-}
+import {
+  ActivitySseDecoder,
+  assertNodeServiceIdentity,
+  localBuildId,
+  parseNodeBridgeRequest,
+  REMOTE_BRIDGE_MAX_LINE_BYTES,
+  REMOTE_BRIDGE_PROTOCOL_VERSION,
+  type NodeBridgeRequest,
+  type NodeBridgeResponse,
+  type NodeBridgeRpcRequest,
+  type NodeBridgeStreamClosed,
+  type NodeBridgeStreamOpenRequest,
+} from "./protocol.ts";
+import { WIRE_SCHEMA_VERSION } from "../shared/wire.ts";
 
 function firstCookie(response: Response): string {
   const values = typeof response.headers.getSetCookie === "function"
@@ -62,6 +45,7 @@ async function establishNodeSession(controlSocketPath: string): Promise<{
   });
   if (!response.ok) throw new Error(`Remote node bootstrap failed (${String(response.status)})`);
   const payload = await response.json() as Record<string, unknown>;
+  assertNodeServiceIdentity(payload);
   if (typeof payload.csrfToken !== "string") throw new Error("Remote node CSRF token is missing");
   return { origin, cookie: firstCookie(response), csrfToken: payload.csrfToken };
 }
@@ -78,20 +62,26 @@ export async function runNodeBridge(options: {
   const input = options.input ?? process.stdin;
   const output = options.output ?? process.stdout;
   const session = await establishNodeSession(options.controlSocketPath);
-  output.write(`${JSON.stringify({ type: "ready", protocol: 1 })}\n`);
-  const lines = createInterface({ input, crlfDelay: Infinity });
-  for await (const line of lines) {
-    if (Buffer.byteLength(line, "utf8") > 2 * 1_024 * 1_024) continue;
-    let request: NodeBridgeRequest | null = null;
-    try {
-      request = safeRequest(JSON.parse(line) as unknown);
-    } catch {
-      // Malformed input gets a bounded response instead of terminating the node.
+  const streams = new Map<string, AbortController>();
+  let outputClosed = false;
+  const write = async (message: unknown): Promise<void> => {
+    if (outputClosed) return;
+    const line = `${JSON.stringify(message)}\n`;
+    if (Buffer.byteLength(line, "utf8") > REMOTE_BRIDGE_MAX_LINE_BYTES) {
+      throw new Error("Remote bridge message exceeded its size limit");
     }
-    if (!request) {
-      output.write(`${JSON.stringify({ id: "invalid", status: 400, body: { error: { code: "BRIDGE_REQUEST_INVALID", message: "Invalid bridge request" } } })}\n`);
-      continue;
-    }
+    if (output.write(line)) return;
+    await once(output, "drain");
+  };
+  await write({
+    type: "hello",
+    protocolVersion: REMOTE_BRIDGE_PROTOCOL_VERSION,
+    wireSchemaVersion: WIRE_SCHEMA_VERSION,
+    buildId: localBuildId(),
+  });
+
+  const rpc = async (request: NodeBridgeRpcRequest): Promise<void> => {
+    let reply: NodeBridgeResponse;
     try {
       const response = await fetch(`${session.origin}${request.path}`, {
         method: request.method,
@@ -119,10 +109,10 @@ export async function runNodeBridge(options: {
           body = { error: { code: "REMOTE_RESPONSE_INVALID", message: "Remote node returned non-JSON data" } };
         }
       }
-      const reply: NodeBridgeResponse = { id: request.id, status: response.status, body };
-      output.write(`${JSON.stringify(reply)}\n`);
+      reply = { type: "response", id: request.id, status: response.status, body };
     } catch (error) {
-      const reply: NodeBridgeResponse = {
+      reply = {
+        type: "response",
         id: request.id,
         status: 502,
         body: {
@@ -132,7 +122,121 @@ export async function runNodeBridge(options: {
           },
         },
       };
-      output.write(`${JSON.stringify(reply)}\n`);
+    }
+    await write(reply);
+  };
+
+  const closeMessage = async (
+    id: string,
+    reason: NodeBridgeStreamClosed["reason"],
+    message: string | null,
+  ): Promise<void> => {
+    streams.delete(id);
+    await write({ type: "stream.closed", id, reason, message } satisfies NodeBridgeStreamClosed);
+  };
+
+  const stream = async (request: NodeBridgeStreamOpenRequest, controller: AbortController): Promise<void> => {
+    try {
+      const response = await fetch(`${session.origin}${request.path}`, {
+        method: "GET",
+        headers: {
+          accept: "text/event-stream",
+          cookie: session.cookie,
+          ...(request.lastEventId ? { "last-event-id": request.lastEventId } : {}),
+        },
+        signal: controller.signal,
+      });
+      if (!response.ok || !response.body) {
+        const text = await response.text();
+        let body: unknown = null;
+        try {
+          body = text ? JSON.parse(text) as unknown : null;
+        } catch {
+          body = { error: { code: "REMOTE_STREAM_INVALID", message: "Remote node returned non-JSON stream error" } };
+        }
+        await write({ type: "stream.opened", id: request.id, status: response.status, body });
+        await closeMessage(request.id, "error", `Remote activity stream failed (${String(response.status)})`);
+        return;
+      }
+      const contentType = response.headers.get("content-type") ?? "";
+      if (!contentType.toLowerCase().startsWith("text/event-stream")) {
+        await write({
+          type: "stream.opened",
+          id: request.id,
+          status: 502,
+          body: { error: { code: "REMOTE_STREAM_INVALID", message: "Remote node did not return an event stream" } },
+        });
+        await closeMessage(request.id, "error", "Remote node did not return an event stream");
+        return;
+      }
+      await write({ type: "stream.opened", id: request.id, status: response.status, body: null });
+      const decoder = new ActivitySseDecoder();
+      for await (const chunk of response.body) {
+        if (controller.signal.aborted) break;
+        for (const event of decoder.push(chunk)) {
+          await write({
+            type: "stream.frame",
+            id: request.id,
+            eventId: event.eventId,
+            data: event.data,
+          });
+        }
+      }
+      if (!controller.signal.aborted) {
+        for (const event of decoder.finish()) {
+          await write({
+            type: "stream.frame",
+            id: request.id,
+            eventId: event.eventId,
+            data: event.data,
+          });
+        }
+      }
+      await closeMessage(
+        request.id,
+        controller.signal.aborted ? "cancelled" : "remote-end",
+        null,
+      );
+    } catch (error) {
+      await closeMessage(
+        request.id,
+        controller.signal.aborted ? "cancelled" : "error",
+        controller.signal.aborted
+          ? null
+          : error instanceof Error ? error.message : "Remote activity stream failed",
+      );
+    }
+  };
+
+  const lines = createInterface({ input, crlfDelay: Infinity });
+  for await (const line of lines) {
+    if (Buffer.byteLength(line, "utf8") > REMOTE_BRIDGE_MAX_LINE_BYTES) continue;
+    let request: NodeBridgeRequest | null = null;
+    try {
+      request = parseNodeBridgeRequest(JSON.parse(line) as unknown);
+    } catch {
+      // Malformed input gets a bounded response instead of terminating the node.
+    }
+    if (!request) {
+      await write({ type: "response", id: "invalid", status: 400, body: { error: { code: "BRIDGE_REQUEST_INVALID", message: "Invalid bridge request" } } });
+      continue;
+    }
+    if (request.type === "rpc") {
+      void rpc(request).catch(() => undefined);
+    } else if (request.type === "stream.open") {
+      if (streams.has(request.id)) {
+        await write({ type: "stream.opened", id: request.id, status: 409, body: { error: { code: "REMOTE_STREAM_EXISTS", message: "Stream id already exists" } } });
+        continue;
+      }
+      const controller = new AbortController();
+      streams.set(request.id, controller);
+      void stream(request, controller).catch(() => undefined);
+    } else {
+      const controller = streams.get(request.id);
+      if (controller) controller.abort();
     }
   }
+  outputClosed = true;
+  for (const controller of streams.values()) controller.abort();
+  streams.clear();
 }

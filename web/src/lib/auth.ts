@@ -1,6 +1,6 @@
 import type { AuthSession } from "../types";
 
-export type BrowserSessionFailure = "offline" | "unauthorized" | "locked" | "unknown";
+export type BrowserSessionFailure = "offline" | "unauthorized" | "unknown";
 
 export class BrowserSessionError extends Error {
   constructor(
@@ -50,9 +50,6 @@ async function exchangeBootstrapSecret(secret: string): Promise<void> {
     if (response.status === 401) {
       throw new BrowserSessionError("This bootstrap link is invalid or has expired.", "unauthorized", 401);
     }
-    if (response.status === 423) {
-      throw new BrowserSessionError("Agent Manager is locked.", "locked", 423);
-    }
     throw new BrowserSessionError("Could not establish a secure cockpit session.", "unknown", response.status);
   }
 }
@@ -86,9 +83,6 @@ export async function establishBrowserSession(): Promise<AuthSession> {
         "unauthorized",
         401,
       );
-    }
-    if (response.status === 423) {
-      throw new BrowserSessionError("Agent Manager is locked.", "locked", 423);
     }
     throw new BrowserSessionError("Could not verify this browser session.", "unknown", response.status);
   }

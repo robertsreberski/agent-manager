@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { discoverTmuxPanes } from "./tmux.ts";
-import type { Runtime } from "./types.ts";
+import { attachTmuxTerminals, discoverTmuxPanes } from "./tmux.ts";
+import type { Runtime, SessionRecord } from "./types.ts";
 
 test("tmux discovery never probes regular files or an unsafe shared directory", () => {
   const root = mkdtempSync(join(tmpdir(), "agent-manager-tmux-security-"));
@@ -91,4 +91,91 @@ test("tmux discovery uses the pinned executable from its runtime", () => {
   discoverTmuxPanes(runtime);
   assert.ok(commands.length > 0);
   assert.equal(commands.every((command) => command === "/opt/pinned/bin/tmux"), true);
+});
+
+test("local tmux evidence never attaches to a remote session with a colliding pid", () => {
+  const remote: SessionRecord = {
+    id: "studio:codex:thread-1",
+    provider: "codex",
+    providerThreadId: "thread-1",
+    providerTreeId: "thread-1",
+    parentId: null,
+    providerTurnId: null,
+    depth: 0,
+    hostId: "studio",
+    hostLabel: "Studio",
+    name: "Remote session",
+    cwd: "/remote/workspace",
+    kind: "interactive",
+    presence: "live",
+    status: "running",
+    providerStatus: null,
+    pid: 123,
+    runtimePid: 123,
+    startedAt: null,
+    updatedAt: "2026-08-04T12:00:00.000Z",
+    childSummary: {
+      total: 0,
+      running: 0,
+      waiting: 0,
+      idle: 0,
+      completed: 0,
+      failed: 0,
+      interrupted: 0,
+      unknown: 0,
+    },
+    todoProgress: null,
+    statusSource: "process",
+    source: "remote-fixture",
+    profile: { value: null, providerValue: null, source: "inferred", confidence: "heuristic" },
+    model: { value: null, providerValue: null, source: "inferred", confidence: "heuristic" },
+    effort: { value: null, providerValue: null, source: "inferred", confidence: "heuristic" },
+    attention: [],
+    terminal: null,
+    control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [] },
+    workspaceIdentity: null,
+    generation: 0,
+  };
+
+  const local: SessionRecord = {
+    ...remote,
+    id: "local:codex:thread-2",
+    providerThreadId: "thread-2",
+    providerTreeId: "thread-2",
+    hostId: "local",
+    hostLabel: "This Mac",
+    name: "Local session",
+    cwd: "/local/workspace",
+  };
+
+  const [remoteResult, localResult] = attachTmuxTerminals(
+    [remote, local],
+    [{
+      socketName: "default",
+      socketPath: null,
+      session: "local",
+      window: "main",
+      windowIndex: 0,
+      paneIndex: 0,
+      paneId: "%1",
+      panePid: 123,
+      tty: "ttys001",
+      attachedClients: 1,
+    }],
+    [{
+      pid: 123,
+      ppid: 1,
+      startedAtMs: null,
+      tty: "ttys001",
+      state: "S+",
+      command: "codex",
+      executable: "codex",
+    }],
+  );
+
+  assert.equal(remoteResult, remote);
+  assert.equal(remoteResult?.terminal, null);
+  assert.equal(remoteResult?.control.plane, "observe-only");
+  assert.equal(localResult?.terminal?.paneId, "%1");
+  assert.deepEqual(localResult?.control.capabilities, ["preview", "attach"]);
 });

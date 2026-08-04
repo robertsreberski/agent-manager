@@ -1,6 +1,7 @@
 import { Worker } from "node:worker_threads";
 
 import type { Diagnostic, SessionRecord } from "../core/types.ts";
+import { WorkspaceIdentityResolver } from "../core/worktree.ts";
 import type {
   DiscoveryScanRequest,
   DiscoveryWorkerMessage,
@@ -36,6 +37,8 @@ export interface DiscoveryReconcilerOptions {
   recentWindowSeconds?: number;
   workerFactory?: () => WorkerPort;
   now?: () => Date;
+  workspaceBudgetMs?: number;
+  workspaceResolver?: Pick<WorkspaceIdentityResolver, "resolveMany">;
 }
 
 function defaultWorkerFactory(): WorkerPort {
@@ -64,6 +67,8 @@ export class DiscoveryReconciler {
   #onUpdate: (update: DiscoveryUpdate) => void;
   #workerFactory: () => WorkerPort;
   #now: () => Date;
+  #workspaceBudgetMs: number;
+  #workspaceResolver: Pick<WorkspaceIdentityResolver, "resolveMany">;
   #worker: WorkerPort | null = null;
   #interval: NodeJS.Timeout | null = null;
   #scanTimeout: NodeJS.Timeout | null = null;
@@ -80,6 +85,10 @@ export class DiscoveryReconciler {
     this.#onUpdate = options.onUpdate;
     this.#workerFactory = options.workerFactory ?? defaultWorkerFactory;
     this.#now = options.now ?? (() => new Date());
+    this.#workspaceBudgetMs = Math.max(100, options.workspaceBudgetMs ?? 2_500);
+    this.#workspaceResolver = options.workspaceResolver ?? new WorkspaceIdentityResolver({
+      totalBudgetMs: this.#workspaceBudgetMs,
+    });
   }
 
   start(): void {
@@ -155,18 +164,50 @@ export class DiscoveryReconciler {
 
   #handleMessage(message: DiscoveryWorkerMessage): void {
     if (message.id !== this.#activeId || this.#stopping) return;
-    this.#clearActive();
     if (message.type === "result") {
-      this.#onUpdate({
-        ok: true,
-        stale: false,
-        generatedAt: message.generatedAt,
-        sessions: message.sessions,
-        diagnostics: message.diagnostics,
-      });
+      void this.#publishResult(message);
+      return;
     } else {
+      this.#clearActive();
       this.#fail(message.message);
     }
+    this.#runQueued();
+  }
+
+  async #publishResult(
+    message: Extract<DiscoveryWorkerMessage, { type: "result" }>,
+  ): Promise<void> {
+    const diagnostics = [...message.diagnostics];
+    let sessions = message.sessions;
+    try {
+      const localCwds = sessions.flatMap((session) =>
+        session.hostId === "local" && session.cwd !== null ? [session.cwd] : []
+      );
+      const identities = await this.#workspaceResolver.resolveMany(localCwds, {
+        budgetMs: this.#workspaceBudgetMs,
+      });
+      sessions = sessions.map((session) => ({
+        ...session,
+        workspaceIdentity: session.hostId === "local" && session.cwd !== null
+          ? identities.get(session.cwd) ?? null
+          : session.workspaceIdentity,
+      }));
+    } catch {
+      diagnostics.push({
+        provider: "system",
+        level: "warning",
+        message: "Git workspace facts are temporarily unavailable.",
+      });
+    }
+    if (message.id !== this.#activeId || this.#stopping) return;
+    this.#clearActive();
+    this.#onUpdate({
+      ok: true,
+      stale: false,
+      generatedAt: message.generatedAt,
+      sessions,
+      diagnostics,
+    });
     this.#runQueued();
   }
 

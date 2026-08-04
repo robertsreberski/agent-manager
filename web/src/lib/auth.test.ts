@@ -50,16 +50,4 @@ describe("establishBrowserSession", () => {
     expect(failure).toMatchObject({ kind: "offline", status: null });
   });
 
-  it("classifies the panic boundary without treating it as an offline response", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
-      error: { code: "CONTROL_PLANE_LOCKED", message: "Agent Manager is locked" },
-    }), {
-      status: 423,
-      headers: { "content-type": "application/json" },
-    })));
-
-    const failure = await establishBrowserSession().catch((error: unknown) => error);
-    expect(failure).toBeInstanceOf(BrowserSessionError);
-    expect(failure).toMatchObject({ kind: "locked", status: 423 });
-  });
 });

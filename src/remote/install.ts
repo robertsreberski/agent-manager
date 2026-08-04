@@ -1,12 +1,13 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { isSafeSshTarget } from "../ops/config.ts";
+import { inspectPackedPackage } from "./package-policy.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -18,6 +19,34 @@ export interface RemoteNodeInstallResult {
 
 function shellLiteral(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+export function resolveAgentManagerPackageRoot(moduleUrl = import.meta.url): string {
+  let directory = dirname(fileURLToPath(moduleUrl));
+  while (true) {
+    const manifestPath = join(directory, "package.json");
+    try {
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as unknown;
+      if (
+        manifest
+        && typeof manifest === "object"
+        && !Array.isArray(manifest)
+        && (manifest as Record<string, unknown>).name === "agent-manager"
+      ) {
+        return directory;
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !(error instanceof SyntaxError)) {
+        throw error;
+      }
+    }
+
+    const parent = dirname(directory);
+    if (parent === directory) {
+      throw new Error("Could not locate the Agent Manager package root");
+    }
+    directory = parent;
+  }
 }
 
 /**
@@ -33,7 +62,9 @@ export async function installRemoteNode(options: {
   scpExecutable?: string;
 }): Promise<RemoteNodeInstallResult> {
   if (!isSafeSshTarget(options.target)) throw new Error("Invalid SSH target");
-  const packageRoot = resolve(options.packageRoot ?? fileURLToPath(new URL("../../", import.meta.url)));
+  const packageRoot = options.packageRoot
+    ? resolve(options.packageRoot)
+    : resolveAgentManagerPackageRoot();
   if (!existsSync(join(packageRoot, "dist", "cli", "index.js"))) {
     throw new Error("Build Agent Manager before installing a remote node (`pnpm build`)");
   }
@@ -43,11 +74,18 @@ export async function installRemoteNode(options: {
     const packed = await execFileAsync(options.npmExecutable ?? "npm", [
       "pack",
       "--json",
+      "--ignore-scripts",
       "--pack-destination",
       temporary,
     ], { cwd: packageRoot, maxBuffer: 2 * 1_024 * 1_024 });
-    const report = JSON.parse(packed.stdout) as Array<{ filename?: unknown }>;
-    const filename = typeof report[0]?.filename === "string" ? report[0].filename : null;
+    const inspection = inspectPackedPackage(packed.stdout);
+    if (inspection.violations.length > 0) {
+      const detail = inspection.violations
+        .map((violation) => `${violation.path}: ${violation.message}`)
+        .join("; ");
+      throw new Error(`Refusing remote install of invalid package: ${detail}`);
+    }
+    const filename = inspection.filename;
     if (!filename || basename(filename) !== filename) throw new Error("npm pack did not return a safe package filename");
     const localPackage = join(temporary, filename);
     await execFileAsync(options.scpExecutable ?? "/usr/bin/scp", [
@@ -66,11 +104,6 @@ export async function installRemoteNode(options: {
       "if [ \"$node_major\" -lt 24 ]; then echo 'Agent Manager requires Node 24' >&2; exit 1; fi",
       "npm install --global --ignore-scripts \"$package\"",
       "agent-manager service install >/dev/null",
-      "uid=$(id -u)",
-      "plist=\"$HOME/Library/LaunchAgents/local.agent-manager.cockpit.plist\"",
-      "launchctl bootout \"gui/$uid/local.agent-manager.cockpit\" >/dev/null 2>&1 || true",
-      "launchctl bootstrap \"gui/$uid\" \"$plist\"",
-      "launchctl kickstart -k \"gui/$uid/local.agent-manager.cockpit\"",
     ].join("; ");
     const remoteCommand = `/bin/zsh -lc ${shellLiteral(script)}`;
     await execFileAsync(options.sshExecutable ?? "/usr/bin/ssh", [

@@ -3,7 +3,16 @@ import { randomUUID } from "node:crypto";
 import { createInterface, type Interface } from "node:readline";
 
 import { isSafeSshTarget } from "../ops/config.ts";
-import type { NodeBridgeRequest, NodeBridgeResponse } from "./node-bridge.ts";
+import {
+  parseNodeBridgeHello,
+  parseNodeBridgeMessage,
+  REMOTE_BRIDGE_MAX_LINE_BYTES,
+  type NodeBridgeHello,
+  type NodeBridgeResponse,
+  type NodeBridgeRpcRequest,
+  type NodeBridgeStreamFrame,
+  type NodeBridgeStreamOpened,
+} from "./protocol.ts";
 
 export class RemoteNodeError extends Error {
   readonly status: number;
@@ -30,6 +39,20 @@ interface PendingRequest {
   timer: NodeJS.Timeout;
 }
 
+interface PendingStream {
+  opened: boolean;
+  resolveOpen: () => void;
+  rejectOpen: (error: Error) => void;
+  timer: NodeJS.Timeout;
+  onFrame: (frame: NodeBridgeStreamFrame) => void;
+  onClose: (error: Error | null) => void;
+}
+
+export interface RemoteActivityStream {
+  readonly remoteBuildId: string;
+  close(): void;
+}
+
 function responseError(response: NodeBridgeResponse): RemoteNodeError {
   const envelope = response.body && typeof response.body === "object"
     ? response.body as Record<string, unknown>
@@ -54,7 +77,10 @@ export class SshNodeClient {
   #resolveReady: (() => void) | null = null;
   #rejectReady: ((error: Error) => void) | null = null;
   #pending = new Map<string, PendingRequest>();
+  #streams = new Map<string, PendingStream>();
   #stderr = "";
+  #hello: NodeBridgeHello | null = null;
+  #readyTimer: NodeJS.Timeout | null = null;
 
   constructor(options: { target: string; sshExecutable?: string }) {
     if (!isSafeSshTarget(options.target)) throw new Error("Invalid SSH target");
@@ -62,7 +88,10 @@ export class SshNodeClient {
     this.sshExecutable = options.sshExecutable ?? "/usr/bin/ssh";
   }
 
-  async request<T = unknown>(input: Omit<NodeBridgeRequest, "id">, timeoutMs = 20_000): Promise<T> {
+  async request<T = unknown>(
+    input: Omit<NodeBridgeRpcRequest, "type" | "id">,
+    timeoutMs = 20_000,
+  ): Promise<T> {
     await this.#ensureReady();
     const child = this.#child;
     if (!child || child.killed || !child.stdin.writable) throw new Error("SSH node bridge is unavailable");
@@ -74,7 +103,7 @@ export class SshNodeClient {
       }, timeoutMs);
       timer.unref();
       this.#pending.set(id, { resolve, reject, timer });
-      child.stdin.write(`${JSON.stringify({ id, ...input })}\n`, (error) => {
+      child.stdin.write(`${JSON.stringify({ type: "rpc", id, ...input })}\n`, (error) => {
         if (!error) return;
         clearTimeout(timer);
         this.#pending.delete(id);
@@ -83,6 +112,73 @@ export class SshNodeClient {
     });
     if (response.status < 200 || response.status >= 300) throw responseError(response);
     return response.body as T;
+  }
+
+  async openActivityStream(options: {
+    path: string;
+    lastEventId?: string;
+    onFrame: (frame: NodeBridgeStreamFrame) => void;
+    onClose: (error: Error | null) => void;
+    timeoutMs?: number;
+  }): Promise<RemoteActivityStream> {
+    await this.#ensureReady();
+    const child = this.#child;
+    const hello = this.#hello;
+    if (!child || child.killed || !child.stdin.writable || !hello) {
+      throw new Error("SSH node bridge is unavailable");
+    }
+    const id = `stream-${randomUUID()}`;
+    const timeoutMs = options.timeoutMs ?? 20_000;
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.#streams.delete(id);
+        const active = this.#child;
+        if (active && !active.killed && active.stdin.writable) {
+          active.stdin.write(`${JSON.stringify({ type: "stream.close", id })}\n`);
+        }
+        reject(new Error(`SSH activity stream timed out after ${String(timeoutMs)}ms`));
+      }, timeoutMs);
+      timer.unref();
+      this.#streams.set(id, {
+        opened: false,
+        resolveOpen: resolve,
+        rejectOpen: reject,
+        timer,
+        onFrame: options.onFrame,
+        onClose: options.onClose,
+      });
+      const message = {
+        type: "stream.open",
+        id,
+        path: options.path,
+        ...(options.lastEventId ? { lastEventId: options.lastEventId } : {}),
+      };
+      child.stdin.write(`${JSON.stringify(message)}\n`, (error) => {
+        if (!error) return;
+        const stream = this.#streams.get(id);
+        if (!stream) return;
+        clearTimeout(stream.timer);
+        this.#streams.delete(id);
+        stream.rejectOpen(error);
+      });
+    });
+    let closed = false;
+    return {
+      remoteBuildId: hello.buildId,
+      close: () => {
+        if (closed) return;
+        closed = true;
+        const stream = this.#streams.get(id);
+        if (stream) {
+          clearTimeout(stream.timer);
+          this.#streams.delete(id);
+        }
+        const active = this.#child;
+        if (active && !active.killed && active.stdin.writable) {
+          active.stdin.write(`${JSON.stringify({ type: "stream.close", id })}\n`);
+        }
+      },
+    };
   }
 
   close(): void {
@@ -114,6 +210,11 @@ export class SshNodeClient {
       this.#resolveReady = resolve;
       this.#rejectReady = reject;
     });
+    this.#readyTimer = setTimeout(() => {
+      this.#reset(new Error("SSH node bridge handshake timed out"));
+      if (!child.killed) child.kill("SIGTERM");
+    }, 15_000);
+    this.#readyTimer.unref();
     this.#lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
     this.#lines.on("line", (line) => this.#onLine(line));
     child.stderr.on("data", (chunk: Buffer) => {
@@ -129,39 +230,136 @@ export class SshNodeClient {
   }
 
   #onLine(line: string): void {
+    if (Buffer.byteLength(line, "utf8") > REMOTE_BRIDGE_MAX_LINE_BYTES) {
+      const child = this.#child;
+      this.#reset(new Error("SSH node bridge sent an oversized message"));
+      child?.kill("SIGTERM");
+      return;
+    }
     let value: unknown;
     try {
       value = JSON.parse(line) as unknown;
     } catch {
+      const child = this.#child;
+      this.#reset(new Error("SSH node bridge sent invalid JSON"));
+      child?.kill("SIGTERM");
       return;
     }
-    if (value && typeof value === "object" && (value as { type?: unknown }).type === "ready") {
-      this.#resolveReady?.();
+    if (!this.#hello) {
+      try {
+        this.#hello = parseNodeBridgeHello(value);
+      } catch (error) {
+        const child = this.#child;
+        this.#reset(error instanceof Error ? error : new Error("Remote node protocol mismatch"));
+        child?.kill("SIGTERM");
+        return;
+      }
+      if (this.#readyTimer) clearTimeout(this.#readyTimer);
+      this.#readyTimer = null;
+      const ready = this.#resolveReady;
       this.#resolveReady = null;
       this.#rejectReady = null;
+      ready?.();
       return;
     }
-    const response = value as Partial<NodeBridgeResponse>;
-    if (typeof response.id !== "string" || typeof response.status !== "number") return;
-    const pending = this.#pending.get(response.id);
-    if (!pending) return;
-    clearTimeout(pending.timer);
-    this.#pending.delete(response.id);
-    pending.resolve(response as NodeBridgeResponse);
+    const message = parseNodeBridgeMessage(value);
+    if (!message || message.type === "hello") {
+      const child = this.#child;
+      this.#reset(new Error("SSH node bridge sent an invalid message"));
+      child?.kill("SIGTERM");
+      return;
+    }
+    if (message.type === "response") {
+      const pending = this.#pending.get(message.id);
+      if (!pending) return;
+      clearTimeout(pending.timer);
+      this.#pending.delete(message.id);
+      pending.resolve(message);
+      return;
+    }
+    const stream = this.#streams.get(message.id);
+    if (!stream) return;
+    if (message.type === "stream.opened") {
+      this.#onStreamOpened(message, stream);
+      return;
+    }
+    if (message.type === "stream.frame") {
+      if (!stream.opened) {
+        this.#failStream(message.id, new Error("Remote activity frame arrived before stream acknowledgement"));
+        return;
+      }
+      try {
+        stream.onFrame(message);
+      } catch (error) {
+        this.#failStream(
+          message.id,
+          error instanceof Error ? error : new Error("Remote activity frame was rejected"),
+        );
+      }
+      return;
+    }
+    const error = message.reason === "error"
+      ? new Error(message.message ?? "Remote activity stream failed")
+      : null;
+    clearTimeout(stream.timer);
+    this.#streams.delete(message.id);
+    if (!stream.opened) {
+      stream.rejectOpen(error ?? new Error("Remote activity stream closed before opening"));
+    } else {
+      stream.onClose(error);
+    }
+  }
+
+  #onStreamOpened(message: NodeBridgeStreamOpened, stream: PendingStream): void {
+    clearTimeout(stream.timer);
+    if (message.status < 200 || message.status >= 300) {
+      this.#streams.delete(message.id);
+      stream.rejectOpen(responseError({
+        type: "response",
+        id: message.id,
+        status: message.status,
+        body: message.body,
+      }));
+      return;
+    }
+    stream.opened = true;
+    stream.resolveOpen();
+  }
+
+  #failStream(id: string, error: Error): void {
+    const stream = this.#streams.get(id);
+    if (!stream) return;
+    clearTimeout(stream.timer);
+    this.#streams.delete(id);
+    if (!stream.opened) stream.rejectOpen(error);
+    else stream.onClose(error);
+    const child = this.#child;
+    if (child && !child.killed && child.stdin.writable) {
+      child.stdin.write(`${JSON.stringify({ type: "stream.close", id })}\n`);
+    }
   }
 
   #reset(error: Error): void {
+    if (this.#readyTimer) clearTimeout(this.#readyTimer);
+    this.#readyTimer = null;
     this.#lines?.close();
     this.#lines = null;
     this.#rejectReady?.(error);
     this.#resolveReady = null;
     this.#rejectReady = null;
     this.#ready = null;
+    this.#hello = null;
     this.#child = null;
     for (const pending of this.#pending.values()) {
       clearTimeout(pending.timer);
       pending.reject(error);
     }
     this.#pending.clear();
+    for (const stream of this.#streams.values()) {
+      clearTimeout(stream.timer);
+      if (!stream.opened) stream.rejectOpen(error);
+      else stream.onClose(error);
+    }
+    this.#streams.clear();
   }
 }

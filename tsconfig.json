@@ -24,8 +24,6 @@
     }
   },
   "include": [
-    "agent-sessions.ts",
-    "agent-sessions.test.ts",
     "src/**/*.ts",
     "src/**/*.tsx",
     "web/**/*.ts",

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { ActivityMutation } from "../../activity/index.ts";
+import type { ManagedSessionRecoveryRecord } from "../../server/contracts.ts";
 import {
   CodexManagedAdapter,
   CodexManagedCreationError,
@@ -128,12 +129,97 @@ function threadResult(
   };
 }
 
+function threadResultWithIdentity(
+  id: string,
+  treeId: string | null,
+  parentThreadId: string | null,
+  cwd = "/workspace",
+): JsonObject {
+  const result = threadResult(id);
+  const thread = result.thread as JsonObject;
+  result.cwd = cwd;
+  thread.cwd = cwd;
+  if (treeId !== null) thread.sessionId = treeId;
+  if (parentThreadId !== null) thread.parentThreadId = parentThreadId;
+  return result;
+}
+
 function threadResultWithRawStatus(status?: JsonValue): JsonObject {
   const result = threadResult();
   const thread = result.thread as JsonObject;
   if (status === undefined) delete thread.status;
   else thread.status = status;
   return result;
+}
+
+function accountUsageResult(): JsonObject {
+  return {
+    summary: {
+      lifetimeTokens: 1_250_000,
+      peakDailyTokens: 240_000,
+      longestRunningTurnSec: 840,
+      currentStreakDays: 4,
+      longestStreakDays: 9,
+    },
+    dailyUsageBuckets: [
+      { startDate: "2026-08-03", tokens: 12_000 },
+      { startDate: "2026-08-04", tokens: 18_500 },
+    ],
+  };
+}
+
+function accountRateLimitsResult(): JsonObject {
+  return {
+    rateLimits: {
+      limitId: "codex",
+      limitName: "Codex",
+      primary: { usedPercent: 42, windowDurationMins: 300, resetsAt: 1_775_299_200 },
+      secondary: null,
+      credits: { hasCredits: true, unlimited: false, balance: "provider-private-balance" },
+      individualLimit: null,
+      spendControlReached: false,
+      planType: "plus",
+      rateLimitReachedType: null,
+    },
+    rateLimitsByLimitId: null,
+    rateLimitResetCredits: {
+      availableCount: 1,
+      credits: [{
+        id: "provider-private-credit-id",
+        resetType: "codexRateLimits",
+        status: "available",
+        grantedAt: 1_775_000_000,
+        expiresAt: null,
+        title: "Reset",
+        description: "Private provider detail",
+      }],
+    },
+  };
+}
+
+function modelCatalogEntry(input: {
+  model: string;
+  displayName: string;
+  description?: string;
+  hidden?: boolean;
+  isDefault?: boolean;
+  defaultEffort?: string;
+  efforts?: readonly string[];
+}): JsonObject {
+  const efforts = input.efforts ?? ["low", "medium", "high"];
+  return {
+    id: `catalog:${input.model}`,
+    model: input.model,
+    displayName: input.displayName,
+    description: input.description ?? "Provider model",
+    hidden: input.hidden ?? false,
+    isDefault: input.isDefault ?? false,
+    defaultReasoningEffort: input.defaultEffort ?? "medium",
+    supportedReasoningEfforts: efforts.map((reasoningEffort) => ({
+      reasoningEffort,
+      description: `${reasoningEffort} reasoning`,
+    })),
+  };
 }
 
 function methodMessages(
@@ -191,17 +277,168 @@ test("negotiates the 0.146 protocol and sends initialized after initialize", asy
   await adapter.dispose();
 });
 
-test("fails closed to read-only when the App Server version drifts", async () => {
+test("withdraws every capability when the App Server version drifts", async () => {
   const { adapter } = await initializedAdapter(
     new FakeCodexTransport("codex-app-server/0.147.0"),
   );
   assert.equal(adapter.capabilities.compatible, false);
-  assert.deepEqual(adapter.capabilities.controls, ["thread.read"]);
+  assert.deepEqual(adapter.capabilities.controls, []);
   await assert.rejects(
     adapter.startThread({ cwd: "/workspace" }),
     /outside supported range/u,
   );
   await adapter.dispose();
+});
+
+test("reads pinned Codex account facts and projects only bounded display-safe fields", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("account/usage/read", accountUsageResult);
+  transport.handlers.set("account/rateLimits/read", accountRateLimitsResult);
+
+  const facts = await adapter.readAccountFacts();
+  assert.deepEqual(facts, {
+    available: true,
+    source: "provider-api",
+    usage: {
+      summary: {
+        lifetimeTokens: 1_250_000,
+        peakDailyTokens: 240_000,
+        longestRunningTurnSec: 840,
+        currentStreakDays: 4,
+        longestStreakDays: 9,
+      },
+      recentDays: [
+        { date: "2026-08-03", tokens: 12_000 },
+        { date: "2026-08-04", tokens: 18_500 },
+      ],
+    },
+    rateLimits: [{
+      label: "Codex",
+      planType: "plus",
+      primary: { usedPercent: 42, windowDurationMins: 300, resetsAt: 1_775_299_200 },
+      secondary: null,
+      spendControlReached: false,
+    }],
+  });
+  const serialized = JSON.stringify(facts);
+  assert.doesNotMatch(serialized, /private|balance|credit-id/u);
+  for (const method of ["account/usage/read", "account/rateLimits/read"]) {
+    const message = methodMessages(transport, method)[0];
+    assert.ok(message);
+    assert.equal(Object.hasOwn(message, "params"), false, `${method} has no params in the 0.146 schema`);
+  }
+  await adapter.dispose();
+});
+
+test("omits individually unsupported Codex account methods without inventing zeroes", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("account/usage/read", accountUsageResult);
+
+  const facts = await adapter.readAccountFacts();
+  assert.equal(facts.usage?.summary.lifetimeTokens, 1_250_000);
+  assert.equal(facts.rateLimits, null);
+  await adapter.dispose();
+});
+
+test("reads the bounded Codex model catalog with per-model effort truth", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("model/list", (params) => {
+    if (params.cursor === "page-2") {
+      assert.deepEqual(params, { limit: 63, includeHidden: false, cursor: "page-2" });
+      return {
+        data: [modelCatalogEntry({
+          model: "gpt-codex-deep",
+          displayName: "Codex Deep",
+          efforts: ["high", "xhigh", "ultra"],
+          defaultEffort: "xhigh",
+        })],
+        // The live 0.146 response may omit its optional terminal cursor.
+      };
+    }
+    assert.deepEqual(params, { limit: 64, includeHidden: false });
+    return {
+      data: [
+        modelCatalogEntry({
+          model: "gpt-codex",
+          displayName: "Codex",
+          description: "Balanced",
+          isDefault: true,
+          efforts: ["low", "medium", "high"],
+          defaultEffort: "medium",
+        }),
+        modelCatalogEntry({
+          model: "hidden-model",
+          displayName: "Hidden",
+          hidden: true,
+        }),
+      ],
+      nextCursor: "page-2",
+    };
+  });
+
+  assert.deepEqual(await adapter.listModels(), [
+    {
+      value: "gpt-codex",
+      label: "Codex",
+      description: "Balanced",
+      isDefault: true,
+      defaultEffort: "medium",
+      efforts: ["low", "medium", "high"],
+    },
+    {
+      value: "gpt-codex-deep",
+      label: "Codex Deep",
+      description: "Provider model",
+      isDefault: false,
+      defaultEffort: "xhigh",
+      efforts: ["high", "xhigh", "ultra"],
+    },
+  ]);
+  assert.equal(methodMessages(transport, "model/list").length, 2);
+  await adapter.dispose();
+});
+
+test("fails closed on malformed Codex model effort metadata", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("model/list", () => ({
+    data: [modelCatalogEntry({
+      model: "broken",
+      displayName: "Broken",
+      efforts: ["high", "high"],
+      defaultEffort: "high",
+    })],
+    nextCursor: null,
+  }));
+  await assert.rejects(adapter.listModels(), /effort option/u);
+
+  const missingIdentity = modelCatalogEntry({
+    model: "missing-identity",
+    displayName: "Missing identity",
+  });
+  delete missingIdentity.id;
+  transport.handlers.set("model/list", () => ({
+    data: [missingIdentity],
+    nextCursor: null,
+  }));
+  await assert.rejects(adapter.listModels(), /catalog identity/u);
+  await adapter.dispose();
+});
+
+test("rejects malformed or timed-out Codex account payloads", async () => {
+  const malformed = await initializedAdapter();
+  malformed.transport.handlers.set("account/usage/read", () => ({
+    ...accountUsageResult(),
+    accessToken: "must-never-cross",
+  }));
+  malformed.transport.handlers.set("account/rateLimits/read", accountRateLimitsResult);
+  await assert.rejects(malformed.adapter.readAccountFacts());
+  await malformed.adapter.dispose();
+
+  const timedOut = await initializedAdapter(new FakeCodexTransport(), 10);
+  timedOut.transport.handlers.set("account/usage/read", () => new Promise(() => undefined));
+  timedOut.transport.handlers.set("account/rateLimits/read", () => new Promise(() => undefined));
+  await assert.rejects(timedOut.adapter.readAccountFacts(), /timed out/u);
+  await timedOut.adapter.dispose();
 });
 
 test("validates the initial message before creating a provider thread", async () => {
@@ -217,7 +454,7 @@ test("validates the initial message before creating a provider thread", async ()
   await adapter.dispose();
 });
 
-test("starts a managed thread, sets planning mode, and dispatches initial input", async () => {
+test("starts a managed thread, stages a plan profile, and dispatches initial input", async () => {
   const { adapter, transport } = await initializedAdapter();
   transport.handlers.set("thread/start", () => threadResult());
   transport.handlers.set("thread/settings/update", () => null);
@@ -227,12 +464,13 @@ test("starts a managed thread, sets planning mode, and dispatches initial input"
 
   const state = await adapter.startThread({
     cwd: "/workspace",
-    mode: "planning",
+    profile: "plan",
     initialMessage: "Build the cockpit",
     approvalPolicy: "on-request",
     sandbox: "workspace-write",
   });
-  assert.equal(state.mode, "planning");
+  assert.equal(state.profile, null);
+  assert.equal(state.pendingSettings?.profile, "plan");
   assert.equal(state.status, "running");
   assert.equal(state.activeTurnId, "turn-1");
   const methods = transport.messages.map((message) => message.method);
@@ -247,7 +485,17 @@ test("starts a managed thread, sets planning mode, and dispatches initial input"
     threadId: "thread-1",
     collaborationMode: {
       mode: "plan",
-      settings: { model: "gpt-5.6" },
+      settings: {
+        model: "gpt-5.6",
+        reasoning_effort: null,
+        developer_instructions: null,
+      },
+    },
+    approvalPolicy: "on-request",
+    sandboxPolicy: {
+      type: "workspaceWrite",
+      writableRoots: ["/workspace"],
+      networkAccess: false,
     },
   });
   assert.deepEqual(methodMessages(transport, "turn/start")[0]?.params, {
@@ -255,6 +503,100 @@ test("starts a managed thread, sets planning mode, and dispatches initial input"
     input: [{ type: "text", text: "Build the cockpit" }],
     clientUserMessageId: "message-1",
   });
+  await adapter.dispose();
+});
+
+test("uses the thread/start default model to stage a null-model managed create", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("thread/start", (params) => {
+    assert.equal(Object.hasOwn(params, "model"), false);
+    return {
+      ...threadResult(),
+      reasoningEffort: "high",
+    };
+  });
+  transport.handlers.set("thread/settings/update", (params) => {
+    assert.deepEqual(params, {
+      threadId: "thread-1",
+      collaborationMode: {
+        mode: "default",
+        settings: {
+          model: "gpt-5.6",
+          reasoning_effort: "medium",
+          developer_instructions: null,
+        },
+      },
+      approvalPolicy: "never",
+      sandboxPolicy: { type: "dangerFullAccess" },
+      effort: "medium",
+    });
+    return {};
+  });
+  transport.handlers.set("turn/start", () => ({
+    turn: { id: "turn-default-model", status: "inProgress", items: [] },
+  }));
+
+  const bridge = new CodexProviderBridge({
+    adapter,
+    resolveWorkspace: () => "/workspace",
+  });
+  const view = await bridge.createSession({
+    provider: "codex",
+    workspaceId: "workspace",
+    initialMessage: "Dispatch with the provider default model",
+    profile: "full-access",
+    model: null,
+    effort: "medium",
+    idempotencyKey: "provider-default-model",
+  }, {
+    actor: { id: "local", kind: "local", displayName: "Local user" },
+    requestId: "provider-default-model",
+    signal: new AbortController().signal,
+    workspace: { id: "workspace", label: "Workspace", path: "/workspace" },
+  });
+
+  assert.equal(view.status, "running");
+  assert.equal(adapter.getThreadState("thread-1")?.model, "gpt-5.6");
+  assert.equal(methodMessages(transport, "thread/settings/update").length, 1);
+  assert.equal(methodMessages(transport, "turn/start").length, 1);
+  assert.deepEqual(methodMessages(transport, "turn/start")[0]?.params, {
+    threadId: "thread-1",
+    input: [{ type: "text", text: "Dispatch with the provider default model" }],
+    clientUserMessageId: "message-1",
+  });
+  bridge.dispose();
+  await adapter.dispose();
+});
+
+test("does not stage settings or dispatch when thread/start omits its required default model", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("thread/start", () => {
+    const result = threadResult();
+    delete result.model;
+    return result;
+  });
+
+  await assert.rejects(
+    adapter.startThread({
+      cwd: "/workspace",
+      profile: "full-access",
+      effort: "medium",
+      initialMessage: "Must remain unsent",
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof CodexManagedCreationError);
+      assert.equal(error.threadState.threadId, "thread-1");
+      assert.equal(error.issue.stage, "profile");
+      assert.equal(error.issue.outcome, "rejected");
+      assert.equal(error.issue.initialMessageDisposition, "not-sent");
+      assert.match(error.issue.message, /did not return the model/u);
+      return true;
+    },
+  );
+
+  assert.equal(methodMessages(transport, "thread/settings/update").length, 0);
+  assert.equal(methodMessages(transport, "turn/start").length, 0);
+  assert.ok(adapter.getThreadState("thread-1"));
   await adapter.dispose();
 });
 
@@ -374,11 +716,16 @@ test("treats an initial turn/start timeout as uncertain and never leaves the pro
 
 test("keeps the ordinary queue gated for an existing thread with unknown status", async () => {
   const { adapter, transport } = await initializedAdapter();
-  transport.handlers.set("thread/read", () => threadResultWithRawStatus());
+  transport.handlers.set("thread/resume", () => threadResultWithRawStatus());
   transport.handlers.set("turn/start", () => ({
     turn: { id: "turn-must-not-start", status: "inProgress", items: [] },
   }));
-  await adapter.readThread("thread-1");
+  await adapter.adoptThread("thread-1", {
+    threadId: "thread-1",
+    treeId: null,
+    parentThreadId: null,
+    cwd: "/workspace",
+  });
 
   const queued = await adapter.queueMessage("thread-1", "Wait for an idle boundary");
 
@@ -497,18 +844,28 @@ test("retains exact typed requests across unrelated events and answers once", as
   });
   assert.equal(adapter.getThreadState("thread-1")?.pendingRequests.length, 1);
 
-  await assert.rejects(
-    adapter.respondToRequest("thread-1", 17, { decision: "acceptForSession" }),
-    /Invalid or unsupported/u,
-  );
-  await adapter.respondToRequest("thread-1", 17, { decision: "accept" });
+  await adapter.respondToRequest("thread-1", 17, { decision: "acceptForSession" });
   assert.equal(adapter.getThreadState("thread-1")?.pendingRequests.length, 0);
   const response = transport.messages.at(-1);
-  assert.deepEqual(response, { jsonrpc: "2.0", id: 17, result: { decision: "accept" } });
+  assert.deepEqual(response, { jsonrpc: "2.0", id: 17, result: { decision: "acceptForSession" } });
   await assert.rejects(
     adapter.respondToRequest("thread-1", 17, { decision: "decline" }),
     /stale, resolved/u,
   );
+
+  transport.request(18, "item/commandExecution/requestApproval", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    itemId: "item-2",
+    startedAtMs: 2,
+    command: "git diff",
+  });
+  await adapter.respondToRequest("thread-1", 18, { decision: "accept" });
+  assert.deepEqual(transport.messages.at(-1), {
+    jsonrpc: "2.0",
+    id: 18,
+    result: { decision: "accept" },
+  });
   await adapter.dispose();
 });
 
@@ -547,6 +904,39 @@ test("provider-independent response envelopes map to exact Codex results", () =>
     decision: "deny",
     reason: "Not now",
   }), { decision: "decline" });
+  assert.deepEqual(codexRequestResponse(approval, {
+    kind: "decision",
+    decision: "allow",
+    persist: true,
+  }), { decision: "acceptForSession" });
+  assert.deepEqual(codexRequestResponse({
+    ...approval,
+    method: "item/fileChange/requestApproval",
+    kind: "file-change-approval",
+  }, {
+    kind: "decision",
+    decision: "allow",
+    persist: true,
+  }), { decision: "acceptForSession" });
+  assert.throws(() => codexRequestResponse(approval, {
+    kind: "decision",
+    decision: "deny",
+    persist: true,
+  }), /cannot persist a denied approval/);
+  assert.throws(() => codexRequestResponse({
+    ...approval,
+    method: "item/permissions/requestApproval",
+    kind: "permission-approval",
+    params: {
+      ...approval.params,
+      cwd: "/workspace",
+      permissions: { network: { enabled: true } },
+    },
+  }, {
+    kind: "decision",
+    decision: "allow",
+    persist: true,
+  }), /scoped to this turn/);
   assert.equal(encodeCodexRequestId(9), "n:9");
   assert.equal(decodeCodexRequestId("n:9"), 9);
   assert.equal(encodeCodexRequestId("9"), "s:9");
@@ -686,6 +1076,7 @@ test("Codex MCP elicitation fails closed across SessionView and action dispatch"
   const { adapter, transport } = await initializedAdapter();
   transport.handlers.set("thread/start", () => threadResult());
   transport.handlers.set("thread/settings/update", () => null);
+  transport.handlers.set("thread/unsubscribe", () => ({}));
   transport.handlers.set("turn/start", () => ({
     turn: { id: "turn-1", status: "inProgress", items: [] },
   }));
@@ -699,14 +1090,16 @@ test("Codex MCP elicitation fails closed across SessionView and action dispatch"
     signal: new AbortController().signal,
     workspace: { id: "workspace", label: "Workspace", path: "/workspace" },
   };
-  await bridge.createSession({
+  const created = await bridge.createSession({
     provider: "codex",
     workspaceId: "workspace",
     initialMessage: "Start",
-    mode: "planning",
-    accessMode: "sandboxed",
+    profile: "plan",
+    model: null,
+    effort: null,
     idempotencyKey: "create-elicit-session",
   }, context);
+  const releaseSelection = await bridge.acquireSelectedSession(created, context);
   transport.request(request.id, request.method, request.params);
   const view = bridge.getManagedSession("thread-1");
   assert.ok(view);
@@ -731,6 +1124,7 @@ test("Codex MCP elicitation fails closed across SessionView and action dispatch"
     ),
     false,
   );
+  await releaseSelection();
   bridge.dispose();
   await adapter.dispose();
 });
@@ -802,7 +1196,7 @@ test("multi-question envelopes map atomically by stable provider question ID", (
   );
 });
 
-test("updates mode from provider notifications and generates argv-only native attach", async () => {
+test("updates profile from provider notifications and generates argv-only native attach", async () => {
   const { adapter, transport } = await initializedAdapter();
   transport.handlers.set("thread/start", () => threadResult());
   await adapter.startThread({ cwd: "/workspace" });
@@ -811,10 +1205,12 @@ test("updates mode from provider notifications and generates argv-only native at
     threadSettings: {
       cwd: "/workspace",
       model: "gpt-5.6",
-      collaborationMode: { mode: "plan", settings: { model: "gpt-5.6" } },
+      approvalPolicy: "on-request",
+      sandboxPolicy: { type: "workspaceWrite" },
+      collaborationMode: { mode: "plan", settings: { developer_instructions: null } },
     },
   });
-  assert.equal(adapter.getThreadState("thread-1")?.mode, "planning");
+  assert.equal(adapter.getThreadState("thread-1")?.profile, "plan");
   assert.deepEqual(adapter.buildAttachCommand("thread-1"), {
     executable: "codex",
     args: [
@@ -829,13 +1225,603 @@ test("updates mode from provider notifications and generates argv-only native at
   await adapter.dispose();
 });
 
-test("method-not-found disables only the failed capability", async () => {
+test("method-not-found falls back to next-turn settings without optimistic state", async () => {
   const { adapter, transport } = await initializedAdapter();
   transport.handlers.set("thread/start", () => threadResult());
   await adapter.startThread({ cwd: "/workspace" });
-  await assert.rejects(adapter.setMode("thread-1", "planning"), /Method not found/u);
-  assert.equal(adapter.capabilities.controls.includes("mode.set"), false);
+  await adapter.setProfile("thread-1", "plan");
+  assert.equal(adapter.capabilities.settingsDelivery, "next-turn");
+  assert.equal(adapter.getThreadState("thread-1")?.profile, null);
+  assert.equal(adapter.getThreadState("thread-1")?.pendingSettings?.profile, "plan");
+  assert.equal(adapter.capabilities.controls.includes("profile.set"), true);
   assert.equal(adapter.capabilities.controls.includes("turn.queue"), true);
+  await adapter.dispose();
+});
+
+test("adopts by Thread.id and unsubscribe releases only this client", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("thread/resume", () => threadResult("foreign-thread"));
+  transport.handlers.set("thread/unsubscribe", () => ({ status: "unsubscribed" }));
+  const state = await adapter.adoptThread("foreign-thread", {
+    threadId: "foreign-thread",
+    treeId: null,
+    parentThreadId: null,
+    cwd: "/workspace",
+  });
+  assert.equal(state.threadId, "foreign-thread");
+  await adapter.releaseThread("foreign-thread");
+  assert.equal(adapter.getThreadState("foreign-thread"), null);
+  assert.equal(methodMessages(transport, "thread/unsubscribe").length, 1);
+  await adapter.dispose();
+});
+
+test("rejects read and resume responses that substitute a different Thread.id", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("thread/read", () => threadResult("wrong-thread"));
+  transport.handlers.set("thread/resume", () => threadResult("wrong-thread"));
+
+  await assert.rejects(
+    adapter.readThread("persisted-thread"),
+    /returned wrong-thread for requested thread persisted-thread/u,
+  );
+  assert.deepEqual(methodMessages(transport, "thread/read")[0]?.params, {
+    threadId: "persisted-thread",
+    includeTurns: false,
+  });
+  await assert.rejects(
+    adapter.resumeThread("persisted-thread"),
+    /returned wrong-thread for requested thread persisted-thread/u,
+  );
+  assert.equal(adapter.getThreadState("wrong-thread"), null);
+  assert.equal(adapter.getThreadState("persisted-thread"), null);
+  await adapter.dispose();
+});
+
+test("emits one truthful removal event for acknowledged end, archive, and delete", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  let nextThread = 0;
+  transport.handlers.set("thread/start", () => threadResult(`lifecycle-${++nextThread}`));
+  transport.handlers.set("thread/archive", () => ({}));
+  transport.handlers.set("thread/delete", () => ({}));
+  transport.handlers.set("thread/unsubscribe", () => ({}));
+  const removals: Array<{ threadId: string; reason: string }> = [];
+  const unsubscribe = adapter.subscribe((event) => {
+    if (event.type === "thread.removed") removals.push(event);
+  });
+
+  await adapter.startThread({ cwd: "/workspace" });
+  await adapter.archiveThread("lifecycle-1");
+  transport.notify("thread/archived", { threadId: "lifecycle-1" });
+  await adapter.startThread({ cwd: "/workspace" });
+  await adapter.deleteThread("lifecycle-2");
+  transport.notify("thread/deleted", { threadId: "lifecycle-2" });
+  await adapter.startThread({ cwd: "/workspace" });
+  await adapter.endThread("lifecycle-3");
+
+  assert.deepEqual(removals, [
+    { type: "thread.removed", threadId: "lifecycle-1", reason: "archived" },
+    { type: "thread.removed", threadId: "lifecycle-2", reason: "deleted" },
+    { type: "thread.removed", threadId: "lifecycle-3", reason: "ended" },
+  ]);
+  assert.deepEqual(adapter.listThreadStates(), []);
+  unsubscribe();
+  await adapter.dispose();
+});
+
+test("restores persisted ownership by capped exact reads and ref-counts selection", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  const recoveredResult = (): JsonObject => ({
+    cwd: "/workspace",
+    model: "gpt-5.6",
+    reasoningEffort: "high",
+    thread: {
+      id: "persisted-thread",
+      sessionId: "tree-1",
+      parentThreadId: "parent-thread",
+      cwd: "/workspace",
+      name: "Provider name",
+      source: "agent-manager",
+      status: { type: "idle" },
+      turns: [],
+    },
+  });
+  transport.handlers.set("thread/list", () => {
+    throw new Error("thread/list must not run during managed recovery");
+  });
+  transport.handlers.set("thread/read", (params) => {
+    if (params.threadId === "missing-thread") {
+      throw new Error("thread not loaded: missing-thread");
+    }
+    return recoveredResult();
+  });
+  transport.handlers.set("thread/resume", recoveredResult);
+  transport.handlers.set("turn/start", () => ({
+    turn: { id: "new-turn", status: "inProgress", items: [] },
+  }));
+  transport.handlers.set("turn/interrupt", () => ({}));
+  transport.handlers.set("thread/unsubscribe", () => ({}));
+  transport.handlers.set("model/list", () => ({
+    data: [modelCatalogEntry({
+      model: "gpt-5.6",
+      displayName: "GPT-5.6",
+      isDefault: true,
+      efforts: ["medium", "high", "xhigh"],
+      defaultEffort: "high",
+    })],
+    nextCursor: null,
+  }));
+  const changes: ReturnType<CodexProviderBridge["toSessionView"]>[] = [];
+  const removals: Array<{ managerSessionId: string; reason: string }> = [];
+  const activity: ActivityMutation[] = [];
+  const bridge = new CodexProviderBridge({
+    adapter,
+    resolveWorkspace: () => "/workspace",
+    now: () => new Date("2026-08-04T10:00:00.000Z"),
+    onSessionChanged: (session) => changes.push(session),
+    onSessionRemoved: (managerSessionId, reason) => {
+      removals.push({ managerSessionId, reason });
+    },
+    onActivity: (_managerSessionId, mutation) => activity.push(mutation),
+  });
+  const signal = new AbortController().signal;
+  const report = await bridge.restoreManagedSessions([
+    {
+      managerSessionId: "local:codex:persisted-thread",
+      provider: "codex",
+      providerThreadId: "persisted-thread",
+      workspaceId: "workspace-1",
+      workspacePath: "/workspace",
+      name: "Persisted cockpit name",
+      profile: "plan",
+      createdAt: "2026-08-03T09:00:00.000Z",
+    },
+    {
+      managerSessionId: "local:codex:missing-thread",
+      provider: "codex",
+      providerThreadId: "missing-thread",
+      workspaceId: "workspace-1",
+      workspacePath: "/workspace",
+      name: null,
+      profile: "execute",
+      createdAt: "2026-08-03T09:05:00.000Z",
+    },
+  ], signal);
+
+  assert.deepEqual(report, {
+    restoredSessionIds: ["local:codex:persisted-thread"],
+    failures: [{
+      managerSessionId: "local:codex:missing-thread",
+      providerThreadId: "missing-thread",
+      reason: "thread not loaded: missing-thread",
+    }],
+    truncated: false,
+  });
+  assert.equal(changes.length, 1, "validated read state must publish once after reconciliation");
+  assert.equal(changes[0]?.name, "Persisted cockpit name");
+  assert.equal(changes[0]?.cwd, "/workspace");
+  assert.equal(changes[0]?.providerTreeId, "tree-1");
+  assert.equal(changes[0]?.parentId, "local:codex:parent-thread");
+  assert.equal(changes[0]?.startedAt, "2026-08-03T09:00:00.000Z");
+  assert.equal(changes[0]?.control.authority, "manager");
+  assert.deepEqual(changes[0]?.control.capabilities, []);
+  assert.equal(adapter.getThreadState("persisted-thread"), null);
+  assert.equal(activity.length, 0);
+  assert.deepEqual(
+    transport.messages.map((message) => message.method),
+    ["initialize", "initialized", "thread/read", "thread/read"],
+  );
+  assert.equal(methodMessages(transport, "thread/list").length, 0);
+
+  const recovered = changes[0]!;
+  const context = {
+    actor: { id: "local", kind: "local" as const, displayName: "Local user" },
+    requestId: "post-restart-action",
+    signal,
+    workspace: null,
+  };
+  await assert.rejects(
+    bridge.performAction(recovered, {
+      type: "send",
+      delivery: "queue",
+      text: "Must remain unloaded",
+      expectedGeneration: recovered.generation,
+      idempotencyKey: "unselected-post-restart-action",
+    }, context),
+    /not selected or loaded/u,
+  );
+  assert.equal(methodMessages(transport, "turn/start").length, 0, "recovery never replays work");
+
+  const releaseFirst = await bridge.acquireSelectedSession(recovered, context);
+  const releaseSecond = await bridge.acquireSelectedSession(recovered, {
+    ...context,
+    requestId: "second-selected-client",
+  });
+  assert.equal(methodMessages(transport, "thread/resume").length, 1);
+  assert.equal(
+    (methodMessages(transport, "thread/resume")[0]?.params as JsonObject).excludeTurns,
+    true,
+  );
+  const selected = bridge.getManagedSession("persisted-thread");
+  assert.ok(selected);
+  assert.ok(selected.control.capabilities.includes("queue"));
+  assert.deepEqual(await bridge.getSettingsOptions(selected, context), {
+    source: "provider-api",
+    models: [{
+      value: "gpt-5.6",
+      label: "GPT-5.6",
+      description: "Provider model",
+      isDefault: true,
+      defaultEffort: "high",
+      efforts: ["medium", "high", "xhigh"],
+    }],
+  });
+  await bridge.performAction(selected, {
+    type: "send",
+    delivery: "queue",
+    text: "A new action after restart",
+    expectedGeneration: selected.generation,
+    idempotencyKey: "post-restart-action",
+  }, context);
+  assert.equal(methodMessages(transport, "turn/start").length, 1);
+
+  await releaseFirst();
+  assert.equal(methodMessages(transport, "thread/unsubscribe").length, 0);
+  await releaseSecond();
+  assert.equal(methodMessages(transport, "thread/unsubscribe").length, 1);
+  assert.equal(adapter.getThreadState("persisted-thread"), null);
+  assert.deepEqual(bridge.getManagedSession("persisted-thread")?.control.capabilities, []);
+
+  const releaseReselected = await bridge.acquireSelectedSession(recovered, {
+    ...context,
+    requestId: "reselected-client",
+  });
+  assert.equal(methodMessages(transport, "thread/resume").length, 2);
+
+  const active = bridge.getManagedSession("persisted-thread");
+  assert.ok(active);
+  await bridge.performAction(active, {
+    type: "end",
+    expectedGeneration: active.generation,
+    expectedProviderTurnId: active.providerTurnId ?? undefined,
+    idempotencyKey: "end-restored-session",
+  }, { ...context, requestId: "end-restored-session" });
+  assert.deepEqual(removals, [
+    {
+      managerSessionId: "local:codex:persisted-thread",
+      reason: "ended",
+    },
+  ]);
+  assert.equal(bridge.getManagedSession("persisted-thread"), null);
+  await releaseReselected();
+
+  bridge.dispose();
+  await adapter.dispose();
+});
+
+test("rejects repeated cold adoption identity drift without exposing controls or activity", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  const threadId = "cold-managed-thread";
+  const record: ManagedSessionRecoveryRecord = {
+    managerSessionId: `local:codex:${threadId}`,
+    provider: "codex",
+    providerThreadId: threadId,
+    workspaceId: "workspace-1",
+    workspacePath: "/workspace",
+    name: "Cold managed thread",
+    profile: "execute",
+    createdAt: "2026-08-03T09:00:00.000Z",
+  };
+  transport.handlers.set("thread/read", () =>
+    threadResultWithIdentity(threadId, "original-tree", "original-parent")
+  );
+  transport.handlers.set("thread/unsubscribe", () => ({}));
+  let resumeCount = 0;
+  transport.handlers.set("thread/resume", () => {
+    resumeCount += 1;
+    const itemId = `stale-adoption-${resumeCount}`;
+    transport.notify("item/started", {
+      threadId,
+      turnId: `stale-turn-${resumeCount}`,
+      item: { type: "agentMessage", id: itemId, text: "", phase: "commentary" },
+    });
+    transport.notify("item/agentMessage/delta", {
+      threadId,
+      turnId: `stale-turn-${resumeCount}`,
+      itemId,
+      delta: `must-not-leak-${resumeCount}`,
+    });
+    return threadResultWithIdentity(
+      threadId,
+      `wrong-tree-${resumeCount}`,
+      `wrong-parent-${resumeCount}`,
+    );
+  });
+  const changes: ReturnType<CodexProviderBridge["toSessionView"]>[] = [];
+  const activity: ActivityMutation[] = [];
+  const bridge = new CodexProviderBridge({
+    adapter,
+    resolveWorkspace: () => "/workspace",
+    onSessionChanged: (session) => changes.push(session),
+    onActivity: (_managerSessionId, mutation) => activity.push(mutation),
+  });
+  const signal = new AbortController().signal;
+
+  assert.deepEqual(await bridge.restoreManagedSessions([record], signal), {
+    restoredSessionIds: [record.managerSessionId],
+    failures: [],
+    truncated: false,
+  });
+  const original = bridge.getManagedSession(threadId);
+  assert.ok(original);
+  assert.equal(original.providerTreeId, "original-tree");
+  assert.equal(original.parentId, "local:codex:original-parent");
+  assert.deepEqual(original.control.capabilities, []);
+
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const cold = bridge.getManagedSession(threadId);
+    assert.ok(cold);
+    await assert.rejects(
+      bridge.acquireSelectedSession(cold, {
+        actor: { id: "local", kind: "local", displayName: "Local user" },
+        requestId: `reject-drift-${attempt}`,
+        signal,
+        workspace: null,
+      }),
+      /changed the validated managed identity/u,
+    );
+    const after = bridge.getManagedSession(threadId);
+    assert.ok(after);
+    assert.equal(after.providerTreeId, "original-tree");
+    assert.equal(after.parentId, "local:codex:original-parent");
+    assert.equal(after.cwd, "/workspace");
+    assert.equal(after.generation, original.generation);
+    assert.equal(after.control.authority, "manager");
+    assert.deepEqual(after.control.capabilities, []);
+    assert.equal(adapter.getThreadState(threadId), null);
+  }
+
+  transport.handlers.set("thread/resume", () => {
+    resumeCount += 1;
+    transport.notify("thread/environment/connected", {
+      threadId,
+      environmentId: "foreign-after-rejections",
+    });
+    return threadResultWithIdentity(threadId, "original-tree", "original-parent");
+  });
+  const stillCold = bridge.getManagedSession(threadId);
+  assert.ok(stillCold);
+  const release = await bridge.acquireSelectedSession(stillCold, {
+    actor: { id: "local", kind: "local", displayName: "Local user" },
+    requestId: "validate-no-stale-activity",
+    signal,
+    workspace: null,
+  });
+  const selected = bridge.getManagedSession(threadId);
+  assert.ok(selected);
+  assert.equal(selected.control.authority, "foreign");
+  assert.deepEqual(selected.control.capabilities, []);
+  assert.deepEqual(activity, [], "rejected adoption activity must never flush later");
+  assert.ok(changes.length >= 3);
+  assert.ok(changes.every((change) =>
+    change.providerTreeId === "original-tree" &&
+    change.parentId === "local:codex:original-parent" &&
+    change.control.capabilities.length === 0
+  ));
+  assert.equal(resumeCount, 3);
+  assert.equal(methodMessages(transport, "thread/resume").length, 3);
+
+  await release();
+  assert.equal(methodMessages(transport, "thread/unsubscribe").length, 1);
+  bridge.dispose();
+  await adapter.dispose();
+});
+
+test("replays a foreign environment event buffered before adoption acknowledgement", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  const threadId = "foreign-controlled-cold-thread";
+  const record: ManagedSessionRecoveryRecord = {
+    managerSessionId: `local:codex:${threadId}`,
+    provider: "codex",
+    providerThreadId: threadId,
+    workspaceId: "workspace-1",
+    workspacePath: "/workspace",
+    name: null,
+    profile: "execute",
+    createdAt: "2026-08-03T09:00:00.000Z",
+  };
+  const recovered = () =>
+    threadResultWithIdentity(threadId, "stable-tree", "stable-parent");
+  transport.handlers.set("thread/read", recovered);
+  transport.handlers.set("thread/resume", () => {
+    transport.notify("thread/environment/connected", {
+      threadId,
+      environmentId: "foreign-environment",
+    });
+    return recovered();
+  });
+  transport.handlers.set("thread/unsubscribe", () => ({}));
+  const changes: ReturnType<CodexProviderBridge["toSessionView"]>[] = [];
+  const bridge = new CodexProviderBridge({
+    adapter,
+    resolveWorkspace: () => "/workspace",
+    onSessionChanged: (session) => changes.push(session),
+  });
+  const signal = new AbortController().signal;
+
+  const report = await bridge.restoreManagedSessions([record], signal);
+  assert.deepEqual(report.failures, []);
+  const cold = bridge.getManagedSession(threadId);
+  assert.ok(cold);
+  const release = await bridge.acquireSelectedSession(cold, {
+    actor: { id: "local", kind: "local", displayName: "Local user" },
+    requestId: "select-foreign-controlled-thread",
+    signal,
+    workspace: null,
+  });
+
+  const selected = bridge.getManagedSession(threadId);
+  assert.ok(selected);
+  assert.equal(selected.control.authority, "foreign");
+  assert.deepEqual(selected.control.capabilities, []);
+  assert.match(selected.control.withheld[0]?.reason ?? "", /foreign-environment/u);
+  assert.deepEqual(adapter.getThreadState(threadId)?.environmentIds, ["foreign-environment"]);
+  assert.equal(adapter.getThreadState(threadId)?.controller, "foreign-environment");
+  assert.equal(changes.at(-1)?.control.authority, "foreign");
+  assert.deepEqual(changes.at(-1)?.control.capabilities, []);
+  assert.equal(methodMessages(transport, "thread/resume").length, 1);
+
+  await release();
+  bridge.dispose();
+  await adapter.dispose();
+});
+
+test("bounds managed recovery to one hundred records and four concurrent reads", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  let activeReads = 0;
+  let maxConcurrentReads = 0;
+  transport.handlers.set("thread/read", async (params) => {
+    activeReads += 1;
+    maxConcurrentReads = Math.max(maxConcurrentReads, activeReads);
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    activeReads -= 1;
+    return threadResultWithIdentity(String(params.threadId), null, null);
+  });
+  const bridge = new CodexProviderBridge({
+    adapter,
+    resolveWorkspace: () => "/workspace",
+  });
+  const records: ManagedSessionRecoveryRecord[] = Array.from(
+    { length: 105 },
+    (_, index) => {
+      const threadId = `bounded-recovery-${index}`;
+      return {
+        managerSessionId: `local:codex:${threadId}`,
+        provider: "codex",
+        providerThreadId: threadId,
+        workspaceId: "workspace-1",
+        workspacePath: "/workspace",
+        name: null,
+        profile: "execute",
+        createdAt: "2026-08-03T09:00:00.000Z",
+      };
+    },
+  );
+
+  const report = await bridge.restoreManagedSessions(
+    records,
+    new AbortController().signal,
+  );
+
+  assert.equal(report.truncated, true);
+  assert.equal(report.restoredSessionIds.length, 100);
+  assert.deepEqual(report.failures, []);
+  assert.equal(methodMessages(transport, "thread/read").length, 100);
+  assert.equal(maxConcurrentReads, 4);
+  assert.equal(activeReads, 0);
+  assert.equal(adapter.listThreadStates().length, 0);
+
+  bridge.dispose();
+  await adapter.dispose();
+});
+
+test("settings are idle-only and become effective only after provider notification", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("thread/start", () => threadResult());
+  transport.handlers.set("thread/settings/update", () => ({}));
+  await adapter.startThread({ cwd: "/workspace" });
+  await adapter.setEffort("thread-1", "high");
+  assert.equal(adapter.getThreadState("thread-1")?.effort, null);
+  assert.equal(adapter.getThreadState("thread-1")?.pendingSettings?.effort, "high");
+  transport.notify("thread/settings/updated", {
+    threadId: "thread-1",
+    threadSettings: {
+      cwd: "/workspace",
+      model: "gpt-5.6",
+      effort: "high",
+      collaborationMode: { mode: "default", settings: {} },
+      approvalPolicy: "on-request",
+      sandboxPolicy: { type: "workspaceWrite" },
+    },
+  });
+  assert.equal(adapter.getThreadState("thread-1")?.effort, "high");
+  assert.equal(adapter.getThreadState("thread-1")?.pendingSettings, null);
+  transport.notify("turn/started", {
+    threadId: "thread-1",
+    turn: { id: "turn-running", status: "inProgress", items: [] },
+  });
+  await assert.rejects(
+    adapter.setProfile("thread-1", "full-access"),
+    /only be changed while the thread is idle/u,
+  );
+  await adapter.dispose();
+});
+
+test("bridge normalizes Codex effort facts without discarding unknown provider values", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("thread/start", () => threadResult());
+  transport.handlers.set("turn/start", () => ({
+    turn: { id: "turn-1", status: "inProgress", items: [] },
+  }));
+  const bridge = new CodexProviderBridge({
+    adapter,
+    resolveWorkspace: () => "/workspace",
+  });
+  await bridge.createSession({
+    provider: "codex",
+    workspaceId: "workspace",
+    initialMessage: "Start",
+    profile: "plan",
+    model: null,
+    effort: null,
+    idempotencyKey: "create-effort-session",
+  }, {
+    actor: { id: "local", kind: "local", displayName: "Local user" },
+    requestId: "request-effort",
+    signal: new AbortController().signal,
+    workspace: { id: "workspace", label: "Workspace", path: "/workspace" },
+  });
+
+  transport.notify("thread/settings/updated", {
+    threadId: "thread-1",
+    threadSettings: { effort: "ultra" },
+  });
+  assert.deepEqual(bridge.getManagedSession("thread-1")?.effort, {
+    value: "ultra",
+    providerValue: "ultra",
+    source: "provider-api",
+    confidence: "exact",
+  });
+
+  transport.notify("thread/settings/updated", {
+    threadId: "thread-1",
+    threadSettings: { effort: "bogusvalue" },
+  });
+  assert.deepEqual(bridge.getManagedSession("thread-1")?.effort, {
+    value: null,
+    providerValue: "bogusvalue",
+    source: "provider-api",
+    confidence: "exact",
+  });
+  bridge.dispose();
+  await adapter.dispose();
+});
+
+test("foreign environment control withdraws writes without losing observation", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("thread/start", () => threadResult());
+  await adapter.startThread({ cwd: "/workspace" });
+  transport.notify("thread/environment/connected", {
+    threadId: "thread-1",
+    environmentId: "other-client",
+  });
+  const state = adapter.getThreadState("thread-1");
+  assert.equal(state?.controller, "foreign-environment");
+  assert.match(state?.writeBlockedReason ?? "", /other-client/u);
+  await assert.rejects(
+    adapter.queueMessage("thread-1", "must stay local"),
+    /controlled by foreign environment/u,
+  );
+  assert.ok(adapter.getThreadState("thread-1"));
   await adapter.dispose();
 });
 
@@ -843,13 +1829,14 @@ test("ProviderControlAdapter bridge creates normalized sessions and streams chan
   const { adapter, transport } = await initializedAdapter();
   transport.handlers.set("thread/start", () => threadResult());
   transport.handlers.set("thread/settings/update", () => null);
+  transport.handlers.set("thread/unsubscribe", () => ({}));
   transport.handlers.set("turn/start", () => ({
     turn: { id: "turn-bridge", status: "inProgress", items: [] },
   }));
   const changes: Array<{
     status: string;
     name: string | null;
-    runId: string | null | undefined;
+    providerTurnId: string | null;
   }> = [];
   const bridge = new CodexProviderBridge({
     adapter,
@@ -861,17 +1848,18 @@ test("ProviderControlAdapter bridge creates normalized sessions and streams chan
     onSessionChanged: (view) => changes.push({
       status: view.status,
       name: view.name,
-      runId: view.runId,
+      providerTurnId: view.providerTurnId,
     }),
   });
   const signal = new AbortController().signal;
-  const view = await bridge.createSession({
+  const created = await bridge.createSession({
     provider: "codex",
     workspaceId: "workspace-1",
     name: "Cockpit builder",
     initialMessage: "Build it",
-    mode: "planning",
-    accessMode: "sandboxed",
+    profile: "plan",
+    model: null,
+    effort: null,
     idempotencyKey: "create-cockpit-builder",
   }, {
     actor: { id: "local", kind: "local", displayName: "Local user" },
@@ -879,13 +1867,21 @@ test("ProviderControlAdapter bridge creates normalized sessions and streams chan
     signal,
     workspace: { id: "workspace-1", label: "Workspace", path: "/workspace" },
   });
-  assert.equal(view.id, "codex:thread-1");
-  assert.equal(view.ownership, "manager");
-  assert.equal(view.control.plane, "codex-app-server");
+  assert.deepEqual(created.control.capabilities, []);
+  const releaseSelection = await bridge.acquireSelectedSession(created, {
+    actor: { id: "local", kind: "local", displayName: "Local user" },
+    requestId: "request-select",
+    signal,
+    workspace: { id: "workspace-1", label: "Workspace", path: "/workspace" },
+  });
+  const view = bridge.getManagedSession("thread-1");
+  assert.ok(view);
+  assert.equal(view.id, "local:codex:thread-1");
+  assert.equal(view.control.authority, "manager");
+  assert.equal(view.control.plane, "codex-private");
   assert.ok(view.control.capabilities.includes("steer"));
-  assert.equal(view.mode.value, "planning");
-  assert.equal(view.effectiveAccess.accessMode, "sandboxed");
-  assert.equal(view.runId, "turn-bridge");
+  assert.equal(view.profile.value, null);
+  assert.equal(view.providerTurnId, "turn-bridge");
 
   transport.notify("turn/completed", {
     threadId: "thread-1",
@@ -894,7 +1890,7 @@ test("ProviderControlAdapter bridge creates normalized sessions and streams chan
   assert.deepEqual(changes.at(-1), {
     status: "idle",
     name: "Cockpit builder",
-    runId: null,
+    providerTurnId: null,
   });
   const attach = await bridge.getAttachInstruction(view, {
     actor: { id: "local", kind: "local", displayName: "Local user" },
@@ -904,6 +1900,7 @@ test("ProviderControlAdapter bridge creates normalized sessions and streams chan
   });
   assert.equal(attach?.kind, "codex-remote");
   assert.deepEqual(attach?.argv.slice(0, 3), ["codex", "resume", "thread-1"]);
+  await releaseSelection();
   bridge.dispose();
   await adapter.dispose();
 });
@@ -911,6 +1908,7 @@ test("ProviderControlAdapter bridge creates normalized sessions and streams chan
 test("ProviderControlAdapter surfaces an addressable recovery handle after mode setup fails", async () => {
   const { adapter, transport } = await initializedAdapter();
   transport.handlers.set("thread/start", () => threadResult());
+  transport.handlers.set("thread/unsubscribe", () => ({}));
   transport.handlers.set("thread/settings/update", () => {
     throw new Error("mode setup rejected");
   });
@@ -933,39 +1931,55 @@ test("ProviderControlAdapter surfaces an addressable recovery handle after mode 
     provider: "codex",
     workspaceId: "workspace",
     initialMessage: "This must not be sent before mode is confirmed",
-    mode: "planning",
-    accessMode: "sandboxed",
+    profile: "plan",
+    model: null,
+    effort: null,
     idempotencyKey: "mode-recovery",
   }, context);
 
-  assert.equal(view.id, "codex:thread-1");
+  assert.equal(view.id, "local:codex:thread-1");
   assert.equal(view.status, "waiting");
-  assert.equal(view.waitingReason, "blocked");
+  assert.equal(view.status, "waiting");
   assert.equal(view.attention[0]?.id, "creation-recovery");
   assert.match(view.attention[0]?.summary ?? "", /initial message was not sent/u);
-  assert.deepEqual(view.control.capabilities, ["attach", "resume"]);
+  assert.deepEqual(view.control.capabilities, []);
   assert.equal(methodMessages(transport, "turn/start").length, 0);
   assert.deepEqual(adapter.getThreadState("thread-1")?.queue, []);
   assert.ok(activity.some((entry) =>
-    entry.managerSessionId === "codex:thread-1" &&
+    entry.managerSessionId === "local:codex:thread-1" &&
     entry.mutation.type === "upsert" &&
     entry.mutation.item.kind === "lifecycle" &&
     entry.mutation.item.state === "failed"
   ));
-  const attach = await bridge.getAttachInstruction(view, context);
-  assert.deepEqual(attach?.argv.slice(0, 3), ["codex", "resume", "thread-1"]);
   await assert.rejects(
     bridge.performAction(view, {
       type: "send",
       delivery: "queue",
       text: "Do not auto-recover",
       expectedGeneration: view.generation,
+      idempotencyKey: "unsafe-unselected-retry",
+    }, context),
+    /not selected or loaded/u,
+  );
+  const releaseSelection = await bridge.acquireSelectedSession(view, context);
+  const selectedView = bridge.getManagedSession("thread-1");
+  assert.ok(selectedView);
+  assert.deepEqual(selectedView.control.capabilities, ["attach", "resume"]);
+  const attach = await bridge.getAttachInstruction(selectedView, context);
+  assert.deepEqual(attach?.argv.slice(0, 3), ["codex", "resume", "thread-1"]);
+  await assert.rejects(
+    bridge.performAction(selectedView, {
+      type: "send",
+      delivery: "queue",
+      text: "Do not auto-recover",
+      expectedGeneration: selectedView.generation,
       idempotencyKey: "unsafe-retry",
     }, context),
     /needs native recovery/u,
   );
   assert.equal(methodMessages(transport, "turn/start").length, 0);
 
+  await releaseSelection();
   bridge.dispose();
   await adapter.dispose();
 });
@@ -974,6 +1988,7 @@ test("ProviderControlAdapter retains buffered live activity when turn acknowledg
   const { adapter, transport } = await initializedAdapter();
   transport.handlers.set("thread/start", () => threadResult());
   transport.handlers.set("thread/settings/update", () => null);
+  transport.handlers.set("thread/unsubscribe", () => ({}));
   const activity: Array<{ managerSessionId: string; mutation: ActivityMutation }> = [];
   let callbackCountInsideTurnStart = -1;
   transport.handlers.set("turn/start", () => {
@@ -1016,39 +2031,45 @@ test("ProviderControlAdapter retains buffered live activity when turn acknowledg
     provider: "codex",
     workspaceId: "workspace",
     initialMessage: "Run exactly once",
-    mode: "execution",
-    accessMode: "sandboxed",
+    profile: "execute",
+    model: null,
+    effort: null,
     idempotencyKey: "uncertain-ack",
   }, context);
 
   assert.equal(callbackCountInsideTurnStart, 0);
-  assert.equal(view.id, "codex:thread-1");
+  assert.equal(view.id, "local:codex:thread-1");
   assert.equal(view.status, "running");
-  assert.equal(view.runId, "turn-provider-confirmed");
-  assert.equal(view.waitingReason, "blocked");
+  assert.equal(view.providerTurnId, "turn-provider-confirmed");
+  assert.equal(view.status, "running");
   assert.match(view.attention[0]?.summary ?? "", /will not be sent again automatically/u);
-  assert.deepEqual(view.control.capabilities, ["interrupt", "attach", "resume"]);
+  assert.deepEqual(view.control.capabilities, []);
   assert.deepEqual(adapter.getThreadState("thread-1")?.queue, []);
   assert.equal(methodMessages(transport, "turn/start").length, 1);
-  assert.ok(activity.every((entry) => entry.managerSessionId === "codex:thread-1"));
+  assert.ok(activity.every((entry) => entry.managerSessionId === "local:codex:thread-1"));
   assert.ok(activity.some((entry) =>
     entry.mutation.type === "append" &&
     entry.mutation.id.endsWith("/answer-uncertain") &&
     entry.mutation.text === "The provider is already producing output"
   ));
 
+  const releaseSelection = await bridge.acquireSelectedSession(view, context);
+  const selectedView = bridge.getManagedSession("thread-1");
+  assert.ok(selectedView);
+  assert.deepEqual(selectedView.control.capabilities, ["interrupt", "attach", "resume"]);
   await assert.rejects(
-    bridge.performAction(view, {
+    bridge.performAction(selectedView, {
       type: "send",
       delivery: "queue",
       text: "Do not duplicate",
-      expectedGeneration: view.generation,
+      expectedGeneration: selectedView.generation,
       idempotencyKey: "do-not-duplicate",
     }, context),
     /needs native recovery/u,
   );
   assert.equal(methodMessages(transport, "turn/start").length, 1);
 
+  await releaseSelection();
   bridge.dispose();
   await adapter.dispose();
 });
@@ -1087,8 +2108,9 @@ test("ProviderControlAdapter buffers first-turn activity until the manager sessi
     provider: "codex",
     workspaceId: "workspace",
     initialMessage: "Start immediately",
-    mode: "execution",
-    accessMode: "sandboxed",
+    profile: "execute",
+    model: null,
+    effort: null,
     idempotencyKey: "first-activity-race",
   }, {
     actor: { id: "local", kind: "local", displayName: "Local user" },
@@ -1099,7 +2121,7 @@ test("ProviderControlAdapter buffers first-turn activity until the manager sessi
 
   assert.equal(callbackCountInsideTurnStart, 0);
   assert.ok(activity.length >= 4, "queue and assistant mutations should flush after mapping");
-  assert.ok(activity.every((entry) => entry.managerSessionId === "codex:thread-1"));
+  assert.ok(activity.every((entry) => entry.managerSessionId === "local:codex:thread-1"));
   const assistantUpsert = activity.find((entry) =>
     entry.mutation.type === "upsert" &&
     entry.mutation.item.kind === "message" &&
@@ -1146,8 +2168,9 @@ test("Codex SessionView publishes exact questions and bounded approval details",
     provider: "codex",
     workspaceId: "workspace",
     initialMessage: "Start",
-    mode: "planning",
-    accessMode: "sandboxed",
+    profile: "plan",
+    model: null,
+    effort: null,
     idempotencyKey: "create-details-session",
   }, context);
 
@@ -1189,6 +2212,7 @@ test("Codex SessionView publishes exact questions and bounded approval details",
         ],
         multiSelect: false,
         allowFreeText: false,
+        isSecret: false,
       },
       {
         id: "access",
@@ -1197,8 +2221,12 @@ test("Codex SessionView publishes exact questions and bounded approval details",
         options: [],
         multiSelect: false,
         allowFreeText: true,
+        isSecret: false,
       },
     ],
+    toolName: null,
+    inputSummary: null,
+    respondable: true,
   });
 
   transport.request("secret-question", "item/tool/requestUserInput", {
@@ -1246,28 +2274,31 @@ test("transport death atomically fails managed sessions and in-flight controls",
     turn: { id: "turn-bootstrap", status: "inProgress", items: [] },
   }));
 
-  const published: Array<{ runtimeAlive: boolean; capabilities: readonly string[] }> = [];
+  const published: Array<{ status: string; capabilities: readonly string[] }> = [];
   const bridge = new CodexProviderBridge({
     adapter,
     resolveWorkspace: () => "/workspace",
     onSessionChanged: (session) => published.push({
-      runtimeAlive: session.runtimeAlive,
+      status: session.status,
       capabilities: session.control.capabilities,
     }),
   });
-  await bridge.createSession({
-    provider: "codex",
-    workspaceId: "workspace",
-    initialMessage: "bootstrap",
-    mode: "execution",
-    accessMode: "sandboxed",
-    idempotencyKey: "runtime-death-session",
-  }, {
-    actor: { id: "local", kind: "local", displayName: "Local user" },
+  const context = {
+    actor: { id: "local", kind: "local" as const, displayName: "Local user" },
     requestId: "runtime-death-create",
     signal: new AbortController().signal,
     workspace: { id: "workspace", label: "Workspace", path: "/workspace" },
-  });
+  };
+  const created = await bridge.createSession({
+    provider: "codex",
+    workspaceId: "workspace",
+    initialMessage: "bootstrap",
+    profile: "execute",
+    model: null,
+    effort: null,
+    idempotencyKey: "runtime-death-session",
+  }, context);
+  await bridge.acquireSelectedSession(created, context);
   transport.notify("turn/completed", {
     threadId: "thread-1",
     turn: { id: "turn-bootstrap", status: "completed", items: [] },
@@ -1297,11 +2328,13 @@ test("transport death atomically fails managed sessions and in-flight controls",
   assert.equal(adapter.getThreadState("thread-1")?.queue[0]?.status, "queued");
 
   const view = bridge.getManagedSession("thread-1");
-  assert.equal(view?.runtimeAlive, false);
   assert.equal(view?.status, "failed");
   assert.deepEqual(view?.attention, []);
-  assert.deepEqual(view?.control.capabilities, []);
-  assert.deepEqual(published.at(-1), { runtimeAlive: false, capabilities: [] });
+  assert.deepEqual(view?.control.capabilities, ["remove-queued"]);
+  assert.deepEqual(published.at(-1), {
+    status: "failed",
+    capabilities: ["remove-queued"],
+  });
   await assert.rejects(
     adapter.queueMessage("thread-1", "must fail closed"),
     /App Server is unavailable/u,

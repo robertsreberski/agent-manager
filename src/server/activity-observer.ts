@@ -1,13 +1,26 @@
 import type { ActivityItemDraft, ActivityResetReason } from "../activity/index.ts";
 import { ActivityHub } from "../activity/index.ts";
-import type { ConversationMessage, SessionView } from "../core/types.ts";
-import type { SessionTranscriptReader, TranscriptReadResult } from "./transcript.ts";
+import type { SessionView } from "../core/types.ts";
+import type {
+  SessionTranscriptReader,
+  TranscriptMessage,
+  TranscriptReadResult,
+  TranscriptUnavailableReason,
+} from "./transcript.ts";
 
-interface TranscriptObservation {
+interface AvailableTranscriptObservation {
+  state: "available";
   source: TranscriptReadResult["transcript"]["source"];
   truncated: boolean;
-  messages: ConversationMessage[];
+  messages: TranscriptMessage[];
 }
+
+interface UnavailableTranscriptObservation {
+  state: "unavailable";
+  reason: TranscriptUnavailableReason;
+}
+
+type TranscriptObservation = AvailableTranscriptObservation | UnavailableTranscriptObservation;
 
 interface ActiveObservation {
   refs: number;
@@ -26,7 +39,7 @@ export interface SelectedTranscriptActivityObserverOptions {
   idlePollMs?: number;
 }
 
-function activityMessage(message: ConversationMessage): ActivityItemDraft {
+function activityMessage(message: TranscriptMessage): ActivityItemDraft {
   const complete = message.status === "complete";
   return {
     kind: "message",
@@ -49,7 +62,7 @@ function activityMessage(message: ConversationMessage): ActivityItemDraft {
   };
 }
 
-function changed(previous: ConversationMessage, next: ConversationMessage): boolean {
+function changed(previous: TranscriptMessage, next: TranscriptMessage): boolean {
   return previous.role !== next.role
     || previous.text !== next.text
     || previous.createdAt !== next.createdAt
@@ -58,8 +71,8 @@ function changed(previous: ConversationMessage, next: ConversationMessage): bool
 }
 
 function replacementReason(
-  previous: TranscriptObservation,
-  next: TranscriptObservation,
+  previous: AvailableTranscriptObservation,
+  next: AvailableTranscriptObservation,
 ): ActivityResetReason | null {
   if (previous.source !== next.source) return "transcript-reset";
   if (previous.truncated !== next.truncated) return "truncation";
@@ -70,8 +83,45 @@ function replacementReason(
   return null;
 }
 
+function unavailableActivity(reason: TranscriptUnavailableReason): ActivityItemDraft {
+  const facts: Record<TranscriptUnavailableReason, {
+    level: "info" | "warning" | "error";
+    title: string;
+    details: string;
+  }> = {
+    "not-found": {
+      level: "info",
+      title: "No transcript found",
+      details: "This session has no readable transcript at its provider-owned location.",
+    },
+    unreadable: {
+      level: "error",
+      title: "Transcript unreadable",
+      details: "The provider transcript exists but cannot be read safely.",
+    },
+    unsupported: {
+      level: "warning",
+      title: "Transcript unsupported",
+      details: "This provider session does not expose a transcript shape Agent Manager can read faithfully.",
+    },
+  };
+  const fact = facts[reason];
+  return {
+    kind: "lifecycle",
+    id: "transcript:availability",
+    event: reason === "unreadable" ? "error" : "status",
+    level: fact.level,
+    title: fact.title,
+    details: fact.details,
+    state: reason === "unreadable" ? "failed" : "complete",
+    source: "transcript",
+    confidence: "inferred",
+    exposure: "transcript-derived",
+  };
+}
+
 /**
- * Projects only the currently selected legacy transcript into the volatile
+ * Projects only the currently selected provider transcript into the volatile
  * activity hub. Managed provider streams must remain the sole authority for
  * manager-owned sessions, so callers decide whether a session is eligible.
  */
@@ -159,19 +209,52 @@ export class SelectedTranscriptActivityObserver {
     try {
       result = this.#reader.read(observation.session);
     } catch {
+      result = {
+        messages: [],
+        transcript: {
+          state: "unavailable",
+          truncated: false,
+          source: null,
+          messageCount: 0,
+          reason: "unreadable",
+        },
+      };
+    }
+    const next: TranscriptObservation = result.transcript.state === "available"
+      ? {
+          state: "available",
+          source: result.transcript.source,
+          truncated: result.transcript.truncated,
+          messages: result.messages,
+        }
+      : {
+          state: "unavailable",
+          reason: result.transcript.reason ?? "unsupported",
+        };
+    const previous = observation.previous;
+    if (next.state === "unavailable") {
+      if (previous?.state === "unavailable" && previous.reason === next.reason) return;
+      this.#hub.ingest(observation.session.id, observation.session.provider, {
+        type: "reset",
+        reason: "transcript-reset",
+        items: [unavailableActivity(next.reason)],
+      });
+      observation.previous = next;
       return;
     }
-    if (result.transcript.state !== "available") return;
-    const next: TranscriptObservation = {
-      source: result.transcript.source,
-      truncated: result.transcript.truncated,
-      messages: result.messages,
-    };
-    const previous = observation.previous;
     if (!previous) {
       this.#hub.ingest(observation.session.id, observation.session.provider, {
         type: "reset",
         reason: next.truncated ? "truncation" : "transcript-reset",
+        items: next.messages.map(activityMessage),
+      });
+      observation.previous = structuredClone(next);
+      return;
+    }
+    if (previous.state === "unavailable") {
+      this.#hub.ingest(observation.session.id, observation.session.provider, {
+        type: "reset",
+        reason: "transcript-reset",
         items: next.messages.map(activityMessage),
       });
       observation.previous = structuredClone(next);
@@ -202,8 +285,8 @@ export class SelectedTranscriptActivityObserver {
 
   #schedule(observation: ActiveObservation): void {
     if (observation.stopped) return;
-    const active = observation.session.activity === "running"
-      || observation.session.activity === "waiting";
+    const active = observation.session.status === "running"
+      || observation.session.status === "waiting";
     observation.timer = setTimeout(() => {
       observation.timer = null;
       this.#refresh(observation);

@@ -1,6 +1,6 @@
 # 12 — Design system
 
-**Status:** Draft · **Depends on:** nothing · **Blocks:** every web phase
+**Status:** Accepted · **Depends on:** nothing · **Blocks:** every web phase
 **Design reference:** the token table in the handoff README; values reproduced here.
 
 ## Purpose
@@ -65,10 +65,11 @@ Lime is **"wants you"**. It is also the primary-button colour (New thread, Execu
 Send), which is consistent — those are the operator's own actions — but it must never mark
 *status* other than wants-you.
 
-Working is grey. Failed is red. Idle is dimmer grey. **Nothing else is lime.** The moment lime
+Working is grey. Failed is red. Idle is dimmer grey. **Nothing else is lime**, except the tiny
+linked-worktree branch glyph specified by frame 7a as a narrow identity marker. The moment lime
 appears on a running session, the board stops being scannable, which is its only job.
 
-The previous emerald primary is retired entirely (spec 13 §B4).
+The previous emerald primary is retired entirely (spec 13).
 
 ### R4 — Semantic colours are not decoration
 
@@ -120,7 +121,7 @@ eyebrow     10px  500 mono, uppercase, letter-spacing 0.14em
 Subset to Latin, `font-display: swap`, preload the two weights used above the fold. Check the
 licences (both are OFL) and record them in `web/public/fonts/LICENSE`.
 
-The PWA precache route policy (`web/src/pwa/route-policy.ts`) must include the fonts.
+The PWA precache route policy and Vite PWA glob must include `.woff2`; today the glob omits fonts.
 
 ### R7 — Spacing and targets
 
@@ -173,19 +174,19 @@ the SVGs from the design bundle; they are there so the mocks render standalone
 `web/src/components/ui/` is a hand-rolled shadcn-lite (button, badge, input, textarea, alert,
 dialog, sheet). The redesign needs menus, radio groups and tabs on top of it.
 
-Bring in the proper shadcn/ui implementations for the new ones rather than hand-rolling more
-(`dropdown-menu`, `radio-group`, `tabs` — all already in `package.json`, spec 13 §A2), and align
-the existing seven with them so the layer is one thing rather than two.
+Use proper shadcn/Radix primitives when a screen actually imports them and align the existing
+layer with those primitives. Remove every declared but unused Radix package now; re-add a package
+in the same slice as its first production import rather than reserving dependencies for future
+screens.
 
 **Every colour in this layer is a token.** The current `ui/badge.tsx:13-16` hardcodes
-`amber-500` / `red-500` / `emerald-500` / `blue-500`; so do parts of `session-activity.tsx`,
-`pending-requests.tsx` and `session-sidebar.tsx`. Normalise all of them in this phase, before the
-components that use them are rewritten — otherwise the literals get copied forward.
+`amber-500` / `red-500` / `emerald-500` / `blue-500`. Replace literals in surviving components;
+delete soon-replaced sidebar/banner components rather than spending a phase normalising dead code.
 
 ## Removals (spec 13)
 
 The light palette and `@custom-variant dark` (R1) · sidebar layout tokens `--scope-rail-*`,
-`--session-list-width` (§B1) · every hardcoded Tailwind colour literal (§B4) · the emerald
+`--session-list-width` · every hardcoded Tailwind colour literal · the emerald
 primary (R3).
 
 ## Acceptance criteria
@@ -202,10 +203,6 @@ primary (R3).
    token set.
 8. A visual pass against `docs/design/cockpit/Cockpit Prototype.dc.html` at 1440 × 900 and
    390 × 844.
-
-## Open questions
-
-- **Q1.** Instrument Sans and IBM Plex Mono add ~4 woff2 files to the precache. Confirm the
-  weight budget against the PWA's cold-load target; if it is tight, drop Instrument Sans 400
-  (body can sit on 500) rather than falling back to a system stack, which would change the
-  layout's rhythm.
+9. Ship Instrument Sans 400/500/600 and IBM Plex Mono 400/500 as Latin-subset woff2 files. The
+   visual type contract takes precedence over speculative cold-load trimming; package size is
+   enforced by the final allowlist instead.

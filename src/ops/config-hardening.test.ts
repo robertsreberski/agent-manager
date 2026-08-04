@@ -5,6 +5,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   readdirSync,
   rmSync,
   symlinkSync,
@@ -25,6 +26,7 @@ import {
   ensurePrivateRuntimeDirectory,
   loadConfig,
   mutateConfig,
+  resetOwnedState,
   saveConfig,
   withConfigLock,
   type AgentManagerPaths,
@@ -150,7 +152,7 @@ test("config validation rejects partial or unsafe identity and invalid ports", (
   assert.throws(() => lstatSync(paths.configFile), { code: "ENOENT" });
 });
 
-test("loads version 1 config as host-aware version 2 without losing workspaces", (t) => {
+test("rejects an incompatible config until an explicit owned-state reset", (t) => {
   const paths = temporaryPaths(t);
   mkdirSync(paths.dataDirectory, { recursive: true, mode: 0o700 });
   writeFileSync(paths.configFile, `${JSON.stringify({
@@ -160,10 +162,43 @@ test("loads version 1 config as host-aware version 2 without losing workspaces",
     workspaces: [{ id: "legacy", name: "Legacy", path: "/tmp/legacy" }],
   })}\n`, { mode: 0o600 });
 
-  const migrated = loadConfig(paths);
-  assert.equal(migrated.version, 2);
-  assert.deepEqual(migrated.hosts, []);
-  assert.equal(migrated.workspaces[0]?.hostId, "local");
+  assert.throws(() => loadConfig(paths), /Unsupported Agent Manager config version/);
+  assert.deepEqual(resetOwnedState(paths), [paths.configFile]);
+  assert.deepEqual(loadConfig(paths), defaultConfig());
+});
+
+test("rejects unknown fields in the current config epoch", (t) => {
+  const paths = temporaryPaths(t);
+  const config = { ...defaultConfig(), obsoleteMode: "planning" };
+  mkdirSync(paths.dataDirectory, { recursive: true, mode: 0o700 });
+  writeFileSync(paths.configFile, `${JSON.stringify(config)}\n`, { mode: 0o600 });
+  assert.throws(() => loadConfig(paths), /unknown or missing fields/);
+});
+
+test("resetOwnedState is bounded to private Agent Manager config and database files", (t) => {
+  const paths = temporaryPaths(t);
+  mkdirSync(paths.dataDirectory, { recursive: true, mode: 0o700 });
+  writeFileSync(paths.configFile, "old config", { mode: 0o600 });
+  writeFileSync(paths.databaseFile, "old database", { mode: 0o600 });
+  writeFileSync(`${paths.databaseFile}-wal`, "old wal", { mode: 0o600 });
+  writeFileSync(paths.auditFile, "keep audit", { mode: 0o600 });
+  const providerSettings = join(dirname(paths.dataDirectory), "provider-settings.json");
+  writeFileSync(providerSettings, "keep provider", { mode: 0o600 });
+
+  assert.deepEqual(resetOwnedState(paths), [
+    paths.configFile,
+    paths.databaseFile,
+    `${paths.databaseFile}-wal`,
+  ]);
+  assert.throws(() => lstatSync(paths.configFile), { code: "ENOENT" });
+  assert.throws(() => lstatSync(paths.databaseFile), { code: "ENOENT" });
+  assert.equal(readFileSync(paths.auditFile, "utf8"), "keep audit");
+  assert.equal(readFileSync(providerSettings, "utf8"), "keep provider");
+
+  assert.throws(() => resetOwnedState({
+    ...paths,
+    configFile: providerSettings,
+  }), /canonical owned state paths/);
 });
 
 test("withConfigLock times out on a live lock and reclaims an old malformed lock", (t) => {

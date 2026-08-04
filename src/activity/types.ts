@@ -1,8 +1,10 @@
-import type { Provider } from "../core/types.ts";
+import type { Provider } from "../shared/session.ts";
+import { WIRE_SCHEMA_VERSION } from "../shared/wire.ts";
 
 export type { Provider };
 
-export const ACTIVITY_SCHEMA_VERSION = 1 as const;
+/** Activity and state frames advance atomically; partial wire upgrades are rejected. */
+export const ACTIVITY_SCHEMA_VERSION = WIRE_SCHEMA_VERSION;
 
 export type ActivityJsonValue =
   | null
@@ -24,14 +26,22 @@ export type ActivitySource = "provider-api" | "transcript";
 export type ActivityConfidence = "exact" | "inferred" | "heuristic";
 export type ActivityExposure = "provider-exposed" | "transcript-derived";
 
-export interface ActivityPlanStep {
+export interface ActivityTodoStep {
   id: string;
   text: string;
-  status: "pending" | "in_progress" | "completed";
+  status: "pending" | "in_progress" | "completed" | "removed";
+  detail: string | null;
+  /** True only when this identity first appeared after the provider's baseline list. */
+  addedAfterStart: boolean;
+  /** Exact provider explanation only; list replacement never manufactures one. */
+  removedReason: string | null;
 }
 
 export interface ActivityFileChange {
+  /** Destination/current provider path. */
   path: string;
+  /** Exact provider old path for a rename; null for every non-rename or when unavailable. */
+  previousPath: string | null;
   operation: "add" | "update" | "delete" | "rename";
   diff: string;
 }
@@ -39,6 +49,8 @@ export interface ActivityFileChange {
 export interface ActivityAttentionOption {
   label: string;
   description: string | null;
+  /** Exact provider recommendation only; null means the provider exposed none. */
+  recommended: boolean | null;
 }
 
 export interface ActivityAttentionQuestion {
@@ -51,6 +63,29 @@ export interface ActivityAttentionQuestion {
   isSecret: boolean;
 }
 
+export interface ActivityAttentionQuestionDraft extends Omit<ActivityAttentionQuestion, "options"> {
+  options: Array<Omit<ActivityAttentionOption, "recommended"> & { recommended?: boolean | null }>;
+}
+
+/**
+ * Exact approval facts exposed by the provider for one request. These fields
+ * are deliberately sparse: null and an empty list mean the harness did not
+ * supply the fact. Agent Manager never parses shell text or walks the
+ * filesystem to manufacture a more reassuring answer.
+ */
+export interface ActivityApprovalFacts {
+  command: string | null;
+  /** Paths used for conservative workspace-tier classification. */
+  paths: string[] | null;
+  /** Write targets named by the provider, preserving its spelling. */
+  writes: string[];
+  network: boolean | null;
+  /** True only when this exact provider request offers a persistent choice. */
+  canPersist: boolean;
+  /** Exact provider count only; never computed by inspecting the filesystem. */
+  deleteCount: number | null;
+}
+
 export interface ActivityQueuedMessage {
   id: string;
   text: string;
@@ -59,9 +94,10 @@ export interface ActivityQueuedMessage {
   turnId: string | null;
 }
 
-interface ActivityItemBase {
+export interface ActivityItemBase {
   schemaVersion: typeof ACTIVITY_SCHEMA_VERSION;
   id: string;
+  /** Foreign key to SessionRecord.id; never a provider thread, tree, or turn id. */
   sessionId: string;
   provider: Provider;
   turnId: string | null;
@@ -95,8 +131,20 @@ export interface ActivityReasoningItem extends ActivityItemBase {
 
 export interface ActivityPlanItem extends ActivityItemBase {
   kind: "plan";
-  text: string;
-  steps: ActivityPlanStep[];
+  path: string | null;
+  version: number | null;
+  markdown: string;
+  supersededBy: string | null;
+  /** Exact provider request identity for this plan approval, when exposed. */
+  approvalRequestId: string | null;
+  approvedAt: string | null;
+}
+
+export interface ActivityTodoItem extends ActivityItemBase {
+  kind: "todo";
+  steps: ActivityTodoStep[];
+  added: number;
+  removed: number;
 }
 
 export interface ActivityToolItem extends ActivityItemBase {
@@ -144,6 +192,7 @@ export interface ActivityAttentionItem extends ActivityItemBase {
   title: string | null;
   summary: string | null;
   questions: ActivityAttentionQuestion[];
+  approvalFacts: ActivityApprovalFacts | null;
   respondable: boolean;
   resolved: boolean;
   isSecret: boolean;
@@ -187,6 +236,7 @@ export type ActivityItem =
   | ActivityMessageItem
   | ActivityReasoningItem
   | ActivityPlanItem
+  | ActivityTodoItem
   | ActivityToolItem
   | ActivityFileChangeItem
   | ActivitySubagentItem
@@ -206,6 +256,8 @@ interface ActivityItemDraftBase {
   source?: ActivitySource;
   confidence?: ActivityConfidence;
   exposure?: ActivityExposure;
+  /** Preserve a provider/remote truncation fact even when the visible field is bounded. */
+  truncated?: boolean;
 }
 
 export type ActivityItemDraft =
@@ -224,8 +276,18 @@ export type ActivityItemDraft =
     })
   | (ActivityItemDraftBase & {
       kind: "plan";
-      text?: string;
-      steps?: readonly ActivityPlanStep[];
+      path?: string | null;
+      version?: number | null;
+      markdown?: string;
+      supersededBy?: string | null;
+      approvalRequestId?: string | null;
+      approvedAt?: string | null;
+    })
+  | (ActivityItemDraftBase & {
+      kind: "todo";
+      steps?: readonly ActivityTodoStep[];
+      added?: number;
+      removed?: number;
     })
   | (ActivityItemDraftBase & {
       kind: "tool";
@@ -255,7 +317,8 @@ export type ActivityItemDraft =
       attentionKind: ActivityAttentionItem["attentionKind"];
       title?: string | null;
       summary?: string | null;
-      questions?: readonly ActivityAttentionQuestion[];
+      questions?: readonly ActivityAttentionQuestionDraft[];
+      approvalFacts?: ActivityApprovalFacts | null;
       respondable?: boolean;
       resolved?: boolean;
       isSecret?: boolean;
@@ -284,6 +347,7 @@ export type ActivityItemDraft =
 
 export type ActivityAppendChannel =
   | "text"
+  | "markdown"
   | "arguments"
   | "result"
   | "output"
@@ -315,11 +379,14 @@ export type ActivityMutation =
       type: "reset";
       reason: ActivityResetReason;
       items?: readonly ActivityItemDraft[];
+      /** The source already discarded activity older than this materialized window. */
+      truncated?: boolean;
     };
 
-interface ActivityFrameBase {
+export interface ActivityFrameBase {
   schemaVersion: typeof ACTIVITY_SCHEMA_VERSION;
   streamEpoch: string;
+  /** Foreign key to SessionRecord.id; never a provider thread, tree, or turn id. */
   sessionId: string;
   provider: Provider;
   seq: number;

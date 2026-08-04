@@ -3,6 +3,11 @@ import { isAbsolute } from "node:path";
 
 import type { ActivityMutation } from "../../activity/index.ts";
 import {
+  codexAccountFacts,
+  parseCodexAccountRateLimits,
+  parseCodexAccountUsage,
+} from "./account-facts.ts";
+import {
   codexActivityOffset,
   projectCodexDiagnostic,
   projectCodexNotification,
@@ -10,7 +15,9 @@ import {
   projectCodexRequestResolved,
   projectCodexServerRequest,
   recordCodexActivityOffsets,
+  recordCodexTodoProjectionState,
   type CodexActivityProjection,
+  type CodexTodoProjectionState,
 } from "./activity-projector.ts";
 import {
   CodexRpcClient,
@@ -25,11 +32,17 @@ import type {
   CodexAdapterEvent,
   CodexAdapterEventListener,
   CodexAttachCommand,
+  CodexControllerState,
   CodexControlCapability,
-  CodexMode,
+  CodexExecutionProfile,
+  CodexModelOption,
   CodexPendingRequest,
   CodexPendingRequestKind,
+  CodexPendingSettings,
   CodexQueuedMessage,
+  CodexReasoningEffort,
+  CodexSettingsDelivery,
+  CodexThreadIdentity,
   CodexThreadState,
   CodexThreadStatus,
   CodexTurnStatus,
@@ -42,30 +55,59 @@ import type {
 } from "./types.ts";
 
 const SUPPORTED_VERSION = "0.146.x" as const;
+const MAX_MODEL_OPTIONS = 64;
+const MAX_MODEL_LIST_PAGES = 8;
+const MAX_PENDING_ADOPTION_EVENTS = 512;
 const ALL_CONTROLS: readonly CodexControlCapability[] = [
   "thread.start",
   "thread.resume",
   "thread.read",
+  "thread.unsubscribe",
+  "thread.rename",
+  "thread.archive",
+  "thread.delete",
   "turn.queue",
   "turn.steer",
   "turn.interrupt",
   "request.respond",
-  "mode.set",
+  "profile.set",
+  "model.set",
+  "effort.set",
   "native.attach",
 ];
 
 interface InternalThreadState {
   threadId: string;
+  treeId: string | null;
+  parentThreadId: string | null;
   cwd: string | null;
+  name: string | null;
+  preview: string | null;
+  source: string | null;
   model: string | null;
-  mode: CodexMode | "unknown";
+  effort: CodexReasoningEffort | null;
+  profile: CodexExecutionProfile | null;
   status: CodexThreadStatus;
   activeTurnId: string | null;
   lastTurnStatus: CodexTurnStatus | null;
   pendingRequests: Map<string, CodexPendingRequest>;
   queue: CodexQueuedMessage[];
+  environmentIds: Set<string>;
+  controller: CodexControllerState;
+  writeBlockedReason: string | null;
+  pendingSettings: CodexPendingSettings | null;
+  nextTurnOverrides: JsonObject | null;
   generation: number;
   dispatchPromise: Promise<void> | null;
+}
+
+type PendingAdoptionEvent =
+  | { kind: "notification"; value: JsonRpcNotification }
+  | { kind: "request"; value: JsonRpcServerRequest };
+
+interface PendingAdoption {
+  events: PendingAdoptionEvent[];
+  overflowed: boolean;
 }
 
 export interface CodexManagedAdapterOptions {
@@ -77,9 +119,11 @@ export interface CodexManagedAdapterOptions {
   requestTimeoutMs?: number;
   now?: () => Date;
   createId?: () => string;
+  /** Environment IDs this client is explicitly allowed to control. */
+  ownedEnvironmentIds?: readonly string[];
 }
 
-export type CodexManagedCreationFailureStage = "mode" | "initial-message";
+export type CodexManagedCreationFailureStage = "profile" | "initial-message";
 export type CodexManagedCreationFailureOutcome = "rejected" | "uncertain";
 
 export interface CodexManagedCreationIssue {
@@ -133,14 +177,72 @@ export function isSupportedCodexVersion(version: string | null): boolean {
   return match?.[1] === "0" && match[2] === "146";
 }
 
-function providerMode(mode: CodexMode): "plan" | "default" {
-  return mode === "planning" ? "plan" : "default";
+function providerMode(profile: CodexExecutionProfile): "plan" | "default" {
+  return profile === "plan" ? "plan" : "default";
 }
 
-function normalizedMode(value: unknown): CodexMode | "unknown" {
-  if (value === "plan") return "planning";
-  if (value === "default") return "execution";
-  return "unknown";
+function normalizedProfile(value: unknown): CodexExecutionProfile | null {
+  if (value === "plan") return "plan";
+  return null;
+}
+
+function sourceKind(value: unknown): string | null {
+  if (typeof value === "string") return value;
+  if (!isObject(value)) return null;
+  return stringField(value, "type") ?? stringField(value, "kind");
+}
+
+function profileSettings(
+  profile: CodexExecutionProfile,
+  cwd: string | null,
+  model: string,
+  effort: CodexReasoningEffort | null,
+): JsonObject {
+  const collaborationMode = {
+    mode: providerMode(profile),
+    // Codex 0.146 models this as a complete `Settings` object, not a patch.
+    // Preserve the provider-selected defaults when the manager did not
+    // explicitly request a model or effort instead of inventing either one.
+    settings: {
+      model,
+      reasoning_effort: effort,
+      developer_instructions: null,
+    },
+  } satisfies JsonObject;
+  if (profile === "full-access") {
+    return {
+      collaborationMode,
+      approvalPolicy: "never",
+      sandboxPolicy: { type: "dangerFullAccess" },
+    };
+  }
+  return {
+    collaborationMode,
+    approvalPolicy: "on-request",
+    sandboxPolicy: {
+      type: "workspaceWrite",
+      writableRoots: cwd ? [cwd] : [],
+      networkAccess: false,
+    },
+  };
+}
+
+function settingsMatchProfile(
+  settings: Record<string, unknown>,
+  profile: CodexExecutionProfile,
+): boolean {
+  const collaboration = isObject(settings.collaborationMode)
+    ? settings.collaborationMode.mode
+    : null;
+  const sandbox = isObject(settings.sandboxPolicy)
+    ? settings.sandboxPolicy.type
+    : null;
+  if (profile === "full-access") {
+    return collaboration === "default" &&
+      settings.approvalPolicy === "never" && sandbox === "dangerFullAccess";
+  }
+  return collaboration === providerMode(profile) &&
+    settings.approvalPolicy === "on-request" && sandbox === "workspaceWrite";
 }
 
 function normalizedThreadStatus(value: unknown): CodexThreadStatus {
@@ -168,8 +270,6 @@ function requestKind(method: string): CodexPendingRequestKind {
     case "item/tool/requestUserInput": return "user-input";
     case "item/permissions/requestApproval": return "permission-approval";
     case "mcpServer/elicitation/request": return "elicitation";
-    case "execCommandApproval": return "legacy-command-approval";
-    case "applyPatchApproval": return "legacy-file-change-approval";
     default: return "unsupported";
   }
 }
@@ -186,7 +286,16 @@ function withoutUndefined(values: Record<string, unknown>): JsonObject {
 }
 
 function extractThreadId(params: Record<string, unknown>): string | null {
-  return stringField(params, "threadId") ?? stringField(params, "conversationId");
+  return stringField(params, "threadId");
+}
+
+function notificationThreadId(notification: JsonRpcNotification): string | null {
+  const direct = extractThreadId(notification.params);
+  if (direct) return direct;
+  if (notification.method === "thread/started" && isObject(notification.params.thread)) {
+    return stringField(notification.params.thread, "id");
+  }
+  return null;
 }
 
 function assertText(text: string): void {
@@ -243,16 +352,7 @@ function isValidRequestResponse(
   switch (request.kind) {
     case "command-approval":
     case "file-change-approval":
-      return isSimpleDecision(response.decision, ["accept", "decline", "cancel"]);
-    case "legacy-command-approval":
-    case "legacy-file-change-approval": {
-      if (isSimpleDecision(response.decision, ["approved", "abort", "timed_out"])) {
-        return true;
-      }
-      return isObject(response.decision) &&
-        isObject(response.decision.denied) &&
-        typeof response.decision.denied.rejection === "string";
-    }
+      return isSimpleDecision(response.decision, ["accept", "acceptForSession", "decline", "cancel"]);
     case "user-input": {
       if (!isObject(response.answers)) return false;
       return Object.values(response.answers).every((answer) =>
@@ -304,11 +404,16 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
   #serverVersion: string | null = null;
   #serverUserAgent: string | null = null;
   #compatibilityReason: string | null = "Adapter has not initialized";
+  #settingsDelivery: CodexSettingsDelivery = "unavailable";
   #enabledControls = new Set<CodexControlCapability>();
   #threads = new Map<string, InternalThreadState>();
+  #adoptedThreadIds = new Set<string>();
+  #pendingAdoptions = new Map<string, PendingAdoption>();
+  #ownedEnvironmentIds: ReadonlySet<string>;
   #listeners = new Set<CodexAdapterEventListener>();
   #removeRpcListeners: Array<() => void> = [];
   #activityOffsets = new Map<string, number>();
+  #activityTodos = new Map<string, CodexTodoProjectionState>();
 
   constructor(options: CodexManagedAdapterOptions) {
     if (!isAbsolute(options.socketPath)) {
@@ -320,6 +425,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     this.#clientVersion = options.clientVersion ?? "0.2.1";
     this.#now = options.now ?? (() => new Date());
     this.#createId = options.createId ?? randomUUID;
+    this.#ownedEnvironmentIds = new Set(options.ownedEnvironmentIds ?? []);
     this.rpc = new CodexRpcClient(
       options.transport,
       options.requestTimeoutMs ?? 30_000,
@@ -353,6 +459,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
       serverVersion: this.#serverVersion,
       serverUserAgent: this.#serverUserAgent,
       supportedVersion: SUPPORTED_VERSION,
+      settingsDelivery: this.#settingsDelivery,
       controls: Object.freeze(controls),
       reason: this.#compatibilityReason,
     });
@@ -383,9 +490,11 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     const compatible = isSupportedCodexVersion(this.#serverVersion);
     if (compatible) {
       this.#enabledControls = new Set(ALL_CONTROLS);
+      this.#settingsDelivery = "experimental-rpc";
       this.#compatibilityReason = null;
     } else {
-      this.#enabledControls = new Set(["thread.read"]);
+      this.#enabledControls.clear();
+      this.#settingsDelivery = "unavailable";
       this.#compatibilityReason = this.#serverVersion
         ? `Codex ${this.#serverVersion} is outside supported range ${SUPPORTED_VERSION}`
         : "Codex App Server did not report a parseable version";
@@ -415,16 +524,44 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
       }),
     ), "thread/start result");
     const state = this.#mergeThreadResponse(result);
+    this.#adoptedThreadIds.add(state.threadId);
     const thread = this.#requireThread(state.threadId);
 
-    if (options.mode) {
+    if (options.profile || options.effort) {
+      const effectiveModel = options.model ?? thread.model;
+      const effectiveEffort = options.effort ?? thread.effort;
+      let requestedProfileSettings: JsonObject = {};
+      if (options.profile) {
+        if (!effectiveModel) {
+          throw this.#managedCreationError(thread, {
+            stage: "profile",
+            outcome: "rejected",
+            message: `Codex thread ${state.threadId} was created, but thread/start did not return the model required to stage its collaboration mode`,
+            initialMessageDisposition: "not-sent",
+          });
+        }
+        requestedProfileSettings = profileSettings(
+          options.profile,
+          state.cwd,
+          effectiveModel,
+          effectiveEffort,
+        );
+      }
       try {
-        await this.setMode(state.threadId, options.mode);
+        await this.#updateSettings(state.threadId, withoutUndefined({
+          ...requestedProfileSettings,
+          model: options.model,
+          effort: options.effort,
+        }), {
+          ...(options.profile ? { profile: options.profile } : {}),
+          ...(options.model ? { model: options.model } : {}),
+          ...(options.effort ? { effort: options.effort } : {}),
+        });
       } catch (error) {
         throw this.#managedCreationError(thread, {
-          stage: "mode",
+          stage: "profile",
           outcome: failureOutcome(error),
-          message: `Codex thread ${state.threadId} was created, but its requested mode could not be confirmed: ${errorMessage(error)}`,
+          message: `Codex thread ${state.threadId} was created, but its requested settings could not be staged: ${errorMessage(error)}`,
           initialMessageDisposition: "not-sent",
         });
       }
@@ -473,6 +610,14 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     threadId: string,
     options: ResumeCodexThreadOptions = {},
   ): Promise<CodexThreadState> {
+    return this.#resumeThread(threadId, options, null);
+  }
+
+  async #resumeThread(
+    threadId: string,
+    options: ResumeCodexThreadOptions,
+    expectedIdentity: CodexThreadIdentity | null,
+  ): Promise<CodexThreadState> {
     this.#assertControl("thread.resume");
     assertStartOptions(options);
     const result = asJsonObject(await this.#call(
@@ -485,10 +630,32 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
         approvalPolicy: options.approvalPolicy,
         sandbox: options.sandbox,
         permissions: options.permissions,
-        excludeTurns: false,
+        // The experimental 0.146 runtime honors this schema-omitted flag for
+        // both legacy and paginated histories. Selection needs identity and
+        // live events, not an unbounded replay of historical turns.
+        excludeTurns: true,
       }),
     ), "thread/resume result");
-    return this.#mergeThreadResponse(result);
+    const returnedThread = asJsonObject(result.thread, "thread");
+    const returnedThreadId = stringField(returnedThread, "id");
+    if (returnedThreadId !== threadId) {
+      throw new Error(
+        `Codex thread/resume returned ${returnedThreadId ?? "no thread ID"} for requested thread ${threadId}`,
+      );
+    }
+    if (expectedIdentity) {
+      const returnedTreeId = stringField(returnedThread, "sessionId");
+      const returnedParentThreadId = stringField(returnedThread, "parentThreadId");
+      const returnedCwd = stringField(result, "cwd") ?? stringField(returnedThread, "cwd");
+      if (returnedTreeId !== expectedIdentity.treeId ||
+          returnedParentThreadId !== expectedIdentity.parentThreadId ||
+          returnedCwd !== expectedIdentity.cwd) {
+        throw new Error("Codex thread/resume changed the validated managed identity");
+      }
+    }
+    const state = this.#mergeThreadResponse(result);
+    this.#adoptedThreadIds.add(threadId);
+    return state;
   }
 
   async readThread(threadId: string): Promise<CodexThreadState> {
@@ -496,9 +663,200 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     const result = asJsonObject(await this.#call(
       "thread.read",
       "thread/read",
-      { threadId, includeTurns: true },
+      // Agent Manager creates paginated-history threads. Codex 0.146 rejects
+      // includeTurns=true for those threads, and startup recovery only needs
+      // bounded identity/status metadata; selected activity has its own stream.
+      { threadId, includeTurns: false },
     ), "thread/read result");
+    const returnedThread = asJsonObject(result.thread, "thread");
+    const returnedThreadId = stringField(returnedThread, "id");
+    if (returnedThreadId !== threadId) {
+      throw new Error(
+        `Codex thread/read returned ${returnedThreadId ?? "no thread ID"} for requested thread ${threadId}`,
+      );
+    }
     return this.#mergeThreadResponse(result);
+  }
+
+  async readAccountFacts() {
+    this.#assertAccountReadable();
+    const optionalRead = async <T>(
+      method: "account/usage/read" | "account/rateLimits/read",
+      parse: (value: unknown) => T,
+    ): Promise<T | null> => {
+      try {
+        return parse(await this.rpc.request(method));
+      } catch (error) {
+        if (error instanceof CodexRpcError && error.code === -32601) return null;
+        throw error;
+      }
+    };
+    const [usage, rateLimits] = await Promise.all([
+      optionalRead("account/usage/read", parseCodexAccountUsage),
+      optionalRead("account/rateLimits/read", parseCodexAccountRateLimits),
+    ]);
+    return codexAccountFacts({ usage, rateLimits });
+  }
+
+  async listModels(): Promise<readonly CodexModelOption[]> {
+    this.#assertModelCatalogReadable();
+    const models: CodexModelOption[] = [];
+    const values = new Set<string>();
+    const cursors = new Set<string>();
+    let cursor: string | null = null;
+
+    for (let page = 0; page < MAX_MODEL_LIST_PAGES; page += 1) {
+      const result = asJsonObject(await this.rpc.request("model/list", {
+        limit: MAX_MODEL_OPTIONS - models.length,
+        includeHidden: false,
+        ...(cursor === null ? {} : { cursor }),
+      }), "model/list result");
+      if (!Array.isArray(result.data)) {
+        throw new Error("Invalid Codex response: model/list data");
+      }
+      for (const raw of result.data) {
+        const model = asJsonObject(raw, "model/list model");
+        if (typeof model.hidden !== "boolean") {
+          throw new Error("Invalid Codex response: model/list model hidden");
+        }
+        const catalogId = stringField(model, "id");
+        if (!catalogId || catalogId !== catalogId.trim() || catalogId.length > 256 ||
+            /[\u0000-\u001f\u007f]/u.test(catalogId)) {
+          throw new Error("Invalid Codex response: model/list catalog identity");
+        }
+        if (model.hidden) continue;
+        const value = stringField(model, "model");
+        const label = stringField(model, "displayName");
+        const description = stringField(model, "description");
+        const defaultEffort = stringField(model, "defaultReasoningEffort");
+        if (!value || value !== value.trim() || value.length > 256 ||
+            /[\u0000-\u001f\u007f]/u.test(value)) {
+          throw new Error("Invalid Codex response: model/list model identifier");
+        }
+        if (!label || label !== label.trim() || label.length > 128 ||
+            /[\u0000-\u001f\u007f]/u.test(label)) {
+          throw new Error("Invalid Codex response: model/list display name");
+        }
+        if (description === null || description.length > 1_000) {
+          throw new Error("Invalid Codex response: model/list description");
+        }
+        if (typeof model.isDefault !== "boolean" || !defaultEffort ||
+            !Array.isArray(model.supportedReasoningEfforts)) {
+          throw new Error("Invalid Codex response: model/list effort metadata");
+        }
+        const efforts: string[] = [];
+        const seenEfforts = new Set<string>();
+        for (const rawEffort of model.supportedReasoningEfforts) {
+          const effort = asJsonObject(rawEffort, "model/list effort");
+          const effortValue = stringField(effort, "reasoningEffort");
+          const effortDescription = stringField(effort, "description");
+          if (!effortValue || effortValue !== effortValue.trim() || effortValue.length > 64 ||
+              /[\u0000-\u001f\u007f]/u.test(effortValue) || effortDescription === null ||
+              effortDescription.length > 1_000 || seenEfforts.has(effortValue)) {
+            throw new Error("Invalid Codex response: model/list effort option");
+          }
+          seenEfforts.add(effortValue);
+          efforts.push(effortValue);
+        }
+        if (efforts.length > 16 || !seenEfforts.has(defaultEffort)) {
+          throw new Error("Invalid Codex response: model/list default effort");
+        }
+        if (values.has(value)) {
+          throw new Error(`Invalid Codex response: duplicate model ${value}`);
+        }
+        values.add(value);
+        models.push(Object.freeze({
+          value,
+          label,
+          description: description.length > 0 ? description : null,
+          isDefault: model.isDefault,
+          defaultEffort,
+          efforts: Object.freeze(efforts),
+        }));
+        if (models.length > MAX_MODEL_OPTIONS) {
+          throw new Error("Codex model catalog exceeds the bounded picker limit");
+        }
+      }
+
+      const nextCursor = result.nextCursor ?? null;
+      if (nextCursor !== null && typeof nextCursor !== "string") {
+        throw new Error("Invalid Codex response: model/list next cursor");
+      }
+      if (nextCursor === null) return Object.freeze(models);
+      if (models.length >= MAX_MODEL_OPTIONS) {
+        throw new Error("Codex model catalog exceeds the bounded picker limit");
+      }
+      if (!nextCursor || cursors.has(nextCursor)) {
+        throw new Error("Invalid Codex response: repeated model/list cursor");
+      }
+      cursors.add(nextCursor);
+      cursor = nextCursor;
+    }
+    throw new Error("Codex model catalog exceeded the bounded pagination limit");
+  }
+
+  async adoptThread(
+    threadId: string,
+    expectedIdentity: CodexThreadIdentity,
+  ): Promise<CodexThreadState> {
+    if (expectedIdentity.threadId !== threadId) {
+      throw new Error("Codex adoption received a mismatched expected thread ID");
+    }
+    if (this.#adoptedThreadIds.has(threadId)) {
+      const existing = this.#threads.get(threadId);
+      if (existing) {
+        const snapshot = this.#snapshot(existing);
+        this.#assertAdoptedIdentity(snapshot, expectedIdentity);
+        return snapshot;
+      }
+    }
+    if (this.#pendingAdoptions.has(threadId)) {
+      throw new Error(`Codex thread ${threadId} is already being adopted`);
+    }
+    const pending: PendingAdoption = { events: [], overflowed: false };
+    this.#pendingAdoptions.set(threadId, pending);
+    try {
+      await this.#resumeThread(threadId, {}, expectedIdentity);
+      this.#pendingAdoptions.delete(threadId);
+      if (pending.overflowed) {
+        await this.releaseThread(threadId).catch(() => undefined);
+        throw new Error("Codex adoption event buffer overflowed before identity validation");
+      }
+      for (const event of pending.events) {
+        if (event.kind === "notification") this.#onNotification(event.value);
+        else this.#onServerRequest(event.value);
+      }
+      const adopted = this.getThreadState(threadId);
+      if (!adopted) throw new Error("Codex thread disappeared during adoption");
+      this.#assertAdoptedIdentity(adopted, expectedIdentity);
+      return adopted;
+    } catch (error) {
+      this.#pendingAdoptions.delete(threadId);
+      if (this.#adoptedThreadIds.has(threadId)) {
+        await this.releaseThread(threadId).catch(() => undefined);
+      } else {
+        this.#threads.delete(threadId);
+      }
+      throw error;
+    }
+  }
+
+  async releaseThread(threadId: string): Promise<void> {
+    this.#assertControl("thread.unsubscribe");
+    if (!this.#adoptedThreadIds.has(threadId)) {
+      this.#threads.delete(threadId);
+      this.#activityOffsets.delete(threadId);
+      this.#activityTodos.delete(threadId);
+      return;
+    }
+    await this.#call("thread.unsubscribe", "thread/unsubscribe", { threadId });
+    this.#adoptedThreadIds.delete(threadId);
+    const state = this.#threads.get(threadId);
+    if (state) {
+      state.pendingRequests.clear();
+      state.queue.length = 0;
+      this.#threads.delete(threadId);
+    }
   }
 
   async queueMessage(
@@ -508,6 +866,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     this.#assertControl("turn.queue");
     assertText(text);
     const state = this.#requireThread(threadId);
+    this.#assertThreadWritable(state);
     return this.#enqueueMessage(state, text);
   }
 
@@ -540,6 +899,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     this.#assertControl("turn.steer");
     assertText(text);
     const state = this.#requireThread(threadId);
+    this.#assertThreadWritable(state);
     if (!state.activeTurnId || state.activeTurnId !== expectedTurnId) {
       throw new Error(
         `Stale Codex turn: expected ${expectedTurnId}, active ${state.activeTurnId ?? "none"}`,
@@ -564,6 +924,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
   async interrupt(threadId: string, expectedTurnId: string): Promise<void> {
     this.#assertControl("turn.interrupt");
     const state = this.#requireThread(threadId);
+    this.#assertThreadWritable(state);
     if (!state.activeTurnId || state.activeTurnId !== expectedTurnId) {
       throw new Error(
         `Stale Codex turn: expected ${expectedTurnId}, active ${state.activeTurnId ?? "none"}`,
@@ -582,6 +943,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
   ): Promise<void> {
     this.#assertControl("request.respond");
     const state = this.#requireThread(threadId);
+    this.#assertThreadWritable(state);
     const key = jsonRpcIdKey(requestId);
     const request = state.pendingRequests.get(key);
     if (!request || request.id !== requestId) {
@@ -606,21 +968,95 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     ));
   }
 
-  async setMode(threadId: string, mode: CodexMode): Promise<void> {
-    this.#assertControl("mode.set");
+  async setProfile(
+    threadId: string,
+    profile: CodexExecutionProfile,
+  ): Promise<void> {
+    this.#assertControl("profile.set");
     const state = this.#requireThread(threadId);
     if (!state.model) {
-      throw new Error("Cannot change Codex mode before the thread model is known");
+      throw new Error(
+        `Codex thread ${threadId} has no provider-confirmed model for collaboration mode settings`,
+      );
     }
-    await this.#call("mode.set", "thread/settings/update", {
+    await this.#updateSettings(
       threadId,
-      collaborationMode: {
-        mode: providerMode(mode),
-        settings: { model: state.model },
-      },
-    });
-    state.mode = mode;
+      profileSettings(profile, state.cwd, state.model, state.effort),
+      { profile },
+    );
+  }
+
+  async setModel(threadId: string, model: string): Promise<void> {
+    this.#assertControl("model.set");
+    const normalized = model.trim();
+    if (!normalized) throw new Error("Codex model must not be empty");
+    await this.#updateSettings(threadId, { model: normalized }, { model: normalized });
+  }
+
+  async setEffort(
+    threadId: string,
+    effort: CodexReasoningEffort,
+  ): Promise<void> {
+    this.#assertControl("effort.set");
+    const normalized = effort.trim();
+    if (!normalized) throw new Error("Codex effort must not be empty");
+    await this.#updateSettings(threadId, { effort: normalized }, { effort: normalized });
+  }
+
+  async removeQueuedMessage(threadId: string, messageId: string): Promise<void> {
+    const state = this.#requireThread(threadId);
+    const index = state.queue.findIndex((item) => item.id === messageId);
+    if (index < 0) throw new Error(`Unknown queued Codex message: ${messageId}`);
+    if (state.queue[index]?.status === "dispatching") {
+      throw new Error("A dispatching Codex message cannot be removed");
+    }
+    state.queue.splice(index, 1);
+    this.#touch(state, true);
+  }
+
+  async renameThread(threadId: string, name: string): Promise<void> {
+    this.#assertControl("thread.rename");
+    const state = this.#requireThread(threadId);
+    this.#assertThreadWritable(state);
+    const normalized = name.trim();
+    if (!normalized) throw new Error("Codex thread name must not be empty");
+    await this.#call("thread.rename", "thread/name/set", { threadId, name: normalized });
+    state.name = normalized;
     this.#touch(state);
+  }
+
+  async archiveThread(threadId: string): Promise<void> {
+    this.#assertControl("thread.archive");
+    const state = this.#requireThread(threadId);
+    this.#assertThreadWritable(state);
+    if (state.activeTurnId || state.status === "running") {
+      throw new Error("A running Codex thread cannot be archived");
+    }
+    await this.#call("thread.archive", "thread/archive", { threadId });
+    this.#forgetThread(threadId, "archived");
+  }
+
+  async deleteThread(threadId: string): Promise<void> {
+    this.#assertControl("thread.delete");
+    const state = this.#requireThread(threadId);
+    this.#assertThreadWritable(state);
+    if (state.activeTurnId || state.status === "running") {
+      throw new Error("A running Codex thread cannot be deleted");
+    }
+    await this.#call("thread.delete", "thread/delete", { threadId });
+    this.#forgetThread(threadId, "deleted");
+  }
+
+  async endThread(threadId: string): Promise<void> {
+    const state = this.#requireThread(threadId);
+    this.#assertThreadWritable(state);
+    if (state.activeTurnId) await this.interrupt(threadId, state.activeTurnId);
+    state.queue.length = 0;
+    this.#touch(state, true);
+    await this.releaseThread(threadId);
+    this.#activityOffsets.delete(threadId);
+    this.#activityTodos.delete(threadId);
+    this.#emit({ type: "thread.removed", threadId, reason: "ended" });
   }
 
   getThreadState(threadId: string): CodexThreadState | null {
@@ -653,6 +1089,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     this.#runtimeAlive = false;
     this.#runtimeFailure = error.message || "Codex App Server is unavailable";
     this.#enabledControls.clear();
+    this.#settingsDelivery = "unavailable";
     this.#compatibilityReason = `Codex App Server is unavailable: ${this.#runtimeFailure}`;
 
     for (const state of this.#threads.values()) {
@@ -699,7 +1136,9 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     for (const remove of this.#removeRpcListeners.splice(0)) remove();
     await this.rpc.close();
     this.#listeners.clear();
+    this.#pendingAdoptions.clear();
     this.#activityOffsets.clear();
+    this.#activityTodos.clear();
   }
 
   async #call(
@@ -723,6 +1162,69 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     }
   }
 
+  async #updateSettings(
+    threadId: string,
+    providerSettings: JsonObject,
+    pending: Omit<CodexPendingSettings, "delivery">,
+  ): Promise<void> {
+    const state = this.#requireThread(threadId);
+    this.#assertThreadWritable(state);
+    if (state.activeTurnId || state.status === "running") {
+      throw new Error("Codex settings can only be changed while the thread is idle");
+    }
+    if (this.#settingsDelivery === "unavailable") {
+      throw new Error("Codex settings are unavailable on this App Server");
+    }
+
+    const previousPending = state.pendingSettings;
+    const previousOverrides = state.nextTurnOverrides;
+    state.pendingSettings = {
+      ...pending,
+      delivery: this.#settingsDelivery === "experimental-rpc"
+        ? "experimental-rpc"
+        : "next-turn",
+    };
+    this.#touch(state);
+
+    if (this.#settingsDelivery === "next-turn") {
+      state.nextTurnOverrides = {
+        ...(state.nextTurnOverrides ?? {}),
+        ...providerSettings,
+      };
+      this.#touch(state);
+      return;
+    }
+
+    try {
+      await this.rpc.request("thread/settings/update", {
+        threadId,
+        ...providerSettings,
+      });
+    } catch (error) {
+      if (error instanceof CodexRpcError && error.code === -32601) {
+        this.#settingsDelivery = "next-turn";
+        state.pendingSettings = { ...pending, delivery: "next-turn" };
+        state.nextTurnOverrides = {
+          ...(state.nextTurnOverrides ?? {}),
+          ...providerSettings,
+        };
+        this.#emit({
+          type: "diagnostic",
+          level: "warning",
+          code: "codex.settings.next_turn_only",
+          message: "thread/settings/update is unavailable; settings will apply to the next turn",
+          threadId,
+        });
+        this.#touch(state);
+        return;
+      }
+      state.pendingSettings = previousPending;
+      state.nextTurnOverrides = previousOverrides;
+      this.#touch(state);
+      throw error;
+    }
+  }
+
   #assertControl(control: CodexControlCapability): void {
     if (!this.#initialized) throw new Error("Codex adapter is not initialized");
     if (this.#disposed) throw new Error("Codex adapter is disposed");
@@ -733,19 +1235,93 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     }
   }
 
+  #assertAccountReadable(): void {
+    if (!this.#initialized) throw new Error("Codex adapter is not initialized");
+    if (this.#disposed) throw new Error("Codex adapter is disposed");
+    if (!this.#runtimeAlive || !isSupportedCodexVersion(this.#serverVersion)) {
+      throw new Error(
+        `Codex account facts are unavailable${this.#compatibilityReason ? `: ${this.#compatibilityReason}` : ""}`,
+      );
+    }
+  }
+
+  #assertModelCatalogReadable(): void {
+    if (!this.#initialized) throw new Error("Codex adapter is not initialized");
+    if (this.#disposed) throw new Error("Codex adapter is disposed");
+    if (!this.#runtimeAlive || !isSupportedCodexVersion(this.#serverVersion)) {
+      throw new Error(
+        `Codex model catalog is unavailable${this.#compatibilityReason ? `: ${this.#compatibilityReason}` : ""}`,
+      );
+    }
+  }
+
+  #assertThreadWritable(state: InternalThreadState): void {
+    if (!this.#adoptedThreadIds.has(state.threadId)) {
+      throw new Error(`Codex thread ${state.threadId} has not been adopted by this client`);
+    }
+    if (state.writeBlockedReason) throw new Error(state.writeBlockedReason);
+  }
+
+  #forgetThread(
+    threadId: string,
+    reason: "archived" | "deleted",
+  ): void {
+    const known = this.#adoptedThreadIds.has(threadId) || this.#threads.has(threadId);
+    this.#adoptedThreadIds.delete(threadId);
+    this.#threads.delete(threadId);
+    this.#activityOffsets.delete(threadId);
+    this.#activityTodos.delete(threadId);
+    if (known) this.#emit({ type: "thread.removed", threadId, reason });
+  }
+
+  #recomputeController(state: InternalThreadState): void {
+    const foreign = [...state.environmentIds].filter(
+      (environmentId) => !this.#ownedEnvironmentIds.has(environmentId),
+    );
+    const mixed = foreign.length > 0 &&
+      foreign.length !== state.environmentIds.size;
+    if (foreign.length === 0) {
+      state.controller = "available";
+      state.writeBlockedReason = null;
+    } else if (foreign.length === 1 && !mixed && state.environmentIds.size === 1) {
+      state.controller = "foreign-environment";
+      state.writeBlockedReason =
+        `Codex thread ${state.threadId} is controlled by foreign environment ${foreign[0]}`;
+    } else {
+      state.controller = "ambiguous-environment";
+      state.writeBlockedReason =
+        `Codex thread ${state.threadId} has ambiguous controller environments`;
+    }
+    for (const request of state.pendingRequests.values()) {
+      request.respondable = request.kind !== "unsupported" &&
+        state.writeBlockedReason === null;
+    }
+  }
+
   #ensureThread(threadId: string): InternalThreadState {
     let state = this.#threads.get(threadId);
     if (!state) {
       state = {
         threadId,
+        treeId: null,
+        parentThreadId: null,
         cwd: null,
+        name: null,
+        preview: null,
+        source: null,
         model: null,
-        mode: "unknown",
+        effort: null,
+        profile: null,
         status: "unknown",
         activeTurnId: null,
         lastTurnStatus: null,
         pendingRequests: new Map(),
         queue: [],
+        environmentIds: new Set(),
+        controller: "available",
+        writeBlockedReason: null,
+        pendingSettings: null,
+        nextTurnOverrides: null,
         generation: 0,
         dispatchPromise: null,
       };
@@ -758,6 +1334,30 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     const state = this.#threads.get(threadId);
     if (!state) throw new Error(`Unknown manager-owned Codex thread: ${threadId}`);
     return state;
+  }
+
+  #assertAdoptedIdentity(
+    state: CodexThreadState,
+    expected: CodexThreadIdentity,
+  ): void {
+    if (state.threadId !== expected.threadId || state.treeId !== expected.treeId ||
+        state.parentThreadId !== expected.parentThreadId || state.cwd !== expected.cwd) {
+      throw new Error("Codex adoption changed the validated managed identity");
+    }
+  }
+
+  #bufferPendingAdoption(
+    threadId: string,
+    event: PendingAdoptionEvent,
+  ): boolean {
+    const pending = this.#pendingAdoptions.get(threadId);
+    if (!pending) return false;
+    if (pending.events.length >= MAX_PENDING_ADOPTION_EVENTS) {
+      pending.overflowed = true;
+    } else {
+      pending.events.push(event);
+    }
+    return true;
   }
 
   #discardUnacknowledgedInitialMessage(state: InternalThreadState): void {
@@ -795,8 +1395,15 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     const threadId = stringField(thread, "id");
     if (!threadId) throw new Error("Codex response did not contain a thread ID");
     const state = this.#ensureThread(threadId);
+    state.treeId = stringField(thread, "sessionId") ?? state.treeId;
+    state.parentThreadId = stringField(thread, "parentThreadId") ??
+      state.parentThreadId;
     state.cwd = stringField(response, "cwd") ?? stringField(thread, "cwd") ?? state.cwd;
+    state.name = stringField(thread, "name") ?? state.name;
+    state.preview = stringField(thread, "preview") ?? state.preview;
+    state.source = sourceKind(thread.source) ?? state.source;
     state.model = stringField(response, "model") ?? state.model;
+    state.effort = stringField(response, "reasoningEffort") ?? state.effort;
     state.status = normalizedThreadStatus(thread.status);
 
     if (Array.isArray(thread.turns)) {
@@ -816,9 +1423,15 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
   #snapshot(state: InternalThreadState): CodexThreadState {
     return Object.freeze({
       threadId: state.threadId,
+      treeId: state.treeId,
+      parentThreadId: state.parentThreadId,
       cwd: state.cwd,
+      name: state.name,
+      preview: state.preview,
+      source: state.source,
       model: state.model,
-      mode: state.mode,
+      effort: state.effort,
+      profile: state.profile,
       status: state.status,
       activeTurnId: state.activeTurnId,
       lastTurnStatus: state.lastTurnStatus,
@@ -826,6 +1439,12 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
         [...state.pendingRequests.values()].map(cloneRequest),
       ),
       queue: Object.freeze(state.queue.map(cloneQueueItem)),
+      environmentIds: Object.freeze([...state.environmentIds].sort()),
+      controller: state.controller,
+      writeBlockedReason: state.writeBlockedReason,
+      pendingSettings: state.pendingSettings
+        ? Object.freeze({ ...state.pendingSettings })
+        : null,
       generation: state.generation,
     });
   }
@@ -878,6 +1497,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
           threadId: state.threadId,
           input: [{ type: "text", text: queued.text }],
           clientUserMessageId: queued.id,
+          ...(state.nextTurnOverrides ?? {}),
         },
       ), "turn/start result");
       const turn = asJsonObject(result.turn, "turn/start turn");
@@ -888,6 +1508,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
       state.activeTurnId = turnId;
       state.status = "running";
       state.lastTurnStatus = "inProgress";
+      state.nextTurnOverrides = null;
       state.queue.shift();
       this.#touch(state, true);
     } catch (error) {
@@ -898,6 +1519,12 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
   }
 
   #onNotification(notification: JsonRpcNotification): void {
+    const pendingThreadId = notificationThreadId(notification);
+    if (pendingThreadId && this.#bufferPendingAdoption(pendingThreadId, {
+      kind: "notification",
+      value: notification,
+    })) return;
+
     let resolvedRequest: CodexPendingRequest | undefined;
     if (notification.method === "serverRequest/resolved") {
       const threadId = extractThreadId(notification.params);
@@ -924,6 +1551,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
       : projectCodexNotification(
           notification,
           (id, channel) => codexActivityOffset(this.#activityOffsets, id, channel),
+          (id) => this.#activityTodos.get(id) ?? null,
         );
     this.#emitActivityProjection(projection);
   }
@@ -932,6 +1560,9 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     const params = notification.params;
     if (notification.method === "thread/started") {
       try {
+        if (!isObject(params.thread)) return;
+        const threadId = stringField(params.thread, "id");
+        if (!threadId || !this.#adoptedThreadIds.has(threadId)) return;
         this.#mergeThreadResponse({ thread: params.thread as JsonValue });
       } catch (error) {
         this.#diagnostic("codex.notification.invalid", error);
@@ -941,7 +1572,8 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
 
     const threadId = extractThreadId(params);
     if (!threadId) return;
-    const state = this.#ensureThread(threadId);
+    const state = this.#threads.get(threadId);
+    if (!state || !this.#adoptedThreadIds.has(threadId)) return;
 
     switch (notification.method) {
       case "thread/status/changed":
@@ -958,12 +1590,58 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
         const settings = params.threadSettings;
         state.cwd = stringField(settings, "cwd") ?? state.cwd;
         state.model = stringField(settings, "model") ?? state.model;
-        if (isObject(settings.collaborationMode)) {
-          state.mode = normalizedMode(settings.collaborationMode.mode);
+        state.effort = stringField(settings, "effort") ?? state.effort;
+        const pending = state.pendingSettings;
+        if (pending?.profile && settingsMatchProfile(settings, pending.profile)) {
+          state.profile = pending.profile;
+        } else if (isObject(settings.collaborationMode)) {
+          const normalized = normalizedProfile(settings.collaborationMode.mode);
+          if (normalized || settings.approvalPolicy === "never") {
+            state.profile = settings.approvalPolicy === "never"
+              ? "full-access"
+              : normalized;
+          }
+        }
+        if (pending) {
+          const profileConfirmed = !pending.profile ||
+            settingsMatchProfile(settings, pending.profile);
+          const modelConfirmed = !pending.model || state.model === pending.model;
+          const effortConfirmed = !pending.effort || state.effort === pending.effort;
+          if (profileConfirmed && modelConfirmed && effortConfirmed) {
+            state.pendingSettings = null;
+          }
         }
         this.#touch(state);
         break;
       }
+      case "thread/environment/connected":
+        if (typeof params.environmentId !== "string") return;
+        state.environmentIds.add(params.environmentId);
+        this.#recomputeController(state);
+        this.#touch(state);
+        break;
+      case "thread/environment/disconnected":
+        if (typeof params.environmentId !== "string") return;
+        state.environmentIds.delete(params.environmentId);
+        this.#recomputeController(state);
+        this.#touch(state);
+        break;
+      case "thread/name/updated":
+        state.name = stringField(params, "name");
+        this.#touch(state);
+        break;
+      case "thread/closed":
+        state.status = "not-loaded";
+        state.activeTurnId = null;
+        state.pendingRequests.clear();
+        this.#touch(state);
+        break;
+      case "thread/archived":
+        this.#forgetThread(threadId, "archived");
+        break;
+      case "thread/deleted":
+        this.#forgetThread(threadId, "deleted");
+        break;
       case "turn/started": {
         if (!isObject(params.turn)) return;
         state.activeTurnId = stringField(params.turn, "id");
@@ -1023,7 +1701,18 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
       });
       return;
     }
-    const state = this.#ensureThread(threadId);
+    if (this.#bufferPendingAdoption(threadId, { kind: "request", value: request })) return;
+    const state = this.#threads.get(threadId);
+    if (!state || !this.#adoptedThreadIds.has(threadId)) {
+      this.#emit({
+        type: "diagnostic",
+        level: "warning",
+        code: "codex.request.unowned",
+        message: `Ignored server request for an unadopted thread: ${threadId}`,
+        threadId,
+      });
+      return;
+    }
     const kind = requestKind(request.method);
     const pending: CodexPendingRequest = {
       id: request.id,
@@ -1032,7 +1721,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
       threadId,
       turnId: stringField(request.params, "turnId"),
       params: structuredClone(request.params),
-      respondable: kind !== "unsupported",
+      respondable: kind !== "unsupported" && state.writeBlockedReason === null,
       receivedAt: this.#now().toISOString(),
     };
     state.pendingRequests.set(jsonRpcIdKey(request.id), pending);
@@ -1068,6 +1757,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     if (!projection) return;
     for (const mutation of projection.mutations) {
       recordCodexActivityOffsets(this.#activityOffsets, mutation);
+      recordCodexTodoProjectionState(this.#activityTodos, mutation);
       this.#emit({
         type: "activity",
         threadId: projection.threadId,

@@ -3,6 +3,7 @@ import test from "node:test";
 
 import { ActivityHub } from "./hub.ts";
 import type { ActivityFrame, ActivityItemDraft } from "./types.ts";
+import type { TodoProgress } from "../shared/session.ts";
 
 function message(id: string, text: string, state: "running" | "complete" = "running"): ActivityItemDraft {
   return {
@@ -123,7 +124,7 @@ test("preserves attention question headers separately from question text", () =>
         id: "random_destination",
         header: "Random pick",
         text: "Which imaginary weekend destination would you choose?",
-        options: [{ label: "Moon cabin", description: null }],
+        options: [{ label: "Moon cabin", description: null, recommended: true }],
         multiSelect: false,
         allowFreeText: true,
         isSecret: false,
@@ -139,11 +140,321 @@ test("preserves attention question headers separately from question text", () =>
   if (item?.kind === "attention") {
     assert.equal(item.summary, null);
     assert.equal(item.questions[0]?.header, "Random pick");
+    assert.equal(item.questions[0]?.options[0]?.recommended, true);
     assert.equal(
       item.questions[0]?.text,
       "Which imaginary weekend destination would you choose?",
     );
   }
+});
+
+test("materializes exact approval facts without filling unknowns", () => {
+  const hub = new ActivityHub({ streamEpoch: "approval-facts" });
+  const frame = hub.ingest("session-a", "claude", {
+    type: "upsert",
+    item: {
+      id: "approval-1",
+      kind: "attention",
+      requestId: "request-1",
+      attentionKind: "permission",
+      approvalFacts: {
+        command: "pnpm test",
+        paths: ["/work/app"],
+        writes: [],
+        network: null,
+        canPersist: false,
+        deleteCount: null,
+      },
+      respondable: true,
+      resolved: false,
+    },
+  });
+  assert.equal(frame.type, "activity.upsert");
+  if (frame.type !== "activity.upsert" || frame.item.kind !== "attention") return;
+  assert.deepEqual(frame.item.approvalFacts, {
+    command: "pnpm test",
+    paths: ["/work/app"],
+    writes: [],
+    network: null,
+    canPersist: false,
+    deleteCount: null,
+  });
+});
+
+test("keeps provider plan artifacts separate from live todo progress", () => {
+  const hub = new ActivityHub({ streamEpoch: "plan-todo-split" });
+  hub.ingest("session-a", "claude", {
+    type: "upsert",
+    item: {
+      id: "plan-1",
+      kind: "plan",
+      path: "/provider/plans/plan.md",
+      version: null,
+      markdown: "# Plan\n\nDo the work.",
+      supersededBy: null,
+      approvedAt: null,
+      state: "complete",
+    },
+  });
+  hub.ingest("session-a", "claude", {
+    type: "upsert",
+    item: {
+      id: "todos-1",
+      kind: "todo",
+      steps: [{
+        id: "todo-1",
+        text: "Implement",
+        status: "in_progress",
+        detail: "Editing the activity model",
+        addedAfterStart: false,
+        removedReason: null,
+      }],
+      added: 1,
+      removed: 0,
+      state: "running",
+    },
+  });
+  const plan = hub.snapshot("session-a")?.items.find((item) => item.kind === "plan");
+  const todo = hub.snapshot("session-a")?.items.find((item) => item.kind === "todo");
+  assert.equal(plan?.kind === "plan" ? plan.markdown : null, "# Plan\n\nDo the work.");
+  assert.equal(plan?.kind === "plan" ? plan.path : null, "/provider/plans/plan.md");
+  assert.deepEqual(todo?.kind === "todo" ? todo.steps : null, [{
+    id: "todo-1",
+    text: "Implement",
+    status: "in_progress",
+    detail: "Editing the activity model",
+    addedAfterStart: false,
+    removedReason: null,
+  }]);
+});
+
+test("streams plan markdown without inventing versions or checklist rows", () => {
+  const hub = new ActivityHub({ streamEpoch: "plan-markdown" });
+  hub.ingest("session-a", "claude", {
+    type: "upsert",
+    item: {
+      id: "plan-1",
+      kind: "plan",
+      path: null,
+      version: null,
+      markdown: "# Pla",
+      supersededBy: null,
+      approvedAt: null,
+    },
+  });
+  const frame = hub.ingest("session-a", "claude", {
+    type: "append",
+    id: "plan-1",
+    channel: "markdown",
+    offset: Buffer.byteLength("# Pla"),
+    text: "n",
+  });
+  assert.equal(frame.type, "activity.append");
+  const plan = hub.snapshot("session-a")?.items[0];
+  assert.equal(plan?.kind === "plan" ? plan.markdown : null, "# Plan");
+  assert.equal(plan?.kind === "plan" ? plan.version : 1, null);
+});
+
+test("publishes content-free progress from the newest authoritative todo", () => {
+  let now = Date.parse("2026-08-04T10:00:00.000Z");
+  const hub = new ActivityHub({ streamEpoch: "todo-metadata", now: () => now });
+  const observed: Array<{ sessionId: string; progress: TodoProgress | null }> = [];
+  const unsubscribe = hub.subscribeTodoProgress((sessionId, progress) => {
+    observed.push({ sessionId, progress });
+  });
+
+  hub.ingest("session-a", "claude", {
+    type: "upsert",
+    item: message("message-1", "todo text must not leak"),
+  });
+  now = Date.parse("2026-08-04T10:01:00.000Z");
+  hub.ingest("session-a", "claude", {
+    type: "upsert",
+    item: {
+      id: "todos-1",
+      kind: "todo",
+      steps: [
+        { id: "one", text: "private first todo", status: "completed", detail: null, addedAfterStart: false, removedReason: null },
+        { id: "two", text: "private current todo", status: "in_progress", detail: "private detail", addedAfterStart: false, removedReason: null },
+      ],
+      added: 2,
+      removed: 0,
+    },
+  });
+  now = Date.parse("2026-08-04T10:02:00.000Z");
+  hub.ingest("session-a", "claude", {
+    type: "upsert",
+    item: {
+      id: "todos-1",
+      kind: "todo",
+      steps: [
+        { id: "one", text: "rewritten private text", status: "completed", detail: null, addedAfterStart: false, removedReason: null },
+        { id: "two", text: "rewritten current text", status: "in_progress", detail: null, addedAfterStart: false, removedReason: null },
+      ],
+    },
+  });
+  now = Date.parse("2026-08-04T10:03:00.000Z");
+  hub.ingest("session-a", "claude", {
+    type: "upsert",
+    item: {
+      id: "todos-1",
+      kind: "todo",
+      steps: [
+        { id: "one", text: "private first todo", status: "completed", detail: null, addedAfterStart: false, removedReason: null },
+        { id: "two", text: "private current todo", status: "completed", detail: null, addedAfterStart: false, removedReason: null },
+      ],
+    },
+  });
+  hub.ingest("session-a", "claude", {
+    type: "upsert",
+    item: { id: "todos-2", kind: "todo", steps: [], added: 0, removed: 0 },
+  });
+  hub.ingest("session-a", "claude", { type: "remove", id: "todos-2" });
+  hub.ingest("session-a", "claude", { type: "reset", reason: "provider-reset", items: [] });
+
+  assert.deepEqual(observed, [
+    {
+      sessionId: "session-a",
+      progress: {
+        completed: 1,
+        total: 2,
+        hasMoved: false,
+        lastTransitionAt: null,
+        active: true,
+      },
+    },
+    {
+      sessionId: "session-a",
+      progress: {
+        completed: 2,
+        total: 2,
+        hasMoved: true,
+        lastTransitionAt: "2026-08-04T10:03:00.000Z",
+        active: false,
+      },
+    },
+    { sessionId: "session-a", progress: null },
+    {
+      sessionId: "session-a",
+      progress: {
+        completed: 2,
+        total: 2,
+        hasMoved: false,
+        lastTransitionAt: null,
+        active: false,
+      },
+    },
+    { sessionId: "session-a", progress: null },
+  ]);
+  assert.doesNotMatch(JSON.stringify(observed), /private|todo text|detail/);
+  assert.equal(hub.todoProgress("session-a"), null);
+  unsubscribe();
+});
+
+test("marks an ordered todo-list change as movement without exposing its contents", () => {
+  let now = Date.parse("2026-08-04T11:00:00.000Z");
+  const hub = new ActivityHub({ streamEpoch: "todo-list-movement", now: () => now });
+  hub.ingest("session-a", "codex", {
+    type: "upsert",
+    item: {
+      id: "todos",
+      kind: "todo",
+      steps: [
+        { id: "one", text: "private active", status: "in_progress", detail: null, addedAfterStart: false, removedReason: null },
+        { id: "two", text: "private pending", status: "pending", detail: null, addedAfterStart: false, removedReason: null },
+      ],
+    },
+  });
+  now = Date.parse("2026-08-04T11:04:00.000Z");
+  hub.ingest("session-a", "codex", {
+    type: "upsert",
+    item: {
+      id: "todos",
+      kind: "todo",
+      steps: [
+        { id: "one", text: "private active", status: "in_progress", detail: null, addedAfterStart: false, removedReason: null },
+        { id: "two", text: "private pending", status: "pending", detail: null, addedAfterStart: false, removedReason: null },
+        { id: "three", text: "private added", status: "pending", detail: null, addedAfterStart: true, removedReason: null },
+      ],
+    },
+  });
+
+  assert.deepEqual(hub.todoProgress("session-a"), {
+    completed: 0,
+    total: 3,
+    hasMoved: true,
+    lastTransitionAt: "2026-08-04T11:04:00.000Z",
+    active: true,
+  });
+  assert.doesNotMatch(
+    JSON.stringify(hub.todoProgress("session-a")),
+    /private active|private pending|private added/,
+  );
+});
+
+test("keeps removed todo tombstones out of global progress counts", () => {
+  let now = Date.parse("2026-08-04T11:00:00.000Z");
+  const hub = new ActivityHub({ streamEpoch: "todo-tombstone-progress", now: () => now });
+  const live = (id: string) => ({
+    id,
+    text: `private ${id}`,
+    status: "pending" as const,
+    detail: null,
+    addedAfterStart: false,
+    removedReason: null,
+  });
+  hub.ingest("session-a", "codex", {
+    type: "upsert",
+    item: { id: "todos", kind: "todo", steps: [live("one"), live("two")] },
+  });
+  now = Date.parse("2026-08-04T11:04:00.000Z");
+  hub.ingest("session-a", "codex", {
+    type: "upsert",
+    item: {
+      id: "todos",
+      kind: "todo",
+      steps: [
+        live("two"),
+        { ...live("one"), status: "removed", removedReason: null },
+      ],
+      added: 0,
+      removed: 1,
+    },
+  });
+  assert.deepEqual(hub.todoProgress("session-a"), {
+    completed: 0,
+    total: 1,
+    hasMoved: true,
+    lastTransitionAt: "2026-08-04T11:04:00.000Z",
+    active: false,
+  });
+});
+
+test("late todo-progress subscribers receive only an existing non-empty summary", () => {
+  const hub = new ActivityHub({ streamEpoch: "todo-late-subscriber" });
+  hub.ingest("with-progress", "codex", {
+    type: "upsert",
+    item: {
+      id: "todos",
+      kind: "todo",
+      steps: [{ id: "one", text: "private", status: "pending", detail: null, addedAfterStart: false, removedReason: null }],
+      added: 1,
+      removed: 0,
+    },
+  });
+  hub.ensureSession("without-progress", "claude");
+  const observed: Array<[string, TodoProgress | null]> = [];
+  hub.subscribeTodoProgress((sessionId, progress) => observed.push([sessionId, progress]));
+  assert.deepEqual(observed, [["with-progress", {
+    completed: 0,
+    total: 1,
+    hasMoved: false,
+    lastTransitionAt: null,
+    active: false,
+  }]]);
+
+  hub.clearSession("with-progress");
+  assert.deepEqual(observed.at(-1), ["with-progress", null]);
 });
 
 test("redacts and bounds activity before snapshots, replay, and subscribers", () => {

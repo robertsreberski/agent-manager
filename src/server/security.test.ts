@@ -18,7 +18,6 @@ import {
   requestAttachAuthorizeSpawnFromControlSocket,
   requestAttachStartedFromControlSocket,
   requestBootstrapFromControlSocket,
-  requestPanicLockFromControlSocket,
   startOwnerControlSocket,
 } from "./control-socket.ts";
 import { ControlLeaseBroker, LeaseConflictError } from "./controls.ts";
@@ -184,20 +183,10 @@ test("owner control socket rejects unsafe parents and validates socket permissio
     assert.throws(() => assertOwnerRuntimeDirectory(linked), /real directory/);
 
     const socketPath = join(runtime, "control.sock");
-    let releasePanic!: () => void;
-    let locked = false;
     const attachLifecycle: unknown[][] = [];
-    const panicGate = new Promise<void>((resolve) => {
-      releasePanic = resolve;
-    });
     const server = await startOwnerControlSocket(socketPath, {
       auth,
       bootstrapOrigin: "http://localhost:43127",
-      isLocked: () => locked,
-      onPanicLock: async () => {
-        locked = true;
-        await panicGate;
-      },
       onAttachAuthorizeSpawn: (...args) => {
         attachLifecycle.push(["authorize", ...args]);
       },
@@ -231,14 +220,6 @@ test("owner control socket rejects unsafe parents and validates socket permissio
     await assert.rejects(requestBootstrapFromControlSocket(socketPath), /mode 0600/);
     chmodSync(socketPath, 0o600);
 
-    let panicSettled = false;
-    const panic = requestPanicLockFromControlSocket(socketPath).finally(() => {
-      panicSettled = true;
-    });
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    assert.equal(panicSettled, false);
-    releasePanic();
-    assert.deepEqual(await panic, { ok: true });
     await new Promise<void>((resolve) => server.close(() => resolve()));
   } finally {
     rmSync(root, { recursive: true, force: true });

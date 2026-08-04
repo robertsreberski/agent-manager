@@ -1,157 +1,100 @@
 import { describe, expect, it, vi } from "vitest";
-
-import { normalizeSession } from "../lib/normalize";
-import type { ControlLease } from "../types";
-import {
-  acquireAutomaticLease,
-  BROWSER_CLIENT_ID_STORAGE_KEY,
-  getOrCreateBrowserClientId,
-  mutationsAreReady,
-  sensitiveBoundaryStatus,
-} from "./use-cockpit";
 import { ApiError } from "../lib/api";
 import { BrowserSessionError } from "../lib/auth";
+import type { ControlLease, SessionView, StateEvent, WireStateSnapshot } from "../types";
+import { AGENT_MANAGER_BUILD_ID, WireUpgradeRequiredError, WIRE_SCHEMA_VERSION } from "../types";
+import { acquireAutomaticLease, applyStateEvent, generateBrowserClientId, isStaleRequestRace, mutationsAreReady, releaseLeasesForPageExit, reloadForWireUpgrade, sensitiveBoundaryStatus, WIRE_UPGRADE_RELOAD_STORAGE_KEY } from "./use-cockpit";
 
 function lease(token: string, seconds = 300): ControlLease {
-  return {
-    token,
-    clientId: "browser",
-    expiresAt: new Date(Date.now() + seconds * 1_000).toISOString(),
-  };
+  return { token, clientId: "browser", expiresAt: new Date(Date.now() + seconds * 1_000).toISOString() };
 }
 
-function session(accessMode: "sandboxed" | "bypass-permissions" = "sandboxed") {
-  return normalizeSession({
-    id: accessMode === "bypass-permissions" ? "codex:bypass" : "codex:sandboxed",
-    provider: "codex",
-    effectiveAccess: { accessMode },
+const target = { id: "local:codex:one" } as SessionView;
+const snapshot: WireStateSnapshot = { schemaVersion: WIRE_SCHEMA_VERSION, buildId: AGENT_MANAGER_BUILD_ID, generatedAt: "2026-08-04T12:00:00Z", seq: 3, stale: false, sessions: [], diagnostics: [] };
+
+describe("strict event reconciliation", () => {
+  it("ignores replay and applies opaque-id removal", () => {
+    const replay = { schemaVersion: WIRE_SCHEMA_VERSION, buildId: AGENT_MANAGER_BUILD_ID, seq: 3, at: "2026-08-04T12:01:00Z", type: "session.remove", payload: { id: "opaque" } } satisfies StateEvent;
+    expect(applyStateEvent(snapshot, replay)).toBe(snapshot);
+    const current = { ...snapshot, sessions: [target] };
+    const remove = { ...replay, seq: 4, payload: { id: target.id } } satisfies StateEvent;
+    expect(applyStateEvent(current, remove).sessions).toEqual([]);
   });
-}
+  it("replaces diagnostics atomically", () => {
+    const event = { schemaVersion: WIRE_SCHEMA_VERSION, buildId: AGENT_MANAGER_BUILD_ID, seq: 4, at: "2026-08-04T12:01:00Z", type: "diagnostic", payload: { stale: true, diagnostics: [{ provider: "system", level: "warning", message: "offline" }] } } satisfies StateEvent;
+    expect(applyStateEvent(snapshot, event)).toMatchObject({ seq: 4, stale: true, diagnostics: event.payload.diagnostics });
+  });
+});
 
-describe("acquireAutomaticLease", () => {
-  it.each(["sandboxed", "bypass-permissions"] as const)(
-    "acquires the same short background lease for %s sessions",
-    async (accessMode) => {
-      const acquired = lease("ready", 60);
-      const acquireLease = vi.fn().mockResolvedValue(acquired);
-      const target = session(accessMode);
-
-      await expect(acquireAutomaticLease(
-        { acquireLease },
-        target,
-        "browser",
-        undefined,
-      )).resolves.toBe(acquired);
-
-      expect(acquireLease).toHaveBeenCalledWith(target.id, "browser", undefined, 60, false);
-    },
-  );
-
-  it("reuses a fresh lease without surfacing renewal UI", async () => {
+describe("internal writer acquisition", () => {
+  it("acquires one short writer token irrespective of profile", async () => {
+    const acquired = lease("ready", 60);
+    const acquireLease = vi.fn().mockResolvedValue(acquired);
+    await expect(acquireAutomaticLease({ acquireLease }, target, "browser", undefined)).resolves.toBe(acquired);
+    expect(acquireLease).toHaveBeenCalledWith(target.id, "browser", undefined, 60, false);
+  });
+  it("reuses a fresh token and takes over only explicitly", async () => {
     const current = lease("current", 60);
     const acquireLease = vi.fn();
-    await expect(acquireAutomaticLease(
-      { acquireLease },
-      session(),
-      "browser",
-      current,
-    )).resolves.toBe(current);
+    await expect(acquireAutomaticLease({ acquireLease }, target, "browser", current)).resolves.toBe(current);
     expect(acquireLease).not.toHaveBeenCalled();
+    const expiring = lease("old", 1);
+    acquireLease.mockResolvedValue(lease("new"));
+    await acquireAutomaticLease({ acquireLease }, target, "browser", expiring, true);
+    expect(acquireLease).toHaveBeenCalledWith(target.id, "browser", "old", 60, true);
   });
+  it("releases every held writer best-effort with keepalive on page exit", () => {
+    const releaseLease = vi.fn()
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("page already closing"));
+    const result = releaseLeasesForPageExit({ releaseLease }, {
+      "local:codex:one": lease("one"),
+      "local:claude:two": lease("two"),
+    });
 
-  it("uses an explicit takeover only after the user resolves a browser conflict", async () => {
-    const current = lease("current", 1);
-    const acquireLease = vi.fn().mockResolvedValue(lease("taken-over"));
-    await acquireAutomaticLease({ acquireLease }, session(), "browser", current, true);
-    expect(acquireLease).toHaveBeenCalledWith(
-      "codex:sandboxed",
-      "browser",
-      "current",
-      60,
-      true,
-    );
-  });
-});
-
-describe("getOrCreateBrowserClientId", () => {
-  it("reuses a valid ID from this tab's session storage", () => {
-    const stored = "web-12345678-1234-1234-1234-123456789abc";
-    const storage = {
-      getItem: vi.fn().mockReturnValue(stored),
-      setItem: vi.fn(),
-    };
-    const generate = vi.fn().mockReturnValue("web-unused-value");
-
-    expect(getOrCreateBrowserClientId(storage, generate)).toBe(stored);
-    expect(storage.getItem).toHaveBeenCalledWith(BROWSER_CLIENT_ID_STORAGE_KEY);
-    expect(storage.setItem).not.toHaveBeenCalled();
-    expect(generate).not.toHaveBeenCalled();
-  });
-
-  it("replaces an invalid stored value with a safe generated ID", () => {
-    const storage = {
-      getItem: vi.fn().mockReturnValue("web-unsafe?client=collision"),
-      setItem: vi.fn(),
-    };
-
-    expect(getOrCreateBrowserClientId(storage, () => "web-safe-tab-1234")).toBe("web-safe-tab-1234");
-    expect(storage.setItem).toHaveBeenCalledWith(
-      BROWSER_CLIENT_ID_STORAGE_KEY,
-      "web-safe-tab-1234",
-    );
-  });
-
-  it("falls back to a page-lifetime ID when storage access throws", () => {
-    const storage = {
-      getItem: vi.fn(() => {
-        throw new DOMException("blocked", "SecurityError");
-      }),
-      setItem: vi.fn(() => {
-        throw new DOMException("blocked", "SecurityError");
-      }),
-    };
-
-    expect(getOrCreateBrowserClientId(storage, () => "web-memory-only-1234")).toBe(
-      "web-memory-only-1234",
-    );
-    expect(storage.setItem).toHaveBeenCalledOnce();
-  });
-
-  it("keeps independently scoped tab stores independent", () => {
-    const firstValues = new Map<string, string>();
-    const secondValues = new Map<string, string>();
-    const firstStorage = {
-      getItem: (key: string) => firstValues.get(key) ?? null,
-      setItem: (key: string, value: string) => firstValues.set(key, value),
-    };
-    const secondStorage = {
-      getItem: (key: string) => secondValues.get(key) ?? null,
-      setItem: (key: string, value: string) => secondValues.set(key, value),
-    };
-
-    expect(getOrCreateBrowserClientId(firstStorage, () => "web-first-tab-1234")).toBe(
-      "web-first-tab-1234",
-    );
-    expect(getOrCreateBrowserClientId(secondStorage, () => "web-second-tab-1234")).toBe(
-      "web-second-tab-1234",
-    );
+    expect(result).toBeUndefined();
+    expect(releaseLease).toHaveBeenCalledTimes(2);
+    expect(releaseLease).toHaveBeenNthCalledWith(1, "local:codex:one", "one", true);
+    expect(releaseLease).toHaveBeenNthCalledWith(2, "local:claude:two", "two", true);
   });
 });
 
-describe("cockpit connectivity guards", () => {
-  it("allows mutations only with an authenticated, open, authoritative snapshot", () => {
+describe("browser identity and connectivity", () => {
+  it("generates a safe lease identity for this document without storage persistence", () => {
+    expect(generateBrowserClientId()).toMatch(/^web-[A-Za-z0-9._:-]{4,124}$/u);
+    expect(generateBrowserClientId()).not.toBe(generateBrowserClientId());
+  });
+  it("hard-reloads exactly once for the same wire mismatch", () => {
+    const values = new Map<string, string>();
+    const storage = {
+      getItem: vi.fn((key: string) => values.get(key) ?? null),
+      setItem: vi.fn((key: string, value: string) => { values.set(key, value); }),
+      removeItem: vi.fn((key: string) => { values.delete(key); }),
+    };
+    const reload = vi.fn();
+    const mismatch = new WireUpgradeRequiredError({ schemaVersion: 2, buildId: "old" });
+    expect(reloadForWireUpgrade(mismatch, storage, reload)).toBe(true);
+    expect(reloadForWireUpgrade(mismatch, storage, reload)).toBe(false);
+    expect(storage.setItem).toHaveBeenCalledWith(WIRE_UPGRADE_RELOAD_STORAGE_KEY, expect.any(String));
+    expect(reload).toHaveBeenCalledOnce();
+  });
+  it("permits writes only from a fresh authenticated stream", () => {
     expect(mutationsAreReady(true, "open", false, "online")).toBe(true);
     expect(mutationsAreReady(true, "retrying", false, "online")).toBe(false);
     expect(mutationsAreReady(true, "open", true, "online")).toBe(false);
-    expect(mutationsAreReady(false, "open", false, "online")).toBe(false);
-    expect(mutationsAreReady(true, "open", false, "offline")).toBe(false);
   });
-
-  it("recognizes API and browser-session privacy boundaries", () => {
+  it("recognizes only authentication as a sensitive boundary", () => {
     expect(sensitiveBoundaryStatus(new ApiError("expired", 401))).toBe(401);
-    expect(sensitiveBoundaryStatus(new BrowserSessionError("locked", "locked", 423))).toBe(423);
+    expect(sensitiveBoundaryStatus(new BrowserSessionError("expired", "unauthorized", 401))).toBe(401);
     expect(sensitiveBoundaryStatus(new ApiError("conflict", 409))).toBeNull();
-    expect(sensitiveBoundaryStatus(new TypeError("offline"))).toBeNull();
   });
-
+  it("recognizes only the exact stale-request first-winner race as quiet", () => {
+    expect(isStaleRequestRace(new ApiError("already answered", 409, {
+      error: { code: "REQUEST_STALE", message: "pending request is no longer active" },
+    }))).toBe(true);
+    expect(isStaleRequestRace(new ApiError("state changed", 409, {
+      error: { code: "STALE_GENERATION", message: "refresh before retrying" },
+    }))).toBe(false);
+    expect(isStaleRequestRace(new Error("REQUEST_STALE"))).toBe(false);
+  });
 });

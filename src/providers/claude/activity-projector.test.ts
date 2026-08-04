@@ -330,6 +330,123 @@ test("keeps 1,250 streamed tokens linear and preserves text-tool-final identity 
   assert.equal(ordered?.[1]?.kind, "tool");
 });
 
+test("projects Claude plan documents and live todo rewrites without inventing artifacts", () => {
+  const projector = new ClaudeActivityProjector();
+  const first = projector.projectMessage(sdk({
+    ...baseMessage("assistant", "artifact-first"),
+    parent_tool_use_id: null,
+    message: {
+      id: "artifact-message-1",
+      role: "assistant",
+      model: "claude-test",
+      stop_reason: "tool_use",
+      stop_sequence: null,
+      type: "message",
+      content: [
+        {
+          type: "tool_use",
+          id: "exit-plan-1",
+          name: "ExitPlanMode",
+          input: {
+            plan: "# Ship it\n\nKeep this markdown verbatim.",
+            planFilePath: "/tmp/claude/plans/ship.md",
+          },
+        },
+        {
+          type: "tool_use",
+          id: "todo-write-1",
+          name: "TodoWrite",
+          input: {
+            todos: [
+              { content: "Inspect", status: "pending", activeForm: "Inspecting" },
+              { content: "Build", status: "in_progress", activeForm: "Building now" },
+            ],
+          },
+        },
+      ],
+      usage: { input_tokens: 1, output_tokens: 1 },
+    },
+  }));
+  const plan = upserts(first).find((item) => item.kind === "plan");
+  assert.equal(plan?.markdown, "# Ship it\n\nKeep this markdown verbatim.");
+  assert.equal(plan?.path, "/tmp/claude/plans/ship.md");
+  assert.equal(plan?.version, null);
+  assert.equal(plan?.supersededBy, null);
+  assert.equal(plan?.approvalRequestId, null);
+  const initialTodo = upserts(first).find((item) => item.kind === "todo");
+  assert.deepEqual(initialTodo && {
+    statuses: initialTodo.steps?.map((step) => step.status),
+    details: initialTodo.steps?.map((step) => step.detail),
+    added: initialTodo.added,
+    removed: initialTodo.removed,
+  }, {
+    statuses: ["pending", "in_progress"],
+    details: [null, "Building now"],
+    added: 0,
+    removed: 0,
+  });
+
+  const rewrite = projector.projectMessage(sdk({
+    ...baseMessage("assistant", "artifact-rewrite"),
+    parent_tool_use_id: null,
+    message: {
+      id: "artifact-message-2",
+      role: "assistant",
+      model: "claude-test",
+      stop_reason: "tool_use",
+      stop_sequence: null,
+      type: "message",
+      content: [{
+        type: "tool_use",
+        id: "todo-write-2",
+        name: "TodoWrite",
+        input: {
+          todos: [
+            { content: "Inspect", status: "completed", activeForm: "Inspecting" },
+            { content: "Verify", status: "in_progress", activeForm: "Verifying" },
+          ],
+        },
+      }],
+      usage: { input_tokens: 1, output_tokens: 1 },
+    },
+  }));
+  const rewrittenTodo = upserts(rewrite).find((item) => item.kind === "todo");
+  assert.equal(rewrittenTodo?.id, initialTodo?.id);
+  assert.equal(rewrittenTodo?.added, 1);
+  assert.equal(rewrittenTodo?.removed, 1);
+  assert.deepEqual(rewrittenTodo?.steps?.map((step) => ({
+    text: step.text,
+    status: step.status,
+    addedAfterStart: step.addedAfterStart,
+    removedReason: step.removedReason,
+  })), [
+    { text: "Inspect", status: "completed", addedAfterStart: false, removedReason: null },
+    { text: "Verify", status: "in_progress", addedAfterStart: true, removedReason: null },
+    { text: "Build", status: "removed", addedAfterStart: false, removedReason: null },
+  ]);
+
+  const noPath = projector.projectMessage(sdk({
+    ...baseMessage("assistant", "plan-no-path"),
+    parent_tool_use_id: null,
+    message: {
+      id: "artifact-message-3",
+      role: "assistant",
+      model: "claude-test",
+      stop_reason: "tool_use",
+      stop_sequence: null,
+      type: "message",
+      content: [{
+        type: "tool_use",
+        id: "exit-plan-2",
+        name: "ExitPlanMode",
+        input: { plan: "# No file supplied" },
+      }],
+      usage: { input_tokens: 1, output_tokens: 1 },
+    },
+  }));
+  assert.equal(upserts(noPath).find((item) => item.kind === "plan")?.path, null);
+});
+
 test("projects tool progress, summaries, structured results, and replace-style usage", () => {
   const projector = new ClaudeActivityProjector();
   const progress = projector.projectMessage(sdk({
@@ -577,6 +694,90 @@ test("projects tasks, hooks, errors, supersedes, retractions, and provider reset
   assert.deepEqual(reset, [{ type: "reset", reason: "provider-reset" }]);
 });
 
+test("projects only provider-identified Claude subagents and their exact child edge", () => {
+  const projector = new ClaudeActivityProjector();
+  const started = projector.projectMessage(sdk({
+    ...baseMessage("system", "subagent-started"),
+    subtype: "task_started",
+    task_id: "agent-task",
+    tool_use_id: "agent-tool",
+    description: "Inspect authentication",
+    subagent_type: "reviewer",
+  }));
+  const subagent = upserts(started).find((item) => item.kind === "subagent");
+  assert.ok(subagent);
+  assert.equal(subagent.parentId, "claude:tool:agent-tool");
+
+  const child = projector.projectMessage(sdk({
+    ...baseMessage("assistant", "subagent-message"),
+    parent_tool_use_id: "agent-tool",
+    message: {
+      id: "subagent-api-message",
+      role: "assistant",
+      model: "claude-test",
+      stop_reason: "end_turn",
+      stop_sequence: null,
+      type: "message",
+      content: [{ type: "text", text: "Found the exact boundary", citations: null }],
+      usage: { input_tokens: 1, output_tokens: 1 },
+    },
+  }));
+  const childMessage = upserts(child).find((item) => item.kind === "message");
+  const updatedSubagent = [...upserts(child)].reverse().find(
+    (item) => item.kind === "subagent",
+  );
+  assert.ok(childMessage);
+  assert.equal(childMessage.parentId, subagent.id);
+  assert.equal(
+    updatedSubagent?.kind === "subagent"
+      ? updatedSubagent.childItemIds?.includes(childMessage.id)
+      : false,
+    true,
+  );
+});
+
+test("does not manufacture Claude subagents from generic or level-only task events", () => {
+  const projector = new ClaudeActivityProjector();
+  const workflow = projector.projectMessage(sdk({
+    ...baseMessage("system", "workflow-started"),
+    subtype: "task_started",
+    task_id: "workflow-task",
+    tool_use_id: "workflow-tool",
+    description: "Run the local spec workflow",
+    task_type: "local_workflow",
+    workflow_name: "spec",
+  }));
+  assert.equal(upserts(workflow).some((item) => item.kind === "subagent"), false);
+  assert.equal(upserts(workflow).some((item) =>
+    item.kind === "lifecycle" && item.id === "claude:task:workflow-task"
+  ), true);
+
+  const level = projector.projectMessage(sdk({
+    ...baseMessage("system", "background-level"),
+    subtype: "background_tasks_changed",
+    tasks: [{
+      task_id: "bash-task",
+      task_type: "shell",
+      description: "Run tests",
+    }],
+  }));
+  assert.equal(upserts(level).some((item) => item.kind === "subagent"), false);
+
+  const unparentedProgress = projector.projectMessage(sdk({
+    ...baseMessage("tool_progress", "tool-progress"),
+    tool_use_id: "child-tool",
+    tool_name: "Read",
+    parent_tool_use_id: null,
+    elapsed_time_seconds: 1,
+    task_id: "unidentified-task",
+    subagent_type: "reviewer",
+  }));
+  assert.equal(
+    upserts(unparentedProgress).some((item) => item.kind === "subagent"),
+    false,
+  );
+});
+
 test("turns exact SDK callbacks into resolvable attention activity", () => {
   const projector = new ClaudeActivityProjector();
   const base: ClaudeManagedSessionSnapshot = {
@@ -588,8 +789,11 @@ test("turns exact SDK callbacks into resolvable attention activity", () => {
     activity: "requires_action",
     mode: "default",
     desiredMode: "default",
+    model: "sonnet",
+    desiredModel: "sonnet",
+    effort: "high",
     sdkVersion: "0.3.220",
-    claudeCodeVersion: "2.1.220",
+    claudeCodeVersion: "2.1.221",
     capabilities: [],
     canSteer: true,
     pendingRequests: [{
@@ -603,7 +807,7 @@ test("turns exact SDK callbacks into resolvable attention activity", () => {
           questions: [{
             header: "Storage",
             question: "Which database?",
-            options: [{ label: "SQLite", description: "Local" }],
+            options: [{ label: "SQLite", description: "Local", recommended: true }],
             multiSelect: false,
             isSecret: true,
           }],
@@ -611,6 +815,7 @@ test("turns exact SDK callbacks into resolvable attention activity", () => {
       },
       createdAt: "2026-08-03T12:00:00.000Z",
     }],
+    stagedMessages: [],
     outstandingMessageIds: [],
     stillQueuedMessageIds: [],
     queueKnowledge: "known",
@@ -626,6 +831,7 @@ test("turns exact SDK callbacks into resolvable attention activity", () => {
   assert.equal(attention?.respondable, true);
   assert.equal(attention?.isSecret, true);
   assert.equal(attention?.questions?.[0]?.text, "Which database?");
+  assert.equal(attention?.questions?.[0]?.options[0]?.recommended, true);
 
   const resolved = projector.projectSnapshot({
     ...base,
@@ -638,6 +844,129 @@ test("turns exact SDK callbacks into resolvable attention activity", () => {
   );
   assert.equal(resolvedAttention?.resolved, true);
   assert.equal(resolvedAttention?.state, "complete");
+});
+
+test("Claude approval activity carries SDK-supplied facts without shell inference", () => {
+  const projector = new ClaudeActivityProjector();
+  const snapshot: ClaudeManagedSessionSnapshot = {
+    localId: "local",
+    sessionId: "provider-session",
+    resumedFrom: null,
+    cwd: "/workspace/app",
+    owner: "manager",
+    activity: "requires_action",
+    mode: "default",
+    desiredMode: "default",
+    model: "sonnet",
+    desiredModel: "sonnet",
+    effort: "high",
+    sdkVersion: "0.3.220",
+    claudeCodeVersion: "2.1.221",
+    capabilities: [],
+    canSteer: true,
+    pendingRequests: [{
+      id: "permission-1",
+      kind: "permission",
+      title: "Claude wants to write a file",
+      toolName: "Write",
+      toolUseId: "write-tool",
+      payload: {
+        input: {
+          file_path: "../shared/output.txt",
+          deleteCount: 2,
+          network: false,
+        },
+        suggestions: [{ type: "addRules", destination: "session" }],
+      },
+      createdAt: "2026-08-03T12:00:00.000Z",
+    }, {
+      id: "permission-2",
+      kind: "permission",
+      title: "Claude wants to run a command",
+      toolName: "Bash",
+      toolUseId: "bash-tool",
+      payload: { input: { command: "rm -rf /tmp/output" } },
+      createdAt: "2026-08-03T12:00:00.000Z",
+    }, {
+      id: "plan-approval-1",
+      kind: "plan-approval",
+      title: "Claude wants to leave plan mode",
+      toolName: "ExitPlanMode",
+      toolUseId: "exit-plan-tool",
+      payload: { input: { plan: "# Exact plan" } },
+      createdAt: "2026-08-03T12:00:00.000Z",
+    }],
+    stagedMessages: [],
+    outstandingMessageIds: [],
+    stillQueuedMessageIds: [],
+    queueKnowledge: "known",
+    handoff: null,
+    lastError: null,
+    generation: 1,
+    startedAt: "2026-08-03T12:00:00.000Z",
+    updatedAt: "2026-08-03T12:00:00.000Z",
+  };
+  const projected = upserts(projector.projectSnapshot(snapshot));
+  const attention = projected.filter(
+    (item) => item.kind === "attention",
+  );
+  const write = attention.find((item) => item.kind === "attention" && item.requestId === "permission-1");
+  assert.equal(write?.kind, "attention");
+  if (write?.kind === "attention") {
+    assert.deepEqual(write.approvalFacts, {
+      command: null,
+      paths: ["/workspace/shared/output.txt"],
+      writes: ["../shared/output.txt"],
+      network: null,
+      canPersist: true,
+      deleteCount: null,
+    });
+  }
+  const bash = attention.find((item) => item.kind === "attention" && item.requestId === "permission-2");
+  assert.equal(bash?.kind, "attention");
+  if (bash?.kind === "attention") {
+    assert.equal(bash.approvalFacts?.command, "rm -rf /tmp/output");
+    assert.equal(bash.approvalFacts?.paths, null);
+    assert.deepEqual(bash.approvalFacts?.writes, []);
+  }
+  const plan = projected.find((item) => item.kind === "plan");
+  assert.equal(plan?.kind, "plan");
+  if (plan?.kind === "plan") {
+    assert.equal(plan.approvalRequestId, "plan-approval-1");
+    assert.equal(plan.approvedAt, null);
+  }
+  const approved = upserts(projector.projectPlanApproval(
+    snapshot.pendingRequests[2]!,
+    "2026-08-03T12:01:00.000Z",
+  ))[0];
+  assert.equal(approved?.kind, "plan");
+  if (approved?.kind === "plan") {
+    assert.equal(approved.approvalRequestId, "plan-approval-1");
+    assert.equal(approved.approvedAt, "2026-08-03T12:01:00.000Z");
+    assert.equal(approved.state, "complete");
+  }
+  const replayed = upserts(projector.projectMessage(sdk({
+    ...baseMessage("assistant", "plan-replay"),
+    parent_tool_use_id: null,
+    message: {
+      id: "plan-replay-message",
+      role: "assistant",
+      model: "claude-test",
+      stop_reason: "tool_use",
+      stop_sequence: null,
+      type: "message",
+      content: [{
+        type: "tool_use",
+        id: "exit-plan-tool",
+        name: "ExitPlanMode",
+        input: { plan: "# Exact plan" },
+      }],
+      usage: { input_tokens: 1, output_tokens: 1 },
+    },
+  }))).find((item) => item.kind === "plan");
+  assert.equal(replayed?.kind === "plan" ? replayed.approvalRequestId : null, "plan-approval-1");
+  assert.equal(replayed?.kind === "plan" ? replayed.approvedAt : null, "2026-08-03T12:01:00.000Z");
+  assert.equal(replayed?.state, "complete");
 });
 
 test("renders Claude rate-limit reset timestamps from Unix seconds", () => {

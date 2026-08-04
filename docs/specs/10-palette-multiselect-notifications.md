@@ -1,6 +1,6 @@
 # 10 — Command palette, multi-select, notifications
 
-**Status:** Draft · **Depends on:** 05, 06 · **Design frames:** `11a` (palette), `12a`
+**Status:** Accepted · **Depends on:** 05, 06 · **Design frames:** `11a` (palette), `12a`
 (multi-select), `12b` (notifications), `13b` (shortcut sheet)
 
 ## Purpose
@@ -42,21 +42,20 @@ The global collection SSE is **deliberately metadata-only** — `metadataOnly()`
 question or command input"*. A search endpoint that returns matching transcript text would be a
 hole in exactly that boundary.
 
-`GET /api/v1/search?q=` must therefore:
+`GET /api/v1/sessions/:id/search?q=` must therefore:
 
-- Search only sessions the authenticated principal can already open — the same set
-  `GET /api/v1/sessions` returns.
+- Search only the selected, authenticated session named by the route. There is no global
+  transcript search response.
 - Reuse `TRANSCRIPT_LIMITS` (`src/server/transcript.ts:32-37`) and the existing path hardening
   (uid-owned root, `O_RDONLY|O_NOFOLLOW`, dev/ino re-verification). Do not write a second
   transcript reader.
 - Be rate-limited like the other read routes (`60/min`).
-- Return **a match location and a short surrounding snippet for the selected session only**; for
-  other sessions return the session id, file offset and match count — enough to navigate to it,
-  not enough to read someone's conversation out of a list.
+- Return bounded literal-match locations and short snippets for that session only.
 - Never enter the global SSE or any replay ring.
 
-If that boundary feels too tight to be useful, the honest resolution is to narrow the feature
-(search the open session only) rather than widen the boundary.
+Remote transcript search is unavailable until the remote bridge implements the same hardened
+reader and wire epoch. The `@` prefix returns no results until a bounded workspace file index is
+available; it must not scan a repository on every keystroke.
 
 ### R4 — Shortcut sheet (`13b`)
 
@@ -67,7 +66,7 @@ If that boundary feels too tight to be useful, the honest resolution is to narro
 | Move | `⌘K` anything · `J`/`K` next, previous session · `1`–`9` jump to a board column · `⌘⇧D` review this turn's changes |
 | Answer | `1`–`9` pick an option · `↵` send · `⌘↵` allow an approval · `E` write a different answer |
 | Write | `⌘L` focus the composer · `↵` queue · `⌘⇧↵` steer now · `⌘.` stop the turn |
-| Set | `M` mode · `⌘⇧M` harness and model · `⌘⇧.` lock everything · `?` this sheet |
+| Set | `M` execution profile · `⌘⇧M` harness and model · `?` this sheet |
 
 > **Conflict to resolve.** The prototype's shortcut sheet lists `⌘↵` to *allow an approval*, but
 > `8a` states that outside-workspace and remote-host approvals have **no keyboard shortcut** —
@@ -99,13 +98,13 @@ categories that determine whether it is safe.
 ### R7 — Three new lifecycle actions
 
 Extend `sessionActionSchema` (`src/server/contracts.ts:50-72`) with `end`, `archive`, `delete`
-and capabilities to match (spec 01 R2 pattern).
+and capabilities to match the strict action gate in spec 01.
 
 | Action | Codex | Claude | Discovered / observe-only |
 | --- | --- | --- | --- |
 | `archive` | `thread/archive` (native) | no equivalent — **capability absent** | absent |
 | `delete` | `thread/delete` (native) | no equivalent — **capability absent** | absent |
-| `end` | `turn/interrupt` then close the thread | end the SDK query | absent |
+| `end` | interrupt active turn, clear manager queue, unsubscribe/detach; thread remains resumable | `Query.close()` for manager-owned SDK only | absent |
 
 Codex has these natively (appendix §1.4); Claude does not. So a mixed selection may support an
 action for some sessions and not others. **The bar must apply an action only where the capability
@@ -116,13 +115,16 @@ Each action is per-session, idempotent, and audited like every other mutation.
 
 ## Requirements — notifications (`12b`)
 
-### R8 — The rule is blocked or not blocked
+### R8 — Exact transitions only
 
-- **A question or approval always notifies.** The agent has stopped and only the operator can
-  restart it.
-- **Finishing waits until the operator has been away 5 minutes.**
+- The first snapshot establishes a baseline and never notifies.
+- A newly observed exact unresolved stable request ID notifies once. Heuristic/inferred
+  attention never notifies.
+- Finishing notifies only after a running-to-finished transition and five continuous minutes of
+  page-hidden/no-input absence.
 - **Progress never notifies.**
-- Short answers ride along as actions in the notification.
+- Notification actions only focus/open the app and select the session. They never answer,
+  approve, deny, stop, or otherwise mutate provider state.
 - Quiet hours mute the sound, not the board.
 
 ### R9 — Local notifications only, and say so
@@ -132,11 +134,14 @@ public endpoint**, so Web Push is not available and half-building it would be wo
 having it.
 
 Use the Notification API from the page and the existing service worker (`web/src/pwa/sw.ts`),
-which delivers while a tab is open or the PWA is installed and running. That is a real limit and
+which delivers only while the application is open/running because there is no Push transport.
+That is a real limit and
 the settings surface must state it plainly — an operator who thinks they will be paged on a
 locked phone and is not has been misled by the UI.
 
-The app badge already exists (`App.tsx`); extend it with the wants-you count.
+Use generic content by default (`Agent Manager needs you` / `A session finished`) with no
+question, command, cwd, or answer on the lock screen. Session name is an explicit opt-in. The app
+badge uses the exact wants-you count.
 
 ### R10 — Preferences
 
@@ -145,7 +150,7 @@ Requesting notification permission happens on the operator's action, never on lo
 
 ## Removals (spec 13)
 
-Nothing directly. §A2 — re-run the dependency import scan after this phase; the palette and
+Nothing directly. Re-run the dependency import scan after this phase; the palette and
 menus should by now have claimed `dropdown-menu`, and anything still unimported is deleted.
 
 ## Acceptance criteria
@@ -153,8 +158,8 @@ menus should by now have claimed `dropdown-menu`, and anything still unimported 
 1. `⌘K` on an untouched board lists wants-you sessions first, before any typing.
 2. Each prefix narrows to its kind; a prefix whose source is unavailable returns empty, not a
    guessed list.
-3. Transcript search returns snippets only for the selected session; other sessions return
-   location and count. Verified by test against the metadata-only boundary.
+3. Transcript search returns bounded snippets only for the selected session. Verified by test
+   against the metadata-only boundary.
 4. Search reuses `TRANSCRIPT_LIMITS` and the existing hardened reader — no second implementation,
    no unhardened path.
 5. `?` shows the sheet; `⌘↵` is documented and implemented as tier-1 approvals only, and does
@@ -163,14 +168,9 @@ menus should by now have claimed `dropdown-menu`, and anything still unimported 
 7. A selection containing a running session offers no delete for it and says why.
 8. A mixed-provider selection reports per-action outcomes rather than failing silently or
    partially.
-9. A question raises a notification; a turn finishing while the operator is present does not.
-10. The notification settings state the local-only limitation.
-
-## Open questions
-
-- **Q1.** "Away 5 minutes" — measured how? Page visibility plus last input is the obvious
-  client-side answer; note that Claude Code solves the same problem with
-  `CLAUDE_CLIENT_PRESENCE_FILE`, which may be worth mirroring for the desktop case.
-- **Q2 (blocking R7).** Does ending a Claude session mean closing the SDK query, or terminating
-  the process? For an adopted or hook-bridged session the manager does not own the process at
-  all — `end` should be **absent** there, not best-effort. Confirm before implementing.
+9. Baseline, duplicate request IDs, heuristics, and a turn finishing while present do not notify;
+   one new exact request does.
+10. Notification settings state the local-only limitation and default to generic lock-screen
+    content.
+11. Multi-session operations use bounded per-session concurrency and report a complete outcome
+    summary; no batch RPC or silent partial success exists.

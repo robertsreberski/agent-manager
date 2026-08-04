@@ -35,7 +35,7 @@ export interface SshHostConfig {
 }
 
 export interface AgentManagerConfig {
-  version: 2;
+  version: 3;
   backend: {
     host: "127.0.0.1";
     port: number;
@@ -135,6 +135,17 @@ const loadedConfigRevisions = new WeakMap<AgentManagerConfig, string>();
 const heldConfigLocks = new Map<string, HeldConfigLock>();
 const sleepCell = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
 
+export const CONFIG_SCHEMA_VERSION = 3 as const;
+
+export class IncompatibleConfigError extends Error {
+  readonly code = "INCOMPATIBLE_CONFIG";
+
+  constructor(version: unknown) {
+    super(`Unsupported Agent Manager config version: ${String(version)}`);
+    this.name = "IncompatibleConfigError";
+  }
+}
+
 export function defaultPaths(homeDirectory = homedir(), uid = process.getuid?.() ?? 0): AgentManagerPaths {
   const dataDirectory = join(homeDirectory, "Library", "Application Support", "agent-manager");
   const runtimeDirectory = `/private/tmp/agent-manager-${uid}`;
@@ -150,7 +161,7 @@ export function defaultPaths(homeDirectory = homedir(), uid = process.getuid?.()
 
 export function defaultConfig(): AgentManagerConfig {
   return {
-    version: 2,
+    version: CONFIG_SCHEMA_VERSION,
     backend: { host: "127.0.0.1", port: 43_127 },
     tailscale: { httpsPort: 9_443, allowedLogin: null, dnsName: null },
     hosts: [],
@@ -186,6 +197,12 @@ function isSafeDnsName(value: unknown): value is string {
   );
 }
 
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const expected = new Set(keys);
+  return Object.keys(value).length === expected.size
+    && Object.keys(value).every((key) => expected.has(key));
+}
+
 export function isSafeSshTarget(value: unknown): value is string {
   return isSafeIdentityText(value, 320)
     && !value.startsWith("-")
@@ -195,21 +212,19 @@ export function isSafeSshTarget(value: unknown): value is string {
 function validateConfig(value: unknown): AgentManagerConfig {
   if (!value || typeof value !== "object") throw new Error("Agent Manager config must be an object");
   const input = value as Record<string, unknown>;
-  if (input.version !== 1 && input.version !== 2) {
-    throw new Error("Unsupported Agent Manager config version");
+  if (input.version !== CONFIG_SCHEMA_VERSION) throw new IncompatibleConfigError(input.version);
+  if (!hasExactKeys(input, ["version", "backend", "tailscale", "hosts", "workspaces"])) {
+    throw new Error("Agent Manager config contains unknown or missing fields");
   }
-  const legacy = input.version === 1;
-  const config = {
-    ...input,
-    version: 2,
-    hosts: legacy ? [] : input.hosts,
-    workspaces: Array.isArray(input.workspaces)
-      ? input.workspaces.map((workspace) => ({
-          ...(workspace as Record<string, unknown>),
-          hostId: legacy ? "local" : (workspace as Record<string, unknown>).hostId,
-        }))
-      : input.workspaces,
-  } as unknown as Partial<AgentManagerConfig>;
+  if (!input.backend || typeof input.backend !== "object") throw new Error("Backend config is invalid");
+  if (!input.tailscale || typeof input.tailscale !== "object") throw new Error("Tailscale config is invalid");
+  const backend = input.backend as Record<string, unknown>;
+  const tailscale = input.tailscale as Record<string, unknown>;
+  if (!hasExactKeys(backend, ["host", "port"])) throw new Error("Backend config is invalid");
+  if (!hasExactKeys(tailscale, ["httpsPort", "allowedLogin", "dnsName"])) {
+    throw new Error("Tailscale config is invalid");
+  }
+  const config = input as unknown as AgentManagerConfig;
   if (config.backend?.host !== "127.0.0.1") throw new Error("Backend host must be 127.0.0.1");
   if (
     !Number.isInteger(config.backend.port)
@@ -234,6 +249,9 @@ function validateConfig(value: unknown): AgentManagerConfig {
   const hostIds = new Set<string>(["local"]);
   const hostTargets = new Set<string>();
   for (const host of config.hosts) {
+    if (!host || typeof host !== "object" || !hasExactKeys(host as unknown as Record<string, unknown>, ["id", "name", "target"])) {
+      throw new Error("SSH host entry is invalid or duplicated");
+    }
     if (
       !isSafeIdentityText(host.id, 128)
       || !isSafeIdentityText(host.name, 120)
@@ -246,17 +264,26 @@ function validateConfig(value: unknown): AgentManagerConfig {
     hostTargets.add(host.target);
   }
   if (!Array.isArray(config.workspaces)) throw new Error("Workspaces must be an array");
+  const workspaceIds = new Set<string>();
+  const workspaceLocations = new Set<string>();
   for (const workspace of config.workspaces) {
+    if (!workspace || typeof workspace !== "object" || !hasExactKeys(workspace as unknown as Record<string, unknown>, ["id", "name", "path", "hostId"])) {
+      throw new Error("Workspace entry is incomplete");
+    }
     if (
       !isSafeIdentityText(workspace.id, 128)
       || !isSafeIdentityText(workspace.name, 120)
       || !isSafeIdentityText(workspace.path, 4_096)
       || !hostIds.has(workspace.hostId)
+      || workspaceIds.has(workspace.id)
+      || workspaceLocations.has(`${workspace.hostId}\0${workspace.path}`)
     ) {
       throw new Error("Workspace entry is incomplete");
     }
+    workspaceIds.add(workspace.id);
+    workspaceLocations.add(`${workspace.hostId}\0${workspace.path}`);
   }
-  return config as AgentManagerConfig;
+  return config;
 }
 
 function serializedConfig(config: AgentManagerConfig): string {
@@ -774,6 +801,53 @@ function assertDirectory(path: string, label: string, requirePrivate: boolean): 
       throw new Error(`${label} must have mode 0700`);
     }
   }
+}
+
+function removeOwnedStateFile(path: string): boolean {
+  const info = lstatIfPresent(path);
+  if (!info) return false;
+  if (info.isSymbolicLink() || !info.isFile()) {
+    throw new Error(`Refusing to reset non-file Agent Manager state: ${path}`);
+  }
+  if (typeof process.getuid === "function" && info.uid !== process.getuid()) {
+    throw new Error(`Refusing to reset Agent Manager state not owned by the current user: ${path}`);
+  }
+  unlinkSync(path);
+  return true;
+}
+
+/**
+ * Remove only Agent Manager's current config and SQLite state. This is an
+ * explicit deployment operation, never an automatic startup migration. It
+ * deliberately leaves audit logs, provider settings, credentials, hooks, and
+ * transcripts untouched.
+ */
+export function resetOwnedState(paths: AgentManagerPaths = defaultPaths()): string[] {
+  if (
+    !isAbsolute(paths.dataDirectory)
+    || resolve(paths.dataDirectory) !== paths.dataDirectory
+    || paths.configFile !== join(paths.dataDirectory, "config.json")
+    || paths.databaseFile !== join(paths.dataDirectory, "state.sqlite")
+  ) {
+    throw new Error("Agent Manager reset paths are not the canonical owned state paths");
+  }
+
+  const existingDirectory = lstatIfPresent(paths.dataDirectory);
+  if (!existingDirectory) return [];
+  assertDirectory(paths.dataDirectory, "Agent Manager data directory", true);
+
+  return withConfigLock(() => {
+    const removed: string[] = [];
+    for (const path of [
+      paths.configFile,
+      paths.databaseFile,
+      `${paths.databaseFile}-wal`,
+      `${paths.databaseFile}-shm`,
+    ]) {
+      if (removeOwnedStateFile(path)) removed.push(path);
+    }
+    return removed;
+  }, paths);
 }
 
 /**

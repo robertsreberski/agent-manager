@@ -1,6 +1,6 @@
 # 07 — Questions and approvals
 
-**Status:** Draft · **Depends on:** 05 · **Design frames:** `6a` (question), `8a` (approvals),
+**Status:** Accepted · **Depends on:** 03, 05 · **Design frames:** `6a` (question), `8a` (approvals),
 `9a-3` `9a-4` `9a-5` (phone)
 
 ## Purpose
@@ -97,7 +97,7 @@ Claude sends `tool_input`. So:
 | Inside vs outside the workspace | **Yes** — compare resolved paths against the workspace root | This is what *selects* the tier |
 | `writes <path>` | **Sometimes** — when the tool input names a path | Show the path the provider gave. Never a count. |
 | `deletes N files` | **No** | **Omit.** Do not glob the filesystem to produce a number; that is the cockpit doing work the agent has not been authorised to do. |
-| network | **Sometimes** — from sandbox policy or an obviously-network command | Show only when the provider's own policy says so |
+| network | **Sometimes** — from an explicit provider network policy/request field | Show only when the provider's own policy says so; never classify command text or a custom tool's lookalike field |
 
 The fact row shrinks to what is true. One honest fact beats three where two are invented.
 
@@ -107,20 +107,7 @@ If the paths in a request cannot be resolved confidently — a shell command wit
 an unparseable input — **treat it as outside the workspace**. The cheap error is an extra click;
 the expensive error is a silent `↵`.
 
-### R9 — Panic lock
-
-The only full-width element: red-tinted fill, triangle glyph,
-`Locked — N sessions held, nothing will run`, and an `Unlock` pill.
-
-The mechanism exists (`src/ops/panic-lock.ts`, `423 CONTROL_PLANE_LOCKED` middleware,
-owner-socket `panic-lock` command). `SECURITY.md:97-99` is explicit that it "deliberately does
-not kill native children or type into unrelated existing agent or tmux sessions" — the banner's
-wording must not overclaim. "Nothing will run" refers to cockpit-mediated actions; sessions the
-manager does not control are unaffected, and the banner should not imply otherwise.
-
-While locked, the hook bridge keeps reporting events and auto-defers decisions (spec 03 R1).
-
-### R10 — Elicitations are shown, not answered
+### R9 — Elicitations are shown, not answered
 
 Unchanged from today, and deliberate: MCP elicitation forms appear in the timeline marked
 non-respondable, pointing at the native provider interface
@@ -128,10 +115,10 @@ non-respondable, pointing at the native provider interface
 `src/providers/claude/provider-adapter.ts:542-544`). The stated reason —
 *"The current cockpit cannot faithfully encode form or URL elicitations"* — still holds.
 
-The hook bridge's `Elicitation` event could return `accept` with content (spec 03 R5). It must
+The hook bridge's `Elicitation` event could return `accept` with content (spec 03). It must
 not, until the cockpit can render the form faithfully.
 
-### R11 — Losing the race
+### R10 — Losing the race
 
 With adoption (spec 02) and the hook bridge (spec 03), a request may be answered in the terminal
 while the cockpit is showing it. On `serverRequest/resolved`, or on a `409 REQUEST_STALE` from
@@ -140,7 +127,7 @@ it was resolved. **This is a normal outcome, not an error toast.**
 
 ## Requirements — where these live
 
-### R12 — Inline first, banner second
+### R11 — Inline first, banner second
 
 Today there is both a "Needs you" banner with a Sheet (`pending-requests.tsx:335`) and an inline
 form in the timeline (`session-activity.tsx:590-614`). The redesign puts the request **in the
@@ -153,7 +140,7 @@ read-only).
 
 ## Removals (spec 13)
 
-The "Needs you" banner and its Sheet from `pending-requests.tsx` (R12). The question form itself
+The "Needs you" banner and its Sheet from `pending-requests.tsx` (R11). The question form itself
 survives, relocated.
 
 ## Acceptance criteria
@@ -171,15 +158,9 @@ survives, relocated.
 7. The fact row omits `deletes` when the provider gave no such fact — no filesystem is walked to
    produce one.
 8. A request answered elsewhere resolves the cockpit's copy quietly.
-9. Panic lock renders full-width, and its wording does not claim to stop sessions the manager
-   does not control.
-
-## Open questions
-
-- **Q1.** `Always allow <class>` (tier 1) implies a persisted allow-rule. Codex has
-  `permissionProfile/list` and `approval_policy`; Claude has `permissions` in settings. Is this
-  a provider-side rule or an Agent Manager one? Provider-side is the honest answer — the cockpit
-  should not build a shadow permission system the terminal does not honour. **Recommend:
-  provider-side, and hide the button where the provider cannot persist it.**
-- **Q2.** Tier 3 wants "how many other sessions share this host". Derivable from the session
-  collection; confirm it means *sessions on that host* rather than *sessions in that workspace*.
+9. `Always allow` appears only when the provider itself supplies a persistence choice. Agent
+   Manager never creates a shadow allow-rule.
+10. The remote tier's count means active sessions on that host and is derived from the current
+    collection; it is omitted when the collection is stale.
+11. Repository searches find no global stop command, state, middleware, sentinel, banner, or
+    documentation. Approval safety relies on exact capability/request gates.

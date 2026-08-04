@@ -3,48 +3,98 @@ import type {
   SessionAttention,
   SessionRecord,
   SessionView,
-} from "../core/types.ts";
-import type { StateEvent, StateEventType, StateSnapshot } from "./contracts.ts";
+  TodoProgress,
+} from "../shared/session.ts";
+import {
+  parseStateEvent,
+  parseSessionRecord,
+  AGENT_MANAGER_BUILD_ID,
+  WIRE_SCHEMA_VERSION,
+  type StateEvent,
+  type StateEventType,
+  type WireActionUpdate,
+  type WireStateSnapshot,
+} from "../shared/wire.ts";
 
 type StateListener = (event: StateEvent) => void;
+type EventOf<T extends StateEventType> = Extract<StateEvent, { type: T }>;
+type EventPayload<T extends StateEventType> = EventOf<T>["payload"];
 
 function clone<T>(value: T): T {
   return structuredClone(value);
 }
 
-function sessionId(record: SessionRecord | SessionView): string {
-  return "id" in record && typeof record.id === "string"
-    ? record.id
-    : `${record.provider}:${record.sessionId}`;
-}
-
-function metadataOnly(record: SessionRecord | SessionView): SessionRecord | SessionView {
+/** Strip selected-session content before a record enters global state/SSE. */
+function metadataOnly(record: SessionRecord): SessionRecord {
   const copy = clone(record);
-  if ("messages" in copy) delete copy.messages;
-  if ("transcript" in copy) delete copy.transcript;
   copy.attention = copy.attention.map((attention): SessionAttention => ({
     id: attention.id,
     kind: attention.kind,
-    // Provider summaries can contain the exact question or command input.
-    // The global collection and its replay ring carry metadata only; selected
-    // clients hydrate exact request content from the activity stream.
     summary: null,
     source: attention.source,
     confidence: attention.confidence,
-    ...(typeof attention.details?.respondable === "boolean"
-      ? { details: { respondable: attention.details.respondable } }
-      : {}),
+    details: attention.details === null
+      ? null
+      : {
+          title: null,
+          questions: null,
+          toolName: null,
+          inputSummary: null,
+          respondable: attention.details.respondable,
+        },
   }));
   return copy;
 }
 
-function comparableSession(record: SessionView): string {
-  const copy = clone(record);
-  copy.generation = 0;
-  // The lease broker owns this transient bit; provider reconciliation must not
-  // repeatedly toggle it or advance the provider-state generation.
-  copy.control.writableLease = false;
-  return JSON.stringify(copy);
+function comparableSession(record: SessionRecord): string {
+  return JSON.stringify({ ...record, generation: 0 });
+}
+
+function normalizeTodoProgress(progress: TodoProgress | null): TodoProgress | null {
+  if (progress === null) return null;
+  const keys = Object.keys(progress).sort();
+  const expectedKeys = ["active", "completed", "hasMoved", "lastTransitionAt", "total"];
+  if (JSON.stringify(keys) !== JSON.stringify(expectedKeys)) {
+    throw new RangeError("todo progress must contain only the exact metadata fields");
+  }
+  if (
+    !Number.isSafeInteger(progress.completed)
+    || progress.completed < 0
+    || !Number.isSafeInteger(progress.total)
+    || progress.total < 0
+    || progress.completed > progress.total
+  ) throw new RangeError("todo progress must be nonnegative and completed cannot exceed total");
+  if (typeof progress.hasMoved !== "boolean" || typeof progress.active !== "boolean") {
+    throw new RangeError("todo movement metadata must be boolean");
+  }
+  if (
+    progress.lastTransitionAt !== null
+    && (
+      typeof progress.lastTransitionAt !== "string"
+      || !Number.isFinite(Date.parse(progress.lastTransitionAt))
+    )
+  ) throw new RangeError("last todo transition must be a timestamp or null");
+  if (progress.hasMoved !== (progress.lastTransitionAt !== null)) {
+    throw new RangeError("todo movement and transition timestamp must agree");
+  }
+  if (progress.active && progress.completed >= progress.total) {
+    throw new RangeError("completed todo progress cannot be active");
+  }
+  return {
+    completed: progress.completed,
+    total: progress.total,
+    hasMoved: progress.hasMoved,
+    lastTransitionAt: progress.lastTransitionAt,
+    active: progress.active,
+  };
+}
+
+function sameTodoProgress(left: TodoProgress | null, right: TodoProgress | null): boolean {
+  return left?.completed === right?.completed
+    && left?.total === right?.total
+    && left?.hasMoved === right?.hasMoved
+    && left?.lastTransitionAt === right?.lastTransitionAt
+    && left?.active === right?.active;
 }
 
 export class EventReplayRing {
@@ -65,13 +115,15 @@ export class EventReplayRing {
     return this.#seq;
   }
 
-  append(type: StateEventType, payload: unknown): StateEvent {
-    const event: StateEvent = {
+  append<T extends StateEventType>(type: T, payload: EventPayload<T>): EventOf<T> {
+    const event = parseStateEvent({
+      schemaVersion: WIRE_SCHEMA_VERSION,
+      buildId: AGENT_MANAGER_BUILD_ID,
       seq: ++this.#seq,
       at: new Date(this.#now()).toISOString(),
       type,
       payload: clone(payload),
-    };
+    }) as EventOf<T>;
     this.#events.push(event);
     if (this.#events.length > this.capacity) this.#events.shift();
     return clone(event);
@@ -96,10 +148,11 @@ export class EventReplayRing {
 
 export class SessionStateStore {
   readonly events: EventReplayRing;
-  #sessions = new Map<string, SessionView>();
+  #sessions = new Map<string, SessionRecord>();
   #discoveryDiagnostics: Diagnostic[] = [];
   #persistentDiagnostics: Diagnostic[] = [];
   #listeners = new Set<StateListener>();
+  #todoProgressOverrides = new Map<string, TodoProgress | null>();
   #nextGeneration = 0;
   #stale = false;
   #now: () => number;
@@ -118,9 +171,10 @@ export class SessionStateStore {
     return session ? clone(session) : null;
   }
 
-  snapshot(): StateSnapshot {
+  snapshot(): WireStateSnapshot {
     return {
-      version: 2,
+      schemaVersion: WIRE_SCHEMA_VERSION,
+      buildId: AGENT_MANAGER_BUILD_ID,
       generatedAt: new Date(this.#now()).toISOString(),
       seq: this.events.sequence,
       stale: this.#stale,
@@ -129,27 +183,24 @@ export class SessionStateStore {
     };
   }
 
-  replace(records: readonly (SessionRecord | SessionView)[], diagnostics: readonly Diagnostic[] = []): void {
+  replace(records: readonly SessionRecord[], diagnostics: readonly Diagnostic[] = []): void {
     const incomingIds = new Set<string>();
-    for (const record of records) {
-      const id = sessionId(record);
+    for (const rawRecord of records) {
+      const record = parseSessionRecord(rawRecord);
+      const id = record.id;
       incomingIds.add(id);
       const previous = this.#sessions.get(id);
-      const candidate: SessionView = {
-        ...metadataOnly(record),
-        id,
+      const metadata = metadataOnly(record);
+      const candidate: SessionRecord = {
+        ...metadata,
+        todoProgress: this.#todoProgressOverrides.has(id)
+          ? clone(this.#todoProgressOverrides.get(id) ?? null)
+          : metadata.todoProgress,
         generation: previous?.generation ?? record.generation,
-        control: {
-          ...clone(record.control),
-          writableLease: previous?.control.writableLease ?? record.control.writableLease,
-        },
       };
 
       if (!previous || comparableSession(previous) !== comparableSession(candidate)) {
         candidate.generation = ++this.#nextGeneration;
-        this.#sessions.set(id, candidate);
-        this.#publish("session.upsert", candidate);
-      } else if (previous.control.writableLease !== candidate.control.writableLease) {
         this.#sessions.set(id, candidate);
         this.#publish("session.upsert", candidate);
       }
@@ -157,6 +208,7 @@ export class SessionStateStore {
 
     for (const id of this.#sessions.keys()) {
       if (incomingIds.has(id)) continue;
+      this.#todoProgressOverrides.delete(id);
       this.#sessions.delete(id);
       this.#publish("session.remove", { id });
     }
@@ -165,37 +217,45 @@ export class SessionStateStore {
     this.#discoveryDiagnostics = clone([...diagnostics]);
     const nextDiagnostics = this.#diagnostics();
     if (JSON.stringify(previousDiagnostics) !== JSON.stringify(nextDiagnostics)) {
-      this.#publish("diagnostic", { diagnostics: clone(nextDiagnostics) });
+      this.#publish("diagnostic", {
+        stale: this.#stale,
+        diagnostics: clone(nextDiagnostics),
+      });
     }
   }
 
-  upsert(record: SessionRecord | SessionView): SessionView {
-    const retained = [...this.#sessions.values()].filter((entry) => entry.id !== sessionId(record));
+  upsert(record: SessionRecord): SessionView {
+    const retained = [...this.#sessions.values()].filter((entry) => entry.id !== record.id);
     this.replace([...retained, record], this.#discoveryDiagnostics);
-    const stored = this.get(sessionId(record));
+    const stored = this.get(record.id);
     if (!stored) throw new Error("session disappeared during upsert");
     return stored;
   }
 
   remove(id: string): boolean {
-    if (!this.#sessions.delete(id)) return false;
+    const removed = this.#sessions.delete(id);
+    this.#todoProgressOverrides.delete(id);
+    if (!removed) return false;
     this.#publish("session.remove", { id });
     return true;
   }
 
-  setWritableLease(id: string, writableLease: boolean): SessionView | null {
-    const current = this.#sessions.get(id);
-    if (!current || current.control.writableLease === writableLease) return current ? clone(current) : null;
-    const next: SessionView = {
-      ...current,
-      control: { ...current.control, writableLease },
+  /** Applies ActivityHub's content-free projection without exposing todo text. */
+  setTodoProgress(id: string, progress: TodoProgress | null): void {
+    const normalized = normalizeTodoProgress(progress);
+    this.#todoProgressOverrides.set(id, normalized);
+    const previous = this.#sessions.get(id);
+    if (!previous || sameTodoProgress(previous.todoProgress, normalized)) return;
+    const candidate: SessionRecord = {
+      ...previous,
+      todoProgress: clone(normalized),
+      generation: ++this.#nextGeneration,
     };
-    this.#sessions.set(id, next);
-    this.#publish("session.upsert", next);
-    return clone(next);
+    this.#sessions.set(id, candidate);
+    this.#publish("session.upsert", candidate);
   }
 
-  publishAction(payload: unknown): StateEvent {
+  publishAction(payload: WireActionUpdate): StateEvent {
     return this.#publish("action.updated", payload);
   }
 
@@ -209,7 +269,10 @@ export class SessionStateStore {
       ...this.#persistentDiagnostics.slice(-99),
       clone(diagnostic),
     ];
-    this.#publish("diagnostic", { diagnostics: clone(this.#diagnostics()) });
+    this.#publish("diagnostic", {
+      stale: this.#stale,
+      diagnostics: clone(this.#diagnostics()),
+    });
   }
 
   setStale(stale: boolean): void {
@@ -230,14 +293,14 @@ export class SessionStateStore {
     const unique = new Map<string, Diagnostic>();
     for (const diagnostic of [...this.#discoveryDiagnostics, ...this.#persistentDiagnostics]) {
       unique.set(
-        `${diagnostic.provider ?? ""}\u0000${diagnostic.level}\u0000${diagnostic.message}`,
+        `${diagnostic.provider}\u0000${diagnostic.level}\u0000${diagnostic.message}`,
         diagnostic,
       );
     }
     return [...unique.values()];
   }
 
-  #publish(type: StateEventType, payload: unknown): StateEvent {
+  #publish<T extends StateEventType>(type: T, payload: EventPayload<T>): EventOf<T> {
     const event = this.events.append(type, payload);
     for (const listener of this.#listeners) {
       try {

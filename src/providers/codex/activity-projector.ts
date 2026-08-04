@@ -1,13 +1,17 @@
 import { createHash } from "node:crypto";
 
 import type {
+  ActivityApprovalFacts,
   ActivityAttentionQuestion,
   ActivityFileChange,
   ActivityItemDraft,
   ActivityMutation,
-  ActivityPlanStep,
   ActivityState,
+  ActivityTodoInputStep,
+  ActivityTodoRewriteState,
 } from "../../activity/index.ts";
+import { reconcileTodoRewrite } from "../../activity/index.ts";
+import { resolveProviderPath } from "../approval-facts.ts";
 import {
   jsonRpcIdKey,
   type JsonRpcNotification,
@@ -30,12 +34,19 @@ export type CodexActivityOffsetLookup = (
   channel: CodexActivityAppendChannel,
 ) => number;
 
+export type CodexTodoProjectionState = ActivityTodoRewriteState;
+
+export type CodexActivityTodoLookup = (
+  id: string,
+) => CodexTodoProjectionState | null;
+
 export interface CodexActivityProjection {
   threadId: string;
   mutations: readonly ActivityMutation[];
 }
 
 const zeroOffset: CodexActivityOffsetLookup = () => 0;
+const noTodoState: CodexActivityTodoLookup = () => null;
 
 function record(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -80,6 +91,23 @@ function requestActivityId(threadId: string, requestId: JsonRpcId): string {
   return scopedId("request", threadId, jsonRpcIdKey(requestId));
 }
 
+function subagentActivityId(childThreadId: string): string {
+  return scopedId("subagent", childThreadId);
+}
+
+function collabAgentActivityState(value: unknown): ActivityState {
+  switch (value) {
+    case "pendingInit": return "pending";
+    case "running": return "running";
+    case "interrupted": return "interrupted";
+    case "completed":
+    case "shutdown": return "complete";
+    case "errored":
+    case "notFound": return "failed";
+    default: return "pending";
+  }
+}
+
 function isoFromMilliseconds(value: unknown): string | null {
   const milliseconds = finiteNumber(value);
   if (milliseconds === null) return null;
@@ -106,6 +134,162 @@ function jsonText(value: unknown): string | null {
   }
 }
 
+function nonemptyStrings(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  if (!value.every((entry) => typeof entry === "string" && entry.length > 0)) {
+    return null;
+  }
+  return value as string[];
+}
+
+function commandActionPaths(
+  value: unknown,
+  cwd: string | null,
+): string[] | null {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const paths: string[] = [];
+  for (const rawAction of value) {
+    const action = record(rawAction);
+    const type = stringValue(action?.type);
+    if (!action || !type || !["read", "listFiles", "search"].includes(type)) {
+      return null;
+    }
+    const path = stringValue(action.path);
+    // A provider action without a path cannot prove the command is confined
+    // to the workspace, so retain the conservative unknown classification.
+    if (!path) return null;
+    paths.push(resolveProviderPath(path, cwd));
+  }
+  return [...new Set(paths)];
+}
+
+function requestsNetworkAccess(params: Record<string, unknown>): boolean | null {
+  const context = record(params.networkApprovalContext);
+  const protocol = stringValue(context?.protocol);
+  if (
+    context
+    && typeof context.host === "string"
+    && context.host.length > 0
+    && protocol !== null
+    && ["http", "https", "socks5Tcp", "socks5Udp"].includes(protocol)
+  ) {
+    return true;
+  }
+  if (Array.isArray(params.proposedNetworkPolicyAmendments)) {
+    const hasExactAmendment = params.proposedNetworkPolicyAmendments.some((raw) => {
+      const amendment = record(raw);
+      return amendment !== null
+        && typeof amendment.host === "string"
+        && amendment.host.length > 0
+        && (amendment.action === "allow" || amendment.action === "deny");
+    });
+    if (hasExactAmendment) return true;
+  }
+  return null;
+}
+
+function permissionApprovalFacts(
+  params: Record<string, unknown>,
+): ActivityApprovalFacts {
+  const cwd = stringValue(params.cwd);
+  const permissions = record(params.permissions);
+  const fileSystem = record(permissions?.fileSystem);
+  const writes: string[] = [];
+  const paths: string[] = [];
+  let ambiguousPath = permissions === null ||
+    (permissions?.fileSystem !== null && permissions?.fileSystem !== undefined && fileSystem === null);
+
+  if (fileSystem) {
+    for (const field of ["read", "write"] as const) {
+      const values = fileSystem[field] === null || fileSystem[field] === undefined
+        ? []
+        : nonemptyStrings(fileSystem[field]);
+      if (values === null) {
+        ambiguousPath = true;
+        continue;
+      }
+      for (const value of values) {
+        paths.push(resolveProviderPath(value, cwd));
+        if (field === "write") writes.push(value);
+      }
+    }
+    if (fileSystem.entries !== null && fileSystem.entries !== undefined) {
+      if (!Array.isArray(fileSystem.entries)) {
+        ambiguousPath = true;
+      } else {
+        for (const rawEntry of fileSystem.entries) {
+          const entry = record(rawEntry);
+          const access = stringValue(entry?.access);
+          const path = record(entry?.path);
+          if (!entry || !access || !path) {
+            ambiguousPath = true;
+            continue;
+          }
+          if (path.type === "path" && typeof path.path === "string" && path.path.length > 0) {
+            paths.push(resolveProviderPath(path.path, cwd));
+            if (access === "write") writes.push(path.path);
+            continue;
+          }
+          if (path.type === "glob_pattern" && typeof path.pattern === "string" && path.pattern.length > 0) {
+            // The glob is an exact display fact but cannot prove containment
+            // without expanding it, which Agent Manager must never do.
+            if (access === "write") writes.push(path.pattern);
+          }
+          ambiguousPath = true;
+        }
+      }
+    }
+  }
+
+  const network = record(permissions?.network);
+  return {
+    command: null,
+    paths: ambiguousPath ? null : [...new Set(paths)],
+    writes: [...new Set(writes)],
+    network: typeof network?.enabled === "boolean" ? network.enabled : null,
+    canPersist: false,
+    // Neither pinned Codex request contract exposes a delete count.
+    deleteCount: null,
+  };
+}
+
+function codexApprovalFacts(
+  method: string,
+  params: Record<string, unknown>,
+): ActivityApprovalFacts | null {
+  if (method === "item/commandExecution/requestApproval") {
+    const cwd = stringValue(params.cwd);
+    return {
+      command: stringValue(params.command),
+      paths: commandActionPaths(params.commandActions, cwd),
+      writes: [],
+      network: requestsNetworkAccess(params),
+      // The pinned response protocol exposes acceptForSession for this exact
+      // request type, even when no policy-amendment proposal is present.
+      canPersist: true,
+      // CommandExecutionRequestApprovalParams has no delete-count field.
+      deleteCount: null,
+    };
+  }
+  if (method === "item/fileChange/requestApproval") {
+    const grantRoot = stringValue(params.grantRoot);
+    return {
+      command: null,
+      paths: grantRoot ? [grantRoot] : null,
+      writes: grantRoot ? [grantRoot] : [],
+      network: null,
+      // The pinned response protocol exposes acceptForSession here too.
+      canPersist: true,
+      // FileChangeRequestApprovalParams has no delete-count field.
+      deleteCount: null,
+    };
+  }
+  if (method === "item/permissions/requestApproval") {
+    return permissionApprovalFacts(params);
+  }
+  return null;
+}
+
 function normalizeFileChanges(value: unknown): ActivityFileChange[] {
   if (!Array.isArray(value)) return [];
   return value.flatMap((rawChange) => {
@@ -124,7 +308,8 @@ function normalizeFileChanges(value: unknown): ActivityFileChange[] {
       ? "rename"
       : "update";
     return [{
-      path: movePath ? `${path} → ${movePath}` : path,
+      path: movePath ?? path,
+      previousPath: movePath ? path : null,
       operation,
       diff: stringValue(change.diff) ?? "",
     }];
@@ -136,7 +321,7 @@ function aggregateDiffChanges(diff: string): ActivityFileChange[] {
   if (headers.length === 0) {
     const path = /^\+\+\+ b\/(.+)$/mu.exec(diff)?.[1] ??
       /^--- a\/(.+)$/mu.exec(diff)?.[1] ?? "(turn diff)";
-    return [{ path, operation: "update", diff }];
+    return [{ path, previousPath: null, operation: "update", diff }];
   }
   return headers.map((match, index) => {
     const start = match.index ?? 0;
@@ -154,10 +339,11 @@ function aggregateDiffChanges(diff: string): ActivityFileChange[] {
       : "update";
     return {
       path: operation === "rename"
-        ? `${oldPath} → ${renamedTo ?? newPath}`
+        ? renamedTo ?? newPath
         : operation === "delete"
         ? oldPath
         : newPath,
+      previousPath: operation === "rename" ? oldPath : null,
       operation,
       diff: patch,
     };
@@ -333,13 +519,10 @@ function projectThreadItem(
         label: null,
       }));
       break;
-    case "plan":
-      mutations.push(upsert({
-        ...baseItem(id, "plan", turnId, state, times.startedAt, times.updatedAt, times.completedAt),
-        text: stringValue(item.text) ?? "",
-        steps: [],
-      }));
-      break;
+    // Codex plan items are transient prose proposals, not provider-backed plan
+    // documents and not structured todos. The authoritative checklist arrives
+    // separately through turn/plan/updated.
+    case "plan": break;
     case "reasoning": {
       const summaries = Array.isArray(item.summary) ? item.summary : [];
       const content = Array.isArray(item.content) ? item.content : [];
@@ -436,7 +619,7 @@ function projectThreadItem(
       }));
       break;
     }
-    case "collabAgentToolCall":
+    case "collabAgentToolCall": {
       mutations.push(toolItem(id, turnId, state, times, {
         toolCallId: itemId,
         name: stringValue(item.tool) ?? "Agent collaboration",
@@ -451,25 +634,58 @@ function projectThreadItem(
         result: jsonText(item.agentsStates),
         output: null,
       }));
+
+      if (item.tool === "spawnAgent" && Array.isArray(item.receiverThreadIds)) {
+        const agentsStates = record(item.agentsStates);
+        for (const receiverThreadId of item.receiverThreadIds) {
+          const childThreadId = stringValue(receiverThreadId);
+          if (!childThreadId) continue;
+          const childState = record(agentsStates?.[childThreadId]);
+          mutations.push(upsert({
+            ...baseItem(
+              subagentActivityId(childThreadId),
+              "subagent",
+              turnId,
+              collabAgentActivityState(childState?.status),
+              times.startedAt,
+              times.updatedAt,
+              null,
+            ),
+            parentId: id,
+            taskId: childThreadId,
+            name: "Codex subagent",
+            description: stringValue(item.prompt),
+            output: stringValue(childState?.message) ?? "",
+            childItemIds: [],
+          }));
+        }
+      }
       break;
-    case "subAgentActivity":
+    }
+    case "subAgentActivity": {
+      const childThreadId = stringValue(item.agentThreadId) ?? itemId;
+      // This event carries no spawning tool identity. Reuse the child-thread
+      // item without a parent field so an earlier exact spawn edge survives;
+      // never mirror activity across sessions or synthesize child-step edges.
+      const { parentId: _parentId, ...activityBase } = baseItem(
+        subagentActivityId(childThreadId),
+        "subagent",
+        turnId,
+        item.kind === "interrupted" ? "interrupted" : "running",
+        times.startedAt,
+        times.updatedAt,
+        item.kind === "interrupted" ? times.completedAt : null,
+      );
       mutations.push(upsert({
-        ...baseItem(
-          id,
-          "subagent",
-          turnId,
-          item.kind === "interrupted" ? "interrupted" : "running",
-          times.startedAt,
-          times.updatedAt,
-          item.kind === "interrupted" ? times.completedAt : null,
-        ),
-        taskId: stringValue(item.agentThreadId) ?? itemId,
+        ...activityBase,
+        taskId: childThreadId,
         name: stringValue(item.agentPath) ?? "Subagent",
         description: stringValue(item.kind),
         output: "",
         childItemIds: [],
       }));
       break;
+    }
     case "webSearch":
       mutations.push(toolItem(id, turnId, state, times, {
         toolCallId: itemId,
@@ -628,6 +844,7 @@ function warningProjection(
 export function projectCodexNotification(
   notification: JsonRpcNotification,
   offsetFor: CodexActivityOffsetLookup = zeroOffset,
+  todoFor: CodexActivityTodoLookup = noTodoState,
 ): CodexActivityProjection | null {
   const { params } = notification;
   switch (notification.method) {
@@ -635,8 +852,7 @@ export function projectCodexNotification(
     case "item/completed": return projectThreadItem(notification, true);
     case "item/agentMessage/delta":
       return deltaProjection(notification, null, "text", params.delta, offsetFor);
-    case "item/plan/delta":
-      return deltaProjection(notification, null, "text", params.delta, offsetFor);
+    case "item/plan/delta": return null;
     case "item/reasoning/summaryTextDelta": {
       const index = finiteNumber(params.summaryIndex);
       return index === null
@@ -739,40 +955,48 @@ export function projectCodexNotification(
       const turnId = stringValue(params.turnId);
       if (!threadId || !turnId || !Array.isArray(params.plan)) return null;
       const updatedAt = notificationTime(notification);
-      const steps: ActivityPlanStep[] = params.plan.flatMap((value, index) => {
+      const occurrences = new Map<string, number>();
+      const nextSteps: ActivityTodoInputStep[] = params.plan.flatMap((value) => {
         const step = record(value);
         const text = stringValue(step?.step);
         const status = stringValue(step?.status);
         if (!text || !status) return [];
-        const normalizedStatus: ActivityPlanStep["status"] = status === "inProgress"
+        const normalizedStatus: ActivityTodoInputStep["status"] = status === "inProgress"
           ? "in_progress"
           : status === "completed"
           ? "completed"
           : "pending";
+        const occurrence = occurrences.get(text) ?? 0;
+        occurrences.set(text, occurrence + 1);
         return [{
-          id: scopedId("plan-step", threadId, turnId, String(index)),
+          id: scopedId("todo-step", threadId, turnId, contentHash(text), String(occurrence)),
           text,
           status: normalizedStatus,
+          detail: null,
         }];
       });
+      const todoId = scopedId("turn-todo", threadId, turnId);
+      const previous = todoFor(todoId);
+      const rewrite = reconcileTodoRewrite(previous, nextSteps);
       return {
         threadId,
         mutations: [upsert({
           ...baseItem(
-            scopedId("turn-plan", threadId, turnId),
-            "plan",
+            todoId,
+            "todo",
             turnId,
-            steps.some((step) => step.status === "in_progress")
+            nextSteps.some((step) => step.status === "in_progress")
               ? "running"
-              : steps.length > 0 && steps.every((step) => step.status === "completed")
+              : nextSteps.length > 0 && nextSteps.every((step) => step.status === "completed")
               ? "complete"
               : "pending",
             null,
             updatedAt,
             null,
           ),
-          text: stringValue(params.explanation) ?? "",
-          steps,
+          steps: rewrite.steps,
+          added: rewrite.added,
+          removed: rewrite.removed,
         })],
       };
     }
@@ -923,8 +1147,7 @@ export function projectCodexNotification(
 export function projectCodexServerRequest(
   request: JsonRpcServerRequest,
 ): CodexActivityProjection | null {
-  const threadId = stringValue(request.params.threadId) ??
-    stringValue(request.params.conversationId);
+  const threadId = stringValue(request.params.threadId);
   if (!threadId) return null;
   const turnId = stringValue(request.params.turnId);
   const questions: ActivityAttentionQuestion[] = normalizeCodexQuestions(
@@ -983,22 +1206,6 @@ export function projectCodexServerRequest(
       // The current cockpit cannot faithfully encode form or URL elicitations.
       respondable = false;
       break;
-    case "execCommandApproval": {
-      attentionKind = "approval";
-      title = "Command approval";
-      const command = request.params.command;
-      summary = Array.isArray(command) && command.every((part) => typeof part === "string")
-        ? command.join(" ")
-        : stringValue(request.params.reason) ?? "Codex wants to run a command";
-      respondable = true;
-      break;
-    }
-    case "applyPatchApproval":
-      attentionKind = "approval";
-      title = "File-change approval";
-      summary = stringValue(request.params.reason) ?? "Codex wants to apply a patch";
-      respondable = true;
-      break;
   }
 
   const startedAt = isoFromMilliseconds(request.params.startedAtMs) ??
@@ -1021,6 +1228,7 @@ export function projectCodexServerRequest(
       title,
       summary,
       questions,
+      approvalFacts: codexApprovalFacts(request.method, request.params),
       respondable,
       resolved: false,
       isSecret,
@@ -1073,6 +1281,7 @@ export function projectCodexRequestResolved(
       title: null,
       summary: null,
       questions: [],
+      approvalFacts: null,
       respondable: false,
       resolved: true,
       isSecret: false,
@@ -1182,4 +1391,25 @@ export function codexActivityOffset(
   channel: CodexActivityAppendChannel,
 ): number {
   return offsets.get(`${id}\u0000${channel}`) ?? 0;
+}
+
+export function recordCodexTodoProjectionState(
+  states: Map<string, CodexTodoProjectionState>,
+  mutation: ActivityMutation,
+): void {
+  if (mutation.type === "reset") {
+    states.clear();
+    return;
+  }
+  if (mutation.type === "remove") {
+    states.delete(mutation.id);
+    return;
+  }
+  if (mutation.type !== "upsert" || mutation.item.kind !== "todo") return;
+  const previous = states.get(mutation.item.id);
+  states.set(mutation.item.id, {
+    steps: mutation.item.steps ?? previous?.steps ?? [],
+    added: mutation.item.added ?? previous?.added ?? 0,
+    removed: mutation.item.removed ?? previous?.removed ?? 0,
+  });
 }

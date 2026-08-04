@@ -4,13 +4,18 @@ import type {
   SessionView,
 } from "../../core/types.ts";
 import type { ActivityMutation } from "../../activity/index.ts";
+import { providerEffort, sessionRecordId } from "../../shared/session.ts";
+import { sessionSettingsOptionsSchema } from "../../server/contracts.ts";
 import type {
   ActionDispatchResult,
   AttachInstruction,
   CreateSessionInput,
+  ManagedSessionRecoveryRecord,
+  ManagedSessionRecoveryReport,
   ProviderControlAdapter,
   RequestContext,
   SessionAction,
+  SessionSettingsOptions,
 } from "../../server/contracts.ts";
 import {
   CodexManagedCreationError,
@@ -31,9 +36,17 @@ import {
 
 interface ManagedMetadata {
   name: string | null;
-  accessMode: "sandboxed" | "bypass-permissions";
+  requestedProfile: CreateSessionInput["profile"];
   createdAt: string;
   creationIssue: CodexManagedCreationIssue | null;
+  workspaceId: string;
+  workspacePath: string;
+}
+
+interface SelectedThreadLease {
+  refs: number;
+  phase: "acquiring" | "active" | "releasing";
+  settled: Promise<void>;
 }
 
 export interface CodexProviderBridgeOptions {
@@ -44,10 +57,36 @@ export interface CodexProviderBridgeOptions {
   ): Promise<string | null> | string | null;
   now?: () => Date;
   onSessionChanged?: (session: SessionView) => void;
+  onSessionRemoved?: (
+    managerSessionId: string,
+    reason: "ended" | "archived" | "deleted",
+  ) => void;
   onActivity?: (managerSessionId: string, mutation: ActivityMutation) => void;
 }
 
 const MAX_BUFFERED_ACTIVITY_MUTATIONS = 4_096;
+const MAX_RECOVERY_RECORDS = 100;
+const RECOVERY_CONCURRENCY = 4;
+const UNLOADED_CAPABILITIES: SessionView["control"]["withheld"][number]["capability"][] = [
+  "queue",
+  "steer",
+  "interrupt",
+  "respond",
+  "set-profile",
+  "set-model",
+  "set-effort",
+  "remove-queued",
+  "end",
+  "archive",
+  "delete",
+  "attach",
+  "resume",
+];
+
+function recoveryError(error: unknown): string {
+  if (error instanceof Error && error.message.trim()) return boundedText(error.message, 1_000);
+  return boundedText(String(error), 1_000);
+}
 
 function pendingKind(request: CodexPendingRequest): SessionView["attention"][number]["kind"] {
   switch (request.kind) {
@@ -56,8 +95,6 @@ function pendingKind(request: CodexPendingRequest): SessionView["attention"][num
     case "elicitation": return "elicitation";
     case "command-approval":
     case "file-change-approval":
-    case "legacy-command-approval":
-    case "legacy-file-change-approval":
       return "approval";
     case "unsupported":
       return "blocked";
@@ -85,15 +122,15 @@ function attentionQuestions(request: CodexPendingRequest): AttentionQuestion[] {
   if (request.kind !== "user-input") return [];
   return normalizeCodexQuestions(request.params.questions).map((question) => ({
     id: question.id,
-    ...(question.header ? { header: question.header } : {}),
+    header: question.header,
     text: question.text,
     options: question.options.map((option) => ({
       label: option.label,
-      ...(option.description === null ? {} : { description: option.description }),
+      description: option.description,
     })),
     multiSelect: question.multiSelect,
     allowFreeText: question.allowFreeText,
-    ...(question.isSecret ? { isSecret: true } : {}),
+    isSecret: question.isSecret,
   }));
 }
 
@@ -120,10 +157,8 @@ function approvalInputSummary(request: CodexPendingRequest): string | null {
 function approvalToolName(request: CodexPendingRequest): string | null {
   switch (request.kind) {
     case "command-approval":
-    case "legacy-command-approval":
       return "Command execution";
     case "file-change-approval":
-    case "legacy-file-change-approval":
       return "File change";
     case "permission-approval":
       return "Permission request";
@@ -141,15 +176,20 @@ function attentionDetails(request: CodexPendingRequest): AttentionDetails | null
     return {
       title: questions.length === 1 ? "Codex needs your answer" : "Codex needs your answers",
       questions,
+      toolName: null,
+      inputSummary: null,
+      respondable: true,
     };
   }
   const toolName = approvalToolName(request);
   const inputSummary = approvalInputSummary(request);
   if (!toolName && !inputSummary) return null;
   return {
-    ...(request.kind === "elicitation" ? { respondable: false } : {}),
-    ...(toolName ? { toolName } : {}),
-    ...(inputSummary ? { inputSummary } : {}),
+    title: null,
+    questions: null,
+    toolName,
+    inputSummary,
+    respondable: request.respondable && request.kind !== "elicitation",
   };
 }
 
@@ -159,12 +199,6 @@ function sessionStatus(state: CodexThreadState): SessionView["status"] {
   if (state.status === "idle") return "idle";
   if (state.status === "system-error") return "failed";
   return "unknown";
-}
-
-function providerMode(mode: CodexThreadState["mode"]): string | null {
-  if (mode === "planning") return "plan";
-  if (mode === "execution") return "default";
-  return null;
 }
 
 function emptyChildren(): SessionView["childSummary"] {
@@ -187,6 +221,7 @@ function mappedCapabilities(
 ): SessionView["control"]["capabilities"] {
   const controls = new Set(adapter.capabilities.controls);
   const result: SessionView["control"]["capabilities"] = [];
+  if (state.writeBlockedReason) return result;
   if (creationIssue) {
     // Do not permit another prompt or mode mutation until a human has inspected
     // the provider thread. Exact pending-request responses and interruption are
@@ -202,11 +237,47 @@ function mappedCapabilities(
   }
   if (controls.has("turn.queue")) result.push("queue");
   if (controls.has("turn.steer")) result.push("steer");
-  if (controls.has("turn.interrupt")) result.push("interrupt");
-  if (controls.has("request.respond")) result.push("respond");
-  if (controls.has("mode.set")) result.push("set-mode");
+  if (state.activeTurnId && controls.has("turn.interrupt")) result.push("interrupt");
+  if (state.pendingRequests.some((request) => request.respondable) &&
+      controls.has("request.respond")) result.push("respond");
+  if (!state.activeTurnId && state.status !== "running") {
+    if (controls.has("profile.set")) result.push("set-profile");
+    if (controls.has("model.set")) result.push("set-model");
+    if (controls.has("effort.set")) result.push("set-effort");
+    if (controls.has("thread.archive")) result.push("archive");
+    if (controls.has("thread.delete")) result.push("delete");
+  }
+  if (state.queue.some((item) => item.status === "queued")) result.push("remove-queued");
+  if (controls.has("thread.unsubscribe")) result.push("end");
   if (controls.has("native.attach")) result.push("attach", "resume");
   return result;
+}
+
+function withheldCapabilities(
+  adapter: CodexManagedAdapter,
+  state: CodexThreadState,
+): SessionView["control"]["withheld"] {
+  if (state.writeBlockedReason) {
+    return ["queue", "steer", "interrupt", "respond", "set-profile", "set-model",
+      "set-effort", "remove-queued", "end", "archive", "delete"].map(
+      (capability) => ({
+        capability: capability as SessionView["control"]["withheld"][number]["capability"],
+        reason: state.writeBlockedReason as string,
+      }),
+    );
+  }
+  if (state.activeTurnId || state.status === "running") {
+    return ["set-profile", "set-model", "set-effort", "archive", "delete"].map(
+      (capability) => ({
+        capability: capability as SessionView["control"]["withheld"][number]["capability"],
+        reason: "Available when the Codex turn is idle",
+      }),
+    );
+  }
+  if (!adapter.capabilities.compatible && adapter.capabilities.reason) {
+    return [{ capability: "queue", reason: adapter.capabilities.reason }];
+  }
+  return [];
 }
 
 export function encodeCodexRequestId(id: JsonRpcId): string {
@@ -282,31 +353,12 @@ function questionAnswerValues(
   return values;
 }
 
-function legacyQuestionAnswer(
-  question: NormalizedCodexQuestion,
-  value: unknown,
-): string[] {
-  if (typeof value === "string") {
-    const namedOption = question.options.some((option) => option.label === value);
-    return questionAnswerValues(question, namedOption ? "" : value, namedOption ? [value] : []);
-  }
-  return questionAnswerValues(
-    question,
-    "",
-    selectedOptionArray(value, question.id),
-  );
-}
-
 /** Translate the provider-independent cockpit envelope into the exact 0.146 RPC result. */
 export function codexRequestResponse(
   request: CodexPendingRequest,
   value: unknown,
 ): JsonObject {
   const response = asJsonObject(value);
-  // Provider-shaped responses remain useful for trusted CLI/tests. Browser
-  // callers use the normalized `kind` envelopes below.
-  if (response.kind === undefined) return response;
-
   if (request.kind === "user-input") {
     const questions = requestQuestions(request);
     if (questions.length === 0) throw new Error("Codex question has no stable question IDs");
@@ -355,32 +407,19 @@ export function codexRequestResponse(
     const answerValue = response.value;
     const answers: JsonObject = {};
 
-    if (typeof answerValue === "object" && answerValue !== null &&
-        !Array.isArray(answerValue)) {
-      const unknownIds = Object.keys(answerValue).filter((id) => !questionsById.has(id));
-      if (unknownIds.length > 0) {
-        throw new Error(`Unknown Codex question ID ${unknownIds.join(", ")}`);
-      }
-      for (const question of questions) {
-        const id = question.id;
-        const item = (answerValue as Record<string, unknown>)[id];
-        answers[id] = { answers: legacyQuestionAnswer(question, item) };
-      }
-    } else {
-      if (questions.length !== 1) {
-        throw new Error("Multiple Codex questions require answers keyed by question ID");
-      }
-      if (typeof answerValue !== "string") {
-        throw new Error(`Codex answer for ${questions[0]!.id} is malformed`);
-      }
-      answers[questions[0]!.id] = {
-        answers: questionAnswerValues(
-          questions[0]!,
-          answerValue,
-          selectedOptionArray(response.selectedOptions, questions[0]!.id),
-        ),
-      };
+    if (questions.length !== 1) {
+      throw new Error("Multiple Codex questions require an atomic answers envelope");
     }
+    if (typeof answerValue !== "string") {
+      throw new Error(`Codex answer for ${questions[0]!.id} is malformed`);
+    }
+    answers[questions[0]!.id] = {
+      answers: questionAnswerValues(
+        questions[0]!,
+        answerValue,
+        selectedOptionArray(response.selectedOptions, questions[0]!.id),
+      ),
+    };
     return { answers };
   }
 
@@ -388,21 +427,23 @@ export function codexRequestResponse(
       (response.decision !== "allow" && response.decision !== "deny")) {
     throw new Error("Codex approval response must use an allow or deny decision");
   }
+  if (response.persist !== undefined && typeof response.persist !== "boolean") {
+    throw new Error("Codex approval persistence must be boolean");
+  }
   const allowed = response.decision === "allow";
-  const reason = typeof response.reason === "string" && response.reason.trim()
-    ? response.reason
-    : "Denied by user";
+  const persist = response.persist === true;
+  if (persist && !allowed) {
+    throw new Error("Codex cannot persist a denied approval");
+  }
 
   switch (request.kind) {
     case "command-approval":
     case "file-change-approval":
-      return { decision: allowed ? "accept" : "decline" };
-    case "legacy-command-approval":
-    case "legacy-file-change-approval":
-      return allowed
-        ? { decision: "approved" }
-        : { decision: { denied: { rejection: reason } } };
+      return { decision: allowed ? persist ? "acceptForSession" : "accept" : "decline" };
     case "permission-approval":
+      if (persist) {
+        throw new Error("Codex permission-profile approvals are scoped to this turn");
+      }
       return {
         permissions: allowed && typeof request.params.permissions === "object" &&
             request.params.permissions !== null && !Array.isArray(request.params.permissions)
@@ -411,6 +452,7 @@ export function codexRequestResponse(
         scope: "turn",
       };
     case "elicitation":
+      if (persist) throw new Error("Codex MCP elicitations do not expose persistence");
       return {
         action: allowed ? "accept" : "decline",
         content: allowed ? (response.value ?? null) : null,
@@ -426,7 +468,13 @@ export class CodexProviderBridge implements ProviderControlAdapter {
   #resolveWorkspace: CodexProviderBridgeOptions["resolveWorkspace"];
   #now: () => Date;
   #onActivity: CodexProviderBridgeOptions["onActivity"];
+  #onSessionChanged: CodexProviderBridgeOptions["onSessionChanged"];
+  #onSessionRemoved: CodexProviderBridgeOptions["onSessionRemoved"];
   #metadata = new Map<string, ManagedMetadata>();
+  #knownStates = new Map<string, CodexThreadState>();
+  #recovering = new Map<string, symbol>();
+  #selectedThreads = new Map<string, SelectedThreadLease>();
+  #creationHandoffs = new Set<string>();
   #bufferedActivity = new Map<string, ActivityMutation[]>();
   #overflowedActivity = new Set<string>();
   #unsubscribe: () => void;
@@ -436,17 +484,21 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     this.#resolveWorkspace = options.resolveWorkspace;
     this.#now = options.now ?? (() => new Date());
     this.#onActivity = options.onActivity;
+    this.#onSessionChanged = options.onSessionChanged;
+    this.#onSessionRemoved = options.onSessionRemoved;
     this.#unsubscribe = this.adapter.subscribe((event) => {
       if (event.type === "activity") {
         this.#forwardOrBufferActivity(event.threadId, event.mutation);
         return;
       }
-      if (event.type === "state.changed" && this.#metadata.has(event.threadId)) {
-        try {
-          options.onSessionChanged?.(this.toSessionView(event.state));
-        } catch {
-          // State consumers cannot be allowed to tear down the provider pump.
-        }
+      if (event.type === "thread.removed") {
+        this.#removeManagedThread(event.threadId, event.reason);
+        return;
+      }
+      if (event.type === "state.changed" && this.#metadata.has(event.threadId) &&
+          !this.#recovering.has(event.threadId) && this.#acceptsLiveEvents(event.threadId)) {
+        this.#knownStates.set(event.threadId, event.state);
+        this.#publishSession(event.state);
       }
     });
   }
@@ -460,16 +512,19 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     const cwd = await this.#resolveWorkspace(input.workspaceId, context);
     if (!cwd) throw new Error(`Unknown or unauthorized workspace ${input.workspaceId}`);
     context.signal.throwIfAborted();
-    const bypassPermissions = input.accessMode === "bypass-permissions";
     let state: CodexThreadState;
     let creationIssue: CodexManagedCreationIssue | null = null;
     try {
       state = await this.adapter.startThread({
         cwd,
-        mode: input.mode,
+        profile: input.profile,
+        ...(input.model ? { model: input.model } : {}),
+        ...(input.effort ? { effort: input.effort } : {}),
         initialMessage: input.initialMessage,
-        approvalPolicy: bypassPermissions ? "never" : "on-request",
-        sandbox: bypassPermissions ? "danger-full-access" : "workspace-write",
+        approvalPolicy: input.profile === "full-access" ? "never" : "on-request",
+        sandbox: input.profile === "full-access"
+          ? "danger-full-access"
+          : "workspace-write",
       });
     } catch (error) {
       if (!(error instanceof CodexManagedCreationError)) throw error;
@@ -481,12 +536,219 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     }
     this.#metadata.set(state.threadId, {
       name: input.name ?? null,
-      accessMode: input.accessMode,
+      requestedProfile: input.profile,
       createdAt: this.#now().toISOString(),
       creationIssue,
+      workspaceId: input.workspaceId,
+      workspacePath: cwd,
     });
+    this.#knownStates.set(state.threadId, state);
+    // `thread/start` owns the initial native detail stream. Keep that stream
+    // alive until the first selected-session acquisition has adopted the exact
+    // thread, otherwise fast first-turn activity can be lost between create
+    // acknowledgement and the browser opening its activity EventSource.
+    this.#creationHandoffs.add(state.threadId);
     this.#flushBufferedActivity(state.threadId);
     return this.toSessionView(state);
+  }
+
+  async restoreManagedSessions(
+    records: readonly ManagedSessionRecoveryRecord[],
+    signal: AbortSignal,
+  ): Promise<ManagedSessionRecoveryReport> {
+    const selected = records.slice(0, MAX_RECOVERY_RECORDS);
+    const failures: Array<string | null> = selected.map(() => null);
+    const restored = selected.map(() => false);
+    const truncatedByRecordLimit = records.length > selected.length;
+    if (selected.length === 0) {
+      return { restoredSessionIds: [], failures: [], truncated: truncatedByRecordLimit };
+    }
+
+    const seenThreadIds = new Set<string>();
+    const candidates: Array<{
+      index: number;
+      record: ManagedSessionRecoveryRecord;
+    }> = [];
+    for (const [index, record] of selected.entries()) {
+      const expectedManagerId = sessionRecordId("local", "codex", record.providerThreadId);
+      if (record.managerSessionId !== expectedManagerId) {
+        failures[index] = "Persisted manager and provider thread identities do not match";
+        continue;
+      }
+      if (seenThreadIds.has(record.providerThreadId)) {
+        failures[index] = "Persisted provider thread identity is duplicated";
+        continue;
+      }
+      seenThreadIds.add(record.providerThreadId);
+      if (this.#metadata.has(record.providerThreadId) ||
+          this.#recovering.has(record.providerThreadId)) {
+        failures[index] = "Codex thread is already managed by this bridge";
+        continue;
+      }
+      candidates.push({ index, record });
+    }
+
+    let cursor = 0;
+    const worker = async (): Promise<void> => {
+      while (cursor < candidates.length) {
+        const candidate = candidates[cursor++];
+        if (!candidate) return;
+        const { index, record } = candidate;
+        const token = Symbol(record.providerThreadId);
+        this.#recovering.set(record.providerThreadId, token);
+        this.#metadata.set(record.providerThreadId, {
+          name: record.name,
+          requestedProfile: record.profile,
+          createdAt: record.createdAt,
+          creationIssue: null,
+          workspaceId: record.workspaceId,
+          workspacePath: record.workspacePath,
+        });
+        const assertActive = (): void => {
+          signal.throwIfAborted();
+          if (this.#recovering.get(record.providerThreadId) !== token) {
+            throw new Error("Codex recovery was superseded or the thread was removed");
+          }
+        };
+        try {
+          assertActive();
+          const read = await this.adapter.readThread(record.providerThreadId);
+          assertActive();
+          this.#assertRecoveredIdentity(read, record);
+          this.#knownStates.set(record.providerThreadId, read);
+          // `thread/read` is an exact, bounded validation step, not adoption.
+          // Drop its local detail state immediately so startup cannot retain a
+          // writable/detailed plane for every persisted record. Selection will
+          // perform the one exact resume that owns future live events.
+          await this.adapter.releaseThread(record.providerThreadId);
+          assertActive();
+          this.#recovering.delete(record.providerThreadId);
+          restored[index] = true;
+          this.#publishSession(read);
+          this.#dropBufferedActivity(record.providerThreadId);
+        } catch (error) {
+          failures[index] = recoveryError(error);
+          if (this.#recovering.get(record.providerThreadId) === token) {
+            this.#recovering.delete(record.providerThreadId);
+            this.#metadata.delete(record.providerThreadId);
+            this.#knownStates.delete(record.providerThreadId);
+            this.#dropBufferedActivity(record.providerThreadId);
+          }
+          if (this.adapter.getThreadState(record.providerThreadId)) {
+            await this.adapter.releaseThread(record.providerThreadId).catch(() => undefined);
+          }
+        }
+      }
+    };
+    await Promise.all(Array.from(
+      { length: Math.min(RECOVERY_CONCURRENCY, candidates.length) },
+      () => worker(),
+    ));
+
+    return {
+      restoredSessionIds: selected.flatMap((record, index) => (
+        restored[index] ? [record.managerSessionId] : []
+      )),
+      failures: selected.flatMap((record, index) => failures[index]
+        ? [{
+            managerSessionId: record.managerSessionId,
+            providerThreadId: record.providerThreadId,
+            reason: failures[index],
+          }]
+        : []),
+      truncated: truncatedByRecordLimit,
+    };
+  }
+
+  async acquireSelectedSession(
+    session: SessionView,
+    context: RequestContext,
+  ): Promise<() => void | Promise<void>> {
+    context.signal.throwIfAborted();
+    if (
+      session.provider !== "codex"
+      || session.hostId !== "local"
+      || session.control.plane !== "codex-private"
+      || session.control.authority !== "manager"
+    ) {
+      throw new Error("Codex detail acquisition requires a local manager-owned session");
+    }
+    const threadId = session.providerThreadId;
+    if (session.id !== sessionRecordId("local", "codex", threadId) ||
+        !this.#metadata.has(threadId) || !this.#knownStates.has(threadId)) {
+      throw new Error("Codex detail acquisition received an unknown managed identity");
+    }
+
+    let lease: SelectedThreadLease;
+    while (true) {
+      const existing = this.#selectedThreads.get(threadId);
+      if (existing?.phase === "releasing") {
+        await existing.settled.catch(() => undefined);
+        context.signal.throwIfAborted();
+        continue;
+      }
+      if (existing) {
+        existing.refs += 1;
+        lease = existing;
+        break;
+      }
+
+      lease = {
+        refs: 1,
+        phase: "acquiring",
+        settled: Promise.resolve(),
+      };
+      this.#selectedThreads.set(threadId, lease);
+      lease.settled = (async () => {
+        const expected = this.#knownStates.get(threadId);
+        const metadata = this.#metadata.get(threadId);
+        if (!expected || !metadata) throw new Error("Managed Codex identity disappeared");
+        const adopted = await this.adapter.adoptThread(threadId, {
+          threadId: expected.threadId,
+          treeId: expected.treeId,
+          parentThreadId: expected.parentThreadId,
+          cwd: expected.cwd,
+        });
+        this.#assertSelectedIdentity(adopted, expected, metadata);
+        if (this.#selectedThreads.get(threadId) !== lease) {
+          throw new Error("Codex selection was superseded");
+        }
+        this.#knownStates.set(threadId, adopted);
+        this.#creationHandoffs.delete(threadId);
+        lease.phase = "active";
+        this.#publishSession(adopted);
+        this.#flushBufferedActivity(threadId);
+      })();
+      break;
+    }
+
+    try {
+      await lease.settled;
+      context.signal.throwIfAborted();
+    } catch (error) {
+      if (lease.phase === "active") {
+        await this.#releaseSelectedSession(threadId, lease).catch(() => undefined);
+      } else if (this.#selectedThreads.get(threadId) === lease) {
+        lease.refs = Math.max(0, lease.refs - 1);
+        if (lease.refs === 0) this.#selectedThreads.delete(threadId);
+      }
+      if (lease.phase !== "active") {
+        if (this.adapter.getThreadState(threadId)) {
+          await this.adapter.releaseThread(threadId).catch(() => undefined);
+        }
+        this.#creationHandoffs.delete(threadId);
+      }
+      const known = this.#knownStates.get(threadId);
+      if (known && this.#metadata.has(threadId)) this.#publishSession(known);
+      throw error;
+    }
+
+    let released = false;
+    return async () => {
+      if (released) return;
+      released = true;
+      await this.#releaseSelectedSession(threadId, lease);
+    };
   }
 
   async performAction(
@@ -495,15 +757,19 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     context: RequestContext,
   ): Promise<ActionDispatchResult> {
     context.signal.throwIfAborted();
-    if (session.provider !== "codex" || session.ownership !== "manager") {
+    if (session.provider !== "codex" || session.control.authority !== "manager") {
       throw new Error("Codex controls apply only to manager-owned Codex sessions");
     }
     if (action.expectedGeneration !== session.generation) {
       throw new Error("Codex session generation changed before dispatch");
     }
-    const state = this.adapter.getThreadState(session.sessionId);
+    const selected = this.#selectedThreads.get(session.providerThreadId);
+    if (!selected || selected.phase !== "active" || selected.refs < 1) {
+      throw new Error("Manager-owned Codex thread is not selected or loaded");
+    }
+    const state = this.adapter.getThreadState(session.providerThreadId);
     if (!state) throw new Error("Manager-owned Codex thread is not loaded");
-    const creationIssue = this.#metadata.get(session.sessionId)?.creationIssue ?? null;
+    const creationIssue = this.#metadata.get(session.providerThreadId)?.creationIssue ?? null;
     if (creationIssue && action.type !== "respond" && action.type !== "interrupt") {
       throw new Error(
         "Codex session creation needs native recovery before messages or mode changes can be dispatched",
@@ -513,21 +779,21 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     switch (action.type) {
       case "send":
         if (action.delivery === "queue") {
-          const queued = await this.adapter.queueMessage(session.sessionId, action.text);
+          const queued = await this.adapter.queueMessage(session.providerThreadId, action.text);
           return {
             status: queued.status === "queued" ? "queued" : "succeeded",
             result: queued,
           };
         }
-        if (!action.expectedRunId) {
+        if (!action.expectedProviderTurnId) {
           throw new Error("Steering requires the expected active Codex turn ID");
         }
         return {
           status: "succeeded",
           result: {
             turnId: await this.adapter.steer(
-              session.sessionId,
-              action.expectedRunId,
+              session.providerThreadId,
+              action.expectedProviderTurnId,
               action.text,
             ),
           },
@@ -541,21 +807,47 @@ export class CodexProviderBridge implements ProviderControlAdapter {
           throw new Error("Codex MCP elicitation forms are not respondable in the cockpit");
         }
         await this.adapter.respondToRequest(
-          session.sessionId,
+          session.providerThreadId,
           decodeCodexRequestId(action.requestId),
           codexRequestResponse(request, action.response),
         );
         return { status: "succeeded" };
       }
       case "interrupt":
-        if (!action.expectedRunId) {
+        if (!action.expectedProviderTurnId) {
           throw new Error("Interrupt requires the expected active Codex turn ID");
         }
-        await this.adapter.interrupt(session.sessionId, action.expectedRunId);
+        await this.adapter.interrupt(
+          session.providerThreadId,
+          action.expectedProviderTurnId,
+        );
         return { status: "succeeded" };
-      case "set-mode":
-        await this.adapter.setMode(session.sessionId, action.mode);
-        return { status: "succeeded", result: { mode: action.mode } };
+      case "set-profile":
+        await this.adapter.setProfile(session.providerThreadId, action.profile);
+        return { status: "succeeded", result: { profile: action.profile } };
+      case "set-model":
+        await this.adapter.setModel(session.providerThreadId, action.model);
+        return { status: "succeeded", result: { model: action.model } };
+      case "set-effort":
+        await this.adapter.setEffort(session.providerThreadId, action.effort);
+        return { status: "succeeded", result: { effort: action.effort } };
+      case "remove-queued":
+        await this.adapter.removeQueuedMessage(
+          session.providerThreadId,
+          action.messageId,
+        );
+        return { status: "succeeded" };
+      case "end":
+        await this.adapter.endThread(session.providerThreadId);
+        return { status: "succeeded" };
+      case "archive":
+        await this.adapter.archiveThread(session.providerThreadId);
+        return { status: "succeeded" };
+      case "delete":
+        await this.adapter.deleteThread(session.providerThreadId);
+        return { status: "succeeded" };
+      case "open-editor":
+        throw new Error("Codex provider does not own editor launch operations");
     }
   }
 
@@ -564,8 +856,12 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     context: RequestContext,
   ): Promise<AttachInstruction | null> {
     context.signal.throwIfAborted();
-    if (session.provider !== "codex" || session.ownership !== "manager") return null;
-    const command = this.adapter.buildAttachCommand(session.sessionId);
+    if (session.provider !== "codex" || session.control.authority !== "manager") return null;
+    const selected = this.#selectedThreads.get(session.providerThreadId);
+    if (!selected || selected.phase !== "active" || selected.refs < 1) {
+      throw new Error("Manager-owned Codex thread is not selected or loaded");
+    }
+    const command = this.adapter.buildAttachCommand(session.providerThreadId);
     return {
       kind: "codex-remote",
       argv: [command.executable, ...command.args],
@@ -574,21 +870,65 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     };
   }
 
+  async getAccountFacts(
+    session: SessionView,
+    context: RequestContext,
+  ) {
+    context.signal.throwIfAborted();
+    if (
+      session.provider !== "codex"
+      || session.hostId !== "local"
+      || session.control.authority !== "manager"
+    ) throw new Error("Codex account facts require a local manager-owned session");
+    return this.adapter.readAccountFacts();
+  }
+
+  async getSettingsOptions(
+    session: SessionView,
+    context: RequestContext,
+  ): Promise<SessionSettingsOptions> {
+    context.signal.throwIfAborted();
+    if (
+      session.provider !== "codex"
+      || session.hostId !== "local"
+      || session.control.authority !== "manager"
+      || !session.control.capabilities.includes("set-model")
+    ) {
+      throw new Error("Codex settings require a local, idle, manager-owned thread");
+    }
+    const before = this.adapter.getThreadState(session.providerThreadId);
+    if (!before || before.activeTurnId || before.status === "running" || before.writeBlockedReason) {
+      throw new Error("Codex settings require a loaded, idle, writable thread");
+    }
+    const models = await this.adapter.listModels();
+    context.signal.throwIfAborted();
+    const current = this.adapter.getThreadState(session.providerThreadId);
+    if (!current || current.generation !== before.generation || current.activeTurnId ||
+        current.status === "running" || current.writeBlockedReason) {
+      throw new Error("Codex thread changed while its model catalog was loading");
+    }
+    return sessionSettingsOptionsSchema.parse({ source: "provider-api", models });
+  }
+
   toSessionView(state: CodexThreadState): SessionView {
+    const selected = this.#selectedThreads.get(state.threadId);
+    const controlsLoaded = selected?.phase === "active" && selected.refs > 0;
+    const liveDetail = controlsLoaded || this.#creationHandoffs.has(state.threadId);
     const metadata = this.#metadata.get(state.threadId) ?? {
       name: null,
-      accessMode: "sandboxed" as const,
+      requestedProfile: "plan" as const,
       createdAt: this.#now().toISOString(),
       creationIssue: null,
+      workspaceId: "",
+      workspacePath: state.cwd ?? "",
     };
-    const bypassPermissions = metadata.accessMode === "bypass-permissions";
     const updatedAt = this.#now().toISOString();
     const recoveryAttention: SessionView["attention"] = metadata.creationIssue
       ? [{
           id: "creation-recovery",
           kind: "blocked",
-          summary: metadata.creationIssue.stage === "mode"
-            ? "The provider thread exists, but its requested mode was not confirmed. The initial message was not sent."
+          summary: metadata.creationIssue.stage === "profile"
+            ? "The provider thread exists, but its requested settings were not confirmed. The initial message was not sent."
             : metadata.creationIssue.outcome === "uncertain"
             ? "The provider thread exists, but the initial-message acknowledgement is uncertain. It will not be sent again automatically."
             : "The provider thread exists, but Codex rejected the initial message. It will not be sent again automatically.",
@@ -596,6 +936,7 @@ export class CodexProviderBridge implements ProviderControlAdapter {
           confidence: "exact",
           details: {
             title: "Managed Codex session needs recovery",
+            questions: null,
             toolName: "Native Codex attach",
             inputSummary: boundedText(metadata.creationIssue.message, 500),
             respondable: false,
@@ -614,84 +955,134 @@ export class CodexProviderBridge implements ProviderControlAdapter {
           summary: requestSummary(request),
           source: "provider-api",
           confidence: "exact",
-          ...(details ? { details } : {}),
+          details,
         };
       },
     );
     return {
-      id: `codex:${state.threadId}`,
+      id: sessionRecordId("local", "codex", state.threadId),
       provider: "codex",
-      sessionId: state.threadId,
-      parentSessionId: null,
-      rootSessionId: state.threadId,
+      providerThreadId: state.threadId,
+      providerTreeId: state.treeId,
+      parentId: state.parentThreadId
+        ? sessionRecordId("local", "codex", state.parentThreadId)
+        : null,
+      providerTurnId: state.activeTurnId,
       depth: 0,
-      name: metadata.name,
-      cwd: state.cwd,
+      hostId: "local",
+      hostLabel: "This Mac",
+      name: metadata.name ?? state.name,
+      cwd: state.cwd ?? metadata.workspacePath,
       kind: "interactive",
-      lifecycle: "live",
+      presence: liveDetail ? "live" : "recent",
       status: normalizedStatus,
       providerStatus: state.status,
-      waitingReason: state.pendingRequests.some((request) => request.kind === "user-input")
-        ? "user-input"
-        : state.pendingRequests.some((request) => request.kind === "unsupported")
-        ? "blocked"
-        : state.pendingRequests.length > 0
-        ? "approval"
-        : metadata.creationIssue
-        ? "blocked"
-        : null,
       pid: null,
       runtimePid: null,
       startedAt: metadata.createdAt,
       updatedAt,
       childSummary: emptyChildren(),
-      statusSource: "inferred",
-      source: "managed:codex-app-server",
-      ownership: "manager",
-      runtimeAlive: this.adapter.runtimeAlive,
-      mode: {
-        value: state.mode,
-        providerValue: providerMode(state.mode),
+      todoProgress: null,
+      statusSource: "provider-api",
+      source: state.source ?? "appServer",
+      profile: {
+        value: state.profile,
+        providerValue: state.profile,
         source: "provider-api",
-        confidence: state.mode === "unknown" ? "heuristic" : "exact",
+        confidence: state.profile === null ? "heuristic" : "exact",
       },
-      activity: normalizedStatus,
+      model: {
+        value: state.model,
+        providerValue: state.model,
+        source: "provider-api",
+        confidence: state.model === null ? "heuristic" : "exact",
+      },
+      effort: providerEffort("codex", state.effort, "provider-api"),
       attention: [...recoveryAttention, ...pendingAttention],
-      effectiveAccess: {
-        accessMode: metadata.accessMode,
-        permissionMode: bypassPermissions ? "never" : "on-request",
-        sandboxMode: bypassPermissions ? "danger-full-access" : "workspace-write",
-      },
       terminal: null,
       control: {
-        plane: "codex-app-server",
-        capabilities: mappedCapabilities(this.adapter, state, metadata.creationIssue),
-        managerOwned: true,
-        writableLease: false,
+        plane: "codex-private",
+        authority: state.writeBlockedReason ? "foreign" : "manager",
+        capabilities: controlsLoaded
+          ? mappedCapabilities(this.adapter, state, metadata.creationIssue)
+          : [],
+        withheld: controlsLoaded
+          ? withheldCapabilities(this.adapter, state)
+          : UNLOADED_CAPABILITIES.map((capability) => ({
+              capability,
+              reason: "Select this session to load exact Codex controls",
+            })),
       },
+      workspaceIdentity: null,
       generation: state.generation,
-      runId: state.activeTurnId,
     };
   }
 
   getManagedSession(sessionId: string): SessionView | null {
-    const state = this.adapter.getThreadState(sessionId);
+    const state = this.adapter.getThreadState(sessionId) ?? this.#knownStates.get(sessionId);
     return state ? this.toSessionView(state) : null;
   }
 
   dispose(): void {
     this.#unsubscribe();
+    this.#metadata.clear();
+    this.#knownStates.clear();
+    this.#recovering.clear();
+    this.#selectedThreads.clear();
+    this.#creationHandoffs.clear();
     this.#bufferedActivity.clear();
     this.#overflowedActivity.clear();
+  }
+
+  #acceptsLiveEvents(threadId: string): boolean {
+    const selected = this.#selectedThreads.get(threadId);
+    return this.#creationHandoffs.has(threadId)
+      || selected?.phase === "active";
+  }
+
+  async #releaseSelectedSession(
+    threadId: string,
+    lease: SelectedThreadLease,
+  ): Promise<void> {
+    if (this.#selectedThreads.get(threadId) !== lease || lease.phase !== "active") return;
+    lease.refs = Math.max(0, lease.refs - 1);
+    if (lease.refs > 0) return;
+
+    lease.phase = "releasing";
+    const current = this.adapter.getThreadState(threadId) ?? this.#knownStates.get(threadId);
+    if (current) {
+      this.#knownStates.set(threadId, current);
+      if (this.#metadata.has(threadId)) this.#publishSession(current);
+    }
+    lease.settled = (async () => {
+      try {
+        if (this.adapter.getThreadState(threadId)) {
+          await this.adapter.releaseThread(threadId);
+        }
+      } finally {
+        if (this.#selectedThreads.get(threadId) === lease) {
+          this.#selectedThreads.delete(threadId);
+        }
+      }
+    })();
+    await lease.settled;
   }
 
   #forwardOrBufferActivity(threadId: string, mutation: ActivityMutation): void {
     if (!this.#onActivity) return;
     if (this.#metadata.has(threadId)) {
-      this.#publishActivity(threadId, mutation);
+      if (!this.#recovering.has(threadId) && this.#acceptsLiveEvents(threadId)) {
+        this.#publishActivity(threadId, mutation);
+      } else if (this.#selectedThreads.get(threadId)?.phase === "acquiring") {
+        this.#bufferActivity(threadId, mutation);
+      }
       return;
     }
 
+    this.#bufferActivity(threadId, mutation);
+  }
+
+  #bufferActivity(threadId: string, mutation: ActivityMutation): void {
     let buffered = this.#bufferedActivity.get(threadId);
     if (!buffered) {
       buffered = [];
@@ -714,9 +1105,76 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     for (const mutation of buffered) this.#publishActivity(threadId, mutation);
   }
 
+  #dropBufferedActivity(threadId: string): void {
+    this.#bufferedActivity.delete(threadId);
+    this.#overflowedActivity.delete(threadId);
+  }
+
+  #assertRecoveredIdentity(
+    state: CodexThreadState,
+    record: ManagedSessionRecoveryRecord,
+  ): void {
+    if (state.threadId !== record.providerThreadId) {
+      throw new Error("Native Codex recovery returned a different thread identity");
+    }
+    if (state.cwd !== record.workspacePath) {
+      throw new Error("Native Codex recovery returned a different workspace");
+    }
+  }
+
+  #assertSelectedIdentity(
+    state: CodexThreadState,
+    expected: CodexThreadState,
+    metadata: ManagedMetadata,
+  ): void {
+    if (state.threadId !== expected.threadId) {
+      throw new Error("Native Codex selection returned a different thread identity");
+    }
+    if (state.cwd !== metadata.workspacePath) {
+      throw new Error("Native Codex selection returned a different workspace");
+    }
+    if (state.treeId !== expected.treeId || state.parentThreadId !== expected.parentThreadId) {
+      throw new Error("Native Codex selection changed the validated thread tree identity");
+    }
+  }
+
+  #publishSession(state: CodexThreadState): void {
+    try {
+      this.#onSessionChanged?.(this.toSessionView(state));
+    } catch {
+      // State consumers cannot be allowed to tear down the provider pump.
+    }
+  }
+
+  #removeManagedThread(
+    threadId: string,
+    reason: "ended" | "archived" | "deleted",
+  ): void {
+    if (!this.#metadata.has(threadId)) return;
+    this.#metadata.delete(threadId);
+    this.#knownStates.delete(threadId);
+    this.#recovering.delete(threadId);
+    this.#selectedThreads.delete(threadId);
+    this.#creationHandoffs.delete(threadId);
+    this.#dropBufferedActivity(threadId);
+    this.#publishRemoval(sessionRecordId("local", "codex", threadId), reason);
+  }
+
+  #publishRemoval(
+    managerSessionId: string,
+    reason: "ended" | "archived" | "deleted",
+  ): void {
+    try {
+      this.#onSessionRemoved?.(managerSessionId, reason);
+    } catch {
+      // Durable cleanup is best-effort at this event boundary; callers surface
+      // their own diagnostic without poisoning unrelated provider sessions.
+    }
+  }
+
   #publishActivity(threadId: string, mutation: ActivityMutation): void {
     try {
-      this.#onActivity?.(`codex:${threadId}`, mutation);
+      this.#onActivity?.(sessionRecordId("local", "codex", threadId), mutation);
     } catch {
       // Activity consumers cannot be allowed to tear down the provider pump.
     }

@@ -19,7 +19,8 @@ export interface BootstrapTokenReply {
 export interface OwnerControlSocketHandlers {
   auth: AuthManager;
   bootstrapOrigin: string;
-  onPanicLock?: () => void | Promise<void>;
+  /** Reloads one-way provider-hook authorization digests from the owned database. */
+  onReloadHooks?: () => void | Promise<void>;
   onAttach?: (sessionId: string) => Promise<AttachInstruction>;
   onAttachAuthorizeSpawn?: (
     sessionId: string,
@@ -39,7 +40,6 @@ export interface OwnerControlSocketHandlers {
     exitCode: number | null,
   ) => void | Promise<void>;
   onAttachFailed?: (sessionId: string, handoffId: string, error: string) => void | Promise<void>;
-  isLocked?: () => boolean;
 }
 
 function currentUid(): number {
@@ -168,10 +168,6 @@ export async function startOwnerControlSocket(
       if (newline < 0) return;
       try {
         const request = JSON.parse(input.subarray(0, newline).toString("utf8")) as Record<string, unknown>;
-        if (handlers.isLocked?.() && request.command !== "panic-lock") {
-          socket.end(`${JSON.stringify({ error: "control-plane-locked" })}\n`);
-          return;
-        }
         if (request.command === "issue-bootstrap") {
           const issued = handlers.auth.issueBootstrapToken();
           socket.end(`${JSON.stringify({
@@ -179,10 +175,14 @@ export async function startOwnerControlSocket(
             origin: handlers.bootstrapOrigin,
             bootstrapUrl: `${handlers.bootstrapOrigin}/#bootstrap=${encodeURIComponent(issued.secret)}`,
           })}\n`);
-        } else if (request.command === "panic-lock") {
-          void Promise.resolve(handlers.onPanicLock?.())
+        } else if (
+          request.command === "reload-hooks"
+          && Object.keys(request).length === 1
+          && handlers.onReloadHooks
+        ) {
+          void Promise.resolve(handlers.onReloadHooks())
             .then(() => socket.end(`${JSON.stringify({ ok: true })}\n`))
-            .catch(() => socket.end(`${JSON.stringify({ error: "panic-lock-failed" })}\n`));
+            .catch(() => socket.end(`${JSON.stringify({ error: "hook-reload-failed" })}\n`));
         } else if (
           request.command === "attach"
           && typeof request.sessionId === "string"
@@ -312,8 +312,12 @@ export function requestBootstrapFromControlSocket(path: string): Promise<Bootstr
   return requestOwnerControlSocket<BootstrapTokenReply>(path, { command: "issue-bootstrap" });
 }
 
-export function requestPanicLockFromControlSocket(path: string): Promise<{ ok: true }> {
-  return requestOwnerControlSocket<{ ok: true }>(path, { command: "panic-lock" });
+export function requestHooksReloadFromControlSocket(
+  path: string,
+): Promise<{ ok: true }> {
+  return requestOwnerControlSocket<{ ok: true }>(path, {
+    command: "reload-hooks",
+  });
 }
 
 export function requestAttachFromControlSocket(

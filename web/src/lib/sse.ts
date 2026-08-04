@@ -1,13 +1,14 @@
+import {
+  parseStateEvent,
+  WireUpgradeRequiredError,
+  type StateEvent,
+  type StateEventType,
+} from "../../../src/shared/wire.ts";
 import type { ConnectionState } from "../types";
 
-export type CockpitEvent =
-  | { type: "snapshot"; payload: unknown; seq: number | null }
-  | { type: "session.upsert"; payload: unknown; seq: number | null }
-  | { type: "session.remove"; payload: unknown; seq: number | null }
-  | { type: "action.updated"; payload: unknown; seq: number | null }
-  | { type: "diagnostic"; payload: unknown; seq: number | null };
+export type CockpitEvent = StateEvent;
 
-const EVENT_TYPES: CockpitEvent["type"][] = [
+const EVENT_TYPES: StateEventType[] = [
   "snapshot",
   "session.upsert",
   "session.remove",
@@ -17,33 +18,23 @@ const EVENT_TYPES: CockpitEvent["type"][] = [
 
 export function parseEvent(
   event: MessageEvent<string>,
-  forcedType?: CockpitEvent["type"],
-): CockpitEvent | null {
+  forcedType?: StateEventType,
+): StateEvent | null {
   try {
-    const decoded: unknown = JSON.parse(event.data);
-    if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) return null;
-    const value = decoded as Record<string, unknown>;
-    const embeddedType = typeof value.type === "string" ? value.type : null;
-    if (forcedType && embeddedType && embeddedType !== forcedType) return null;
-    const candidate = forcedType ?? embeddedType;
-    if (!candidate || !EVENT_TYPES.includes(candidate as CockpitEvent["type"])) return null;
-    return {
-      type: candidate as CockpitEvent["type"],
-      payload: Object.hasOwn(value, "payload") ? value.payload : value,
-      seq: typeof value.seq === "number" && Number.isSafeInteger(value.seq) && value.seq >= 0
-        ? value.seq
-        : null,
-    } as CockpitEvent;
-  } catch {
+    const parsed = parseStateEvent(JSON.parse(event.data) as unknown);
+    return forcedType && parsed.type !== forcedType ? null : parsed;
+  } catch (error) {
+    if (error instanceof WireUpgradeRequiredError) throw error;
     return null;
   }
 }
 
 export function connectCockpitEvents(options: {
   clientId: string;
-  onEvent: (event: CockpitEvent) => void;
+  onEvent: (event: StateEvent) => void;
   onConnection: (state: ConnectionState) => void;
   onReconnect: () => void;
+  onUpgradeRequired: (error: WireUpgradeRequiredError) => void;
 }): () => void {
   let openedOnce = false;
   let closed = false;
@@ -51,6 +42,19 @@ export function connectCockpitEvents(options: {
   eventsUrl.searchParams.set("clientId", options.clientId);
   const source = new EventSource(eventsUrl, { withCredentials: true });
   options.onConnection("connecting");
+
+  const dispatch = (event: MessageEvent<string>, forcedType?: StateEventType): void => {
+    if (closed) return;
+    try {
+      const parsed = parseEvent(event, forcedType);
+      if (parsed) options.onEvent(parsed);
+    } catch (error) {
+      if (!(error instanceof WireUpgradeRequiredError)) throw error;
+      closed = true;
+      source.close();
+      options.onUpgradeRequired(error);
+    }
+  };
 
   source.onopen = () => {
     if (closed) return;
@@ -62,13 +66,11 @@ export function connectCockpitEvents(options: {
     if (!closed) options.onConnection(openedOnce ? "retrying" : "offline");
   };
   source.onmessage = (event) => {
-    const parsed = parseEvent(event);
-    if (parsed) options.onEvent(parsed);
+    dispatch(event);
   };
   for (const type of EVENT_TYPES) {
     source.addEventListener(type, (event) => {
-      const parsed = parseEvent(event as MessageEvent<string>, type);
-      if (parsed) options.onEvent(parsed);
+      dispatch(event as MessageEvent<string>, type);
     });
   }
 

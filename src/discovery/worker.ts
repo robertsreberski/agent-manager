@@ -1,6 +1,6 @@
 import { parentPort } from "node:worker_threads";
 
-import { buildListing } from "../core/discovery.ts";
+import { scanObservedSessions } from "../core/discovery.ts";
 import type {
   DiscoveryScanFailure,
   DiscoveryScanRequest,
@@ -22,13 +22,9 @@ parentPort.on("message", (request: DiscoveryScanRequest) => {
   }
 
   try {
-    const listing = buildListing({
-      json: true,
-      includeChildren: true,
+    const listing = scanObservedSessions({
       recentWindowSeconds: request.recentWindowSeconds,
       providers: new Set(["codex", "claude"]),
-      statuses: null,
-      help: false,
     });
     const response: DiscoveryScanResult = {
       type: "result",
@@ -48,4 +44,3 @@ parentPort.on("message", (request: DiscoveryScanRequest) => {
     parentPort?.postMessage(response);
   }
 });
-

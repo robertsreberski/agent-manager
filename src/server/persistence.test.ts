@@ -5,10 +5,13 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
+import { digestCodexHookToken } from "../providers/codex/codex-hook-auth.ts";
+import { digestHookBearerToken } from "../providers/hooks/auth.ts";
 import type { SessionAction } from "./contracts.ts";
 import {
   actionFingerprint,
   createSessionFingerprint,
+  IncompatibleDatabaseError,
   ManagerDatabase,
   redactedPreview,
 } from "./persistence.ts";
@@ -77,6 +80,89 @@ test("workspace persistence removes configured launch targets and previews omit 
   assert.doesNotMatch(preview, /hunter2|abcdefghijklmnop/);
 });
 
+test("persists Claude hook authorization as a digest and tracks monotonic liveness", () => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-manager-hook-db-"));
+  const path = join(directory, "state.sqlite");
+  const bearer = "plaintext-hook-token-that-must-not-enter-agent-manager-state";
+  const digest = digestHookBearerToken(bearer);
+  try {
+    let database = new ManagerDatabase(path);
+    assert.deepEqual(database.upsertClaudeHookInstallRecord({
+      id: "hook-install-1",
+      provider: "claude",
+      schemaVersion: 1,
+      tokenDigest: digest,
+      createdAt: "2026-08-04T12:00:00.000Z",
+      settingsPath: "/Users/test/.claude/settings.json",
+      endpoint: "http://127.0.0.1:43127/api/v1/hooks/claude",
+      createdHooksProperty: true,
+    }), {
+      id: "hook-install-1",
+      provider: "claude",
+      schemaVersion: 1,
+      tokenDigest: digest,
+      createdAt: "2026-08-04T12:00:00.000Z",
+      settingsPath: "/Users/test/.claude/settings.json",
+      endpoint: "http://127.0.0.1:43127/api/v1/hooks/claude",
+      createdHooksProperty: true,
+      lastSeenAt: null,
+    });
+    assert.equal(database.markClaudeHookSeen("hook-install-1", "2026-08-04T12:01:00.000Z"), true);
+    assert.equal(database.markClaudeHookSeen("hook-install-1", "2026-08-04T12:00:30.000Z"), false);
+    database.close();
+
+    database = new ManagerDatabase(path);
+    assert.equal(
+      database.getClaudeHookInstallRecord("/Users/test/.claude/settings.json")?.lastSeenAt,
+      "2026-08-04T12:01:00.000Z",
+    );
+    assert.equal(database.removeClaudeHookInstallRecord("hook-install-1"), true);
+    assert.equal(database.listClaudeHookInstallRecords().length, 0);
+    database.close();
+
+    assert.equal(readFileSync(path).includes(Buffer.from(bearer)), false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("persists Codex hook digests and integrity metadata without its bearer", () => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-manager-codex-hook-db-"));
+  const path = join(directory, "state.sqlite");
+  const bearer = "codex-plaintext-token-that-must-not-enter-agent-manager-state";
+  const digest = digestCodexHookToken(bearer);
+  const shimDigest = `sha256:${"b".repeat(64)}`;
+  try {
+    let database = new ManagerDatabase(path);
+    const stored = database.upsertCodexHookInstallRecord({
+      id: "codex-hook-install-1",
+      provider: "codex",
+      schemaVersion: 1,
+      tokenDigest: digest,
+      createdAt: "2026-08-04T12:00:00.000Z",
+      settingsPath: "/Users/test/.codex/hooks.json",
+      shimPath: "/Users/test/Library/Application Support/agent-manager/hooks/codex-hook.mjs",
+      endpoint: "http://127.0.0.1:43127/api/v1/hooks/codex",
+      command: "'/Users/test/Library/Application Support/agent-manager/hooks/codex-hook.mjs'",
+      shimDigest,
+    });
+    assert.equal(stored.lastSeenAt, null);
+    assert.equal(database.markCodexHookSeen("codex-hook-install-1", "2026-08-04T12:01:00.000Z"), true);
+    database.close();
+
+    database = new ManagerDatabase(path);
+    assert.equal(
+      database.getCodexHookInstallRecord("/Users/test/.codex/hooks.json")?.lastSeenAt,
+      "2026-08-04T12:01:00.000Z",
+    );
+    assert.equal(database.removeCodexHookInstallRecord("codex-hook-install-1"), true);
+    database.close();
+    assert.equal(readFileSync(path).includes(Buffer.from(bearer)), false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("queued work stays durable until recovery marks it unknown and scrubs content", () => {
   const directory = mkdtempSync(join(tmpdir(), "agent-manager-queued-db-"));
   const path = join(directory, "state.sqlite");
@@ -121,8 +207,9 @@ test("session creation intent is durable without storing the initial message", (
     provider: "codex" as const,
     workspaceId: "workspace-one",
     initialMessage: "create-private-needle",
-    mode: "planning" as const,
-    accessMode: "sandboxed" as const,
+    profile: "plan" as const,
+    model: null,
+    effort: null,
     idempotencyKey: "idempotency-create-test",
   };
   try {
@@ -177,8 +264,8 @@ test("workspace identity is scoped to its host and removing a host cascades only
   database.close();
 });
 
-test("migrates legacy path-only workspaces onto the implicit local host", () => {
-  const directory = mkdtempSync(join(tmpdir(), "agent-manager-workspace-migration-"));
+test("rejects an incompatible database without migrating or deleting its records", () => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-manager-workspace-reject-"));
   const path = join(directory, "state.sqlite");
   try {
     const legacy = new DatabaseSync(path);
@@ -201,18 +288,17 @@ test("migrates legacy path-only workspaces onto the implicit local host", () => 
     `);
     legacy.close();
 
-    const migrated = new ManagerDatabase(path);
-    assert.deepEqual(migrated.getWorkspace("legacy-workspace"), {
-      id: "legacy-workspace",
-      label: "Legacy",
-      path: "/tmp/legacy",
-      hostId: "local",
-      hostLabel: "This Mac",
-      hostKind: "local",
-      remoteWorkspaceId: null,
-      createdAt: "2026-08-01T00:00:00.000Z",
-    });
-    migrated.close();
+    const inspected = new DatabaseSync(path, { readOnly: true });
+    assert.throws(() => new ManagerDatabase(path), IncompatibleDatabaseError);
+    assert.equal(
+      (inspected.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
+      2,
+    );
+    assert.equal(
+      (inspected.prepare("SELECT label FROM workspaces WHERE id = 'legacy-workspace'").get() as { label: string }).label,
+      "Legacy",
+    );
+    inspected.close();
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

@@ -1,172 +1,139 @@
-# 01 — Control planes
+# 01 — Control planes and shared contract
 
-**Status:** Draft · **Depends on:** `appendix-harness-capabilities.md` · **Blocks:** 02, 03, 06
+**Status:** Accepted · **Depends on:** appendix and spec 02 decision · **Blocks:** all runtime/UI work
 
 ## Purpose
 
-Replace the binary *manager-owned vs external* with a spectrum of control planes, each
-advertising the capabilities it can actually honour. This is the type-level change that lets
-specs 02 and 03 exist without weakening any guarantee the project currently makes.
+Represent authority and provider capability directly. “Manager-owned” and “external” are not
+authorization shortcuts, and duplicated web/server DTOs are not allowed.
 
-## Background
+## Shared public types
 
-`ControlPlane` (`src/core/types.ts:105-127`) already anticipates a spectrum — it has five
-members and a `capabilities: ControlCapability[]` list beside it. The gate chain in
-`POST /api/v1/sessions/:id/actions` (`src/server/server.ts:1414-1445`) already tests
-`session.control.capabilities.includes(capability)` rather than testing ownership. So the
-architecture takes new planes without structural change; what it needs is two new members and
-truthful derivation for each.
-
-The one place ownership is tested directly is lease acquisition
-(`src/server/server.ts:1215-1219`), which rejects with `409 CONTROL_UNAVAILABLE` when a session
-has none of `queue|steer|interrupt|respond|set-mode`. That test stays correct: it is
-capability-based, not ownership-based.
-
-## Requirements
-
-### R1 — Extend `ControlPlane`
+The server, web client, and remote node import one strict shared contract. The final module name
+may follow the repository layout, but there is only one definition and one runtime parser.
 
 ```ts
+export type ExecutionProfile =
+  | "ask-first"
+  | "plan"
+  | "execute"
+  | "full-access"
+  | "unknown";
+
 export type ControlPlane =
-  | "codex-app-server"   // manager-spawned private socket — unchanged
-  | "codex-daemon"       // NEW — shared app-server daemon, thread adopted (spec 02)
-  | "claude-sdk"         // manager-owned SDK query — unchanged
-  | "claude-hook-bridge" // NEW — external session with hooks installed (spec 03)
+  | "codex-private"
+  | "codex-hook-bridge"
+  | "claude-sdk"
+  | "claude-hook-bridge"
   | "tmux-attach"
   | "resume-only"
   | "observe-only";
-```
 
-`observeOnlyControl()` (`src/core/types.ts:301-308`) remains the default for anything
-discovered. A session is only promoted out of it by positive evidence.
-
-### R2 — Extend `ControlCapability`
-
-Add `set-model`, `set-effort`, `set-access` (required by spec 06). Keep the existing eight.
-
-```ts
 export type ControlCapability =
-  | "queue" | "steer" | "interrupt" | "respond" | "set-mode"
-  | "set-model" | "set-effort" | "set-access"   // NEW
-  | "preview" | "attach" | "resume";
+  | "queue"
+  | "steer"
+  | "interrupt"
+  | "respond"
+  | "set-profile"
+  | "set-model"
+  | "set-effort"
+  | "remove-queued"
+  | "preview"
+  | "attach"
+  | "resume"
+  | "archive"
+  | "delete"
+  | "end"
+  | "open-editor";
 ```
 
-`requiredCapability()` (`src/server/contracts.ts:233-244`) gains the three new mappings. It is
-an exhaustive switch over `SessionAction`, so the compiler will find every call site.
+`codex-private` is the only managed Codex plane after spec 02's shared-daemon NO-GO. It names
+the manager-owned private app-server runtime; `codex-app-server` is protocol terminology, not a
+second plane label. `codex-hook-bridge` observes ordinary official CLI sessions and may answer
+only request shapes the installed/trusted Codex hook actually exposes.
 
-### R3 — Capability matrix
+`SessionControl` contains `plane`, one authority state (`manager | foreign | none`), the exact
+capability list, and optional display-only withheld reasons. Authorization reads capabilities,
+never prose, ownership booleans, UI state, or provider strings.
 
-This is the contract. A plane may advertise **less** than its row at runtime (degraded
-creation, withdrawn method, version drift) but never more.
+The wire envelope includes a required epoch/build identifier. A mismatch returns a typed
+upgrade error and closes the stream. The PWA hard-reloads; a remote node reports that it needs
+updating. There is no compatibility parser.
 
-| Plane | queue | steer | interrupt | respond | set-mode | set-model | set-effort | set-access | preview | attach | resume |
-| --- | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: |
-| `codex-app-server` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ |
-| `codex-daemon` | ✓ | ✓ | ✓ | **spike** | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ |
-| `claude-sdk` | ✓ | ✓¹ | ✓ | ✓ | ✓ | spike | spike | ✓ | — | ✓ | ✓ |
-| `claude-hook-bridge` | ✗ | ✗ | ✗ | ✓² | ✗ | ✗ | ✗ | ✗ | ✓³ | ✓³ | ✗ |
-| `tmux-attach` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ | ✗ |
-| `resume-only` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ |
-| `observe-only` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+Every source constructs the same distributed identity: `SessionRecord.id` =
+`` `${hostId}:${provider}:${providerThreadId}` ``. `providerThreadId` is the exact
+provider identity, `providerTreeId` groups related provider threads, and `parentId` is the stable
+composed ID of the parent. Local, remote, hook, scan, SDK, and private app-server projectors may
+not use different encodings.
 
-¹ `canSteer` requires exact version pins on both the SDK and the CLI
-(`src/providers/claude/managed-session.ts:593-595`).
-² Permission and elicitation decisions only — the hook is holding the harness. Not arbitrary responses.
-³ Only when an unambiguous tmux target also resolves; `preview`/`attach` are orthogonal to the bridge.
+## Capability ceilings
 
-### R4 — `claude-hook-bridge` must not advertise `queue` or `steer`
+A live adapter may advertise less than its row because of version drift, controller ambiguity,
+transport loss, or a provider method being absent. It never advertises more.
 
-There is no local channel to send a user message to an external Claude session
-(appendix §2.1). The composer for such a session renders read-only with the reason stated, and
-offers attach as the escape hatch — the same shape `tmux-attach` sessions already have.
+| Plane | queue/steer | interrupt | respond | profile/model/effort | preview/attach/resume | lifecycle |
+| --- | --- | --- | --- | --- | --- | --- |
+| `codex-private` | provider | provider | provider | experimental update, next-turn fallback; idle-only UI | guarded native handoff | provider RPCs only |
+| `codex-hook-bridge` | never | never | trusted hook shapes only | never | tmux-derived only | never fabricate |
+| `claude-sdk` | queue; steer only when pinned | yes | SDK callbacks | SDK `setModel`, effort flag, permission mode | guarded handoff/resume | `Query.close()` for manager-owned end |
+| `claude-hook-bridge` | never | never | `PermissionRequest` only | never | tmux-derived only | never fabricate |
+| `tmux-attach` | never | never | never | never | preview/attach | none |
+| `resume-only` | never | never | never | never | attach/resume | none |
+| `observe-only` | never | never | never | never | none | none |
 
-**Prohibited implementations**, both of which would technically "work" and both of which lie:
+Lifecycle actions are exact:
 
-- Blocking a `Stop` hook and returning the operator's text as `reason` or `additionalContext`.
-  That injects a system instruction attributed to no one; the transcript would show the model
-  responding to a message the user never sent.
-- Codex `thread/inject_items` for the same purpose.
+- Codex archive/delete use the corresponding RPC only when advertised. A running delete
+  is rejected server-side.
+- Codex end means interrupt the active turn, clear only the manager queue, unsubscribe/detach,
+  and retain the resumable thread; no nonexistent `thread/close` is claimed.
+- Claude end calls `Query.close()` only for a manager-owned SDK query. External Claude sessions
+  have no end capability.
+- Multi-select invokes the same per-session actions with bounded concurrency and reports every
+  success/failure; there is no imaginary batch RPC.
 
-### R5 — Provenance is per-plane, not per-session
+## Execution profile mapping
 
-`ActivitySource` / `ActivityConfidence` / `ActivityExposure` (`src/activity/types.ts:23-25`)
-are set by whatever produced the item, and a single session may mix them — a hook-bridged
-Claude session gets `provider-api`/`exact`/`provider-exposed` items from hooks *and* may still
-have `transcript`/`inferred`/`transcript-derived` items from the polling observer for the parts
-hooks do not cover.
+The profile is provider-neutral product intent and maps atomically at the adapter boundary.
 
-| Producer | source | confidence | exposure |
-| --- | --- | --- | --- |
-| Codex app-server / daemon stream | `provider-api` | `exact` | `provider-exposed` |
-| Claude Agent SDK stream | `provider-api` | `exact` | `provider-exposed` |
-| Hook bridge | `provider-api` | `exact` | `provider-exposed` |
-| `SelectedTranscriptActivityObserver` | `transcript` | `inferred` | `transcript-derived` |
-| Discovery heuristics (`agent-sessions.ts`) | `transcript` | `heuristic` | `transcript-derived` |
+| Profile | Claude | Codex |
+| --- | --- | --- |
+| `ask-first` | default permission mode | approval on request + workspace-write sandbox |
+| `plan` | plan permission mode | plan collaboration mode + safe approval/sandbox |
+| `execute` | accept-edits equivalent | on-request approval + workspace-write sandbox |
+| `full-access` | bypass permissions | never approve + danger-full-access sandbox |
 
-Hook events **are** provider events: the harness called us, synchronously, with its own payload.
-Labelling them `inferred` would be as dishonest as labelling a transcript guess `exact`.
+Provider vocabulary is internal. If a provider/version cannot express the whole mapping, that
+profile is unavailable; the app does not apply half of it. Codex settings are selected only
+while idle. With `experimentalApi: true`, the pinned 0.146 experimental schema exposes
+`thread/settings/update`; send that exact request and treat `thread/settings/updated` as the
+effective state. On `-32601`, withdraw the live-setting method and use the selected values as
+`turn/start` overrides on the next turn. Never optimistically assert effective state. Claude SDK
+changes use its real live methods while the UI honours adapter-level capability withdrawal.
 
-### R6 — Two controllers is a state, not an error
+## Provenance and arbitration
 
-Adoption creates a case that never existed: a session with a live cockpit plane *and* a live
-foreign controller (a TUI, an editor). The existing native-handoff state machine
-(`src/server/server.ts:345-364`, `:1963-2226`) already models exactly this, with statuses
-`preparing | prepared | authorized | attached | reclaiming | degraded`.
-
-Reuse it. Do not add a parallel mechanism.
-
-- An adopted thread whose foreign controller is live is `attached`; cockpit **writes stay
-  disabled**, observation continues at full fidelity.
-- Loss of certainty about who controls the session resolves to `degraded` and fail-closed, as
-  it does today (`src/server/server.ts:1944`, `:2107`).
-- Capability withdrawal on a per-method basis already exists for Codex `-32601`
-  (`src/providers/codex/adapter.ts:713-721`) and on transport loss (`:651-693`). Adopted
-  threads use the same paths.
-
-### R7 — Every plane states itself in the UI
-
-The session panel (design `9b`) answers "what may it do" in plain sentences with a tick,
-question mark or cross — never provider strings like `danger-full-access`. The plane name and
-its reason for any withheld capability must be available to that surface. Extend `SessionControl`:
-
-```ts
-export interface SessionControl {
-  plane: ControlPlane;
-  capabilities: ControlCapability[];
-  managerOwned: boolean;
-  writableLease: boolean;
-  /** NEW — why a capability the plane could offer is currently withheld. */
-  withheld?: ReadonlyArray<{ capability: ControlCapability; reason: string }>;
-}
-```
-
-`withheld` is what turns a greyed-out control into an explanation. It is display-only and must
-never be consulted for authorisation — the gate reads `capabilities`.
-
-## Non-goals
-
-- Adopting a Codex thread whose daemon is not running. No daemon, no `codex-daemon` plane.
-- Any Claude adoption path built on `--resume` of a session the manager did not own. That
-  creates a second controller for a live conversation with no arbitration primitive, which is
-  the hazard R6 exists to prevent. `ClaudeManagedSession` documents this deliberately
-  (`src/providers/claude/managed-session.ts:80-84`).
-- Remote Control. It is cloud-routed with no local endpoint (appendix §2.1).
+- Provenance belongs to every activity item. A session may legitimately contain exact hook/API
+  items and inferred transcript items.
+- Controller arbitration is one generic state machine, not a copy of wrapper/PID-specific
+  native handoff logic. Unknown or multiple foreign environments withdraw all semantic writes
+  until a safe reclaim completes.
+- Selecting a session is the ref-counted adoption/subscription boundary. Deselecting releases
+  the selected stream and daemon subscription.
+- A hook event is exact provider evidence. A process/transcript scan remains heuristic and may
+  supply visibility, never write authority.
 
 ## Acceptance criteria
 
-1. `ControlPlane` and `ControlCapability` extended; `requiredCapability()` exhaustive and compiling.
-2. A session on each plane produces exactly the capability set in R3, verified by unit test per plane.
-3. `POST /actions` for a capability absent from the plane returns `409 CAPABILITY_UNAVAILABLE`
-   without reaching a provider adapter.
-4. A `claude-hook-bridge` session rejects `send` at the gate, and the composer explains why
-   rather than silently disabling.
-5. `withheld` reasons render in the session panel; no provider string leaks into that surface.
-6. Existing tests for lease gating, generation staleness and native-handoff status transitions
-   still pass unmodified.
-
-## Open questions
-
-- **Q1.** Should `codex-app-server` (private socket) survive at all once `codex-daemon` works,
-  or does the manager always go through the daemon? Keeping both doubles the supervisor's
-  surface. Defer until spec 02's spike lands — if the daemon is reliable, collapsing to one
-  path is a simplification worth taking.
+1. Server, browser, and remote code import the same strict schema; old aliases and duplicate
+   fields are deleted.
+2. One atomic `set-profile` action replaces `set-mode` and `set-access`; exhaustive action gates
+   reject absent capabilities before provider dispatch.
+3. Full access is orange, immediate, and represented by the same profile everywhere.
+4. Codex settings remain idle-only, use the pinned experimental method when available, and
+   fall back to next-turn overrides after exact method withdrawal.
+5. Hook planes reject queue/steer, heuristic attention is never respondable, and withheld
+   reasons render as plain language.
+6. Ambiguous controller state withdraws writes without losing observation.
+7. `codex-private` is the only managed Codex plane in production code and tests; neither a
+   `codex-daemon` nor a `codex-app-server` plane label remains.

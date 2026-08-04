@@ -21,12 +21,10 @@ import {
   sep,
 } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { redactActivityText } from "../activity/redaction.ts";
 import type {
-  ConversationMessage,
   Provider,
-  SessionTranscript,
   SessionView,
-  TranscriptUnavailableReason,
 } from "../core/types.ts";
 
 export const TRANSCRIPT_LIMITS = Object.freeze({
@@ -38,16 +36,56 @@ export const TRANSCRIPT_LIMITS = Object.freeze({
 
 type SessionIdentity = Pick<
   SessionView,
-  "provider" | "sessionId" | "parentSessionId" | "rootSessionId"
+  "provider" | "providerThreadId" | "providerTreeId" | "parentId"
 >;
 
+export type TranscriptUnavailableReason = "not-found" | "unreadable" | "unsupported";
+export type TranscriptSource = "codex-rollout" | "claude-transcript" | "provider-api";
+
+export interface TranscriptAvailability {
+  state: "available" | "unavailable";
+  truncated: boolean;
+  source: TranscriptSource | null;
+  messageCount: number;
+  reason: TranscriptUnavailableReason | null;
+}
+
 export interface TranscriptReadResult {
-  messages: ConversationMessage[];
-  transcript: SessionTranscript;
+  messages: TranscriptMessage[];
+  transcript: TranscriptAvailability;
+}
+
+export interface TranscriptSearchMatch {
+  messageId: string;
+  role: TranscriptMessage["role"];
+  createdAt: string | null;
+  snippet: string;
+  matchStart: number;
+  matchEnd: number;
+}
+
+export interface TranscriptSearchResult {
+  matches: TranscriptSearchMatch[];
+  truncated: boolean;
+}
+
+/** Internal reader output. Conversation history is projected into ActivityItem. */
+export interface TranscriptMessage {
+  id: string;
+  role: "user" | "assistant" | "system" | "tool";
+  text: string;
+  createdAt: string | null;
+  status: "running" | "complete" | "incomplete";
+  label: string | null;
 }
 
 export interface SessionTranscriptReader {
   read(session: SessionIdentity): TranscriptReadResult;
+  search?(
+    session: SessionIdentity,
+    query: string,
+    limit?: number,
+  ): TranscriptSearchResult;
 }
 
 export interface LocalTranscriptReaderOptions {
@@ -86,7 +124,7 @@ interface FileWalkResult {
 }
 
 interface ParsedMessages {
-  messages: ConversationMessage[];
+  messages: TranscriptMessage[];
   truncated: boolean;
 }
 
@@ -147,7 +185,7 @@ function unavailable(reason: TranscriptUnavailableReason): TranscriptReadResult 
 
 function available(
   provider: Provider,
-  messages: ConversationMessage[],
+  messages: TranscriptMessage[],
   truncated: boolean,
 ): TranscriptReadResult {
   return {
@@ -343,7 +381,7 @@ function utf8Prefix(text: string, limit: number): { text: string; truncated: boo
   return { text: "", truncated: true };
 }
 
-function capMessages(input: ConversationMessage[]): ParsedMessages {
+function capMessages(input: TranscriptMessage[]): ParsedMessages {
   let truncated = false;
   const perMessage = input.flatMap((message) => {
     const capped = utf8Prefix(message.text, TRANSCRIPT_LIMITS.messageBytes);
@@ -351,7 +389,7 @@ function capMessages(input: ConversationMessage[]): ParsedMessages {
     return capped.text.length > 0 ? [{ ...message, text: capped.text }] : [];
   });
 
-  const retained: ConversationMessage[] = [];
+  const retained: TranscriptMessage[] = [];
   let totalBytes = 0;
   for (let index = perMessage.length - 1; index >= 0; index -= 1) {
     const message = perMessage[index];
@@ -389,7 +427,7 @@ function syntheticCodexUserContext(text: string): boolean {
 }
 
 function codexMessages(tail: JsonlTail, fileIdentity: string): ParsedMessages {
-  const messages: ConversationMessage[] = [];
+  const messages: TranscriptMessage[] = [];
   const seenIds = new Set<string>();
   const seenAdjacent = new Set<string>();
   let previousKey: string | null = null;
@@ -449,12 +487,12 @@ function matchesClaudeIdentity(
 ): boolean {
   if (!stringValue(object.uuid)) return false;
   if (isChild) {
-    const expected = claudeAgentId(session.sessionId);
+    const expected = claudeAgentId(session.providerThreadId);
     return object.isSidechain === true && stringValue(object.agentId) === expected;
   }
   return object.isSidechain !== true &&
     stringValue(object.agentId) === null &&
-    stringValue(object.sessionId) === session.sessionId;
+    stringValue(object.sessionId) === session.providerThreadId;
 }
 
 function claudeChain(
@@ -535,7 +573,7 @@ function claudeMessages(
   isChild: boolean,
 ): ParsedMessages {
   const chain = claudeChain(tail, session, isChild);
-  const messages: ConversationMessage[] = [];
+  const messages: TranscriptMessage[] = [];
   const byId = new Map<string, { index: number; fragments: Set<string> }>();
   let truncated = chain.truncated;
 
@@ -736,18 +774,17 @@ function claudeCandidates(
     failure("unreadable");
   }
   const candidates: string[] = [];
-  const childId = claudeAgentId(session.sessionId);
-  const rootId = session.rootSessionId !== session.sessionId
-    ? session.rootSessionId
-    : session.parentSessionId;
+  const childId = claudeAgentId(session.providerThreadId);
+  const rootId = session.providerTreeId !== null && session.providerTreeId !== session.providerThreadId
+    ? session.providerTreeId
+    : null;
   for (const entry of projectEntries) {
     if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
     const project = join(projects.canonical, entry.name);
     if (!isChild) {
-      candidates.push(join(project, `${session.sessionId}.jsonl`));
+      candidates.push(join(project, `${session.providerThreadId}.jsonl`));
       continue;
     }
-    candidates.push(join(project, `agent-${childId}.jsonl`));
     if (rootId) {
       candidates.push(join(project, rootId, "subagents", `agent-${childId}.jsonl`));
     }
@@ -767,12 +804,13 @@ function claudeFile(
   session: SessionIdentity,
   uid: number,
 ): { file: OpenTranscript; isChild: boolean } {
-  if (!SAFE_PROVIDER_ID.test(session.sessionId)) failure("unsupported");
-  const isChild = session.parentSessionId !== null || session.rootSessionId !== session.sessionId;
+  if (!SAFE_PROVIDER_ID.test(session.providerThreadId)) failure("unsupported");
+  const isChild = session.parentId !== null
+    || (session.providerTreeId !== null && session.providerTreeId !== session.providerThreadId);
   if (
     isChild &&
-    (!SAFE_PROVIDER_ID.test(session.rootSessionId) ||
-      (session.parentSessionId !== null && !SAFE_PROVIDER_ID.test(session.parentSessionId)))
+    session.providerTreeId !== null &&
+    !SAFE_PROVIDER_ID.test(session.providerTreeId)
   ) failure("unsupported");
   const projects = rootInfo(join(claudeHomePath, "projects"), uid);
   const candidates = claudeCandidates(projects, session, isChild);
@@ -798,7 +836,7 @@ export class LocalSessionTranscriptReader implements SessionTranscriptReader {
     let file: OpenTranscript | null = null;
     try {
       if (session.provider === "codex") {
-        file = codexFile(this.#codexHome, session.sessionId, this.#uid).file;
+        file = codexFile(this.#codexHome, session.providerThreadId, this.#uid).file;
         const parsed = codexMessages(readJsonlTail(file), file.identity);
         return available("codex", parsed.messages, parsed.truncated);
       }
@@ -818,6 +856,58 @@ export class LocalSessionTranscriptReader implements SessionTranscriptReader {
     } finally {
       if (file) closeSync(file.descriptor);
     }
+  }
+
+  search(
+    session: SessionIdentity,
+    query: string,
+    limit = 20,
+  ): TranscriptSearchResult {
+    const needle = query.trim();
+    if (needle.length < 2 || needle.length > 200 || needle.includes("\0")) {
+      return { matches: [], truncated: false };
+    }
+    const boundedLimit = Number.isFinite(limit)
+      ? Math.max(1, Math.min(50, Math.floor(limit)))
+      : 20;
+    const transcript = this.read(session);
+    if (transcript.transcript.state !== "available") {
+      return { matches: [], truncated: transcript.transcript.truncated };
+    }
+    const loweredNeedle = needle.toLocaleLowerCase("en-US");
+    const matches: TranscriptSearchMatch[] = [];
+    let exhausted = false;
+    for (const message of transcript.messages) {
+      const safeText = redactActivityText(message.text);
+      const lowered = safeText.toLocaleLowerCase("en-US");
+      let offset = 0;
+      while (offset <= lowered.length) {
+        const index = lowered.indexOf(loweredNeedle, offset);
+        if (index < 0) break;
+        if (matches.length >= boundedLimit) {
+          exhausted = true;
+          break;
+        }
+        const start = Math.max(0, index - 80);
+        const end = Math.min(safeText.length, index + needle.length + 120);
+        const prefix = start > 0 ? "…" : "";
+        const suffix = end < safeText.length ? "…" : "";
+        matches.push({
+          messageId: message.id,
+          role: message.role,
+          createdAt: message.createdAt,
+          snippet: `${prefix}${safeText.slice(start, end)}${suffix}`,
+          matchStart: prefix.length + index - start,
+          matchEnd: prefix.length + index - start + needle.length,
+        });
+        offset = index + Math.max(1, loweredNeedle.length);
+      }
+      if (exhausted) break;
+    }
+    return {
+      matches,
+      truncated: transcript.transcript.truncated || exhausted,
+    };
   }
 }
 

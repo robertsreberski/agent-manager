@@ -5,7 +5,11 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import test from "node:test";
 
-import { buildAndPublishWeb, publishStagedWebBuild } from "./build-web.ts";
+import {
+  atomicSwapWebDirectories,
+  buildAndPublishWeb,
+  publishStagedWebBuild,
+} from "./build-web.ts";
 
 async function write(path: string, contents: string): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
@@ -22,7 +26,22 @@ async function fixture(t: test.TestContext): Promise<string> {
   return root;
 }
 
-test("publishes files atomically in browser-safe order and retains old hashes", async (t) => {
+test("atomically exchanges complete web directories on macOS", async (t) => {
+  const root = await fixture(t);
+  const staged = join(root, "staged");
+  const live = join(root, "live");
+  await Promise.all([
+    write(join(staged, "generation.txt"), "new"),
+    write(join(live, "generation.txt"), "old"),
+  ]);
+
+  await atomicSwapWebDirectories(staged, live);
+
+  assert.equal(await read(join(live, "generation.txt")), "new");
+  assert.equal(await read(join(staged, "generation.txt")), "old");
+});
+
+test("publishes one exact web generation in browser-safe validation order", async (t) => {
   const root = await fixture(t);
   const stageDir = join(root, "dist", ".web-stage-fixture");
   const liveDir = join(root, "dist", "web");
@@ -52,7 +71,7 @@ test("publishes files atomically in browser-safe order and retains old hashes", 
   assert.equal(await read(join(liveDir, "index.html")), "new index");
   assert.equal(await read(join(liveDir, "sw.js")), "new worker");
   assert.equal(await read(join(liveDir, "assets", "index-new.js")), "new asset");
-  assert.equal(await read(join(liveDir, "assets", "index-old.js")), "old asset");
+  assert.equal(existsSync(join(liveDir, "assets", "index-old.js")), false);
 
   const liveEntries = await readdir(liveDir, { recursive: true });
   assert.equal(liveEntries.some((entry) => entry.includes(".publish-")), false);
@@ -125,7 +144,7 @@ test("build failure cleans only its unique stage and leaves the live release int
   assert.equal(await read(serverBundle), "server bundle");
 });
 
-test("successful builds clean their stage without cleaning live or sibling dist files", async (t) => {
+test("successful builds replace old web assets without cleaning sibling dist files", async (t) => {
   const root = await fixture(t);
   const distDir = join(root, "dist");
   const liveDir = join(distDir, "web");
@@ -154,6 +173,6 @@ test("successful builds clean their stage without cleaning live or sibling dist 
   assert.equal(await read(join(liveDir, "index.html")), "new index");
   assert.equal(await read(join(liveDir, "sw.js")), "new worker");
   assert.equal(await read(join(liveDir, "assets", "index-new.js")), "new asset");
-  assert.equal(await read(join(liveDir, "assets", "index-old.js")), "old asset");
+  assert.equal(existsSync(join(liveDir, "assets", "index-old.js")), false);
   assert.equal(await read(serverBundle), "server bundle");
 });

@@ -1,14 +1,14 @@
-import { execFile, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { chmod, lstat, mkdir, unlink } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import { promisify } from "node:util";
 
 import { CodexManagedAdapter } from "./adapter.ts";
 import type { MessageTransport } from "./rpc.ts";
 import { isSupportedCodexVersion } from "./adapter.ts";
 import { UnixWebSocketTransport } from "./unix-websocket.ts";
+import { probeCodexVersion } from "./version.ts";
 
-const execFileAsync = promisify(execFile);
+export { probeCodexVersion } from "./version.ts";
 
 export interface ManagedChildProcess {
   pid?: number | undefined;
@@ -62,18 +62,6 @@ export interface CodexSupervisorState {
   exitCode: number | null;
   exitSignal: NodeJS.Signals | null;
   lastUnexpectedExit: CodexUnexpectedExit | null;
-}
-
-function parseVersion(value: string): string | null {
-  return value.match(/\b(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)/u)?.[1] ?? null;
-}
-
-export async function probeCodexVersion(executable: string): Promise<string | null> {
-  const { stdout, stderr } = await execFileAsync(executable, ["--version"], {
-    timeout: 5_000,
-    maxBuffer: 64 * 1024,
-  });
-  return parseVersion(`${stdout}\n${stderr}`);
 }
 
 function isInside(parent: string, child: string): boolean {
@@ -138,7 +126,7 @@ export class CodexAppServerSupervisor {
     if (!isAbsolute(options.runtimeDir)) {
       throw new Error("Codex runtime directory must be absolute");
     }
-    const socketName = options.socketName ?? "codex-app-server.sock";
+    const socketName = options.socketName ?? "codex-private.sock";
     if (socketName.includes("/") || socketName === "." || socketName === "..") {
       throw new Error("Codex socketName must be a plain filename");
     }

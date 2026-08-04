@@ -1,140 +1,102 @@
-# 00 — Overview: cockpit redesign and control-plane re-evaluation
+# 00 — Cockpit rebuild contract
 
-**Status:** Draft · **Supersedes:** nothing · **Changes public claims in:** `README.md`, `SECURITY.md`
+**Status:** Accepted · **Compatibility:** none · **Audience:** one trusted macOS user
 
-## Why this exists
+## Goal
 
-Agent Manager splits sessions in two: *manager-owned*, with full semantic control, and
-*external*, observe-only and transcript-derived. That split was not timidity — it was an
-accurate reading of the harnesses. Both providers' control channels were connection-scoped:
-Codex approvals arrive as JSON-RPC server→client requests on the socket the client opened, and
-Claude's `canUseTool` / `onElicitation` are callbacks passed into `query()`. A session started
-in someone else's terminal had already bound those channels to that terminal, and the
-filesystem transcript is a write-only side effect with no path back to the owning process.
+Agent Manager is a local cockpit for seeing and controlling Codex and Claude sessions. The web
+application is rebuilt against `docs/design/cockpit/`, using assistant-ui's component grammar,
+and reports the harness as it is rather than presenting controls that merely look plausible.
 
-**That reading is now out of date.** See `appendix-harness-capabilities.md` for the evidence.
-In short:
+The organising model is repository → worktree → session. Selecting a card opens an overlay
+thread drawer. Starting work creates a draft thread; its first send atomically creates the
+provider session. Browser writer leases remain internal concurrency plumbing and never appear as
+a routine ownership control.
 
-- **Codex runs a shared app-server daemon** with a `thread/list` index, per-client
-  subscriptions (`thread/unsubscribe`), and a `serverRequest/resolved` broadcast for
-  arbitrating who answered what. `ThreadSourceKind` distinguishes `cli` threads — sessions
-  started in a terminal — from `appServer` ones.
-- **Both harnesses have hooks that can block and decide**, over HTTP, synchronously, with
-  600s timeouts. Claude reloads hook config **live via file watcher, with no session restart**,
-  so an install takes effect on sessions that are already running.
-- **Claude still has no local control channel** for an arbitrary interactive session. Remote
-  Control is cloud-routed. External Claude sessions can be observed exactly and can have their
-  decisions answered — but they cannot be queued or steered.
+## Locked decisions
 
-The web layer was drawn against the old concept, and the Claude Design handoff
-(`docs/design/cockpit/`) replaces its three organising ideas: a host-grouped list becomes a
-repo → worktree **board**; a modal launcher becomes a **draft thread** whose composer owns
-harness/model/effort/mode/access for the session's life; and the operator-held **lease
-disappears** from view.
-
-Both halves serve one commitment, which is the project's reason to exist: **the most faithful
-depiction of what is actually happening with the harness.**
+- This is a pre-prototype personal tool. Replace contracts in place, cold-reset Agent
+  Manager-owned state, and delete old code in the same slice. Do not add migrations, aliases,
+  deprecated fields, feature flags, backup flows, or parallel compatibility paths.
+- There is one execution profile: `ask-first | plan | execute | full-access`. Profile is atomic;
+  raw provider permission/sandbox strings never become a second public setting.
+- Full access is an immediate orange menu action. There is no confirmation dialog and no
+  browser arming period.
+- There is no global control-stop switch. No persistent sentinel, CLI/owner-socket command,
+  middleware state, UI, documentation surface, or test for one remains.
+- Claude external decisions use the Claude HTTP `PermissionRequest` hook only. Codex hooks are
+  a separate command-hook integration and require Codex trust. Provider schemas are never
+  conflated.
+- Shared-daemon Codex control ships only after the isolated two-client gate in spec 02 passes.
+  Agent Manager never starts, restarts, or stops the user's daemon.
+- There is one selected-session activity timeline. Retention is bounded and stated honestly;
+  there is no fake REST backscroll over an already-truncated buffer.
+- Build and deployment are personal-tool commands: `pnpm dev`, `pnpm check`, and `pnpm deploy`.
+  There is no publishing, tagging, changelog, release branch, or rollback ceremony.
 
 ## Honesty rules
 
-These bind every spec. They are the difference between this project and a dashboard.
+1. Render only provider facts or explicitly labelled derivations. Inferred attention stays in
+   Wants You with a dashed lime edge, muted body, and “looks blocked — from transcript”; it is
+   never respondable and never triggers a notification.
+2. Authorise from the live capability set. A missing action remains unavailable and the UI
+   states why; a capability ceiling is not a promise.
+3. Never fake steering through Claude `Stop`, Codex `thread/inject_items`, terminal keystrokes,
+   or a hook return value attributed to the wrong actor.
+4. Preserve provenance per activity item: provider API/exact/provider-exposed versus
+   transcript/inferred or heuristic/transcript-derived.
+5. Fail closed on controller ambiguity and wire-version mismatch. Fail open to a waiting
+   provider hook by releasing it with an empty successful response.
+6. Global state and SSE remain metadata-only. Exact prompts, answers, commands, paths, and
+   transcript snippets use authenticated selected-session routes with `Cache-Control: no-store`.
 
-1. **Never render a fact the harness did not supply.** Derive what is derivable (is this path
-   inside the workspace?), omit the rest. Do not invent "deletes 412 files" because the design
-   frame shows a number there.
-2. **Never advertise a capability that will fail.** Capabilities are derived from the live
-   control plane, not asserted. A control that cannot work renders disabled *with its reason*,
-   per the design's own rule that capabilities read as plain sentences with a tick, question
-   mark or cross.
-3. **Never disguise a side channel as the real thing.** Claude's `Stop` hook can block with a
-   `reason` that the model then acts on. That is a system instruction, not a user turn.
-   Using it to fake steering would put words in the transcript the operator never said.
-   Codex's `thread/inject_items` is the same trap. Neither is a steering channel.
-4. **Provenance survives the redesign.** `source` / `confidence` / `exposure`
-   (`src/activity/types.ts:23-25`) must remain visible wherever they are not `provider-api` /
-   `exact` / `provider-exposed`. A prettier surface must not launder an inference into a fact.
-5. **Fail closed on ownership, fail open to the harness.** Ambiguity about who controls a
-   session disables cockpit writes. A hook that times out waiting for a browser must return
-   control to the harness's own prompt — never leave a terminal wedged.
-6. **What a spec replaces, the same commit deletes.** This is the first revision; nothing is
-   owed compatibility. No deprecation, no flag, no parallel old path. See
-   [`13-removals.md`](13-removals.md) — it is not a cleanup backlog, it is a constraint on
-   every phase.
+## Specifications and implementation order
 
-## The spec set
-
-Every implementation phase implements exactly one spec, and no phase starts before its spec is
-reviewed. Read in this order.
-
-| Spec | Covers | Design frames |
+| Wave | Specifications | Result |
 | --- | --- | --- |
-| [`01-control-planes.md`](01-control-planes.md) | The plane spectrum, capability derivation, two-controller safety | — |
-| [`02-codex-daemon-adoption.md`](02-codex-daemon-adoption.md) | Joining the shared daemon, thread adoption, approval arbitration | — |
-| [`03-hook-bridge.md`](03-hook-bridge.md) | Hook installation, event ingestion, blocking decisions | — |
-| [`04-workspace-model.md`](04-workspace-model.md) | Repo → worktree discovery, branch, dirty counts | `7a` |
-| [`05-board-and-drawer.md`](05-board-and-drawer.md) | Board columns, cards, scopes, host filter, overlay drawer, thread | `7a` `4a` `4b` |
-| [`06-composer.md`](06-composer.md) | Harness/model/effort/mode/access, draft sessions, queue vs steer, lease removal | `5a` `6b` |
-| [`07-questions-and-approvals.md`](07-questions-and-approvals.md) | `request_user_input`, multi-question, three approval tiers, panic lock | `6a` `8a` `9a-3` `9a-4` |
-| [`08-plan-and-todos.md`](08-plan-and-todos.md) | Plan document vs todo checklist — two different objects | `14a` `14b` `15a` `15b` |
-| [`09-diffs.md`](09-diffs.md) | Inline diff, review drawer, phone unified | `10a` `10b` `13a` |
-| [`10-palette-multiselect-notifications.md`](10-palette-multiselect-notifications.md) | ⌘K, selection bar, notification policy | `11a` `12a` `12b` |
-| [`11-system-states-and-first-run.md`](11-system-states-and-first-run.md) | Connecting, offline, ended, empty, onboarding, phone | `8b` `13b` `13c` `9a-1` |
-| [`12-design-system.md`](12-design-system.md) | Tokens, type, fonts, icons, motion | tokens |
-| [`13-removals.md`](13-removals.md) | What each phase deletes, and why now is the moment | — |
-| [`appendix-harness-capabilities.md`](appendix-harness-capabilities.md) | The survey specs 01–03 rest on | — |
+| 0 | 00–03, appendix | Correct protocol facts; run the isolated Codex gate before freezing contracts |
+| 1 | 01, 04, 13 | One strict shared wire schema, cold reset, discovery/workspace model, structural deletions |
+| 2 | 02, 03 | Codex controller path, Claude and Codex hook bridges, controller arbitration |
+| 3 | 12, 05, 06, 07 | Design system, board/drawer/thread, drafts/composer, questions/approvals |
+| 4 | 08–11 | Plans/todos, diffs, palette/lifecycle/notifications, system states/mobile/first run |
+| 5 | 13 | Dependency and package pruning, exact clean build, simple local deployment, final verification |
 
-## Delivery order
+`use-cockpit` is decomposed and the shared contract is frozen before parallel UI work. One
+integrator owns server hot files and one owns web hot files; package/lock changes have one owner.
+Workers do not edit those integration surfaces concurrently.
 
-Follows the handoff's own suggested order, with the control-plane work slotted where it
-unblocks UI that would otherwise have nothing to show.
+## Required public model
 
-| # | Phase | Specs | Gate |
-| --- | --- | --- | --- |
-| 0 | Standalone cleanup — untrack `dogfood-output/`, dependency audit | 13 §A | — |
-| 1 | Design system | 12 | — |
-| 2 | Workspace model | 04 | — |
-| 3 | Board + drawer + thread | 05 | 12, 04 |
-| 4 | Composer, draft sessions, lease removal | 06 | 05 |
-| 5 | Questions and approvals | 07 | 05 |
-| 6 | Codex daemon adoption | 01, 02 | **daemon spike** (spec 02 §Prerequisite) |
-| 7 | Hook bridge | 01, 03 | 06 |
-| 8 | Plan and todos | 08 | 05 |
-| 9 | Diffs | 09 | 05 |
-| 10 | Palette, multi-select, notifications | 10 | 05, 06 |
-| 11 | System states, phone, first run | 11 | all |
+- One shared server/browser schema and one wire epoch. Old clients and remote nodes fail closed
+  and request a reload/update; they are not normalized into the new shape.
+- Distributed session identity is always `SessionRecord.id` =
+  `` `${hostId}:${provider}:${providerThreadId}` ``. `providerThreadId` preserves
+  the exact provider thread identity; `providerTreeId` groups a provider thread tree. For Codex,
+  `providerThreadId` is `Thread.id` and protocol `sessionId` becomes `providerTreeId`. This is the
+  current app-stable encoding, not a compatibility alias.
+- One activity/status truth, one attention truth, and one controller/authority truth. Delete
+  duplicate `status`/`activity`, `lifecycle`/`runtimeAlive`, `waitingReason`/`attention`, and
+  ownership aliases rather than reconciling them forever.
+- Provider settings, lifecycle, activity, request responses, and editor operations are typed,
+  capability-gated actions. Browser input never selects an executable or supplies shell text.
 
-Phases 6 and 7 change what `README.md` and `SECURITY.md` promise. `SECURITY.md:37-41` currently
-states that Agent Manager "does not adopt external sessions into its semantic control plane."
-**Rewrite that claim in the same commit as the behaviour change, never after.**
+## Design authority
 
-## Frictions between the design and the harnesses
+`Cockpit Redesign.dc.html` is normative for surviving frames. The complete prototype supplies
+the board, drawer, composer, questions, and boundary-truncated approval frame. `support.js` is
+canvas runtime only and is not product code. Frame `8b` is absent; spec 11 defines it using the
+adjacent design grammar, and this exception is recorded in `docs/design/cockpit/NOTES.md`.
 
-Resolving these *is* the work. Each is owned by a spec.
+## Completion gates
 
-| # | Friction | Owner | Resolution |
-| --- | --- | --- | --- |
-| 1 | Board groups by repo → worktree; no worktree concept exists | 04 | Add discovery |
-| 2 | Design removes all lease UI; the lease is real single-writer safety | 06 | Keep mechanism, surface only conflicts |
-| 3 | Composer owns model/effort/access; no mid-session change exists | 06 | New actions; disable with a stated reason where unsupported |
-| 4 | Plan is a versioned markdown file; Codex emits structured steps | 08 | Two item kinds; Codex renders as todos, no fake path |
-| 5 | Approval facts ("deletes 412 files") are in no provider payload | 07 | Show only derivable facts |
-| 6 | Diff "expand context" implies re-reading the file | 09 | Expand only within the patch |
-| 7 | External attention is heuristic with `id: null`, but the board has no visual for it | 05 | **Open — needs a design decision** |
-| 8 | Palette searches transcript text; the global feed is metadata-only by design | 10 | Scoped search, offsets not content |
-| 9 | Offline outbox vs `expectedGeneration` | 11 | Re-validate at flush, confirm on material change |
-| 10 | Design loads Google Fonts; CSP is `default-src 'self'` | 12 | Self-host woff2 |
-
-## Invariants the rebuild must not break
-
-Each has a test today. Keep the tests, whatever happens to the component around them.
-
-| Invariant | Where |
-| --- | --- |
-| Inline answer controls only for `!resolved && waiting && provider-api && exact && provider-exposed && !truncated` | `web/src/components/session-thread.tsx:126-145` |
-| Attention metadata never synthesises answer controls | `web/src/components/session-thread.tsx:147-190` |
-| Activity frame cursor equality check | `web/src/lib/session-activity.ts:148` |
-| UTF-8 byte-offset append verification | `web/src/lib/session-activity.ts:224` |
-| `isRunning: false` on the external store — assistant-ui must not invent a running message | `web/src/components/session-thread.tsx:601-604` |
-| Composer `preventDefault` for unsupported delivery, or the draft is lost | `web/src/components/session-thread.tsx:353-361` |
-| Global SSE carries metadata only; exact request content is selected-session only | `src/server/state.ts:21-39` |
-| Attach instructions to the browser are owner-socket wrappers, never raw provider commands | `src/server/server.ts:802-811` |
+- Every accepted spec is implemented or a provider limitation is explicitly unavailable; no
+  fake control or silent fallback remains.
+- Existing exact-interaction invariants survive: request exactness, unsupported-send draft
+  preservation, `isRunning: false`, cursor equality, UTF-8 append validation, and idempotent
+  creation.
+- Disposable real Claude hook and isolated two-client Codex tests do not alter global hook
+  configuration, the running shared daemon, or existing sessions.
+- Visual/keyboard/accessibility checks cover 320px, 390×844, 900/901px, and 1440×900.
+- `pnpm check`, package-content checks, `pnpm deploy`, local health, and browser smoke pass.
+- Repository searches find no global stop/sentinel code, old mode/access contract, migration aliases,
+  duplicate timeline, obsolete launcher/sidebar, release ceremony, or tracked dogfood artifacts.

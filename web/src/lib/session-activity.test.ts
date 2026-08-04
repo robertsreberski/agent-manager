@@ -12,7 +12,7 @@ const EPOCH = "epoch:with-colon";
 
 function message(overrides: Partial<ActivityMessageItem> = {}): ActivityMessageItem {
   return {
-    schemaVersion: 1,
+    schemaVersion: 3,
     id: "message-1",
     sessionId: SESSION_ID,
     provider: "codex",
@@ -41,7 +41,7 @@ function frame(
   value: { type: ActivityFrame["type"]; seq: number; [key: string]: unknown },
 ): ActivityFrame {
   return {
-    schemaVersion: 1,
+    schemaVersion: 3,
     streamEpoch: EPOCH,
     sessionId: SESSION_ID,
     provider: "codex",
@@ -98,7 +98,7 @@ describe("reduceSessionActivity", () => {
       truncated: false,
     });
     let state = reduceSessionActivity(emptySessionActivity(SESSION_ID), SESSION_ID, snapshot).state;
-    expect(state.hasSnapshot).toBe(true);
+    expect(state.streamEpoch).toBe(EPOCH);
     expect((state.items[0] as ActivityMessageItem | undefined)?.text).toBe("hé");
 
     state = reduceSessionActivity(state, SESSION_ID, frame({
@@ -203,7 +203,6 @@ describe("reduceSessionActivity", () => {
     expect(result.state).toMatchObject({
       streamEpoch: "replacement-epoch",
       seq: 1,
-      hasSnapshot: true,
       truncated: true,
     });
     expect(result.state.items.map((item) => item.id)).toEqual(["replacement"]);

@@ -1,9 +1,9 @@
+import { parseActivityFrame as parseWireActivityFrame } from "../../../src/activity/wire.ts";
 import {
   ACTIVITY_SCHEMA_VERSION,
   type ActivityAppendFrame,
   type ActivityFrame,
   type ActivityItem,
-  type ActivityItemState,
   type ActivityJsonValue,
   type SessionActivityView,
 } from "../types";
@@ -16,138 +16,6 @@ export const ACTIVITY_EVENT_TYPES: ActivityFrame["type"][] = [
   "activity.reset",
 ];
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function isStringOrNull(value: unknown): value is string | null {
-  return value === null || typeof value === "string";
-}
-
-function isNumberOrNull(value: unknown): value is number | null {
-  return value === null || (typeof value === "number" && Number.isFinite(value));
-}
-
-function isNonNegativeInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
-}
-
-const ITEM_STATES: ActivityItemState[] = [
-  "pending",
-  "running",
-  "waiting",
-  "complete",
-  "failed",
-  "interrupted",
-];
-
-function hasActivityItemBase(value: Record<string, unknown>): boolean {
-  return value.schemaVersion === ACTIVITY_SCHEMA_VERSION
-    && typeof value.id === "string"
-    && value.id.length > 0
-    && typeof value.sessionId === "string"
-    && (value.provider === "codex" || value.provider === "claude")
-    && isStringOrNull(value.turnId)
-    && isStringOrNull(value.parentId)
-    && isNonNegativeInteger(value.seq)
-    && isNonNegativeInteger(value.revision)
-    && ITEM_STATES.includes(value.state as ActivityItemState)
-    && isStringOrNull(value.startedAt)
-    && isStringOrNull(value.updatedAt)
-    && isStringOrNull(value.completedAt)
-    && (value.source === "provider-api" || value.source === "transcript")
-    && (value.confidence === "exact" || value.confidence === "inferred" || value.confidence === "heuristic")
-    && (value.exposure === "provider-exposed" || value.exposure === "transcript-derived")
-    && typeof value.truncated === "boolean";
-}
-
-function isActivityItem(value: unknown): value is ActivityItem {
-  if (!isRecord(value) || !hasActivityItemBase(value)) return false;
-  switch (value.kind) {
-    case "message":
-      return (value.role === "user" || value.role === "assistant" || value.role === "system" || value.role === "tool")
-        && (value.phase === "commentary" || value.phase === "final" || value.phase === null)
-        && typeof value.text === "string"
-        && isStringOrNull(value.label);
-    case "reasoning":
-      return (value.reasoningKind === "summary" || value.reasoningKind === "raw")
-        && isStringOrNull(value.label)
-        && typeof value.text === "string";
-    case "plan":
-      return typeof value.text === "string"
-        && Array.isArray(value.steps)
-        && value.steps.every((step) => isRecord(step)
-          && typeof step.id === "string"
-          && typeof step.text === "string"
-          && (step.status === "pending" || step.status === "in_progress" || step.status === "completed"));
-    case "tool":
-      return typeof value.toolCallId === "string"
-        && typeof value.name === "string"
-        && typeof value.category === "string"
-        && typeof value.output === "string";
-    case "file-change":
-      return typeof value.summary === "string"
-        && Array.isArray(value.changes)
-        && value.changes.every((change) => isRecord(change)
-          && typeof change.path === "string"
-          && (change.operation === "add" || change.operation === "update" || change.operation === "delete" || change.operation === "rename")
-          && typeof change.diff === "string");
-    case "subagent":
-      return typeof value.taskId === "string"
-        && typeof value.name === "string"
-        && isStringOrNull(value.description)
-        && typeof value.output === "string"
-        && Array.isArray(value.childItemIds)
-        && value.childItemIds.every((id) => typeof id === "string");
-    case "attention":
-      return typeof value.requestId === "string"
-        && typeof value.attentionKind === "string"
-        && isStringOrNull(value.title)
-        && isStringOrNull(value.summary)
-        && Array.isArray(value.questions)
-        && typeof value.respondable === "boolean"
-        && typeof value.resolved === "boolean"
-        && typeof value.isSecret === "boolean";
-    case "queue":
-      return Array.isArray(value.messages)
-        && value.messages.every((message) => isRecord(message)
-          && typeof message.id === "string"
-          && typeof message.text === "string"
-          && typeof message.status === "string"
-          && typeof message.enqueuedAt === "string"
-          && isStringOrNull(message.turnId));
-    case "lifecycle":
-      return typeof value.event === "string"
-        && (value.level === "info" || value.level === "warning" || value.level === "error")
-        && typeof value.title === "string"
-        && isStringOrNull(value.details);
-    case "usage":
-      return (value.scope === "turn" || value.scope === "thread" || value.scope === "session")
-        && isNumberOrNull(value.inputTokens)
-        && isNumberOrNull(value.outputTokens)
-        && isNumberOrNull(value.cachedInputTokens)
-        && isNumberOrNull(value.reasoningTokens)
-        && isNumberOrNull(value.totalTokens)
-        && isNumberOrNull(value.costUsd);
-    default:
-      return false;
-  }
-}
-
-function hasActivityFrameBase(value: Record<string, unknown>): boolean {
-  if (
-    value.schemaVersion !== ACTIVITY_SCHEMA_VERSION
-    || typeof value.streamEpoch !== "string"
-    || value.streamEpoch.length === 0
-    || typeof value.sessionId !== "string"
-    || (value.provider !== "codex" && value.provider !== "claude")
-    || !isNonNegativeInteger(value.seq)
-    || typeof value.cursor !== "string"
-    || typeof value.at !== "string"
-  ) return false;
-  return value.cursor === encodeActivityCursor(value.streamEpoch, value.sessionId, value.seq);
-}
-
 export function encodeActivityCursor(
   streamEpoch: string,
   sessionId: string,
@@ -156,41 +24,24 @@ export function encodeActivityCursor(
   return `${streamEpoch}:${encodeURIComponent(sessionId)}:${sequence}`;
 }
 
+/**
+ * The browser uses the same fail-closed decoder as the server. The extra
+ * cursor and foreign-key checks bind a named SSE event to one activity
+ * stream instead of trusting the transport event name.
+ */
 export function parseActivityFrame(
   event: MessageEvent<string>,
   forcedType?: ActivityFrame["type"],
 ): ActivityFrame | null {
   try {
-    const decoded: unknown = JSON.parse(event.data);
-    if (!isRecord(decoded) || !hasActivityFrameBase(decoded)) return null;
-    if (!ACTIVITY_EVENT_TYPES.includes(decoded.type as ActivityFrame["type"])) return null;
-    if (forcedType && decoded.type !== forcedType) return null;
-
-    switch (decoded.type) {
-      case "activity.snapshot":
-      case "activity.reset":
-        if (!Array.isArray(decoded.items)
-          || !decoded.items.every(isActivityItem)
-          || decoded.items.some((item) => item.sessionId !== decoded.sessionId)
-          || typeof decoded.truncated !== "boolean") return null;
-        if (decoded.type === "activity.reset" && typeof decoded.reason !== "string") return null;
-        return decoded as unknown as ActivityFrame;
-      case "activity.upsert":
-        if (!isActivityItem(decoded.item) || decoded.item.sessionId !== decoded.sessionId) return null;
-        return decoded as unknown as ActivityFrame;
-      case "activity.append":
-        if (typeof decoded.id !== "string"
-          || !isNonNegativeInteger(decoded.revision)
-          || !isNonNegativeInteger(decoded.offset)
-          || typeof decoded.text !== "string"
-          || typeof decoded.truncated !== "boolean"
-          || !["text", "arguments", "result", "output", "diff", "details"].includes(String(decoded.channel))) return null;
-        return decoded as unknown as ActivityFrame;
-      case "activity.remove":
-        return typeof decoded.id === "string" ? decoded as unknown as ActivityFrame : null;
-      default:
-        return null;
-    }
+    const frame = parseWireActivityFrame(JSON.parse(event.data) as unknown);
+    if (forcedType && frame.type !== forcedType) return null;
+    if (frame.cursor !== encodeActivityCursor(frame.streamEpoch, frame.sessionId, frame.seq)) return null;
+    if ((frame.type === "activity.snapshot" || frame.type === "activity.reset")
+      && frame.items.some((item) => item.sessionId !== frame.sessionId || item.provider !== frame.provider)) return null;
+    if (frame.type === "activity.upsert"
+      && (frame.item.sessionId !== frame.sessionId || frame.item.provider !== frame.provider)) return null;
+    return frame;
   } catch {
     return null;
   }
@@ -200,7 +51,6 @@ export function emptySessionActivity(sessionId: string | null): SessionActivityV
   return {
     sessionId,
     items: [],
-    hasSnapshot: false,
     truncated: false,
     streamEpoch: null,
     cursor: null,
@@ -210,7 +60,7 @@ export function emptySessionActivity(sessionId: string | null): SessionActivityV
   };
 }
 
-function orderedUnique(items: ActivityItem[]): ActivityItem[] {
+function orderedUnique(items: readonly ActivityItem[]): ActivityItem[] {
   const byId = new Map<string, ActivityItem>();
   for (const item of items) {
     const previous = byId.get(item.id);
@@ -225,24 +75,27 @@ function appendText(current: string | null, frame: ActivityAppendFrame): string 
   return `${value}${frame.text}`;
 }
 
+function displayJson(value: ActivityJsonValue | string | null): string {
+  if (value === null) return "";
+  if (typeof value === "string") return value;
+  return JSON.stringify(value);
+}
+
 function applyAppend(item: ActivityItem, frame: ActivityAppendFrame): ActivityItem | null {
-  if (frame.revision <= item.revision) return item;
+  if (frame.revision !== item.revision + 1) return null;
   let next: ActivityItem | null = null;
-  if (frame.channel === "text" && (item.kind === "message" || item.kind === "reasoning" || item.kind === "plan")) {
+  if (frame.channel === "text" && (item.kind === "message" || item.kind === "reasoning")) {
     const text = appendText(item.text, frame);
     if (text !== null) next = { ...item, text };
+  } else if (frame.channel === "markdown" && item.kind === "plan") {
+    const markdown = appendText(item.markdown, frame);
+    if (markdown !== null) next = { ...item, markdown };
   } else if (frame.channel === "arguments" && item.kind === "tool") {
-    const current = typeof item.arguments === "string"
-      ? item.arguments
-      : item.arguments === null ? "" : JSON.stringify(item.arguments);
-    const text = appendText(current, frame);
-    if (text !== null) next = { ...item, arguments: text };
+    const argumentsText = appendText(displayJson(item.arguments), frame);
+    if (argumentsText !== null) next = { ...item, arguments: argumentsText };
   } else if (frame.channel === "result" && item.kind === "tool") {
-    const current = typeof item.result === "string"
-      ? item.result
-      : item.result === null ? "" : JSON.stringify(item.result);
-    const text = appendText(current, frame);
-    if (text !== null) next = { ...item, result: text };
+    const result = appendText(displayJson(item.result), frame);
+    if (result !== null) next = { ...item, result };
   } else if (frame.channel === "output" && (item.kind === "tool" || item.kind === "subagent")) {
     const output = appendText(item.output, frame);
     if (output !== null) next = { ...item, output };
@@ -250,7 +103,7 @@ function applyAppend(item: ActivityItem, frame: ActivityAppendFrame): ActivityIt
     const details = appendText(item.details, frame);
     if (details !== null) next = { ...item, details };
   } else if (frame.channel === "diff" && item.kind === "file-change") {
-    const change = item.changes.at(-1) ?? { path: "", operation: "update" as const, diff: "" };
+    const change = item.changes.at(-1) ?? { path: "", previousPath: null, operation: "update" as const, diff: "" };
     const diff = appendText(change.diff, frame);
     if (diff !== null) next = {
       ...item,
@@ -259,6 +112,7 @@ function applyAppend(item: ActivityItem, frame: ActivityAppendFrame): ActivityIt
   }
   return next ? {
     ...next,
+    schemaVersion: ACTIVITY_SCHEMA_VERSION,
     revision: frame.revision,
     updatedAt: frame.at,
     truncated: next.truncated || frame.truncated,
@@ -268,14 +122,11 @@ function applyAppend(item: ActivityItem, frame: ActivityAppendFrame): ActivityIt
 export interface ActivityReduction {
   state: SessionActivityView;
   accepted: boolean;
-  /** The client view cannot safely apply this frame and needs a fresh snapshot. */
+  /** The materialized view cannot safely apply this delta. Reconnect for a snapshot. */
   requiresReset?: boolean;
 }
 
-/**
- * Applies only frames for the currently selected session. It intentionally has
- * no relationship to SessionStateGuard: activity uses its own epoch/cursor.
- */
+/** Activity has an independent epoch and cursor from the board state stream. */
 export function reduceSessionActivity(
   state: SessionActivityView,
   selectedSessionId: string | null,
@@ -287,12 +138,15 @@ export function reduceSessionActivity(
 
   const baseline = frame.type === "activity.snapshot" || frame.type === "activity.reset";
   if (state.streamEpoch !== null && frame.streamEpoch !== state.streamEpoch && !baseline) {
-    return { state, accepted: false };
+    return { state, accepted: false, requiresReset: true };
   }
-  if (frame.streamEpoch === state.streamEpoch && state.seq !== null && frame.seq <= state.seq) {
-    return { state, accepted: false };
+  if (frame.streamEpoch === state.streamEpoch && state.seq !== null) {
+    if (frame.seq <= state.seq) return { state, accepted: false };
+    if (!baseline && frame.seq !== state.seq + 1) return { state, accepted: false, requiresReset: true };
   }
-  if (!state.hasSnapshot && !baseline) return { state, accepted: false };
+  if ((state.streamEpoch === null || state.seq === null) && !baseline) {
+    return { state, accepted: false, requiresReset: true };
+  }
 
   let items = state.items;
   let truncated = state.truncated;
@@ -318,12 +172,10 @@ export function reduceSessionActivity(
     case "activity.append": {
       const index = items.findIndex((item) => item.id === frame.id);
       if (index < 0) return { state, accepted: false, requiresReset: true };
-      const item = applyAppend(items[index]!, frame);
-      if (!item) return { state, accepted: false, requiresReset: true };
-      if (item !== items[index]) {
-        items = items.map((value, itemIndex) => itemIndex === index ? item : value);
-        changed = true;
-      }
+      const appended = applyAppend(items[index]!, frame);
+      if (!appended) return { state, accepted: false, requiresReset: true };
+      items = items.map((item, itemIndex) => itemIndex === index ? appended : item);
+      changed = true;
       break;
     }
     case "activity.remove": {
@@ -339,7 +191,6 @@ export function reduceSessionActivity(
     state: {
       ...state,
       items,
-      hasSnapshot: state.hasSnapshot || baseline,
       truncated,
       streamEpoch: frame.streamEpoch,
       cursor: frame.cursor,

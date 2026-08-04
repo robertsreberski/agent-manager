@@ -1,206 +1,110 @@
-# 03 — Hook bridge
+# 03 — Provider-specific hook bridges
 
-**Status:** Draft · **Depends on:** 01 · **Design frames:** feeds `6a`, `8a`, `9b`
+**Status:** Accepted · **Depends on:** 01 · **Design frames:** 6a, 8a, 9b
 
 ## Purpose
 
-Give externally-started sessions — both harnesses — a faithful live event stream, and let the
-operator answer the decisions those sessions are blocked on, without the manager having started
-them.
+Observe ordinary terminal sessions through provider-owned event surfaces and answer only the
+blocking decisions each provider can faithfully delegate. Claude and Codex have different
+transports, schemas, trust, and response semantics; they are two adapters behind one activity
+contract, never one “universal hook” implementation.
 
-This is the whole of what is possible for external Claude sessions, and a useful complement to
-spec 02 for Codex.
+## Installation contract
 
-## Background
+- Installation is an explicit CLI operation: `agent-manager hooks status|install|uninstall`
+  with provider/scope flags. First run explains the benefit and points at the command; it does
+  not write settings from the browser.
+- User scope is the default. Project-local scope is optional and warns that the target is a
+  machine-local service. Managed-policy settings are never changed or bypassed.
+- Before writing, print the exact diff and require terminal confirmation. Edit only Agent
+  Manager-owned entries, preserve unrelated settings, and use an atomic replace. Reinstall and
+  uninstall are idempotent. Do not create a backup/migration tree.
+- `status` distinguishes absent, installed-unseen, active, stale token/schema, untrusted, and
+  provider-disabled. Installation is not called active until a later real event arrives.
+- Tests use disposable home/settings overlays and real disposable sessions. They never mutate
+  global settings, global trust, the shared daemon, or an existing user session.
 
-From `appendix-harness-capabilities.md` §2.3 and §1.5:
+## Claude HTTP bridge
 
-- Both harnesses support hooks. Claude's set is large: `PreToolUse`, `PostToolUse`,
-  `PermissionRequest`, `Elicitation`, `MessageDisplay`, `SubagentStart/Stop`,
-  `TaskCreated/TaskCompleted`, `Stop`, `Notification`, `PreCompact`/`PostCompact`,
-  `SessionStart`/`SessionEnd`, and more.
-- Hooks may be `type: "http"`. The payload arrives as a POST body.
-- Hooks are **synchronous by default**, with a 600s default timeout for `command`/`http`.
-- `PreToolUse` returns `permissionDecision: allow | deny | ask | defer`;
-  `PermissionRequest` returns `decision.behavior: allow | deny` with optional `updatedInput`;
-  `Elicitation` returns `action: accept | decline | cancel`.
-- Every payload carries `session_id`, `transcript_path`, `cwd`, `permission_mode`,
-  `hook_event_name`, and inside a subagent, `agent_id` + `agent_type`.
-- **Claude reloads `settings.json` hook config live via file watcher — no session restart.**
-  This is the reason the bridge reaches sessions that are already running.
-- Hooks from user, project, local and managed sources are **merged, not replaced**, so
-  installing ours does not disturb anyone else's.
+Claude hooks use a high-entropy per-install token and loopback HTTP:
 
-The repo already *consumes* hook events, but only from its own SDK query: `includeHookEvents:
-true` (`src/providers/claude/managed-session.ts:500`), projected to `lifecycle` items with
-`event: "hook"` (`src/providers/claude/activity-projector.ts:1265-1290`). There is **no hook
-installation code anywhere** — nothing writes `~/.claude/settings.json`, and no hook script ships.
+```text
+POST http://127.0.0.1:<port>/api/v1/hooks/claude/<token>
+```
 
-## Requirements
+The route is outside browser cookie/CSRF auth but remains loopback/Host restricted, bounded by
+body size and time, constant-time token checked, no-store, and redacted before logging or
+projection. A token is never included in browser state.
 
-### R1 — Transport: loopback HTTP
+Observed pinned behaviour:
 
-New route on the existing server: `POST /api/v1/hooks/:token`.
+- Claude Code `2.1.221` reloads a newly added local settings handler for later events in an
+  already-running session. The install edit itself produces no event, hence installed-unseen.
+- The hook `session_id` matches the session registry/`claude agents --json --all`, including a
+  disposable `--bg` probe, and is the correlation key.
+- `PermissionRequest` is the only faithful interactive decision surface for an externally
+  started interactive session. `PreToolUse` defer is honoured in print mode but ignored for
+  interactive/batch cases, so it is observed only and never presented as respondable.
+- `Elicitation` remains visible but non-respondable until every provider form/URL shape can be
+  represented without loss.
 
-- `type: "http"` hooks pointing at `http://127.0.0.1:<port>/api/v1/hooks/<token>`.
-- The token is per-install, high-entropy, stored with the install record, and rotatable. It
-  authenticates the hook, which cannot present the browser's cookie.
-- The route is exempt from cookie auth and CSRF (a hook is not a browser) but **not** from the
-  Host allowlist, and it binds loopback-only like the rest of the server
-  (`src/server/server.ts:442-480`). It must reject any request whose token is unknown, with no
-  timing signal about which tokens exist.
-- The route is exempt from the panic lock's `423 CONTROL_PLANE_LOCKED` **for reads**, but a
-  locked control plane must still refuse to *answer* a decision — a panic lock that stopped
-  reporting events would hide the very thing it was pulled for. Locked ⇒ observe and
-  auto-defer to the harness.
-- A `type: "command"` shim (a tiny script that POSTs stdin to the same route) is the fallback
-  for hosts where HTTP hooks are unavailable. Same token, same route.
+For each held `PermissionRequest`, allocate an Agent Manager request UUID. Claude does not
+provide a tool-use ID on this hook, so `(session, prompt, tool)` is not unique enough. Hold the
+HTTP response in memory, publish exact respondable attention, and resolve it once. Allow/deny
+uses Claude's exact response shape. Timeout, browser loss, token rotation, server shutdown, or
+any exception returns an empty successful response so Claude falls through to its native prompt.
+Pending holds are never persisted or replayed.
 
-### R2 — Installation is explicit, marked, and reversible
+No Claude hook return is used to queue, steer, end, or inject an operator message. In particular,
+`Stop` plus `reason`/`additionalContext` is a system-side instruction, not a user turn.
 
-Agent Manager writes a **marked block** into `~/.claude/settings.json` and `~/.codex/hooks.json`
-(or project-scoped equivalents, operator's choice).
+## Codex command-hook bridge
 
-- Show the exact diff and require confirmation before writing. Never write silently.
-- Delimit the managed region so uninstall is exact and hand edits outside it survive. Preserve
-  the rest of the file byte-for-byte — these are the user's settings, containing unrelated
-  configuration.
-- Back up before first write.
-- **Never touch managed-policy settings.** They are an administrator's, and
-  `disableAllHooks` at that level is not ours to work around.
-- `install` / `uninstall` / `status` are CLI commands, surfaced in `doctor`
-  (`src/ops/doctor.ts`): is the block present, is it current, does the token still match.
-- Re-install on token rotation or schema change must be idempotent.
+Codex `0.146.x` hooks currently execute trusted **command** handlers. HTTP handlers are not
+supported, and parsed `prompt`/`agent` handlers are skipped. Agent Manager installs a pinned
+absolute command shim with `shell: false`; the shim reads the Codex stdin payload and posts it to
+a separate loopback route/token. It never reuses the Claude parser or response builder.
 
-### R3 — Event ingestion maps onto the existing activity model
+- Non-managed hooks require explicit trust through Codex's `/hooks` interface. Installation
+  reports awaiting-trust until the exact hook hash is trusted; a changed command/config hash
+  returns to that state.
+- Use only documented Codex event fields: `session_id`, `transcript_path`, `cwd`,
+  `hook_event_name`, `model`, turn ID, and event-specific tool/request fields.
+- Codex `PreToolUse` can return allow/deny, not `ask`. `PermissionRequest` can return allow,
+  deny, or no decision. Advertise `respond` only for a request type verified in the pinned live
+  probe and only while its command invocation is held.
+- Hook observation supplements ordinary non-daemon CLI sessions. It does not imply app-server
+  queue, steer, interrupt, settings, archive, or delete authority.
 
-Hook payloads become `ActivityMutation`s (`src/activity/types.ts:303-318`) through a new
-projector under `src/providers/hooks/`. Do not invent a parallel item model.
+## Activity projection and source arbitration
 
-| Hook event | Activity item |
-| --- | --- |
-| `SessionStart` / `SessionEnd` | `lifecycle` (`status`) |
-| `UserPromptSubmit` | `message` (`role: user`) |
-| `PreToolUse` | `tool`, state `running` |
-| `PostToolUse` / `PostToolUseFailure` | `tool`, state `complete` / `failed` |
-| `PermissionRequest` | `attention` (`attentionKind: permission`) |
-| `Elicitation` | `attention` (`attentionKind: elicitation`) — **not respondable**, see R5 |
-| `MessageDisplay` | `message` (`role: assistant`) |
-| `SubagentStart` / `SubagentStop` | `subagent` |
-| `TaskCreated` / `TaskCompleted` | todo item (spec 08) |
-| `PreCompact` / `PostCompact` | `lifecycle` (`context-compaction`) |
-| `Stop` / `StopFailure` | `lifecycle` (`turn-completed` / `turn-failed`) |
-| `Notification` | `lifecycle` (`warning`) |
+Both adapters emit the shared `ActivityMutation` model with provider-api/exact/provider-exposed
+provenance, provider IDs when available, and redaction. Typical mappings are session/turn
+lifecycle, user prompts/messages, tool start/completion/failure, permission attention,
+subagents, tasks/todos, compaction, and warnings. Unsupported/unknown events become bounded
+diagnostic lifecycle items, not guessed semantic content.
 
-Provenance is `provider-api` / `exact` / `provider-exposed` (spec 01 R5). These are the
-harness's own payloads, delivered synchronously by the harness.
+There is one visible timeline:
 
-`agent_id` / `agent_type` populate `parentId` and the subagent hierarchy, which the contract
-supports (`src/activity/types.ts:62-79`) and the UI currently drops.
-
-Two payload rules, both inherited from existing policy:
-
-- **Redaction still applies.** Route hook payloads through `src/activity/redaction.ts` exactly
-  as provider streams are. Tool inputs can contain secrets.
-- **The global feed stays metadata-only.** `metadataOnly()` (`src/server/state.ts:21-39`)
-  strips exact request content from the collection SSE. Hook-derived attention must obey it —
-  exact content reaches the selected-session stream only.
-
-### R4 — Blocking decisions
-
-This is the capability that makes the bridge worth building.
-
-Flow for `PermissionRequest` / `PreToolUse`:
-
-1. Hook POSTs. The route registers a pending decision keyed by `(session_id, prompt_id, tool)`
-   and **holds the HTTP response open**.
-2. An `attention` item with `respondable: true` reaches the selected-session activity stream.
-3. The operator answers. The response resolves the held request with the appropriate decision
-   shape and the item is marked resolved.
-4. If the operator does not answer within the bridge's own deadline, the route returns a
-   **defer** — `permissionDecision: "defer"` for `PreToolUse`, or an empty/exit-0 response
-   elsewhere — and the harness falls through to its own prompt.
-
-Hard constraints:
-
-- **The bridge deadline must be comfortably under the hook timeout** (600s default; 30s for
-  `UserPromptSubmit`, 10s for `MessageDisplay`). Pick per event, not one global number.
-- **Fail open to the harness, always.** Manager shutdown, panic lock, browser disconnect, token
-  rotation, unhandled exception — every path must release the hook. A wedged terminal because a
-  browser tab closed is the worst possible failure of this feature, and it is worse than not
-  shipping it.
-- Hold state in memory only. A pending decision does not survive a manager restart; on restart,
-  release everything.
-- Respect the existing exactness gate. The UI only offers inline controls for
-  `!resolved && waiting && provider-api && exact && provider-exposed && !truncated`
-  (`web/src/components/session-thread.tsx:126-145`). Hook attention satisfies it by construction;
-  do not weaken the gate to make it fit.
-
-### R5 — Elicitations stay non-respondable
-
-MCP elicitation forms are visible but deliberately not answerable in the cockpit, in both
-providers today (`src/providers/codex/provider-bridge.ts:540-542`,
-`src/providers/codex/activity-projector.ts:983-984`,
-`src/providers/claude/provider-adapter.ts:542-544`). The stated reason stands:
-
-> `// The current cockpit cannot faithfully encode form or URL elicitations.`
-
-The `Elicitation` hook *could* return `accept` with `content`. Do not use it until the cockpit
-can render the form faithfully. Show the elicitation, mark it non-respondable, point at the
-native interface — the behaviour the README already promises.
-
-### R6 — No steering
-
-Restated here because the hook API makes it tempting: `Stop` with `decision: "block"` and a
-`reason` will make the model continue, acting on that reason. It is not a user message. See
-spec 01 R4. A `claude-hook-bridge` session advertises no `queue` and no `steer`.
-
-### R7 — Interaction with the transcript observer
-
-A hook-bridged session should stop being polled for the parts hooks now cover.
-`SelectedTranscriptActivityObserver` eligibility (`src/server/server.ts:379-388`) currently keys
-on `!managerOwned || nativeHandoffs.has(id)`. Extend it: a session with a healthy bridge
-suppresses polling for hook-covered kinds, and falls back the moment the bridge goes quiet.
-
-Do not run both and dedupe — that produces double items with conflicting provenance, which is
-precisely the confusion R5 of spec 01 exists to prevent.
-
-## Non-goals
-
-- Installing hooks on remote SSH hosts. Local only in this pass; the install shape should not
-  preclude it later.
-- Using hooks for manager-owned sessions. They already have the SDK/app-server stream, which is
-  richer. Manager-owned sessions must not double-report.
-- `WorktreeCreate` interception. Spec 04 reads worktrees from git; it does not need to mediate
-  their creation.
+- For kinds covered by a healthy hook, suppress equivalent transcript projection.
+- Transcript observation may fill uncovered kinds with inferred provenance.
+- On hook silence or removal, fall back to bounded transcript observation without duplicating
+  stable provider IDs.
+- Global SSE receives metadata only; exact question/tool content appears only in the
+  authenticated selected-session stream.
 
 ## Acceptance criteria
 
-1. `install` writes a marked block, shows the diff first, backs up, and preserves every
-   unrelated setting byte-for-byte. `uninstall` restores exactly. Round-trip tested against a
-   settings file containing unrelated hooks, MCP servers and permissions.
-2. With hooks installed, a Claude session started in a **real terminal** (not by the manager)
-   shows tool calls, subagents and messages in the cockpit with `exact` / `provider-exposed`
-   provenance.
-3. Triggering a permission prompt in that terminal surfaces an answerable request in the
-   browser; answering it releases the terminal with the right decision.
-4. Not answering it releases the terminal to its own prompt before the hook times out.
-5. Killing the manager mid-decision releases every held hook. Verified by test, not by
-   inspection.
-6. A hook POST with an unknown token is rejected, and no non-loopback origin can reach the route.
-7. The session's composer is read-only with a stated reason, and no `send` action is accepted.
-8. Panic lock: events keep flowing, decisions auto-defer.
-9. Redaction applies to hook payloads; the global SSE carries no exact request content.
-
-## Open questions
-
-- **Q1.** Project-scoped (`.claude/settings.json`, committable) vs user-scoped
-  (`~/.claude/settings.json`) install default. Project scope would follow a repo to teammates,
-  which is almost certainly wrong for a machine-local daemon URL. **Recommend user scope**, with
-  project scope available and warned about.
-- **Q2.** How does the bridge correlate a hook `session_id` to an Agent Manager session record
-  when the session was discovered by process scan? `session_id` matches the Claude registry's
-  `sessionId` (`~/.claude/sessions/<pid>.json`), which discovery already parses
-  (`agent-sessions.ts:828-893`) — confirm that holds for every entrypoint, including `--bg`.
-- **Q3.** Codex hook payload schema is assumed to mirror Claude's from the shape of
-  `~/.codex/hooks.json`. Verify against `hooks/list` on the daemon before implementing R3 for Codex.
+1. Install/status/uninstall preserves unrelated settings, shows a diff, is idempotent, and
+   correctly reports Claude active versus installed-unseen and Codex awaiting-trust.
+2. A disposable external Claude session emits exact activity and one `PermissionRequest` can be
+   allowed/denied from the cockpit; unanswered/server-killed requests fall through promptly.
+3. Claude `PreToolUse`, elicitation, Stop, and arbitrary text never become response/steer paths.
+4. A disposable Codex CLI session proves the trusted command shim, provider-specific schema,
+   supported event projection, and any advertised request response.
+5. Unknown tokens, non-loopback traffic, oversized/invalid payloads, stale decisions, and
+   duplicate answers are rejected without provider or secret leakage.
+6. Hook-derived content is redacted, selected-session only, bounded, and deduplicated against
+   transcript observation.
+7. External hook sessions reject all actions not present in their live capability list with a
+   plain-language reason.

@@ -1,5 +1,9 @@
 import { AsyncInbox } from "./async-inbox.ts";
 import {
+  CLAUDE_MANAGER_OWNER_ENV,
+  CLAUDE_MANAGER_OWNER_VALUE,
+} from "../hooks/claude-source.ts";
+import {
   CLAUDE_AGENT_SDK_VERSION,
   CLAUDE_CODE_VERSION,
   type ClaudeActivity,
@@ -7,6 +11,7 @@ import {
   type ClaudeCliHandoff,
   type ClaudeElicitationRequest,
   type ClaudeElicitationResult,
+  type ClaudeEffortLevel,
   type ClaudeInterruptResult,
   type ClaudeManagedResumeConfig,
   type ClaudeManagedSessionConfig,
@@ -14,6 +19,7 @@ import {
   type ClaudeMessageListener,
   type ClaudePendingRequest,
   type ClaudePermissionMode,
+  type ClaudePermissionUpdate,
   type ClaudePermissionResult,
   type ClaudeRequestResponse,
   type ClaudeSdkQuery,
@@ -21,6 +27,7 @@ import {
   type ClaudeSdkRuntime,
   type ClaudeSdkUserMessage,
   type ClaudeSessionListener,
+  type ClaudeStagedMessage,
 } from "./types.ts";
 
 interface Deferred<T> {
@@ -33,6 +40,7 @@ interface PermissionPending {
   public: ClaudePendingRequest;
   type: "permission";
   input: Record<string, unknown>;
+  suggestions: ClaudePermissionUpdate[];
   toolUseId: string;
   promise: Promise<ClaudePermissionResult>;
   settle(result: ClaudePermissionResult): void;
@@ -98,6 +106,7 @@ export class ClaudeManagedSession {
   readonly #outstandingMessageIds = new Set<string>();
   readonly #stillQueuedMessageIds = new Set<string>();
   readonly #backgroundTaskIds = new Set<string>();
+  readonly #stagedMessages: ClaudeStagedMessage[] = [];
 
   #query: ClaudeSdkQuery | null = null;
   #inbox: AsyncInbox<ClaudeSdkUserMessage> | null = null;
@@ -110,6 +119,9 @@ export class ClaudeManagedSession {
   #providerActivity: ClaudeActivity = "starting";
   #mode: ClaudePermissionMode;
   #desiredMode: ClaudePermissionMode;
+  #model: string | null = null;
+  #desiredModel: string | null;
+  #effort: ClaudeEffortLevel | null;
   #claudeCodeVersion: string | null = null;
   #capabilities: string[] = [];
   #canSteer = false;
@@ -141,6 +153,8 @@ export class ClaudeManagedSession {
     this.#updatedAt = this.#startedAt;
     this.#mode = config.mode;
     this.#desiredMode = config.mode;
+    this.#desiredModel = config.model ?? null;
+    this.#effort = config.effort ?? null;
   }
 
   static async start(
@@ -183,11 +197,15 @@ export class ClaudeManagedSession {
       activity,
       mode: this.#mode,
       desiredMode: this.#desiredMode,
+      model: this.#model,
+      desiredModel: this.#desiredModel,
+      effort: this.#effort,
       sdkVersion: this.#runtime.sdkVersion,
       claudeCodeVersion: this.#claudeCodeVersion,
       capabilities: [...this.#capabilities],
       canSteer: this.#canSteer,
       pendingRequests,
+      stagedMessages: this.#stagedMessages.map((message) => ({ ...message })),
       outstandingMessageIds: [...this.#outstandingMessageIds],
       stillQueuedMessageIds: [...this.#stillQueuedMessageIds],
       queueKnowledge: this.#queueKnowledge,
@@ -220,7 +238,7 @@ export class ClaudeManagedSession {
 
   send(text: string, delivery: "queue" | "steer" = "queue"): string {
     this.#assertManagerControl();
-    const { inbox } = this.#requireLiveConsumer();
+    this.#requireLiveConsumer();
     if (delivery === "steer" && !this.#canSteer) {
       throw new Error(
         `Steer-now is unavailable for Claude Code ${this.#claudeCodeVersion ?? "before initialization"}`,
@@ -228,21 +246,30 @@ export class ClaudeManagedSession {
     }
 
     const uuid = this.#runtime.randomUUID();
-    const message = this.#createUserMessage(
-      nonEmptyText(text, "message"),
-      delivery === "steer" ? "now" : "later",
-      uuid,
-    );
-    this.#outstandingMessageIds.add(uuid);
-    try {
-      inbox.push(message);
-    } catch (error) {
-      this.#outstandingMessageIds.delete(uuid);
-      throw error;
+    const normalizedText = nonEmptyText(text, "message");
+    if (delivery === "queue" && !this.#canDispatchQueuedMessage()) {
+      this.#stagedMessages.push({
+        id: uuid,
+        text: normalizedText,
+        enqueuedAt: this.#runtime.now().toISOString(),
+      });
+      this.#touch();
+      return uuid;
     }
+
+    this.#dispatchMessage(uuid, normalizedText, delivery === "steer" ? "now" : "later");
     if (this.#providerActivity === "idle") this.#providerActivity = "running";
     this.#touch();
     return uuid;
+  }
+
+  removeStagedMessage(id: string): boolean {
+    this.#assertManagerControl();
+    const index = this.#stagedMessages.findIndex((message) => message.id === id);
+    if (index < 0) return false;
+    this.#stagedMessages.splice(index, 1);
+    this.#touch();
+    return true;
   }
 
   async interrupt(): Promise<ClaudeInterruptResult> {
@@ -286,6 +313,35 @@ export class ClaudeManagedSession {
     this.#touch();
   }
 
+  async setModel(model?: string): Promise<void> {
+    this.#assertManagerControl();
+    const normalized = model === undefined ? undefined : nonEmptyText(model, "model");
+    const { query } = this.#requireLiveConsumer();
+    await query.setModel(normalized);
+    this.#desiredModel = normalized ?? null;
+    this.#model = normalized ?? null;
+    this.#touch();
+  }
+
+  async setEffort(effort: ClaudeEffortLevel | null): Promise<void> {
+    this.#assertManagerControl();
+    const { query } = this.#requireLiveConsumer();
+    await query.applyFlagSettings({ effortLevel: effort });
+    this.#effort = effort;
+    this.#touch();
+  }
+
+  supportedModels() {
+    this.#assertManagerControl();
+    const { query } = this.#requireLiveConsumer();
+    return query.supportedModels();
+  }
+
+  /** Ends only the manager-owned SDK query; external Claude processes are never targeted. */
+  end(): void {
+    this.dispose();
+  }
+
   respondToRequest(id: string, response: ClaudeRequestResponse): void {
     const request = this.#pending.get(id);
     if (!request) throw new Error(`Claude request ${id} is no longer pending`);
@@ -325,13 +381,21 @@ export class ClaudeManagedSession {
     }
 
     if (response.decision === "allow") {
+      if (response.persist === true && request.suggestions.length === 0) {
+        throw new Error("Claude did not expose a persistent permission choice");
+      }
       request.settle({
         behavior: "allow",
         updatedInput: response.updatedInput
           ? { ...response.updatedInput }
           : { ...request.input },
+        ...(response.persist === true
+          ? { updatedPermissions: structuredClone(request.suggestions) }
+          : {}),
         toolUseID: request.toolUseId,
-        decisionClassification: "user_temporary",
+        decisionClassification: response.persist === true
+          ? "user_permanent"
+          : "user_temporary",
       });
       return;
     }
@@ -367,6 +431,7 @@ export class ClaudeManagedSession {
       this.#outstandingMessageIds.size > 0 ||
       this.#stillQueuedMessageIds.size > 0 ||
       (this.#inbox?.bufferedCount ?? 0) !== 0 ||
+      this.#stagedMessages.length > 0 ||
       this.#queueKnowledge !== "known"
     ) {
       throw new Error("Claude CLI handoff requires a known-empty input queue");
@@ -455,6 +520,11 @@ export class ClaudeManagedSession {
     this.#disposed = true;
     this.#disconnectQuery();
     this.#abortAllPending();
+    this.#stagedMessages.splice(0);
+    this.#outstandingMessageIds.clear();
+    this.#stillQueuedMessageIds.clear();
+    this.#backgroundTaskIds.clear();
+    this.#queueKnowledge = "known";
     this.#providerActivity = "closed";
     this.#touch();
   }
@@ -488,7 +558,8 @@ export class ClaudeManagedSession {
     const environment = {
       ...process.env,
       ...this.#config.environment,
-      CLAUDE_AGENT_SDK_CLIENT_APP: "agent-manager/0.2.1",
+      CLAUDE_AGENT_SDK_CLIENT_APP: "agent-manager",
+      [CLAUDE_MANAGER_OWNER_ENV]: CLAUDE_MANAGER_OWNER_VALUE,
     };
     try {
       const query = this.#runtime.createQuery({
@@ -502,6 +573,7 @@ export class ClaudeManagedSession {
           permissionMode: this.#desiredMode,
           allowDangerouslySkipPermissions:
             this.#config.allowDangerouslySkipPermissions ?? false,
+          ...(this.#config.effort ? { effort: this.#config.effort } : {}),
           env: environment,
           ...(resumeSessionId ? { resume: resumeSessionId } : {}),
           ...(this.#config.model ? { model: this.#config.model } : {}),
@@ -589,11 +661,13 @@ export class ClaudeManagedSession {
       }
       this.#sessionId = sessionId;
       this.#claudeCodeVersion = codeVersion;
+      this.#model = message.model;
       this.#capabilities = [...(message.capabilities ?? [])];
       this.#canSteer =
         this.#runtime.sdkVersion === CLAUDE_AGENT_SDK_VERSION &&
         codeVersion === CLAUDE_CODE_VERSION;
       this.#mode = message.permissionMode;
+      this.#providerActivity = this.#outstandingMessageIds.size > 0 ? "running" : "idle";
       this.#lastError = null;
       this.#touch();
       this.#ready.resolve();
@@ -610,17 +684,19 @@ export class ClaudeManagedSession {
         this.#stillQueuedMessageIds.clear();
       }
       this.#providerActivity = message.state === "idle"
-        ? (this.#isManagerQueueDrained() ? "idle" : "running")
+        ? (this.#isProviderTurnDrained() ? "idle" : "running")
         : message.state;
       this.#touch();
+      if (message.state === "idle") this.#dispatchNextStagedMessage();
       return;
     }
 
     if (message.type === "system" && message.subtype === "background_tasks_changed") {
       this.#backgroundTaskIds.clear();
       for (const task of message.tasks) this.#backgroundTaskIds.add(task.task_id);
-      this.#providerActivity = this.#isManagerQueueDrained() ? "idle" : "running";
+      this.#providerActivity = this.#isProviderTurnDrained() ? "idle" : "running";
       this.#touch();
+      if (this.#providerActivity === "idle") this.#dispatchNextStagedMessage();
       return;
     }
 
@@ -661,9 +737,10 @@ export class ClaudeManagedSession {
         // session_state_changed(idle) after a terminal result. Treat the result
         // as an idle fallback only when every manager-tracked queue and
         // background-work signal drained.
-        this.#providerActivity = this.#isManagerQueueDrained() ? "idle" : "running";
+        this.#providerActivity = this.#isProviderTurnDrained() ? "idle" : "running";
       }
       this.#touch();
+      if (message.subtype === "success") this.#dispatchNextStagedMessage();
     }
   }
 
@@ -719,6 +796,9 @@ export class ClaudeManagedSession {
         : toolName === "ExitPlanMode"
           ? "plan-approval"
           : "permission";
+    const suggestions = options.suggestions
+      ? structuredClone(options.suggestions)
+      : [];
     const request: ClaudePendingRequest = {
       id: options.requestId,
       kind: requestKind,
@@ -740,8 +820,8 @@ export class ClaudeManagedSession {
         ...(options.description ? { description: options.description } : {}),
         ...(options.displayName ? { displayName: options.displayName } : {}),
         ...(options.agentID ? { agentId: options.agentID } : {}),
-        ...(options.suggestions
-          ? { suggestions: structuredClone(options.suggestions) }
+        ...(suggestions.length > 0
+          ? { suggestions: structuredClone(suggestions) }
           : {}),
         ...(options.matchedAskRule
           ? { matchedAskRule: structuredClone(options.matchedAskRule) }
@@ -775,6 +855,7 @@ export class ClaudeManagedSession {
       public: request,
       type: "permission",
       input: { ...input },
+      suggestions,
       toolUseId: options.toolUseID,
       promise: result.promise,
       settle: (value) => {
@@ -878,6 +959,42 @@ export class ClaudeManagedSession {
     };
   }
 
+  #dispatchMessage(
+    id: string,
+    text: string,
+    priority: "now" | "later",
+  ): void {
+    const { inbox } = this.#requireLiveConsumer();
+    this.#outstandingMessageIds.add(id);
+    try {
+      inbox.push(this.#createUserMessage(text, priority, id));
+    } catch (error) {
+      this.#outstandingMessageIds.delete(id);
+      throw error;
+    }
+  }
+
+  #canDispatchQueuedMessage(): boolean {
+    return this.#providerActivity === "idle" && this.#isProviderTurnDrained();
+  }
+
+  #dispatchNextStagedMessage(): void {
+    if (!this.#canDispatchQueuedMessage()) return;
+    const next = this.#stagedMessages.shift();
+    if (!next) return;
+    try {
+      this.#dispatchMessage(next.id, next.text, "later");
+      this.#providerActivity = "running";
+      this.#touch();
+    } catch (error) {
+      this.#stagedMessages.unshift(next);
+      this.#lastError = `Could not dispatch queued Claude message: ${
+        error instanceof Error ? error.message : String(error)
+      }`;
+      this.#touch();
+    }
+  }
+
   #assertManagerControl(): void {
     if (this.#disposed) throw new Error("Claude managed session is disposed");
     if (this.#owner !== "manager") {
@@ -901,6 +1018,11 @@ export class ClaudeManagedSession {
   }
 
   #isManagerQueueDrained(): boolean {
+    return this.#isProviderTurnDrained()
+      && this.#stagedMessages.length === 0;
+  }
+
+  #isProviderTurnDrained(): boolean {
     return this.#pending.size === 0
       && this.#outstandingMessageIds.size === 0
       && this.#stillQueuedMessageIds.size === 0

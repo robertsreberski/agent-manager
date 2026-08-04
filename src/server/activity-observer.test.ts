@@ -10,17 +10,19 @@ function externalSession(): SessionView {
   return {
     id: "codex:external-thread",
     provider: "codex",
-    sessionId: "external-thread",
-    parentSessionId: null,
-    rootSessionId: "external-thread",
+    providerThreadId: "external-thread",
+    providerTreeId: "external-thread",
+    parentId: null,
+    providerTurnId: null,
     depth: 0,
+    hostId: "local",
+    hostLabel: "This Mac",
     name: "External",
     cwd: "/tmp",
     kind: "interactive",
-    lifecycle: "live",
+    presence: "live",
     status: "running",
     providerStatus: "running",
-    waitingReason: null,
     pid: 42,
     runtimePid: 42,
     startedAt: null,
@@ -37,28 +39,34 @@ function externalSession(): SessionView {
     },
     statusSource: "transcript",
     source: "fixture",
-    ownership: "external",
-    runtimeAlive: true,
-    mode: {
-      value: "unknown",
+    profile: {
+      value: null,
       providerValue: null,
       source: "transcript",
       confidence: "inferred",
     },
-    activity: "running",
-    attention: [],
-    effectiveAccess: {
-      accessMode: "unknown",
-      permissionMode: null,
-      sandboxMode: null,
+    model: {
+      value: null,
+      providerValue: null,
+      source: "transcript",
+      confidence: "inferred",
     },
+    effort: {
+      value: null,
+      providerValue: null,
+      source: "transcript",
+      confidence: "inferred",
+    },
+    todoProgress: null,
+    attention: [],
     terminal: null,
     control: {
       plane: "observe-only",
+      authority: "none",
       capabilities: [],
-      managerOwned: false,
-      writableLease: false,
+      withheld: [],
     },
+    workspaceIdentity: null,
     generation: 1,
   };
 }
@@ -138,6 +146,79 @@ test("observes a selected transcript live and stops polling after release", asyn
   assert.equal(settled?.kind === "message" ? settled.text : null, "replacement branch");
 
   unsubscribe();
+  observer.dispose();
+  hub.dispose();
+});
+
+test("projects transcript failure reasons into the sole activity timeline", () => {
+  const hub = new ActivityHub({ streamEpoch: "observer-unavailable" });
+  const session = externalSession();
+  hub.ensureSession(session.id, session.provider);
+  let reason: "not-found" | "unreadable" = "not-found";
+  const observer = new SelectedTranscriptActivityObserver({
+    hub,
+    reader: {
+      read() {
+        return {
+          messages: [],
+          transcript: {
+            state: "unavailable",
+            truncated: false,
+            source: null,
+            messageCount: 0,
+            reason,
+          },
+        };
+      },
+    },
+  });
+
+  const release = observer.acquire(session);
+  let item = hub.snapshot(session.id)?.items[0];
+  assert.equal(item?.kind, "lifecycle");
+  assert.equal(item?.kind === "lifecycle" ? item.title : null, "No transcript found");
+  assert.equal(item?.source, "transcript");
+  assert.equal(item?.confidence, "inferred");
+
+  reason = "unreadable";
+  observer.seedOnce(session);
+  item = hub.snapshot(session.id)?.items[0];
+  assert.equal(item?.kind === "lifecycle" ? item.title : null, "Transcript unreadable");
+  assert.equal(item?.state, "failed");
+
+  release();
+  observer.dispose();
+  hub.dispose();
+});
+
+test("replaces an unavailable lifecycle fact when transcript content appears", () => {
+  const hub = new ActivityHub({ streamEpoch: "observer-recovered" });
+  const session = externalSession();
+  hub.ensureSession(session.id, session.provider);
+  let current: TranscriptReadResult = {
+    messages: [],
+    transcript: {
+      state: "unavailable",
+      truncated: false,
+      source: null,
+      messageCount: 0,
+      reason: "not-found",
+    },
+  };
+  const observer = new SelectedTranscriptActivityObserver({
+    hub,
+    reader: { read: () => structuredClone(current) },
+  });
+
+  const release = observer.acquire(session);
+  current = transcript("recovered", "History is now available");
+  observer.seedOnce(session);
+  const items = hub.snapshot(session.id)?.items ?? [];
+  assert.equal(items.length, 1);
+  assert.equal(items[0]?.kind, "message");
+  assert.equal(items[0]?.kind === "message" ? items[0].text : null, "History is now available");
+
+  release();
   observer.dispose();
   hub.dispose();
 });

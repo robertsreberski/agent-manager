@@ -1,21 +1,18 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import type { Provider } from "../core/types.ts";
-import type { Actor, CreateSessionInput, SessionAction } from "./contracts.ts";
+import type { WireWorkspaceRecord } from "../shared/workspace.ts";
+import {
+  sessionActionSchema,
+  type Actor,
+  type CreateSessionInput,
+  type SessionAction,
+} from "./contracts.ts";
 
-export interface WorkspaceRecord {
-  id: string;
-  label: string;
-  path: string;
-  hostId: string;
-  hostLabel: string;
-  hostKind: "local" | "ssh";
-  remoteWorkspaceId: string | null;
-  createdAt: string;
-}
+export type WorkspaceRecord = WireWorkspaceRecord;
 
 export interface HostRecord {
   id: string;
@@ -34,6 +31,38 @@ export interface ManagedSessionMetadata {
   metadata: Record<string, unknown>;
   createdAt: string;
   updatedAt: string;
+}
+
+/**
+ * Durable authorization metadata for one surgical Claude hook install.
+ * The bearer token itself lives only in Claude's settings; this record keeps
+ * the one-way digest needed by the loopback hook route.
+ */
+export interface ClaudeHookInstallRecord {
+  id: string;
+  provider: "claude";
+  schemaVersion: 1;
+  tokenDigest: string;
+  createdAt: string;
+  settingsPath: string;
+  endpoint: string;
+  createdHooksProperty: boolean;
+  lastSeenAt: string | null;
+}
+
+/** Observation-only Codex command-hook authorization and integrity metadata. */
+export interface CodexHookInstallRecord {
+  id: string;
+  provider: "codex";
+  schemaVersion: 1;
+  tokenDigest: string;
+  createdAt: string;
+  settingsPath: string;
+  shimPath: string;
+  endpoint: string;
+  command: string;
+  shimDigest: string;
+  lastSeenAt: string | null;
 }
 
 export interface PersistedAction {
@@ -107,21 +136,122 @@ function asString(value: unknown): string {
   return typeof value === "string" ? value : String(value ?? "");
 }
 
-function safeJsonParse<T>(value: unknown, fallback: T): T {
-  if (typeof value !== "string") return fallback;
+function assertClaudeHookInstallRecord(
+  input: Omit<ClaudeHookInstallRecord, "lastSeenAt">,
+): void {
+  if (
+    input.provider !== "claude"
+    || input.schemaVersion !== 1
+    || !/^[A-Za-z0-9._:-]{1,256}$/u.test(input.id)
+    || !/^sha256:[a-f0-9]{64}$/u.test(input.tokenDigest)
+    || !input.settingsPath.startsWith("/")
+    || input.settingsPath.length > 32_768
+    || input.settingsPath.includes("\0")
+    || !Number.isFinite(Date.parse(input.createdAt))
+  ) {
+    throw new Error("Claude hook install record is invalid");
+  }
+  let endpoint: URL;
   try {
-    return JSON.parse(value) as T;
+    endpoint = new URL(input.endpoint);
   } catch {
-    return fallback;
+    throw new Error("Claude hook install endpoint is invalid");
+  }
+  if (
+    endpoint.protocol !== "http:"
+    || !["127.0.0.1", "[::1]", "localhost"].includes(endpoint.hostname)
+    || endpoint.pathname !== "/api/v1/hooks/claude"
+    || endpoint.search.length > 0
+    || endpoint.hash.length > 0
+    || endpoint.username.length > 0
+    || endpoint.password.length > 0
+  ) {
+    throw new Error("Claude hook install endpoint must be the loopback hook route");
   }
 }
 
-function actionText(action: SessionAction): string {
-  if (action.type === "send") return action.text;
-  if (action.type === "respond") {
-    return typeof action.response === "string" ? action.response : JSON.stringify(action.response);
+function assertCodexHookInstallRecord(
+  input: Omit<CodexHookInstallRecord, "lastSeenAt">,
+): void {
+  if (
+    input.provider !== "codex"
+    || input.schemaVersion !== 1
+    || !/^[A-Za-z0-9._:-]{1,256}$/u.test(input.id)
+    || !/^sha256:[a-f0-9]{64}$/u.test(input.tokenDigest)
+    || !/^sha256:[a-f0-9]{64}$/u.test(input.shimDigest)
+    || !Number.isFinite(Date.parse(input.createdAt))
+    || input.command.length === 0
+    || input.command.length > 32_768
+    || /[\u0000-\u001f\u007f]/u.test(input.command)
+    || ![input.settingsPath, input.shimPath].every((path) =>
+      path.startsWith("/") && path.length <= 32_768 && !path.includes("\0")
+    )
+  ) {
+    throw new Error("Codex hook install record is invalid");
   }
-  return action.type === "set-mode" ? action.mode : "interrupt";
+  let endpoint: URL;
+  try {
+    endpoint = new URL(input.endpoint);
+  } catch {
+    throw new Error("Codex hook install endpoint is invalid");
+  }
+  if (
+    endpoint.protocol !== "http:"
+    || !["127.0.0.1", "[::1]", "localhost"].includes(endpoint.hostname)
+    || endpoint.pathname !== "/api/v1/hooks/codex"
+    || endpoint.search.length > 0
+    || endpoint.hash.length > 0
+    || endpoint.username.length > 0
+    || endpoint.password.length > 0
+  ) {
+    throw new Error("Codex hook install endpoint must be the loopback hook route");
+  }
+}
+
+function parseJson(value: unknown): unknown {
+  if (typeof value !== "string") throw new Error("Persisted JSON value is not text");
+  try {
+    return JSON.parse(value) as unknown;
+  } catch (error) {
+    throw new Error("Persisted JSON value is malformed", { cause: error });
+  }
+}
+
+function parseMetadata(value: unknown): Record<string, unknown> {
+  const parsed = parseJson(value);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Managed session metadata is not an object");
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function parsePersistedAction(value: unknown): SessionAction | null {
+  const parsed = parseJson(value);
+  if (parsed && typeof parsed === "object" && Object.keys(parsed).length === 0) return null;
+  const result = sessionActionSchema.safeParse(parsed);
+  if (!result.success) {
+    throw new Error("Persisted action does not match the current database epoch", {
+      cause: result.error,
+    });
+  }
+  return result.data;
+}
+
+function actionText(action: SessionAction): string {
+  switch (action.type) {
+    case "send": return action.text;
+    case "respond": return JSON.stringify(action.response);
+    case "set-profile": return action.profile;
+    case "set-model": return action.model;
+    case "set-effort": return action.effort;
+    case "remove-queued": return action.messageId;
+    case "open-editor": return action.relativePath;
+    case "interrupt":
+    case "end":
+    case "archive":
+    case "delete":
+      return action.type;
+  }
 }
 
 /** Audit previews contain operation metadata only, never prompt or response text. */
@@ -130,7 +260,30 @@ export function redactedPreview(action: SessionAction): string {
     case "send": return `send:${action.delivery};content-omitted`;
     case "respond": return `respond:${action.response.kind};content-omitted`;
     case "interrupt": return "interrupt";
-    case "set-mode": return `set-mode:${action.mode}`;
+    case "set-profile": return `set-profile:${action.profile}`;
+    case "set-model": return "set-model:value-omitted";
+    case "set-effort": return `set-effort:${action.effort}`;
+    case "remove-queued": return "remove-queued:id-omitted";
+    case "end": return "end";
+    case "archive": return "archive";
+    case "delete": return "delete";
+    case "open-editor": return "open-editor:path-omitted";
+  }
+}
+
+export const DATABASE_SCHEMA_VERSION = 4 as const;
+
+export class IncompatibleDatabaseError extends Error {
+  readonly code = "INCOMPATIBLE_DATABASE";
+  readonly expectedVersion = DATABASE_SCHEMA_VERSION;
+  readonly actualVersion: number | null;
+
+  constructor(actualVersion: number | null) {
+    super(
+      `Unsupported Agent Manager database version: ${actualVersion === null ? "unreadable" : String(actualVersion)}`,
+    );
+    this.name = "IncompatibleDatabaseError";
+    this.actualVersion = actualVersion;
   }
 }
 
@@ -140,21 +293,41 @@ export class ManagerDatabase {
 
   constructor(path = ":memory:") {
     this.path = path;
+    const hadDatabase = path !== ":memory:" && existsSync(path) && statSync(path).size > 0;
     if (path !== ":memory:") {
       mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     }
     this.#database = new DatabaseSync(path);
+    if (hadDatabase) {
+      let actualVersion: number | null = null;
+      try {
+        actualVersion = this.#schemaVersion();
+      } catch {
+        actualVersion = null;
+      }
+      if (actualVersion !== DATABASE_SCHEMA_VERSION) {
+        this.#database.close();
+        throw new IncompatibleDatabaseError(actualVersion);
+      }
+    }
     if (path !== ":memory:") chmodSync(path, 0o600);
-    this.#migrate();
+    this.#initialize();
   }
 
   close(): void {
     this.#database.close();
   }
 
-  #migrate(): void {
+  #schemaVersion(): number {
+    return Number(
+      (this.#database.prepare("PRAGMA user_version").get() as { user_version?: number }).user_version ?? 0,
+    );
+  }
+
+  #initialize(): void {
     this.#database.exec(`
       PRAGMA secure_delete = ON;
+      PRAGMA foreign_keys = ON;
       CREATE TABLE IF NOT EXISTS hosts (
         id TEXT PRIMARY KEY,
         label TEXT NOT NULL,
@@ -185,6 +358,30 @@ export class ManagerDatabase {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         UNIQUE (provider, provider_session_id)
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS claude_hook_installs (
+        id TEXT PRIMARY KEY,
+        provider TEXT NOT NULL CHECK (provider = 'claude'),
+        schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+        token_digest TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        settings_path TEXT NOT NULL UNIQUE,
+        endpoint TEXT NOT NULL,
+        created_hooks_property INTEGER NOT NULL CHECK (created_hooks_property IN (0, 1)),
+        last_seen_at TEXT
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS codex_hook_installs (
+        id TEXT PRIMARY KEY,
+        provider TEXT NOT NULL CHECK (provider = 'codex'),
+        schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+        token_digest TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        settings_path TEXT NOT NULL UNIQUE,
+        shim_path TEXT NOT NULL UNIQUE,
+        endpoint TEXT NOT NULL,
+        command TEXT NOT NULL,
+        shim_digest TEXT NOT NULL,
+        last_seen_at TEXT
       ) STRICT;
       CREATE TABLE IF NOT EXISTS queued_actions (
         id TEXT PRIMARY KEY,
@@ -241,72 +438,8 @@ export class ManagerDatabase {
       ) STRICT;
       CREATE INDEX IF NOT EXISTS audit_events_session_at
         ON audit_events(session_id, at DESC);
+      PRAGMA user_version = ${DATABASE_SCHEMA_VERSION};
     `);
-    const version = Number((this.#database.prepare("PRAGMA user_version").get() as { user_version?: number }).user_version ?? 0);
-    if (version < 2) {
-      this.#database.exec(`
-        BEGIN IMMEDIATE;
-        ALTER TABLE queued_actions RENAME TO queued_actions_v1;
-        CREATE TABLE queued_actions (
-          id TEXT PRIMARY KEY,
-          session_id TEXT NOT NULL,
-          action_type TEXT NOT NULL,
-          payload_json TEXT NOT NULL,
-          idempotency_key TEXT NOT NULL,
-          status TEXT NOT NULL CHECK (status IN ('pending', 'dispatching', 'queued', 'unknown')),
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL,
-          UNIQUE (session_id, idempotency_key)
-        ) STRICT;
-        INSERT INTO queued_actions
-          SELECT id, session_id, action_type, payload_json, idempotency_key,
-                 status, created_at, updated_at
-          FROM queued_actions_v1;
-        DROP TABLE queued_actions_v1;
-        PRAGMA user_version = 2;
-        COMMIT;
-      `);
-    }
-    const workspaceColumns = this.#database.prepare("PRAGMA table_info(workspaces)").all() as unknown as Array<{ name: string }>;
-    if (!workspaceColumns.some((column) => column.name === "host_id")) {
-      this.#database.exec(`
-        PRAGMA foreign_keys = OFF;
-        BEGIN IMMEDIATE;
-        ALTER TABLE managed_sessions RENAME TO managed_sessions_v2;
-        ALTER TABLE workspaces RENAME TO workspaces_v2;
-        CREATE TABLE workspaces (
-          id TEXT PRIMARY KEY,
-          label TEXT NOT NULL,
-          path TEXT NOT NULL,
-          host_id TEXT NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
-          remote_workspace_id TEXT,
-          created_at TEXT NOT NULL,
-          UNIQUE (host_id, path)
-        ) STRICT;
-        INSERT INTO workspaces (id, label, path, host_id, remote_workspace_id, created_at)
-          SELECT id, label, path, 'local', NULL, created_at FROM workspaces_v2;
-        CREATE TABLE managed_sessions (
-          id TEXT PRIMARY KEY,
-          provider TEXT NOT NULL CHECK (provider IN ('codex', 'claude')),
-          provider_session_id TEXT NOT NULL,
-          workspace_id TEXT REFERENCES workspaces(id) ON DELETE SET NULL,
-          metadata_json TEXT NOT NULL,
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL,
-          UNIQUE (provider, provider_session_id)
-        ) STRICT;
-        INSERT INTO managed_sessions
-          SELECT id, provider, provider_session_id, workspace_id, metadata_json, created_at, updated_at
-          FROM managed_sessions_v2;
-        DROP TABLE managed_sessions_v2;
-        DROP TABLE workspaces_v2;
-        COMMIT;
-        PRAGMA foreign_keys = ON;
-      `);
-    } else {
-      this.#database.exec("PRAGMA foreign_keys = ON;");
-    }
-    this.#database.exec("PRAGMA user_version = 3;");
   }
 
   addHost(input: {
@@ -458,10 +591,188 @@ export class ManagerDatabase {
       provider: asString(row.provider) as Provider,
       providerSessionId: asString(row.provider_session_id),
       workspaceId: row.workspace_id === null ? null : asString(row.workspace_id),
-      metadata: safeJsonParse<Record<string, unknown>>(row.metadata_json, {}),
+      metadata: parseMetadata(row.metadata_json),
       createdAt: asString(row.created_at),
       updatedAt: asString(row.updated_at),
     }));
+  }
+
+  removeManagedSession(id: string): boolean {
+    const result = this.#database.prepare("DELETE FROM managed_sessions WHERE id = ?").run(id);
+    return Number(result.changes) > 0;
+  }
+
+  listClaudeHookInstallRecords(): ClaudeHookInstallRecord[] {
+    const rows = this.#database.prepare(`
+      SELECT id, provider, schema_version, token_digest, created_at,
+             settings_path, endpoint, created_hooks_property, last_seen_at
+      FROM claude_hook_installs ORDER BY created_at, id
+    `).all() as unknown as Record<string, unknown>[];
+    return rows.map((row) => {
+      const record: ClaudeHookInstallRecord = {
+        id: asString(row.id),
+        provider: "claude",
+        schemaVersion: 1,
+        tokenDigest: asString(row.token_digest),
+        createdAt: asString(row.created_at),
+        settingsPath: asString(row.settings_path),
+        endpoint: asString(row.endpoint),
+        createdHooksProperty: Number(row.created_hooks_property) === 1,
+        lastSeenAt: row.last_seen_at === null ? null : asString(row.last_seen_at),
+      };
+      assertClaudeHookInstallRecord(record);
+      if (record.lastSeenAt !== null && !Number.isFinite(Date.parse(record.lastSeenAt))) {
+        throw new Error("Persisted Claude hook last-seen timestamp is invalid");
+      }
+      return record;
+    });
+  }
+
+  getClaudeHookInstallRecord(settingsPath: string): ClaudeHookInstallRecord | null {
+    return this.listClaudeHookInstallRecords().find(
+      (record) => record.settingsPath === settingsPath,
+    ) ?? null;
+  }
+
+  upsertClaudeHookInstallRecord(
+    input: Omit<ClaudeHookInstallRecord, "lastSeenAt">,
+  ): ClaudeHookInstallRecord {
+    assertClaudeHookInstallRecord(input);
+    this.#database.prepare(`
+      INSERT INTO claude_hook_installs (
+        id, provider, schema_version, token_digest, created_at,
+        settings_path, endpoint, created_hooks_property, last_seen_at
+      ) VALUES (?, 'claude', 1, ?, ?, ?, ?, ?, NULL)
+      ON CONFLICT(settings_path) DO UPDATE SET
+        id = excluded.id,
+        token_digest = excluded.token_digest,
+        created_at = excluded.created_at,
+        endpoint = excluded.endpoint,
+        created_hooks_property = excluded.created_hooks_property,
+        last_seen_at = CASE
+          WHEN claude_hook_installs.id = excluded.id
+            AND claude_hook_installs.token_digest = excluded.token_digest
+          THEN claude_hook_installs.last_seen_at
+          ELSE NULL
+        END
+    `).run(
+      input.id,
+      input.tokenDigest,
+      input.createdAt,
+      input.settingsPath,
+      input.endpoint,
+      input.createdHooksProperty ? 1 : 0,
+    );
+    const stored = this.getClaudeHookInstallRecord(input.settingsPath);
+    if (!stored) throw new Error("Claude hook install record disappeared during upsert");
+    return stored;
+  }
+
+  removeClaudeHookInstallRecord(id: string): boolean {
+    const result = this.#database.prepare(
+      "DELETE FROM claude_hook_installs WHERE id = ?",
+    ).run(id);
+    return Number(result.changes) > 0;
+  }
+
+  markClaudeHookSeen(id: string, at = new Date().toISOString()): boolean {
+    if (!Number.isFinite(Date.parse(at))) throw new Error("Claude hook last-seen timestamp is invalid");
+    const result = this.#database.prepare(`
+      UPDATE claude_hook_installs
+      SET last_seen_at = ?
+      WHERE id = ? AND (last_seen_at IS NULL OR last_seen_at < ?)
+    `).run(at, id, at);
+    return Number(result.changes) > 0;
+  }
+
+  listCodexHookInstallRecords(): CodexHookInstallRecord[] {
+    const rows = this.#database.prepare(`
+      SELECT id, provider, schema_version, token_digest, created_at,
+             settings_path, shim_path, endpoint, command, shim_digest, last_seen_at
+      FROM codex_hook_installs ORDER BY created_at, id
+    `).all() as unknown as Record<string, unknown>[];
+    return rows.map((row) => {
+      const record: CodexHookInstallRecord = {
+        id: asString(row.id),
+        provider: "codex",
+        schemaVersion: 1,
+        tokenDigest: asString(row.token_digest),
+        createdAt: asString(row.created_at),
+        settingsPath: asString(row.settings_path),
+        shimPath: asString(row.shim_path),
+        endpoint: asString(row.endpoint),
+        command: asString(row.command),
+        shimDigest: asString(row.shim_digest),
+        lastSeenAt: row.last_seen_at === null ? null : asString(row.last_seen_at),
+      };
+      assertCodexHookInstallRecord(record);
+      if (record.lastSeenAt !== null && !Number.isFinite(Date.parse(record.lastSeenAt))) {
+        throw new Error("Persisted Codex hook last-seen timestamp is invalid");
+      }
+      return record;
+    });
+  }
+
+  getCodexHookInstallRecord(settingsPath: string): CodexHookInstallRecord | null {
+    return this.listCodexHookInstallRecords().find(
+      (record) => record.settingsPath === settingsPath,
+    ) ?? null;
+  }
+
+  upsertCodexHookInstallRecord(
+    input: Omit<CodexHookInstallRecord, "lastSeenAt">,
+  ): CodexHookInstallRecord {
+    assertCodexHookInstallRecord(input);
+    this.#database.prepare(`
+      INSERT INTO codex_hook_installs (
+        id, provider, schema_version, token_digest, created_at, settings_path,
+        shim_path, endpoint, command, shim_digest, last_seen_at
+      ) VALUES (?, 'codex', 1, ?, ?, ?, ?, ?, ?, ?, NULL)
+      ON CONFLICT(settings_path) DO UPDATE SET
+        id = excluded.id,
+        token_digest = excluded.token_digest,
+        created_at = excluded.created_at,
+        shim_path = excluded.shim_path,
+        endpoint = excluded.endpoint,
+        command = excluded.command,
+        shim_digest = excluded.shim_digest,
+        last_seen_at = CASE
+          WHEN codex_hook_installs.id = excluded.id
+            AND codex_hook_installs.token_digest = excluded.token_digest
+            AND codex_hook_installs.shim_digest = excluded.shim_digest
+          THEN codex_hook_installs.last_seen_at
+          ELSE NULL
+        END
+    `).run(
+      input.id,
+      input.tokenDigest,
+      input.createdAt,
+      input.settingsPath,
+      input.shimPath,
+      input.endpoint,
+      input.command,
+      input.shimDigest,
+    );
+    const stored = this.getCodexHookInstallRecord(input.settingsPath);
+    if (!stored) throw new Error("Codex hook install record disappeared during upsert");
+    return stored;
+  }
+
+  removeCodexHookInstallRecord(id: string): boolean {
+    const result = this.#database.prepare(
+      "DELETE FROM codex_hook_installs WHERE id = ?",
+    ).run(id);
+    return Number(result.changes) > 0;
+  }
+
+  markCodexHookSeen(id: string, at = new Date().toISOString()): boolean {
+    if (!Number.isFinite(Date.parse(at))) throw new Error("Codex hook last-seen timestamp is invalid");
+    const result = this.#database.prepare(`
+      UPDATE codex_hook_installs
+      SET last_seen_at = ?
+      WHERE id = ? AND (last_seen_at IS NULL OR last_seen_at < ?)
+    `).run(at, id, at);
+    return Number(result.changes) > 0;
   }
 
   beginCreateSessionIntent(input: {
@@ -644,8 +955,11 @@ export class ManagerDatabase {
     this.#database.exec("BEGIN IMMEDIATE");
     try {
       for (const row of rows) {
-        const action = safeJsonParse<SessionAction | null>(row.payload_json, null);
+        const action = parsePersistedAction(row.payload_json);
         if (action) {
+          if (action.type !== asString(row.action_type)) {
+            throw new Error("Persisted action type does not match its payload");
+          }
           this.#database.prepare(`
             INSERT INTO action_receipts (
               session_id, idempotency_key, request_sha256, action_id,
@@ -725,8 +1039,11 @@ export class ManagerDatabase {
       FROM queued_actions WHERE status = 'pending' ORDER BY created_at
     `).all() as unknown as Record<string, unknown>[];
     return rows.flatMap((row) => {
-      const action = safeJsonParse<SessionAction | null>(row.payload_json, null);
+      const action = parsePersistedAction(row.payload_json);
       if (!action) return [];
+      if (action.type !== asString(row.action_type)) {
+        throw new Error("Persisted action type does not match its payload");
+      }
       return [{
         id: asString(row.id),
         sessionId: asString(row.session_id),
@@ -746,8 +1063,11 @@ export class ManagerDatabase {
       FROM queued_actions WHERE session_id = ? AND idempotency_key = ?
     `).get(sessionId, idempotencyKey) as Record<string, unknown> | undefined;
     if (!row) return null;
-    const action = safeJsonParse<SessionAction | null>(row.payload_json, null);
+    const action = parsePersistedAction(row.payload_json);
     if (!action) return null;
+    if (action.type !== asString(row.action_type)) {
+      throw new Error("Persisted action type does not match its payload");
+    }
     return {
       id: asString(row.id),
       sessionId: asString(row.session_id),

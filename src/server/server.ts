@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import type { Server as NetServer } from "node:net";
+import { isAbsolute } from "node:path";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 import rateLimit from "@fastify/rate-limit";
@@ -14,11 +16,50 @@ import { ZodError, z } from "zod";
 
 import {
   ActivityHub,
-  encodeActivityCursor,
-  parseActivityCursor,
+  type ActivityAttentionItem,
   type ActivityFrame,
 } from "../activity/index.ts";
-import type { Diagnostic, Provider, SessionRecord, SessionView } from "../core/types.ts";
+import type {
+  Diagnostic,
+  Provider,
+  SessionAttention,
+  SessionRecord,
+  SessionView,
+} from "../core/types.ts";
+import { WorkspaceIdentityResolver } from "../core/worktree.ts";
+import {
+  CodexHookBridge,
+} from "../providers/codex/codex-hook-bridge.ts";
+import type { CodexHookAuthorizationRecord } from "../providers/codex/codex-hook-auth.ts";
+import { registerCodexHookRoute } from "../providers/codex/codex-hook-route.ts";
+import {
+  ClaudeHookBridge,
+  ClaudeHookSourceArbiter,
+  registerClaudeHookRoute,
+  type ClaudeHookPendingPermission,
+  type HookAuthorizationRecord,
+} from "../providers/hooks/index.ts";
+import {
+  selectedAttentionDetailsQuerySchema,
+  selectedAttentionDetailsResponseSchema,
+  type SelectedAttentionDetail,
+} from "../shared/attention-detail.ts";
+import {
+  availableSessionAccountFactsSchema,
+  selectedSessionFactsQuerySchema,
+  selectedSessionFactsResponseSchema,
+  type SessionAccountFacts,
+  type SessionTurnUsage,
+} from "../shared/session-facts.ts";
+import { selectedTodoDetailResponseSchema } from "../shared/todo-detail.ts";
+import {
+  setupHarnessProbeResponseSchema,
+  setupReadModelSchema,
+  type SetupHarnessProbe,
+} from "../shared/setup.ts";
+import { sessionRecordId } from "../shared/session.ts";
+import { AGENT_MANAGER_BUILD_ID, WIRE_SCHEMA_VERSION } from "../shared/wire.ts";
+import { workspaceListResponseSchema } from "../shared/workspace.ts";
 import {
   DiscoveryReconciler,
   type DiscoveryReconcilerOptions,
@@ -32,12 +73,15 @@ import { AuthManager, type AuthManagerOptions, type AuthSession } from "./auth.t
 import {
   createSessionSchema,
   directoryCompletionQuerySchema,
+  executionProfileSchema,
   leaseRequestSchema,
   requiredCapability,
   resolveWorkspaceSchema,
   sessionActionSchema,
+  sessionSettingsOptionsSchema,
   type ActionRecord,
   type AttachInstruction,
+  type ManagedSessionRecoveryRecord,
   type ProviderControlAdapters,
   type PanePreviewAdapter,
   type RequestContext,
@@ -61,31 +105,48 @@ import {
   TmuxPanePreviewAdapter,
   tmuxAttachInstruction,
 } from "./preview.ts";
+import { LocalPlanFileReader, type PlanFileReader } from "./plan-file.ts";
 import { SessionStateStore } from "./state.ts";
-import type { SessionTranscriptReader, TranscriptReadResult } from "./transcript.ts";
+import type { SessionTranscriptReader } from "./transcript.ts";
 import { SelectedTranscriptActivityObserver } from "./activity-observer.ts";
+import { MacEditorLauncher, type EditorLauncher } from "./editor.ts";
+import { probeLocalHarnesses } from "./harness-probe.ts";
+import { SetupHookManager, type SetupHookManagerOptions } from "./setup-hooks.ts";
+import { probeSetupHosts } from "./setup-hosts.ts";
+import {
+  persistDiscoveredWorkspaces,
+  setupNearbyWorkspaces,
+} from "./setup-workspaces.ts";
 import {
   localDirectoryCompletions,
-  resolveLocalWorkspacePath,
-  workspaceLabel,
+  resolveWorkspaceForHost,
+  workspaceResolutionResponse,
 } from "./workspaces.ts";
 
 const previewQuerySchema = z.object({
   lines: z.coerce.number().int().min(1).max(200).default(200),
   bytes: z.coerce.number().int().min(1_024).max(65_536).default(65_536),
 });
+const transcriptSearchQuerySchema = z.object({
+  q: z.string()
+    .trim()
+    .min(2)
+    .max(200)
+    .refine((value) => !value.includes("\0"), "query contains an invalid character"),
+  limit: z.coerce.number().int().min(1).max(50).default(20),
+}).strict();
 const eventsQuerySchema = z.object({
   clientId: z.string().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/).optional(),
-}).strict();
-const activityHistoryQuerySchema = z.object({
-  before: z.string().min(1).max(256).optional(),
-  limit: z.coerce.number().int().min(1).max(400).default(200),
 }).strict();
 const bootstrapSchema = z.object({ secret: z.string().min(32).max(256) }).strict();
 
 const NO_STORE = "no-store";
 const REVALIDATE = "public, max-age=0, must-revalidate";
 const IMMUTABLE = "public, max-age=31536000, immutable";
+const SETTINGS_OPTIONS_TIMEOUT_MS = 3_000;
+const SESSION_FACTS_TIMEOUT_MS = 3_000;
+const MANAGED_SESSION_RECOVERY_TIMEOUT_MS = 10_000;
+const CODEX_HOOK_FRESHNESS_MS = 30_000;
 const CONTENT_SECURITY_POLICY = [
   "default-src 'self'",
   "base-uri 'none'",
@@ -151,10 +212,20 @@ export interface AgentManagerServerOptions {
   state?: SessionStateStore;
   /** Volatile selected-session activity projection. Never persisted. */
   activityHub?: ActivityHub;
+  /** Shared with the Claude SDK adapter so a session has only one activity authority. */
+  claudeHookSourceArbiter?: ClaudeHookSourceArbiter;
+  /** Test/embedder seam; production authorization records load from ManagerDatabase. */
+  claudeHookAuthorizationRecords?: readonly HookAuthorizationRecord[];
+  /** Test/embedder seam; production authorization records load from ManagerDatabase. */
+  codexHookAuthorizationRecords?: readonly CodexHookAuthorizationRecord[];
   database?: ManagerDatabase;
   adapters?: ProviderControlAdapters;
   previewAdapter?: PanePreviewAdapter;
-  /** Reads bounded conversation detail only for the authenticated detail route. */
+  /** Pinned local editor operation; false removes the server capability. */
+  editorLauncher?: EditorLauncher | false;
+  /** Reads only provider-registered plan artifacts from explicit local roots. */
+  planFileReader?: PlanFileReader;
+  /** Supplies bounded transcript-derived items to the selected-session activity stream. */
   transcriptReader?: SessionTranscriptReader;
   /** Canonical tmux executable used by the production preview adapter. */
   tmuxExecutable?: string;
@@ -163,7 +234,7 @@ export interface AgentManagerServerOptions {
   logger?: boolean;
   /** Production web assets; false disables static and SPA routes. */
   staticDir?: string | false;
-  initialSessions?: readonly (SessionRecord | SessionView)[];
+  initialSessions?: readonly SessionRecord[];
   initialDiagnostics?: readonly Diagnostic[];
   /** Enabled by default; pass false in deterministic unit tests. */
   discovery?: false | Omit<DiscoveryReconcilerOptions, "onUpdate">;
@@ -171,10 +242,26 @@ export interface AgentManagerServerOptions {
   maxSseClients?: number;
   maxSseClientsPerAuthSession?: number;
   shutdownTimeoutMs?: number;
+  /** Test/embedder seam; production account reads stay under three seconds. */
+  sessionFactsTimeoutMs?: number;
   /** Configured owner SSH nodes. Browser input can only select these stable IDs. */
   remoteHosts?: readonly RemoteHostDefinition[];
   sshExecutable?: string;
   remotePollIntervalMs?: number;
+  /** Test/embedder seam for the bounded local setup probe. */
+  setupHarnessProbe?: () => Promise<SetupHarnessProbe>;
+  /** Test/embedder seam for an already configured remote host. */
+  setupRemoteHarnessProbe?: (hostId: string) => Promise<SetupHarnessProbe>;
+  /** User settings root used by hook status/preview. */
+  homeDirectory?: string;
+  /** Loopback origin written into provider hooks. */
+  hookEndpointOrigin?: string;
+  /** Pinned Node executable written into the Codex hook shim. */
+  nodeExecutable?: string;
+  /** Read-only live Codex hooks/list trust and enable probe. */
+  codexHookTrustStatus?: SetupHookManagerOptions["codexTrustStatus"];
+  /** Test/embedder seam; production hook authority evidence expires after 30 seconds. */
+  codexHookFreshnessMs?: number;
 }
 
 export interface AgentManagerBackend {
@@ -188,7 +275,7 @@ export interface AgentManagerBackend {
   close(): Promise<void>;
   bootstrapUrl(origin?: string): string;
   replaceSessions(
-    sessions: readonly (SessionRecord | SessionView)[],
+    sessions: readonly SessionRecord[],
     diagnostics?: readonly Diagnostic[],
   ): void;
 }
@@ -243,9 +330,17 @@ function actionRecord(
   action: SessionAction,
   status: ActionRecord["status"],
   createdAt: string,
-  extra: Pick<ActionRecord, "completedAt" | "error"> = {},
+  extra: Partial<Pick<ActionRecord, "completedAt" | "error">> = {},
 ): ActionRecord {
-  return { id, sessionId, type: action.type, status, createdAt, ...extra };
+  return {
+    id,
+    sessionId,
+    type: action.type,
+    status,
+    createdAt,
+    completedAt: extra.completedAt ?? null,
+    error: extra.error ?? null,
+  };
 }
 
 function routeSessionId(request: FastifyRequest): string {
@@ -263,6 +358,72 @@ function providerAdapter(
   const adapter = adapters[provider];
   if (!adapter) throw new ApiError(501, "PROVIDER_CONTROL_UNAVAILABLE", `${provider} control is unavailable`);
   return adapter;
+}
+
+function codexRecoveryRecords(database: ManagerDatabase): {
+  records: ManagedSessionRecoveryRecord[];
+  diagnostics: Diagnostic[];
+} {
+  const records: ManagedSessionRecoveryRecord[] = [];
+  const diagnostics: Diagnostic[] = [];
+  for (const persisted of database.listManagedSessions()) {
+    if (persisted.provider !== "codex") continue;
+    const workspace = persisted.workspaceId
+      ? database.getWorkspace(persisted.workspaceId)
+      : null;
+    const profile = executionProfileSchema.safeParse(persisted.metadata.profile);
+    const name = persisted.metadata.name;
+    const valid = persisted.providerSessionId.length > 0
+      && persisted.providerSessionId.length <= 512
+      && persisted.id === sessionRecordId("local", "codex", persisted.providerSessionId)
+      && workspace !== null
+      && workspace.hostId === "local"
+      && workspace.hostKind === "local"
+      && isAbsolute(workspace.path)
+      && persisted.metadata.hostId === "local"
+      && (name === null || (typeof name === "string" && name.length <= 120))
+      && profile.success
+      && Number.isFinite(Date.parse(persisted.createdAt))
+      && Number.isFinite(Date.parse(persisted.updatedAt));
+    if (!valid || !workspace || !persisted.workspaceId || !profile.success) {
+      diagnostics.push({
+        provider: "codex",
+        level: "warning",
+        message: `Skipped invalid persisted Codex manager identity ${persisted.id}`,
+      });
+      continue;
+    }
+    records.push({
+      managerSessionId: persisted.id,
+      provider: "codex",
+      providerThreadId: persisted.providerSessionId,
+      workspaceId: persisted.workspaceId,
+      workspacePath: workspace.path,
+      name: name as string | null,
+      profile: profile.data,
+      createdAt: persisted.createdAt,
+    });
+  }
+  return { records, diagnostics };
+}
+
+function withLocalEditorCapability(
+  session: SessionRecord,
+  available: boolean,
+): SessionRecord {
+  if (
+    !available
+    || session.hostId !== "local"
+    || session.workspaceIdentity === null
+    || session.control.capabilities.includes("open-editor")
+  ) return session;
+  return {
+    ...session,
+    control: {
+      ...session.control,
+      capabilities: [...session.control.capabilities, "open-editor"],
+    },
+  };
 }
 
 export async function createAgentManagerServer(
@@ -284,7 +445,11 @@ export async function createAgentManagerServer(
   const state = options.state ?? new SessionStateStore({
     replayCapacity: options.replayCapacity ?? 512,
   });
+  const workspaceIdentityResolver = new WorkspaceIdentityResolver();
   const activityHub = options.activityHub ?? new ActivityHub();
+  const releaseTodoProgress = activityHub.subscribeTodoProgress(
+    (sessionId, progress) => state.setTodoProgress(sessionId, progress),
+  );
   const database = options.database ?? new ManagerDatabase(options.databasePath);
   for (const remoteHost of options.remoteHosts ?? []) {
     database.addHost({
@@ -302,6 +467,319 @@ export async function createAgentManagerServer(
   const previewAdapter = options.previewAdapter ?? new TmuxPanePreviewAdapter(
     options.tmuxExecutable === undefined ? {} : { executable: options.tmuxExecutable },
   );
+  const editorLauncher = options.editorLauncher === false
+    ? null
+    : options.editorLauncher ?? new MacEditorLauncher();
+  const planFileReader = options.planFileReader ?? new LocalPlanFileReader();
+  let discovery: DiscoveryReconciler | null = null;
+  const claudeHookSourceArbiter = options.claudeHookSourceArbiter
+    ?? new ClaudeHookSourceArbiter();
+  const claudeHookBases = new Map<string, SessionRecord>();
+  const claudeHookPermissions = new Map<
+    string,
+    Map<string, ClaudeHookPendingPermission>
+  >();
+  const sseClients = new Map<FastifyReply, {
+    authSessionId: string;
+    clientId: string | null;
+    channel: "global" | "activity";
+    sessionId: string | null;
+    close: () => void;
+  }>();
+  let scheduleClaudePermissionPresenceCheck = (): void => undefined;
+  const claudeHookLastSeenAt = new Map<string, number>();
+  const claudeHookSession = (providerSessionId: string): string =>
+    sessionRecordId("local", "claude", providerSessionId);
+  const hookAttention = (
+    request: ClaudeHookPendingPermission,
+  ): SessionAttention => ({
+    id: request.id,
+    kind: request.toolName === "AskUserQuestion"
+      ? "question"
+      : request.toolName === "ExitPlanMode"
+        ? "approval"
+        : "permission",
+    summary: null,
+    source: "hook",
+    confidence: "exact",
+    details: {
+      title: null,
+      questions: null,
+      toolName: null,
+      inputSummary: null,
+      respondable: true,
+    },
+  });
+  const decorateClaudeHookSession = (session: SessionRecord): SessionRecord => {
+    const pending = claudeHookPermissions.get(session.id);
+    if (!pending || pending.size === 0) return session;
+    const hookRequests = [...pending.values()];
+    return {
+      ...session,
+      status: "waiting",
+      statusSource: "hook",
+      updatedAt: hookRequests.reduce(
+        (latest, request) => request.createdAt > latest ? request.createdAt : latest,
+        session.updatedAt,
+      ),
+      attention: [
+        ...session.attention.filter((attention) => attention.source !== "hook"),
+        ...hookRequests.map(hookAttention),
+      ],
+      control: {
+        plane: "claude-hook-bridge",
+        // A held hook grants one exact response path; it does not transfer
+        // ownership of the externally-started provider process to the SDK.
+        authority: "foreign",
+        capabilities: session.control.capabilities.includes("respond")
+          ? session.control.capabilities
+          : [...session.control.capabilities, "respond"],
+        withheld: session.control.withheld.filter(
+          (withheld) => withheld.capability !== "respond",
+        ),
+      },
+    };
+  };
+  const rememberClaudeHookBase = (session: SessionRecord): SessionRecord => {
+    if (
+      session.provider !== "claude"
+      || session.hostId !== "local"
+      || session.control.authority === "manager"
+    ) return session;
+    claudeHookBases.set(session.id, structuredClone(session));
+    return decorateClaudeHookSession(session);
+  };
+  const refreshClaudeHookSession = (sessionId: string): void => {
+    const base = claudeHookBases.get(sessionId);
+    if (!base || !state.get(sessionId)) return;
+    state.upsert(withLocalEditorCapability(
+      decorateClaudeHookSession(base),
+      editorLauncher !== null,
+    ));
+  };
+  const hookAuthorizationRecords = (): HookAuthorizationRecord[] =>
+    (options.claudeHookAuthorizationRecords
+      ?? database.listClaudeHookInstallRecords()).map((record) => ({
+      id: record.id,
+      provider: "claude",
+      tokenDigest: record.tokenDigest,
+      createdAt: record.createdAt,
+      settingsPath: record.settingsPath,
+    }));
+  const claudeHookBridge = new ClaudeHookBridge({
+    authorizationRecords: hookAuthorizationRecords(),
+    sourceArbiter: claudeHookSourceArbiter,
+    onHookSeen: (event) => {
+      const sessionId = claudeHookSession(event.providerSessionId);
+      const receivedAt = Date.parse(event.receivedAt);
+      const previous = claudeHookLastSeenAt.get(sessionId);
+      // A hook returning after transcript fallback is a source switch. Reset
+      // once so inferred transcript items never mix with exact hook items.
+      if (previous === undefined || receivedAt - previous > 30_000) {
+        activityHub.ingest(sessionId, "claude", {
+          type: "reset",
+          reason: "provider-reset",
+          items: [],
+        });
+      }
+      claudeHookLastSeenAt.set(sessionId, receivedAt);
+      try {
+        database.markClaudeHookSeen(event.installId, event.receivedAt);
+      } catch {
+        state.addDiagnostic({
+          provider: "claude",
+          level: "warning",
+          message: "Claude hook activity is live, but its liveness receipt could not be persisted.",
+        });
+      }
+      discovery?.scan();
+    },
+    onActivity: (providerSessionId, mutation) => {
+      activityHub.ingest(claudeHookSession(providerSessionId), "claude", mutation);
+    },
+    onPermissionChanged: (event) => {
+      const sessionId = claudeHookSession(event.request.sessionId);
+      let pending = claudeHookPermissions.get(sessionId);
+      if (event.type === "opened") {
+        if (!pending) {
+          pending = new Map();
+          claudeHookPermissions.set(sessionId, pending);
+        }
+        pending.set(event.request.id, structuredClone(event.request));
+      } else if (pending) {
+        pending.delete(event.request.id);
+        if (pending.size === 0) claudeHookPermissions.delete(sessionId);
+      }
+      refreshClaudeHookSession(sessionId);
+      scheduleClaudePermissionPresenceCheck();
+    },
+    onError: () => state.addDiagnostic({
+      provider: "claude",
+      level: "warning",
+      message: "A Claude hook event could not be projected faithfully.",
+    }),
+  });
+  const codexHookLastSeenAt = new Map<string, number>();
+  const codexHookBases = new Map<string, SessionRecord>();
+  const codexHookExpiryTimers = new Map<string, NodeJS.Timeout>();
+  const codexHookNeedsReset = new Set<string>();
+  const codexHookFreshnessMs = Math.max(
+    1,
+    options.codexHookFreshnessMs ?? CODEX_HOOK_FRESHNESS_MS,
+  );
+  const codexHookSession = (providerSessionId: string): string =>
+    sessionRecordId("local", "codex", providerSessionId);
+  const hasRecentCodexHookEvidence = (sessionId: string, now = Date.now()): boolean => {
+    const lastSeenAt = codexHookLastSeenAt.get(sessionId);
+    return lastSeenAt !== undefined
+      && lastSeenAt <= now
+      && now - lastSeenAt <= codexHookFreshnessMs;
+  };
+  const codexHookCapabilities = (
+    session: SessionRecord,
+  ): SessionRecord["control"]["capabilities"] => session.control.capabilities.filter(
+    (capability) => capability === "preview"
+      || capability === "attach"
+      || capability === "resume"
+      || capability === "open-editor",
+  );
+  const decorateCodexHookSession = (session: SessionRecord): SessionRecord => {
+    if (
+      session.provider !== "codex"
+      || session.hostId !== "local"
+      || session.control.authority === "manager"
+      || !hasRecentCodexHookEvidence(session.id)
+    ) return session;
+    const capabilities = codexHookCapabilities(session);
+    return {
+      ...session,
+      control: {
+        plane: "codex-hook-bridge",
+        authority: "foreign",
+        capabilities,
+        withheld: session.control.withheld.filter((withheld) =>
+          capabilities.includes(withheld.capability)
+        ),
+      },
+    };
+  };
+  const rememberCodexHookBase = (session: SessionRecord): SessionRecord => {
+    if (
+      session.provider !== "codex"
+      || session.hostId !== "local"
+      || session.control.authority === "manager"
+    ) return session;
+    if (session.control.plane !== "codex-hook-bridge") {
+      codexHookBases.set(session.id, structuredClone(session));
+    }
+    return decorateCodexHookSession(codexHookBases.get(session.id) ?? session);
+  };
+  const refreshCodexHookSession = (sessionId: string): void => {
+    const current = state.get(sessionId);
+    if (!current || current.control.authority === "manager") return;
+    const base = codexHookBases.get(sessionId);
+    if (!base) return;
+    state.upsert(withLocalEditorCapability(
+      decorateCodexHookSession(base),
+      editorLauncher !== null,
+    ));
+  };
+  const scheduleCodexHookExpiry = (sessionId: string, seenAt: number): void => {
+    const previous = codexHookExpiryTimers.get(sessionId);
+    if (previous) clearTimeout(previous);
+    const timer = setTimeout(() => {
+      codexHookExpiryTimers.delete(sessionId);
+      if (codexHookLastSeenAt.get(sessionId) !== seenAt) return;
+      codexHookLastSeenAt.delete(sessionId);
+      codexHookNeedsReset.delete(sessionId);
+      refreshCodexHookSession(sessionId);
+    }, codexHookFreshnessMs + 1);
+    timer.unref();
+    codexHookExpiryTimers.set(sessionId, timer);
+  };
+  const codexHookAuthorizationRecords = (): CodexHookAuthorizationRecord[] =>
+    (options.codexHookAuthorizationRecords
+      ?? database.listCodexHookInstallRecords()).map((record) => ({
+      id: record.id,
+      provider: "codex",
+      tokenDigest: record.tokenDigest,
+      createdAt: record.createdAt,
+      settingsPath: record.settingsPath,
+      shimPath: record.shimPath,
+    }));
+  const codexHookBridge = new CodexHookBridge({
+    authorizationRecords: codexHookAuthorizationRecords(),
+    onActivity: (providerSessionId, mutation) => {
+      const sessionId = codexHookSession(providerSessionId);
+      if (state.get(sessionId)?.control.authority === "manager") return;
+      if (codexHookNeedsReset.delete(sessionId)) {
+        activityHub.ingest(sessionId, "codex", {
+          type: "reset",
+          reason: "provider-reset",
+          items: [],
+        });
+      }
+      activityHub.ingest(sessionId, "codex", mutation);
+    },
+    onHookSeen: (event) => {
+      const sessionId = codexHookSession(event.providerSessionId);
+      if (state.get(sessionId)?.control.authority !== "manager") {
+        const receivedAt = Date.parse(event.receivedAt);
+        const at = Number.isFinite(receivedAt) ? receivedAt : Date.now();
+        if (!hasRecentCodexHookEvidence(sessionId, at)) {
+          codexHookNeedsReset.add(sessionId);
+        }
+        codexHookLastSeenAt.set(sessionId, at);
+        refreshCodexHookSession(sessionId);
+        scheduleCodexHookExpiry(sessionId, at);
+      }
+      try {
+        database.markCodexHookSeen(event.installId, event.receivedAt);
+      } catch {
+        state.addDiagnostic({
+          provider: "codex",
+          level: "warning",
+          message: "Codex hook activity is live, but its liveness receipt could not be persisted.",
+        });
+      }
+      discovery?.scan();
+    },
+    onError: () => state.addDiagnostic({
+      provider: "codex",
+      level: "warning",
+      message: "A Codex hook event could not be projected faithfully.",
+    }),
+  });
+  const reloadHookAuthorizations = (): void => {
+    claudeHookBridge.replaceAuthorizationRecords(
+      database.listClaudeHookInstallRecords().map((record) => ({
+        id: record.id,
+        provider: "claude",
+        tokenDigest: record.tokenDigest,
+        createdAt: record.createdAt,
+        settingsPath: record.settingsPath,
+      })),
+    );
+    codexHookBridge.replaceAuthorizationRecords(
+      database.listCodexHookInstallRecords().map((record) => ({
+        id: record.id,
+        provider: "codex",
+        tokenDigest: record.tokenDigest,
+        createdAt: record.createdAt,
+        settingsPath: record.settingsPath,
+        shimPath: record.shimPath,
+      })),
+    );
+  };
+  const setupHooks = new SetupHookManager({
+    database,
+    homeDirectory: options.homeDirectory ?? homedir(),
+    endpointOrigin: options.hookEndpointOrigin ?? `http://127.0.0.1:${String(port)}`,
+    nodeExecutable: options.nodeExecutable ?? process.execPath,
+    ...(options.codexHookTrustStatus
+      ? { codexTrustStatus: options.codexHookTrustStatus }
+      : {}),
+  });
   const transcriptReader = options.transcriptReader;
   const auth = new AuthManager({
     allowedHosts,
@@ -321,7 +799,6 @@ export async function createAgentManagerServer(
   const leases = new ControlLeaseBroker({
     onChange: (sessionId, leased) => {
       const session = state.get(sessionId);
-      state.setWritableLease(sessionId, leased);
       if (!leased && session?.hostId && session.hostId !== "local") {
         void remoteHosts.releaseControl(sessionId).catch(() => undefined);
       }
@@ -329,19 +806,39 @@ export async function createAgentManagerServer(
   });
   let controlSocket: NetServer | null = null;
   let databaseClosed = false;
-  let discovery: DiscoveryReconciler | null = null;
   let lastStaleDiagnostic: string | null = null;
-  let locked = false;
   let cleanupPromise: Promise<void> | null = null;
   const shutdownTimeoutMs = Math.max(250, options.shutdownTimeoutMs ?? 2_000);
   const maxSseClients = Math.max(1, options.maxSseClients ?? 16);
-  const maxSseClientsPerAuthSession = Math.max(1, options.maxSseClientsPerAuthSession ?? 2);
-  const sseClients = new Map<FastifyReply, {
-    authSessionId: string;
-    clientId: string | null;
-    channel: string;
-    close: () => void;
-  }>();
+  // A selected browser tab owns two streams: global metadata and activity.
+  // Let the personal-tool owner use the bounded process pool by default (eight
+  // fully selected tabs), while embedders can still impose a stricter actor cap.
+  const maxSseClientsPerAuthSession = Math.max(
+    1,
+    options.maxSseClientsPerAuthSession ?? maxSseClients,
+  );
+  const hasRelevantCockpitConnection = (sessionId: string): boolean =>
+    [...sseClients.values()].some((client) =>
+      client.channel === "global"
+      || (client.channel === "activity" && client.sessionId === sessionId)
+    );
+  let claudePermissionPresenceCheckScheduled = false;
+  scheduleClaudePermissionPresenceCheck = (): void => {
+    if (claudePermissionPresenceCheckScheduled) return;
+    claudePermissionPresenceCheckScheduled = true;
+    // EventSource replaces a same-client stream synchronously. Reconcile in a
+    // microtask so closing the superseded socket cannot create a false
+    // zero-client window, while a real last disconnect still fails open now.
+    queueMicrotask(() => {
+      claudePermissionPresenceCheckScheduled = false;
+      for (const request of claudeHookBridge.pending()) {
+        const sessionId = claudeHookSession(request.sessionId);
+        if (!hasRelevantCockpitConnection(sessionId)) {
+          claudeHookBridge.failOpen(request.id, "browser-lost");
+        }
+      }
+    });
+  };
   interface NativeHandoff {
     handoffId: string;
     spawnNonce: string;
@@ -380,11 +877,23 @@ export async function createAgentManagerServer(
     hub: activityHub,
     ...(transcriptReader ? { reader: transcriptReader } : {}),
     resolveSession: (id) => state.get(id),
-    eligible: (session) => !session.control.managerOwned || nativeHandoffs.has(session.id),
+    eligible: (session) => session.provider === "claude"
+      ? session.control.authority !== "manager"
+        && claudeHookSourceArbiter.shouldPollTranscript(session.providerThreadId)
+      : (
+          session.control.authority !== "manager"
+          && !hasRecentCodexHookEvidence(session.id)
+        ) || nativeHandoffs.has(session.id),
   });
   const shouldObserveTranscript = (session: SessionView): boolean =>
-    session.hostId === undefined || session.hostId === "local"
-      ? !session.control.managerOwned || nativeHandoffs.has(session.id)
+    session.hostId === "local"
+      ? session.provider === "claude"
+        ? session.control.authority !== "manager"
+          && claudeHookSourceArbiter.shouldPollTranscript(session.providerThreadId)
+        : (
+            session.control.authority !== "manager"
+            && !hasRecentCodexHookEvidence(session.id)
+          ) || nativeHandoffs.has(session.id)
       : false;
   const isRemoteSession = (session: SessionView): boolean =>
     typeof session.hostId === "string" && session.hostId !== "local";
@@ -400,26 +909,111 @@ export async function createAgentManagerServer(
     }
   });
   const replaceDiscoveredSessions = (
-    sessions: readonly (SessionRecord | SessionView)[],
+    sessions: readonly SessionRecord[],
     diagnostics: readonly Diagnostic[],
   ): void => {
-    const retained = state.list().filter((session) =>
-      session.control.managerOwned || isRemoteSession(session)
-    );
+    let nextDiagnostics = [...diagnostics];
+    try {
+      persistDiscoveredWorkspaces(database, sessions);
+    } catch {
+      nextDiagnostics = [...nextDiagnostics, {
+        provider: "system",
+        level: "warning",
+        message: "A discovered repository could not be remembered for first run.",
+      }];
+    }
+    const discoveredIds = new Set(sessions.map((session) => session.id));
+    const retained = state.list().filter((session) => (
+      session.control.authority === "manager"
+      && session.control.plane !== "claude-hook-bridge"
+    ) || (
+      claudeHookPermissions.has(session.id)
+      && !discoveredIds.has(session.id)
+    ) || isRemoteSession(session));
     const retainedIds = new Set(retained.map((session) => session.id));
-    const external = sessions.filter((session) => {
-      const id = "id" in session ? session.id : `${session.provider}:${session.sessionId}`;
-      return !retainedIds.has(id);
-    });
-    state.replace([...external, ...retained], diagnostics);
+    const external = sessions
+      .filter((session) => !retainedIds.has(session.id))
+      .map(rememberClaudeHookBase)
+      .map(rememberCodexHookBase)
+      .map((session) => withLocalEditorCapability(session, editorLauncher !== null));
+    state.replace([...external, ...retained], nextDiagnostics);
   };
 
   if (options.initialSessions || options.initialDiagnostics) {
-    state.replace(options.initialSessions ?? state.list(), []);
+    try {
+      persistDiscoveredWorkspaces(database, options.initialSessions ?? state.list());
+    } catch {
+      // Initial observation must still render when optional setup persistence fails.
+    }
+    state.replace(
+      (options.initialSessions ?? state.list())
+        .map(rememberClaudeHookBase)
+        .map(rememberCodexHookBase)
+        .map((session) => withLocalEditorCapability(session, editorLauncher !== null)),
+      [],
+    );
     for (const diagnostic of options.initialDiagnostics ?? []) state.addDiagnostic(diagnostic);
   }
   database.markInterruptedDispatchesUnknown();
   database.recoverCreateSessionIntents();
+
+  try {
+    const recovery = codexRecoveryRecords(database);
+    for (const diagnostic of recovery.diagnostics) state.addDiagnostic(diagnostic);
+    if (recovery.records.length > 0) {
+      const restore = adapters.codex?.restoreManagedSessions;
+      if (!restore) {
+        state.addDiagnostic({
+          provider: "codex",
+          level: "warning",
+          message: `${recovery.records.length} persisted Codex manager session(s) could not be restored because private controls are unavailable`,
+        });
+      } else {
+        const controller = new AbortController();
+        const abortTimer = setTimeout(
+          () => controller.abort(new Error("Managed Codex recovery timed out")),
+          MANAGED_SESSION_RECOVERY_TIMEOUT_MS,
+        );
+        abortTimer.unref();
+        try {
+          const report = await bounded(
+            restore.call(adapters.codex, recovery.records, controller.signal),
+            MANAGED_SESSION_RECOVERY_TIMEOUT_MS,
+            "managed Codex recovery",
+          );
+          for (const failure of report.failures) {
+            state.addDiagnostic({
+              provider: "codex",
+              level: "warning",
+              message: `Could not restore ${failure.managerSessionId}: ${failure.reason}`,
+            });
+          }
+          if (report.truncated) {
+            state.addDiagnostic({
+              provider: "codex",
+              level: "warning",
+              message: "Managed Codex recovery reached its persisted-session limit",
+            });
+          }
+        } catch (error) {
+          controller.abort(error);
+          state.addDiagnostic({
+            provider: "codex",
+            level: "warning",
+            message: `Managed Codex recovery stopped safely: ${error instanceof Error ? error.message : String(error)}`,
+          });
+        } finally {
+          clearTimeout(abortTimer);
+        }
+      }
+    }
+  } catch (error) {
+    state.addDiagnostic({
+      provider: "codex",
+      level: "warning",
+      message: `Persisted Codex manager identities could not be read safely: ${error instanceof Error ? error.message : String(error)}`,
+    });
+  }
 
   remoteHosts.start({
     onSessions: (hostId, sessions) => {
@@ -428,6 +1022,15 @@ export async function createAgentManagerServer(
         if (!nextIds.has(previousId)) state.remove(previousId);
       }
       remoteSessionIds.set(hostId, nextIds);
+      try {
+        persistDiscoveredWorkspaces(database, sessions);
+      } catch {
+        state.addDiagnostic({
+          provider: "system",
+          level: "warning",
+          message: `A repository observed on ${hostId} could not be remembered.`,
+        });
+      }
       for (const session of sessions) state.upsert(session);
     },
     onDiagnostic: (diagnostic) => state.addDiagnostic(diagnostic),
@@ -452,7 +1055,12 @@ export async function createAgentManagerServer(
       throw new ApiError(400, "INVALID_HOST", "request Host is not allowed");
     }
 
-    if (isMutation(request.method) && !auth.validateMutationOrigin(request)) {
+    const isProviderHook = request.routeOptions.config.agentManagerPublicHook === true;
+    if (
+      isMutation(request.method)
+      && !isProviderHook
+      && !auth.validateMutationOrigin(request)
+    ) {
       throw new ApiError(403, "INVALID_ORIGIN", "mutation Origin is not allowed");
     }
     if (
@@ -463,13 +1071,10 @@ export async function createAgentManagerServer(
     }
 
     const path = request.url.split("?", 1)[0];
-    if (locked && path !== "/api/v1/healthz") {
-      throw new ApiError(423, "CONTROL_PLANE_LOCKED", "Agent Manager is locked");
-    }
     const publicPath = path === "/api/v1/healthz"
       || path === "/api/v1/auth/bootstrap"
       || path === "/api/v1/auth/session";
-    if (!path?.startsWith("/api/") || publicPath) return;
+    if (!path?.startsWith("/api/") || publicPath || isProviderHook) return;
 
     const session = auth.authenticateCookie(request);
     if (!session) throw new ApiError(401, "AUTH_REQUIRED", "authentication is required");
@@ -478,6 +1083,9 @@ export async function createAgentManagerServer(
       throw new ApiError(403, "CSRF_INVALID", "CSRF token is missing or invalid");
     }
   });
+
+  registerClaudeHookRoute(app, claudeHookBridge);
+  registerCodexHookRoute(app, codexHookBridge);
 
   app.addHook("onSend", async (request, reply, payload) => {
     const rawContentType = reply.getHeader("content-type");
@@ -574,7 +1182,7 @@ export async function createAgentManagerServer(
     actorId: session.actor.id,
   });
 
-  app.get("/api/v1/healthz", async () => ({ ok: !locked, locked }));
+  app.get("/api/v1/healthz", async () => ({ ok: true }));
 
   app.post("/api/v1/auth/bootstrap", {
     config: { rateLimit: { max: 10, timeWindow: "1 minute" } },
@@ -583,7 +1191,13 @@ export async function createAgentManagerServer(
     const session = auth.exchangeBootstrap(body.secret);
     if (!session) throw new ApiError(401, "BOOTSTRAP_INVALID", "bootstrap token is invalid or expired");
     reply.header("Set-Cookie", auth.sessionCookie(session, auth.cookieShouldBeSecure(request)));
-    return { authenticated: true, csrfToken: session.csrfToken, actor: session.actor };
+    return {
+      authenticated: true,
+      csrfToken: session.csrfToken,
+      actor: session.actor,
+      wireSchemaVersion: WIRE_SCHEMA_VERSION,
+      buildId: AGENT_MANAGER_BUILD_ID,
+    };
   });
 
   app.get("/api/v1/auth/session", {
@@ -591,12 +1205,24 @@ export async function createAgentManagerServer(
   }, async (request, reply) => {
     const existing = auth.authenticateCookie(request);
     if (existing) {
-      return { authenticated: true, csrfToken: existing.csrfToken, actor: existing.actor };
+      return {
+        authenticated: true,
+        csrfToken: existing.csrfToken,
+        actor: existing.actor,
+        wireSchemaVersion: WIRE_SCHEMA_VERSION,
+        buildId: AGENT_MANAGER_BUILD_ID,
+      };
     }
     const session = auth.establishTailscaleSession(request);
     if (!session) throw new ApiError(401, "AUTH_REQUIRED", "authentication is required");
     reply.header("Set-Cookie", auth.sessionCookie(session, auth.cookieShouldBeSecure(request)));
-    return { authenticated: true, csrfToken: session.csrfToken, actor: session.actor };
+    return {
+      authenticated: true,
+      csrfToken: session.csrfToken,
+      actor: session.actor,
+      wireSchemaVersion: WIRE_SCHEMA_VERSION,
+      buildId: AGENT_MANAGER_BUILD_ID,
+    };
   });
 
   app.get("/api/v1/sessions", async () => state.snapshot());
@@ -610,87 +1236,354 @@ export async function createAgentManagerServer(
     if (isRemoteSession(session)) {
       return { session: await remoteHosts.session(id) };
     }
-    let detail: TranscriptReadResult;
-    try {
-      detail = transcriptReader?.read(session) ?? {
-        messages: [],
-        transcript: {
-          state: "unavailable",
-          truncated: false,
-          source: null,
-          messageCount: 0,
-          reason: "unsupported",
-        },
-      };
-    } catch {
-      detail = {
-        messages: [],
-        transcript: {
-          state: "unavailable",
-          truncated: false,
-          source: null,
-          messageCount: 0,
-          reason: "unreadable",
-        },
-      };
-    }
-    return { session: { ...session, ...detail } };
+    return { session };
   });
 
-  app.get("/api/v1/sessions/:id/activity", {
+  app.get("/api/v1/sessions/:id/attention-details", {
+    config: { rateLimit: { max: 60, timeWindow: "1 minute" } },
+  }, async (request) => {
+    const sessionId = routeSessionId(request);
+    const session = state.get(sessionId);
+    if (!session) throw new ApiError(404, "SESSION_NOT_FOUND", "session was not found");
+    const query = selectedAttentionDetailsQuerySchema.parse(request.query);
+    const snapshot = activityHub.snapshot(sessionId);
+    const details: SelectedAttentionDetail[] = [];
+
+    for (const requestId of query.requestId) {
+      // The metadata record is the liveness gate. ActivityHub can retain a
+      // resolved or evicted request, but content is returned only while this
+      // exact request ID is still pending in the current global generation.
+      const metadataMatches = session.attention.filter((attention) =>
+        attention.id === requestId && attention.confidence === "exact"
+      );
+      if (metadataMatches.length !== 1) continue;
+      const metadata = metadataMatches[0]!;
+      const activityMatches = (snapshot?.items ?? []).filter((item): item is ActivityAttentionItem =>
+        item.kind === "attention"
+        && item.requestId === requestId
+        && item.attentionKind === metadata.kind
+        && item.confidence === "exact"
+        && item.exposure === "provider-exposed"
+        && !item.resolved
+        && (item.state === "pending" || item.state === "waiting")
+      );
+      if (activityMatches.length !== 1) continue;
+      const activity = activityMatches[0]!;
+      const parentTool = activity.parentId === null
+        ? null
+        : snapshot?.items.find((item) =>
+            item.id === activity.parentId
+            && item.kind === "tool"
+            && item.confidence === "exact"
+            && item.exposure === "provider-exposed"
+          ) ?? null;
+      const hookToolName = claudeHookPermissions.get(sessionId)?.get(requestId)?.toolName ?? null;
+
+      details.push({
+        requestId,
+        kind: activity.attentionKind,
+        title: activity.title && activity.title.trim().length > 0 ? activity.title : null,
+        toolName: hookToolName
+          ?? (parentTool?.kind === "tool" && parentTool.name.trim().length > 0 ? parentTool.name : null),
+        questions: activity.questions.flatMap((question) =>
+          question.id.trim().length > 0 && question.text.trim().length > 0
+            ? [{ id: question.id, text: question.text }]
+            : []
+        ),
+        truncated: activity.truncated,
+      });
+    }
+
+    // State and activity are updated independently. Never return a projection
+    // assembled across generations; the phone keeps the generic metadata row
+    // and will retry against the next request-ID key instead.
+    const current = state.get(sessionId);
+    if (!current) throw new ApiError(404, "SESSION_NOT_FOUND", "session was not found");
+    const stable = current.generation === session.generation
+      && current.provider === session.provider
+      && current.providerThreadId === session.providerThreadId;
+    return selectedAttentionDetailsResponseSchema.parse({
+      sessionId,
+      generation: current.generation,
+      details: stable ? details : [],
+    });
+  });
+
+  app.get("/api/v1/sessions/:id/todo-detail", {
+    config: { rateLimit: { max: 60, timeWindow: "1 minute" } },
+  }, async (request) => {
+    const sessionId = routeSessionId(request);
+    const session = state.get(sessionId);
+    if (!session) throw new ApiError(404, "SESSION_NOT_FOUND", "session was not found");
+
+    const progress = session.todoProgress;
+    const snapshot = activityHub.snapshot(sessionId);
+    const currentTodo = [...(snapshot?.items ?? [])]
+      .filter((item) => item.kind === "todo")
+      .sort((left, right) => right.seq - left.seq || right.id.localeCompare(left.id))[0];
+    let todo: {
+      completed: number;
+      total: number;
+      current: string | null;
+    } | null = null;
+
+    if (
+      progress
+      && progress.total > 0
+      && currentTodo?.kind === "todo"
+      && currentTodo.confidence === "exact"
+      && currentTodo.exposure === "provider-exposed"
+    ) {
+      const live = currentTodo.steps.filter((step) => step.status !== "removed");
+      const completed = live.filter((step) => step.status === "completed").length;
+      const active = live.filter((step) => step.status === "in_progress");
+      const activeMatches = active.length > 0 && completed < live.length;
+      if (
+        completed === progress.completed
+        && live.length === progress.total
+        && activeMatches === progress.active
+      ) {
+        const exactCurrent = active.length === 1 && active[0]!.text.trim().length > 0
+          ? active[0]!.text
+          : null;
+        todo = { completed, total: live.length, current: exactCurrent };
+      }
+    }
+
+    // Counts are the content-free join key. Recheck the global identity after
+    // reading ActivityHub so stale text can never be paired with a newer row.
+    const current = state.get(sessionId);
+    if (!current) throw new ApiError(404, "SESSION_NOT_FOUND", "session was not found");
+    const stable = current.generation === session.generation
+      && current.provider === session.provider
+      && current.providerThreadId === session.providerThreadId
+      && current.todoProgress?.completed === progress?.completed
+      && current.todoProgress?.total === progress?.total
+      && current.todoProgress?.active === progress?.active;
+    return selectedTodoDetailResponseSchema.parse({
+      sessionId,
+      generation: current.generation,
+      todo: stable ? todo : null,
+    });
+  });
+
+  app.get("/api/v1/sessions/:id/settings-options", {
+    config: { rateLimit: { max: 60, timeWindow: "1 minute" } },
+  }, async (request) => {
+    const session = state.get(routeSessionId(request));
+    if (!session) throw new ApiError(404, "SESSION_NOT_FOUND", "session was not found");
+    if (isRemoteSession(session)) {
+      return { available: false as const, reason: "remote-session" as const, models: [] };
+    }
+    if (session.control.authority !== "manager") {
+      return { available: false as const, reason: "not-manager-owned" as const, models: [] };
+    }
+    if (!session.control.capabilities.includes("set-model")) {
+      return { available: false as const, reason: "provider-unavailable" as const, models: [] };
+    }
+    const adapter = adapters[session.provider];
+    if (!adapter?.getSettingsOptions) {
+      return { available: false as const, reason: "unsupported-provider" as const, models: [] };
+    }
+    try {
+      const options = sessionSettingsOptionsSchema.parse(
+        await bounded(
+          adapter.getSettingsOptions(session, context(request)),
+          SETTINGS_OPTIONS_TIMEOUT_MS,
+          "provider settings lookup",
+        ),
+      );
+      const current = state.get(session.id);
+      if (
+        !current
+        || current.generation !== session.generation
+        || current.provider !== session.provider
+        || current.providerThreadId !== session.providerThreadId
+        || current.hostId !== "local"
+        || current.control.authority !== "manager"
+        || !current.control.capabilities.includes("set-model")
+      ) {
+        return { available: false as const, reason: "provider-unavailable" as const, models: [] };
+      }
+      return { available: true as const, ...options };
+    } catch {
+      return { available: false as const, reason: "provider-unavailable" as const, models: [] };
+    }
+  });
+
+  app.get("/api/v1/sessions/:id/facts", {
+    config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
+  }, async (request) => {
+    const sessionId = routeSessionId(request);
+    const session = state.get(sessionId);
+    if (!session) throw new ApiError(404, "SESSION_NOT_FOUND", "session was not found");
+    const query = selectedSessionFactsQuerySchema.parse(request.query);
+    if (query.generation !== session.generation) {
+      throw new ApiError(409, "STALE_GENERATION", "session state changed before facts were read");
+    }
+
+    const usageItems = (activityHub.snapshot(sessionId)?.items ?? [])
+      .filter((item) => item.kind === "usage" && item.scope === "turn")
+      .filter((item) => session.providerTurnId === null || item.turnId === session.providerTurnId)
+      .sort((left, right) => right.seq - left.seq || right.id.localeCompare(left.id));
+    const usage = usageItems[0];
+    const token = (value: number | null): number | null =>
+      value !== null && Number.isSafeInteger(value) && value >= 0 ? value : null;
+    const money = (value: number | null): number | null =>
+      value !== null && Number.isFinite(value) && value >= 0 ? value : null;
+    const turnUsage: SessionTurnUsage | null = usage?.kind === "usage"
+      ? {
+          turnId: usage.turnId,
+          inputTokens: token(usage.inputTokens),
+          outputTokens: token(usage.outputTokens),
+          cachedInputTokens: token(usage.cachedInputTokens),
+          reasoningTokens: token(usage.reasoningTokens),
+          totalTokens: token(usage.totalTokens),
+          costUsd: money(usage.costUsd),
+        }
+      : null;
+
+    let account: SessionAccountFacts;
+    if (isRemoteSession(session)) {
+      account = { available: false, reason: "remote-session" };
+    } else if (session.control.authority !== "manager") {
+      account = { available: false, reason: "not-manager-owned" };
+    } else if (session.provider !== "codex") {
+      account = { available: false, reason: "unsupported-provider" };
+    } else {
+      const adapter = adapters.codex;
+      if (!adapter?.getAccountFacts) {
+        account = { available: false, reason: "unsupported-provider" };
+      } else {
+        try {
+          account = availableSessionAccountFactsSchema.parse(await bounded(
+            adapter.getAccountFacts(session, context(request)),
+            Math.max(1, options.sessionFactsTimeoutMs ?? SESSION_FACTS_TIMEOUT_MS),
+            "Codex account facts lookup",
+          ));
+        } catch {
+          account = { available: false, reason: "provider-unavailable" };
+        }
+      }
+    }
+
+    const current = state.get(sessionId);
+    if (
+      !current
+      || current.generation !== session.generation
+      || current.provider !== session.provider
+      || current.providerThreadId !== session.providerThreadId
+      || current.providerTurnId !== session.providerTurnId
+    ) {
+      throw new ApiError(409, "STALE_GENERATION", "session state changed while facts were read");
+    }
+    return selectedSessionFactsResponseSchema.parse({
+      sessionId,
+      generation: current.generation,
+      turnUsage,
+      account,
+    });
+  });
+
+  app.get("/api/v1/sessions/:id/search", {
     config: { rateLimit: { max: 60, timeWindow: "1 minute" } },
   }, async (request) => {
     const id = routeSessionId(request);
     const session = state.get(id);
     if (!session) throw new ApiError(404, "SESSION_NOT_FOUND", "session was not found");
-    activityHub.ensureSession(id, session.provider);
+    const query = transcriptSearchQuerySchema.parse(request.query);
     if (isRemoteSession(session)) {
-      const release = remoteHosts.acquireActivity(id, activityHub, session.provider);
-      const timer = setTimeout(release, 1_500);
-      timer.unref();
-    } else if (shouldObserveTranscript(session)) {
-      transcriptActivity.seedOnce(session);
+      throw new ApiError(
+        409,
+        "TRANSCRIPT_SEARCH_UNAVAILABLE",
+        "remote transcript search is not available",
+      );
     }
-    const { before, limit } = activityHistoryQuerySchema.parse(request.query);
-    const snapshot = activityHub.snapshot(id);
-    if (!snapshot) {
-      return {
-        schemaVersion: 1,
-        sessionId: id,
-        provider: session.provider,
-        streamEpoch: activityHub.streamEpoch,
-        cursor: null,
-        items: [],
-        truncated: false,
-        hasMore: false,
-        nextBefore: null,
-      };
+    if (!transcriptReader?.search) {
+      throw new ApiError(
+        409,
+        "TRANSCRIPT_SEARCH_UNAVAILABLE",
+        "transcript search is not available for this session",
+      );
     }
-    const beforeSequence = before === undefined
-      ? null
-      : parseActivityCursor(before, activityHub.streamEpoch, id);
-    if (before !== undefined && beforeSequence === null) {
-      throw new ApiError(409, "ACTIVITY_CURSOR_STALE", "activity history cursor is invalid or expired");
-    }
-    const eligible = beforeSequence === null
-      ? snapshot.items
-      : snapshot.items.filter((item) => item.seq < beforeSequence);
-    const items = eligible.slice(-limit);
-    const hasMore = snapshot.truncated || eligible.length > items.length;
-    const first = items[0];
     return {
-      schemaVersion: snapshot.schemaVersion,
-      sessionId: id,
-      provider: session.provider,
-      streamEpoch: snapshot.streamEpoch,
-      cursor: snapshot.cursor,
-      items,
-      truncated: snapshot.truncated,
-      hasMore,
-      nextBefore: hasMore && first
-        ? encodeActivityCursor(snapshot.streamEpoch, id, first.seq)
-        : null,
+      sessionId: session.id,
+      ...transcriptReader.search(session, query.q, query.limit),
     };
+  });
+
+  app.get("/api/v1/sessions/:id/plans/:itemId", {
+    config: { rateLimit: { max: 60, timeWindow: "1 minute" } },
+  }, async (request) => {
+    const sessionId = routeSessionId(request);
+    const session = state.get(sessionId);
+    if (!session) throw new ApiError(404, "SESSION_NOT_FOUND", "session was not found");
+    if (isRemoteSession(session)) {
+      throw new ApiError(409, "PLAN_FILE_UNAVAILABLE", "remote plan-file reads are not available");
+    }
+    const itemId = (request.params as { itemId: string }).itemId;
+    const item = activityHub.snapshot(sessionId)?.items.find((candidate) =>
+      candidate.id === itemId && candidate.kind === "plan"
+    );
+    if (!item || item.kind !== "plan") {
+      throw new ApiError(404, "PLAN_ITEM_NOT_FOUND", "registered plan item was not found");
+    }
+    if (item.path === null) {
+      throw new ApiError(
+        409,
+        "PLAN_FILE_UNAVAILABLE",
+        "the provider did not supply a path for this plan",
+        { reason: "no-path" },
+      );
+    }
+    const result = planFileReader.read(item.path);
+    if (result.state === "unavailable") {
+      throw new ApiError(
+        409,
+        "PLAN_FILE_UNAVAILABLE",
+        "the registered plan file cannot be read safely",
+        { reason: result.reason },
+      );
+    }
+    return {
+      sessionId,
+      itemId: item.id,
+      path: item.path,
+      markdown: result.markdown,
+      truncated: result.truncated,
+    };
+  });
+
+  app.get("/api/v1/setup/harnesses", {
+    config: { rateLimit: { max: 10, timeWindow: "1 minute" } },
+  }, async () => setupHarnessProbeResponseSchema.parse({
+    harnesses: await (options.setupHarnessProbe ?? probeLocalHarnesses)(),
+  }));
+
+  app.get("/api/v1/setup", {
+    config: { rateLimit: { max: 10, timeWindow: "1 minute" } },
+  }, async (request) => {
+    requireSession(request);
+    syncRemoteHostDefinitions();
+    try {
+      persistDiscoveredWorkspaces(database, state.list());
+    } catch {
+      // The read model can still return already-known folders.
+    }
+    const [hooks, hosts] = await Promise.all([
+      setupHooks.offers(),
+      probeSetupHosts({
+        hosts: database.listHosts(),
+        remoteStates: remoteHosts.states(),
+        localProbe: options.setupHarnessProbe ?? probeLocalHarnesses,
+        remoteProbe: options.setupRemoteHarnessProbe ?? ((hostId) => remoteHosts.probeHarnesses(hostId)),
+      }),
+    ]);
+    return setupReadModelSchema.parse({
+      nearby: setupNearbyWorkspaces(database, state.list()),
+      hooks,
+      hosts,
+    });
   });
 
   app.get("/api/v1/hosts", async () => {
@@ -725,7 +1618,9 @@ export async function createAgentManagerServer(
     return { hostId, paths };
   });
 
-  app.get("/api/v1/workspaces", async () => ({ workspaces: database.listWorkspaces() }));
+  app.get("/api/v1/workspaces", async () => workspaceListResponseSchema.parse({
+    workspaces: database.listWorkspaces(),
+  }));
 
   app.post("/api/v1/workspaces/resolve", {
     config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
@@ -735,25 +1630,20 @@ export async function createAgentManagerServer(
     const host = database.getHost(input.hostId);
     if (!host) throw new ApiError(404, "HOST_NOT_FOUND", "host is not configured");
     try {
-      if (host.kind === "local") {
-        const path = resolveLocalWorkspacePath(input.path);
-        return {
-          workspace: database.addWorkspace({
-            hostId: host.id,
-            label: workspaceLabel(path),
-            path,
-          }),
-        };
-      }
-      const resolved = await remoteHosts.resolveWorkspace(host.id, input.path);
-      return {
-        workspace: database.addWorkspace({
-          hostId: host.id,
-          label: resolved.label,
-          path: resolved.path,
-          remoteWorkspaceId: resolved.remoteWorkspaceId,
-        }),
-      };
+      const resolved = await resolveWorkspaceForHost({
+        hostId: host.id,
+        hostKind: host.kind,
+        path: input.path,
+        localResolver: workspaceIdentityResolver,
+        remote: remoteHosts,
+      });
+      const workspace = database.addWorkspace({
+        hostId: host.id,
+        label: resolved.label,
+        path: resolved.path,
+        remoteWorkspaceId: resolved.remoteWorkspaceId,
+      });
+      return workspaceResolutionResponse(workspace, resolved.workspaceIdentity);
     } catch (error) {
       if (error instanceof RemoteNodeError) throw error;
       throw new ApiError(400, "WORKSPACE_INVALID", "workspace path is not an accessible directory");
@@ -799,7 +1689,13 @@ export async function createAgentManagerServer(
     if (!session) throw new ApiError(404, "SESSION_NOT_FOUND", "session was not found");
     if (isRemoteSession(session)) return remoteHosts.attach(session.id);
     let instruction: AttachInstruction | null = null;
-    if (session.control.managerOwned && session.control.capabilities.includes("attach")) {
+    if (
+      session.control.authority === "manager"
+      && (
+        session.control.capabilities.includes("attach")
+        || session.control.capabilities.includes("resume")
+      )
+    ) {
       // The browser may only advertise the owner-socket wrapper. Returning a
       // raw provider command here would let a copied command bypass the
       // native handoff state machine and race the manager for ownership.
@@ -865,6 +1761,7 @@ export async function createAgentManagerServer(
       if (expiry) clearTimeout(expiry);
       unsubscribe();
       sseClients.delete(reply);
+      scheduleClaudePermissionPresenceCheck();
       if (!reply.raw.destroyed) reply.raw.destroy();
     };
     const write = (chunk: string): boolean => {
@@ -878,13 +1775,21 @@ export async function createAgentManagerServer(
         return false;
       }
     };
-    sseClients.set(reply, { authSessionId: authSession.id, clientId, channel, close });
+    sseClients.set(reply, {
+      authSessionId: authSession.id,
+      clientId,
+      channel,
+      sessionId: null,
+      close,
+    });
 
     const supplied = request.headers["last-event-id"];
     const value = Array.isArray(supplied) ? supplied[0] : supplied;
     const after = value === undefined ? null : Number.parseInt(value, 10);
     if (after === null || !Number.isSafeInteger(after) || after < 0) {
       write(encodeSse({
+        schemaVersion: WIRE_SCHEMA_VERSION,
+        buildId: AGENT_MANAGER_BUILD_ID,
         seq: state.events.sequence,
         type: "snapshot",
         at: new Date().toISOString(),
@@ -894,6 +1799,8 @@ export async function createAgentManagerServer(
       const replay = state.events.replayAfter(after);
       if (replay.gap) {
         write(encodeSse({
+          schemaVersion: WIRE_SCHEMA_VERSION,
+          buildId: AGENT_MANAGER_BUILD_ID,
           seq: state.events.sequence,
           type: "snapshot",
           at: new Date().toISOString(),
@@ -943,6 +1850,31 @@ export async function createAgentManagerServer(
     if (sseClients.size >= maxSseClients || actorStreams >= maxSseClientsPerAuthSession) {
       throw new ApiError(429, "SSE_LIMIT_REACHED", "too many live event streams");
     }
+    const providerAdapter = adapters[session.provider];
+    let releaseProviderSelection: () => void | Promise<void> = () => undefined;
+    if (
+      session.hostId === "local"
+      && session.provider === "codex"
+      && session.control.plane === "codex-private"
+      && session.control.authority === "manager"
+      && providerAdapter?.acquireSelectedSession
+    ) {
+      try {
+        releaseProviderSelection = await providerAdapter.acquireSelectedSession(session, {
+          actor: authSession.actor,
+          requestId: request.id,
+          signal: requestAbortSignal(request),
+          workspace: null,
+          managerSessionId: id,
+        });
+      } catch {
+        throw new ApiError(
+          503,
+          "SESSION_DETAIL_UNAVAILABLE",
+          "the selected Codex session could not be loaded safely",
+        );
+      }
+    }
     const releaseTranscript = isRemoteSession(session)
       ? remoteHosts.acquireActivity(id, activityHub, session.provider)
       : shouldObserveTranscript(session)
@@ -972,7 +1904,9 @@ export async function createAgentManagerServer(
       if (expiry) clearTimeout(expiry);
       unsubscribe();
       releaseTranscript();
+      void Promise.resolve(releaseProviderSelection()).catch(() => undefined);
       sseClients.delete(reply);
+      scheduleClaudePermissionPresenceCheck();
       if (!reply.raw.destroyed) reply.raw.destroy();
     };
     const write = (frame: ActivityFrame): boolean => {
@@ -990,7 +1924,13 @@ export async function createAgentManagerServer(
         return false;
       }
     };
-    sseClients.set(reply, { authSessionId: authSession.id, clientId, channel, close });
+    sseClients.set(reply, {
+      authSessionId: authSession.id,
+      clientId,
+      channel,
+      sessionId: id,
+      close,
+    });
 
     // Subscribe before reading the snapshot/replay high-water. Frames that
     // arrive during initialization are buffered, then de-duplicated by the
@@ -1085,8 +2025,9 @@ export async function createAgentManagerServer(
           provider: input.provider,
           workspaceId: input.workspaceId,
           hostId: workspace.hostId,
-          mode: input.mode,
-          accessMode: input.accessMode,
+          profile: input.profile,
+          model: input.model,
+          effort: input.effort,
         },
       });
       database.markCreateSessionDispatching(authSession.actor.id, input.idempotencyKey);
@@ -1128,7 +2069,7 @@ export async function createAgentManagerServer(
         "the provider creation outcome is unknown and will not be replayed",
       );
     }
-    if (created.provider !== input.provider || !created.control.managerOwned) {
+    if (created.provider !== input.provider || created.control.authority !== "manager") {
       database.markCreateSessionUnknown(authSession.actor.id, input.idempotencyKey);
       try {
         database.auditOperation({
@@ -1153,13 +2094,14 @@ export async function createAgentManagerServer(
         session: {
           id: created.id,
           provider: created.provider,
-          providerSessionId: workspace.hostKind === "ssh" ? created.id : created.sessionId,
+          providerSessionId: created.providerThreadId,
           workspaceId: workspace.id,
           metadata: {
             managerRequestId: begun.intent.managerRequestId,
             name: input.name ?? null,
-            mode: input.mode,
-            accessMode: input.accessMode,
+            profile: input.profile,
+            model: input.model,
+            effort: input.effort,
             hostId: workspace.hostId,
           },
           createdAt: created.startedAt ?? now,
@@ -1187,7 +2129,7 @@ export async function createAgentManagerServer(
         "the session may exist but its durable creation receipt could not be committed",
       );
     }
-    const stored = state.upsert(created);
+    const stored = state.upsert(withLocalEditorCapability(created, editorLauncher !== null));
     try {
       database.auditOperation({
         actor: authSession.actor,
@@ -1213,7 +2155,20 @@ export async function createAgentManagerServer(
     const session = state.get(routeSessionId(request));
     if (!session) throw new ApiError(404, "SESSION_NOT_FOUND", "session was not found");
     if (!session.control.capabilities.some((capability) =>
-      ["queue", "steer", "interrupt", "respond", "set-mode"].includes(capability)
+      [
+        "queue",
+        "steer",
+        "interrupt",
+        "respond",
+        "set-profile",
+        "set-model",
+        "set-effort",
+        "remove-queued",
+        "end",
+        "archive",
+        "delete",
+        "open-editor",
+      ].includes(capability)
     )) {
       throw new ApiError(409, "CONTROL_UNAVAILABLE", "session has no writable semantic controls");
     }
@@ -1271,39 +2226,6 @@ export async function createAgentManagerServer(
       throw new ApiError(500, "LEASE_AUDIT_FAILED", "lease outcome could not be recorded safely");
     }
     return { lease };
-  });
-
-  app.delete("/api/v1/control-leases", async (request, reply) => {
-    const authSession = requireSession(request);
-    try {
-      database.auditOperation({
-        actor: authSession.actor,
-        operation: "lease.release-all",
-        targetId: authSession.actor.id,
-        phase: "attempt",
-        outcome: "requested",
-      });
-    } catch {
-      throw new ApiError(500, "LEASE_AUDIT_FAILED", "lease release could not be recorded safely");
-    }
-    const releasedSessionIds = leases.releaseForAuthSession(authSession.id);
-    try {
-      database.auditOperation({
-        actor: authSession.actor,
-        operation: "lease.release-all",
-        targetId: authSession.actor.id,
-        phase: "outcome",
-        outcome: "succeeded",
-        details: { releasedCount: releasedSessionIds.length },
-      });
-    } catch {
-      state.addDiagnostic({
-        provider: "system",
-        level: "error",
-        message: `Browser lease release completed for ${releasedSessionIds.length} sessions without an outcome audit`,
-      });
-    }
-    void reply.status(204).send();
   });
 
   app.delete("/api/v1/sessions/:id/control-lease", async (request, reply) => {
@@ -1444,13 +2366,58 @@ export async function createAgentManagerServer(
           await remoteHosts.acquireControl(session.id, false, true);
         }
 
-        const dispatchAction = () => isRemoteSession(session)
-          ? remoteHosts.performAction(session.id, action)
-          : providerAdapter(adapters, session.provider).performAction(
-              session,
-              action,
-              context(request),
-            );
+        const dispatchAction = async () => {
+          if (
+            action.type === "respond"
+            && session.control.plane === "claude-hook-bridge"
+          ) {
+            try {
+              return claudeHookBridge.respondWithEnvelope(
+                action.requestId,
+                action.response.kind === "decision"
+                  ? {
+                      kind: "decision",
+                      decision: action.response.decision,
+                      ...(action.response.reason === undefined
+                        ? {}
+                        : { reason: action.response.reason }),
+                      ...(action.response.persist === undefined
+                        ? {}
+                        : { persist: action.response.persist }),
+                    }
+                  : action.response,
+              )
+                ? { status: "succeeded" as const }
+                : {
+                    status: "failed" as const,
+                    error: {
+                      code: "REQUEST_STALE",
+                      message: "the Claude hook request is no longer active",
+                    },
+                  };
+            } catch {
+              return {
+                status: "failed" as const,
+                error: {
+                  code: "CLAUDE_HOOK_RESPONSE_INVALID",
+                  message: "the response does not match the exact Claude request",
+                },
+              };
+            }
+          }
+          if (action.type === "open-editor" && editorLauncher) {
+            await editorLauncher.open(session, action);
+            return { status: "succeeded" as const };
+          }
+          if (isRemoteSession(session)) {
+            return remoteHosts.performAction(session.id, action);
+          }
+          return providerAdapter(adapters, session.provider).performAction(
+            session,
+            action,
+            context(request),
+          );
+        };
         const actionId = randomUUID();
         const createdAt = new Date().toISOString();
         let record = actionRecord(actionId, id, action, "pending", createdAt);
@@ -1490,7 +2457,7 @@ export async function createAgentManagerServer(
               ...(result.status === "queued" ? {} : { completedAt: new Date().toISOString() }),
               ...(result.status === "failed"
                 ? {
-                    error: {
+                    error: result.error ?? {
                       code: "PROVIDER_REJECTED",
                       message: "the provider rejected the requested action",
                     },
@@ -1552,7 +2519,7 @@ export async function createAgentManagerServer(
             sessionId: id,
             generation: action.expectedGeneration,
             action,
-            requestOrRunId: action.expectedRunId ?? null,
+            requestOrRunId: action.expectedProviderTurnId ?? null,
             outcome: "dispatch-attempt",
             providerAcknowledged: false,
             precondition: `generation=${action.expectedGeneration};capability=${capability}`,
@@ -1593,7 +2560,7 @@ export async function createAgentManagerServer(
             ...(result.status === "queued" ? {} : { completedAt: new Date().toISOString() }),
             ...(result.status === "failed"
               ? {
-                  error: {
+                  error: result.error ?? {
                     code: "PROVIDER_REJECTED",
                     message: "the provider rejected the requested action",
                   },
@@ -1626,7 +2593,7 @@ export async function createAgentManagerServer(
             sessionId: id,
             generation: action.expectedGeneration,
             action,
-            requestOrRunId: action.expectedRunId ?? null,
+            requestOrRunId: action.expectedProviderTurnId ?? null,
             outcome: record.status,
             providerAcknowledged: acknowledged,
             precondition: `generation=${action.expectedGeneration};capability=${capability}`,
@@ -1685,7 +2652,7 @@ export async function createAgentManagerServer(
         if (acknowledged && auditPersisted && record.status !== "unknown") {
           database.acknowledgeAction(actionId);
         } else {
-          database.markActionUnknown(actionId, record.completedAt);
+          database.markActionUnknown(actionId, record.completedAt ?? undefined);
         }
         state.publishAction(record);
         return record;
@@ -1705,18 +2672,13 @@ export async function createAgentManagerServer(
     return reply.status(404).send(errorBody("NOT_FOUND", "route was not found"));
   });
 
-  const enterLocked = (): void => {
-    if (locked) return;
-    locked = true;
-    auth.revokeAll();
-    leases.releaseAll();
-    for (const client of [...sseClients.values()]) client.close();
-  };
-
   const cleanupResources = (): Promise<void> => {
     if (cleanupPromise) return cleanupPromise;
     cleanupPromise = (async () => {
       const errors: unknown[] = [];
+      claudeHookBridge.shutdown();
+      for (const timer of codexHookExpiryTimers.values()) clearTimeout(timer);
+      codexHookExpiryTimers.clear();
       for (const handoff of nativeHandoffs.values()) {
         clearTimeout(handoff.timer);
         if (handoff.wrapperMonitor) clearInterval(handoff.wrapperMonitor);
@@ -1756,6 +2718,7 @@ export async function createAgentManagerServer(
         }
       }
       transcriptActivity.dispose();
+      releaseTodoProgress();
       remoteHosts.dispose();
       if (options.onShutdown) {
         tasks.push(bounded(Promise.resolve(options.onShutdown()), shutdownTimeoutMs, "runtime shutdown"));
@@ -1785,8 +2748,12 @@ export async function createAgentManagerServer(
     return cleanupPromise;
   };
 
+  app.addHook("preClose", async () => {
+    // Release held PermissionRequest POSTs before Fastify waits for routes to drain.
+    claudeHookBridge.shutdown();
+  });
+
   app.addHook("onClose", async () => {
-    enterLocked();
     await cleanupResources();
   });
 
@@ -1843,7 +2810,7 @@ export async function createAgentManagerServer(
     if (handoff.reclaimCompleted) return;
     handoff.reclaimCompleted = true;
     handoff.reclaimedView = view;
-    if (view) state.upsert(view);
+    if (view) state.upsert(withLocalEditorCapability(view, editorLauncher !== null));
     try {
       auditHandoff(sessionId, "outcome", "reclaimed", { provider: handoff.provider });
     } catch {
@@ -1961,9 +2928,14 @@ export async function createAgentManagerServer(
   };
 
   const nativeAttach = async (sessionId: string): Promise<AttachInstruction> => {
-    if (locked) throw new Error("control plane is locked");
     const session = state.get(sessionId);
     if (!session) throw new Error("session not found");
+    if (
+      !session.control.capabilities.includes("attach")
+      && !session.control.capabilities.includes("resume")
+    ) {
+      throw new Error("session does not advertise native attach or resume");
+    }
     if (nativeHandoffs.has(sessionId)) throw new Error("native handoff is already active");
     const adapter = adapters[session.provider];
     const reservationId = randomUUID();
@@ -1978,7 +2950,7 @@ export async function createAgentManagerServer(
       handoffId: reservationId,
       spawnNonce,
       provider: session.provider,
-      providerSessionId: session.sessionId,
+      providerSessionId: session.providerThreadId,
       timer,
       status: "preparing",
       providerNotified: false,
@@ -2126,30 +3098,26 @@ export async function createAgentManagerServer(
     controlSocket = await startOwnerControlSocket(options.controlSocketPath, {
       auth,
       bootstrapOrigin: publicOrigin,
-      isLocked: () => locked,
-      onPanicLock: async () => {
-        enterLocked();
-        try {
-          database.auditOperation({
-            actor: localOwnerActor,
-            operation: "panic.lock",
-            targetId: "control-plane",
-            phase: "attempt",
-            outcome: "locked-cleanup-starting",
-          });
-        } catch {
-          state.addDiagnostic({
-            provider: "system",
-            level: "error",
-            message: "Panic lock engaged, but its audit row could not be persisted",
-          });
-        }
-        try {
-          await bounded(app.close(), shutdownTimeoutMs + 250, "panic cleanup");
-        } catch (error) {
-          await cleanupResources().catch(() => undefined);
-          throw error;
-        }
+      onReloadHooks: () => {
+        claudeHookBridge.replaceAuthorizationRecords(
+          database.listClaudeHookInstallRecords().map((record) => ({
+            id: record.id,
+            provider: "claude",
+            tokenDigest: record.tokenDigest,
+            createdAt: record.createdAt,
+            settingsPath: record.settingsPath,
+          })),
+        );
+        codexHookBridge.replaceAuthorizationRecords(
+          database.listCodexHookInstallRecords().map((record) => ({
+            id: record.id,
+            provider: "codex",
+            tokenDigest: record.tokenDigest,
+            createdAt: record.createdAt,
+            settingsPath: record.settingsPath,
+            shimPath: record.shimPath,
+          })),
+        );
       },
       onAttach: nativeAttach,
       onAttachAuthorizeSpawn: (sessionId, handoffId, spawnNonce, wrapperPid) => {
@@ -2228,6 +3196,7 @@ export async function createAgentManagerServer(
 
   if (options.discovery !== false) {
     discovery = new DiscoveryReconciler({
+      workspaceResolver: workspaceIdentityResolver,
       ...(options.discovery ?? {}),
       onUpdate: (update) => {
         if (update.ok) {
@@ -2262,14 +3231,12 @@ export async function createAgentManagerServer(
       try {
         return await app.listen({ host, port });
       } catch (error) {
-        enterLocked();
         await app.close().catch(() => undefined);
         await cleanupResources().catch(() => undefined);
         throw error;
       }
     },
     close: async () => {
-      enterLocked();
       try {
         await bounded(app.close(), shutdownTimeoutMs + 250, "server shutdown");
       } catch (error) {

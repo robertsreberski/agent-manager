@@ -349,6 +349,7 @@ export function attachTmuxTerminals(
 ): SessionRecord[] {
   const pidCounts = new Map<number, number>();
   for (const record of records) {
+    if (record.hostId !== "local") continue;
     for (const pid of new Set([record.pid, record.runtimePid].filter((value): value is number => value !== null))) {
       pidCounts.set(pid, (pidCounts.get(pid) ?? 0) + 1);
     }
@@ -358,14 +359,18 @@ export function attachTmuxTerminals(
   );
 
   return records.map((record) => {
+    // This process table and these panes belong to the local discovery worker.
+    // Remote terminals are projected by their remote host and must never be
+    // correlated against local pid/tty/socket facts.
+    if (record.hostId !== "local") return record;
     const pane = matchSessionToTmuxPane(record, panes, processes, sharedPids);
     if (!pane) return record;
     const control = record.control.plane === "observe-only"
       ? {
           plane: "tmux-attach" as const,
+          authority: "foreign" as const,
           capabilities: ["preview", "attach"] as const,
-          managerOwned: false,
-          writableLease: false,
+          withheld: record.control.withheld,
         }
       : record.control;
     return {

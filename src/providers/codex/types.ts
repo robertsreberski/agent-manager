@@ -1,4 +1,5 @@
 import type { ActivityMutation } from "../../activity/index.ts";
+import type { AvailableSessionAccountFacts } from "../../shared/session-facts.ts";
 
 export type JsonRpcId = string | number;
 
@@ -12,7 +13,23 @@ export type JsonValue =
 
 export type JsonObject = { [key: string]: JsonValue };
 
-export type CodexMode = "planning" | "execution";
+export type CodexExecutionProfile =
+  | "ask-first"
+  | "plan"
+  | "execute"
+  | "full-access";
+
+export type CodexReasoningEffort = string;
+
+export type CodexSettingsDelivery =
+  | "experimental-rpc"
+  | "next-turn"
+  | "unavailable";
+
+export type CodexControllerState =
+  | "available"
+  | "foreign-environment"
+  | "ambiguous-environment";
 
 export type CodexThreadStatus =
   | "not-loaded"
@@ -31,20 +48,27 @@ export type CodexControlCapability =
   | "thread.start"
   | "thread.resume"
   | "thread.read"
+  | "thread.unsubscribe"
+  | "thread.rename"
+  | "thread.archive"
+  | "thread.delete"
   | "turn.queue"
   | "turn.steer"
   | "turn.interrupt"
   | "request.respond"
-  | "mode.set"
+  | "profile.set"
+  | "model.set"
+  | "effort.set"
   | "native.attach";
 
 export interface CodexAdapterCapabilities {
-  /** False as soon as the private App Server transport is lost. */
+  /** False as soon as the App Server transport is lost. */
   runtimeAlive: boolean;
   compatible: boolean;
   serverVersion: string | null;
   serverUserAgent: string | null;
   supportedVersion: "0.146.x";
+  settingsDelivery: CodexSettingsDelivery;
   controls: readonly CodexControlCapability[];
   reason: string | null;
 }
@@ -55,8 +79,6 @@ export type CodexPendingRequestKind =
   | "user-input"
   | "permission-approval"
   | "elicitation"
-  | "legacy-command-approval"
-  | "legacy-file-change-approval"
   | "unsupported";
 
 export interface CodexPendingRequest {
@@ -80,30 +102,66 @@ export interface CodexQueuedMessage {
 
 export interface CodexThreadState {
   threadId: string;
+  treeId: string | null;
+  parentThreadId: string | null;
   cwd: string | null;
+  name: string | null;
+  preview: string | null;
+  source: string | null;
   model: string | null;
-  mode: CodexMode | "unknown";
+  effort: CodexReasoningEffort | null;
+  profile: CodexExecutionProfile | null;
   status: CodexThreadStatus;
   activeTurnId: string | null;
   lastTurnStatus: CodexTurnStatus | null;
   pendingRequests: readonly CodexPendingRequest[];
   queue: readonly CodexQueuedMessage[];
+  environmentIds: readonly string[];
+  controller: CodexControllerState;
+  writeBlockedReason: string | null;
+  pendingSettings: CodexPendingSettings | null;
   generation: number;
+}
+
+export interface CodexThreadIdentity {
+  threadId: string;
+  treeId: string | null;
+  parentThreadId: string | null;
+  cwd: string | null;
+}
+
+export interface CodexPendingSettings {
+  profile?: CodexExecutionProfile;
+  model?: string;
+  effort?: CodexReasoningEffort;
+  delivery: Exclude<CodexSettingsDelivery, "unavailable">;
+}
+
+/** A picker entry returned by the pinned App Server's `model/list` method. */
+export interface CodexModelOption {
+  value: string;
+  label: string;
+  description: string | null;
+  isDefault: boolean;
+  defaultEffort: string;
+  efforts: readonly string[];
 }
 
 export interface StartCodexThreadOptions {
   cwd: string;
   model?: string;
+  effort?: CodexReasoningEffort;
   approvalPolicy?: "untrusted" | "on-request" | "never";
   sandbox?: "read-only" | "workspace-write" | "danger-full-access";
   permissions?: string;
-  mode?: CodexMode;
+  profile?: CodexExecutionProfile;
   initialMessage?: string;
 }
 
 export interface ResumeCodexThreadOptions {
   cwd?: string;
   model?: string;
+  effort?: CodexReasoningEffort;
   approvalPolicy?: "untrusted" | "on-request" | "never";
   sandbox?: "read-only" | "workspace-write" | "danger-full-access";
   permissions?: string;
@@ -120,6 +178,11 @@ export type CodexAdapterEvent =
       type: "state.changed";
       threadId: string;
       state: CodexThreadState;
+    }
+  | {
+      type: "thread.removed";
+      threadId: string;
+      reason: "ended" | "archived" | "deleted";
     }
   | {
       type: "request.pending";
@@ -162,6 +225,13 @@ export interface ManagedCodexAdapter {
     options?: ResumeCodexThreadOptions,
   ): Promise<CodexThreadState>;
   readThread(threadId: string): Promise<CodexThreadState>;
+  listModels(): Promise<readonly CodexModelOption[]>;
+  readAccountFacts(): Promise<AvailableSessionAccountFacts>;
+  adoptThread(
+    threadId: string,
+    expectedIdentity: CodexThreadIdentity,
+  ): Promise<CodexThreadState>;
+  releaseThread(threadId: string): Promise<void>;
   queueMessage(threadId: string, text: string): Promise<CodexQueuedMessage>;
   steer(
     threadId: string,
@@ -174,7 +244,14 @@ export interface ManagedCodexAdapter {
     requestId: JsonRpcId,
     response: JsonObject,
   ): Promise<void>;
-  setMode(threadId: string, mode: CodexMode): Promise<void>;
+  setProfile(threadId: string, profile: CodexExecutionProfile): Promise<void>;
+  setModel(threadId: string, model: string): Promise<void>;
+  setEffort(threadId: string, effort: CodexReasoningEffort): Promise<void>;
+  removeQueuedMessage(threadId: string, messageId: string): Promise<void>;
+  renameThread(threadId: string, name: string): Promise<void>;
+  archiveThread(threadId: string): Promise<void>;
+  deleteThread(threadId: string): Promise<void>;
+  endThread(threadId: string): Promise<void>;
   getThreadState(threadId: string): CodexThreadState | null;
   listThreadStates(): readonly CodexThreadState[];
   buildAttachCommand(threadId: string): CodexAttachCommand;

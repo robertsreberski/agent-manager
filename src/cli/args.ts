@@ -1,5 +1,4 @@
 export type CliCommand =
-  | { name: "list"; args: string[] }
   | { name: "serve"; host: "127.0.0.1"; port: number }
   | { name: "open"; launchBrowser: boolean }
   | { name: "attach"; sessionId: string }
@@ -9,9 +8,14 @@ export type CliCommand =
   | { name: "host"; operation: "add"; label: string; target: string }
   | { name: "tailscale"; operation: "install" | "status" | "off" }
   | { name: "service"; operation: "print" | "install" }
+  | {
+      name: "hooks";
+      operation: "status" | "install" | "uninstall";
+      provider: "claude" | "codex" | null;
+      scope: "user" | "project";
+      yes: boolean;
+    }
   | { name: "node"; operation: "bridge" }
-  | { name: "panic-lock" }
-  | { name: "panic-unlock" }
   | { name: "help" };
 
 function required(value: string | undefined, message: string): string {
@@ -29,14 +33,12 @@ function parsePort(value: string | undefined): number {
 
 export function parseCliCommand(argv: readonly string[]): CliCommand {
   const [rawCommand, ...rest] = argv;
-  const command = rawCommand ?? "list";
+  const command = rawCommand ?? "open";
   switch (command) {
     case "-h":
     case "--help":
     case "help":
       return { name: "help" };
-    case "list":
-      return { name: "list", args: rest };
     case "serve": {
       let host: "127.0.0.1" = "127.0.0.1";
       let port = 43_127;
@@ -109,18 +111,56 @@ export function parseCliCommand(argv: readonly string[]): CliCommand {
       }
       throw new Error("Usage: agent-manager service print|install");
     }
+    case "hooks": {
+      const operation = rest[0];
+      if (operation !== "status" && operation !== "install" && operation !== "uninstall") {
+        throw new Error(
+          "Usage: agent-manager hooks status|install|uninstall [--provider claude|codex] [--scope user|project] [--yes]",
+        );
+      }
+      let provider: "claude" | "codex" | null = null;
+      let scope: "user" | "project" = "user";
+      let yes = false;
+      const seen = new Set<string>();
+      for (let index = 1; index < rest.length; index += 1) {
+        const argument = rest[index];
+        if (argument === "--provider") {
+          if (seen.has(argument)) throw new Error("--provider may be supplied only once");
+          seen.add(argument);
+          const value = required(rest[index + 1], "--provider requires claude or codex");
+          if (value !== "claude" && value !== "codex") {
+            throw new Error("--provider requires claude or codex");
+          }
+          provider = value;
+          index += 1;
+        } else if (argument === "--scope") {
+          if (seen.has(argument)) throw new Error("--scope may be supplied only once");
+          seen.add(argument);
+          const value = required(rest[index + 1], "--scope requires user or project");
+          if (value !== "user" && value !== "project") {
+            throw new Error("--scope requires user or project");
+          }
+          scope = value;
+          index += 1;
+        } else if (argument === "--yes") {
+          if (yes) throw new Error("--yes may be supplied only once");
+          yes = true;
+        } else {
+          throw new Error(`Unknown hooks option: ${String(argument)}`);
+        }
+      }
+      if (operation !== "status" && provider === null) {
+        throw new Error(`hooks ${operation} requires --provider claude or --provider codex`);
+      }
+      if (operation === "status" && yes) {
+        throw new Error("--yes is valid only for hook installation or removal");
+      }
+      return { name: "hooks", operation, provider, scope, yes };
+    }
     case "node":
       if (rest.length === 1 && rest[0] === "bridge") return { name: "node", operation: "bridge" };
       throw new Error("Usage: agent-manager node bridge");
-    case "panic-lock":
-      if (rest.length > 0) throw new Error("Usage: agent-manager panic-lock");
-      return { name: "panic-lock" };
-    case "panic-unlock":
-      if (rest.length > 0) throw new Error("Usage: agent-manager panic-unlock");
-      return { name: "panic-unlock" };
     default:
-      // Preserve the original script's convenient option-first invocation.
-      if (command.startsWith("-")) return { name: "list", args: [command, ...rest] };
       throw new Error(`Unknown command: ${command}`);
   }
 }
@@ -128,7 +168,7 @@ export function parseCliCommand(argv: readonly string[]): CliCommand {
 export const CLI_HELP = `Agent Manager local cockpit
 
 Usage:
-  agent-manager list [agent-sessions options]
+  agent-manager                         Open the cockpit
   agent-manager serve [--host 127.0.0.1] [--port 43127]
   agent-manager open [--no-browser]
   agent-manager attach <session-id>
@@ -136,10 +176,10 @@ Usage:
   agent-manager workspace list|add <path>|remove <id>
   agent-manager host list|add <name> <ssh-target>|install <ssh-target>|remove <id>
   agent-manager tailscale install|status|off
+  agent-manager hooks status [--provider claude|codex] [--scope user|project]
+  agent-manager hooks install|uninstall --provider claude|codex [--scope user|project] [--yes]
   agent-manager service print|install
   agent-manager node bridge
-  agent-manager panic-lock
-  agent-manager panic-unlock
 
-Controls are capability-gated. Existing external sessions remain attach-only.
+Controls are capability-gated per session and provider; unavailable actions are never implied.
 `;

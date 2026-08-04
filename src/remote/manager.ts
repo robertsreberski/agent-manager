@@ -1,11 +1,23 @@
 import { hostname } from "node:os";
+import { isAbsolute } from "node:path";
 
 import type { ActivityHub } from "../activity/hub.ts";
-import type { ActivityItem, ActivityItemDraft } from "../activity/types.ts";
 import type { Diagnostic, Provider, SessionView } from "../core/types.ts";
+import { sessionRecordId } from "../shared/session.ts";
 import type { ActionDispatchResult, CreateSessionInput, SessionAction } from "../server/contracts.ts";
 import type { WorkspaceRecord } from "../server/persistence.ts";
+import {
+  setupHarnessProbeResponseSchema,
+  type SetupHarnessProbe,
+} from "../shared/setup.ts";
+import {
+  parseStateSnapshot,
+  sessionRecordSchema,
+} from "../shared/wire.ts";
+import { workspaceResolutionResponseSchema } from "../shared/workspace.ts";
+import { RemoteActivityMirror } from "./activity-stream.ts";
 import { RemoteNodeError, SshNodeClient } from "./ssh-client.ts";
+import type { RemoteActivityStream } from "./ssh-client.ts";
 
 export interface RemoteHostDefinition {
   id: string;
@@ -35,8 +47,13 @@ interface RemoteHostCallbacks {
   onDiagnostic?: (diagnostic: Diagnostic) => void;
 }
 
-function encodedRemoteId(hostId: string, remoteId: string): string {
-  return `remote:${hostId}:${Buffer.from(remoteId, "utf8").toString("base64url")}`;
+interface ActiveRemoteActivity {
+  count: number;
+  provider: Provider;
+  mirror: RemoteActivityMirror;
+  stream: RemoteActivityStream | null;
+  retry: NodeJS.Timeout | null;
+  attempt: object | null;
 }
 
 function errorMessage(error: unknown): string {
@@ -49,8 +66,37 @@ function payloadRecord(value: unknown): Record<string, unknown> {
     : {};
 }
 
+function exactRecord(
+  value: unknown,
+  required: readonly string[],
+  label: string,
+): Record<string, unknown> {
+  const record = payloadRecord(value);
+  const keys = Object.keys(record);
+  if (
+    keys.length !== required.length
+    || !required.every((key) => Object.hasOwn(record, key))
+  ) throw new Error(`Remote node returned an invalid ${label}`);
+  return record;
+}
+
 function shellLiteral(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+function remapParentId(
+  hostId: string,
+  session: SessionView,
+  knownIds: ReadonlyMap<string, string>,
+): string | null {
+  if (session.parentId === null) return null;
+  const known = knownIds.get(session.parentId);
+  if (known) return known;
+  const prefix = `${session.hostId}:${session.provider}:`;
+  if (!session.parentId.startsWith(prefix) || session.parentId.length === prefix.length) {
+    throw new Error("Remote node returned an invalid parent session identity");
+  }
+  return sessionRecordId(hostId, session.provider, session.parentId.slice(prefix.length));
 }
 
 export class RemoteHostManager {
@@ -60,7 +106,7 @@ export class RemoteHostManager {
   #sessionReferences = new Map<string, RemoteSessionReference>();
   #leases = new Map<string, RemoteLease>();
   #pollers = new Map<string, NodeJS.Timeout>();
-  #activityPollers = new Map<string, { count: number; timer: NodeJS.Timeout; hashes: Map<string, string> }>();
+  #activityStreams = new Map<string, ActiveRemoteActivity>();
   #pollIntervalMs: number;
   #sshExecutable?: string;
   #callbacks: RemoteHostCallbacks | null = null;
@@ -124,9 +170,10 @@ export class RemoteHostManager {
     for (const [localId, reference] of this.#sessionReferences) {
       if (reference.hostId !== hostId) continue;
       removed.push(localId);
-      const activity = this.#activityPollers.get(localId);
-      if (activity) clearInterval(activity.timer);
-      this.#activityPollers.delete(localId);
+      const activity = this.#activityStreams.get(localId);
+      if (activity?.retry) clearTimeout(activity.retry);
+      activity?.stream?.close();
+      this.#activityStreams.delete(localId);
       this.#sessionReferences.delete(localId);
     }
     for (const key of this.#leases.keys()) {
@@ -141,12 +188,12 @@ export class RemoteHostManager {
   }
 
   async listSessions(hostId: string): Promise<SessionView[]> {
-    const payload = await this.#request<Record<string, unknown>>(hostId, {
+    const payload = await this.#request<unknown>(hostId, {
       method: "GET",
       path: "/api/v1/sessions",
     });
-    const rawSessions = Array.isArray(payload.sessions) ? payload.sessions : [];
-    return this.#mapSessions(hostId, rawSessions);
+    const snapshot = parseStateSnapshot(payload);
+    return this.#mapSessions(hostId, snapshot.sessions);
   }
 
   async session(localId: string): Promise<SessionView> {
@@ -155,7 +202,8 @@ export class RemoteHostManager {
       method: "GET",
       path: `/api/v1/sessions/${encodeURIComponent(reference.remoteId)}`,
     });
-    const raw = payload.session ?? payload;
+    const envelope = exactRecord(payload, ["session"], "session response");
+    const raw = sessionRecordSchema.parse(envelope.session);
     const mapped = this.#mapSessions(reference.hostId, [raw])[0];
     if (!mapped) throw new Error("Remote node returned an invalid session");
     return mapped;
@@ -166,31 +214,46 @@ export class RemoteHostManager {
       method: "GET",
       path: `/api/v1/hosts/local/directories?path=${encodeURIComponent(path)}&limit=${String(limit)}`,
     });
-    return Array.isArray(payload.paths)
-      ? payload.paths.filter((value): value is string => typeof value === "string")
-      : [];
+    const envelope = exactRecord(payload, ["paths"], "directory completion response");
+    if (
+      !Array.isArray(envelope.paths)
+      || envelope.paths.length > Math.max(1, Math.min(50, limit))
+      || envelope.paths.some((value) => typeof value !== "string" || !isAbsolute(value))
+    ) throw new Error("Remote node returned invalid directory completions");
+    return envelope.paths as string[];
+  }
+
+  async probeHarnesses(hostId: string): Promise<SetupHarnessProbe> {
+    const payload = await this.#request<unknown>(hostId, {
+      method: "GET",
+      path: "/api/v1/setup/harnesses",
+    });
+    return setupHarnessProbeResponseSchema.parse(payload).harnesses;
   }
 
   async resolveWorkspace(hostId: string, path: string): Promise<{
     path: string;
     label: string;
     remoteWorkspaceId: string;
+    workspaceIdentity: SessionView["workspaceIdentity"];
   }> {
     const payload = await this.#request<Record<string, unknown>>(hostId, {
       method: "POST",
       path: "/api/v1/workspaces/resolve",
       body: { hostId: "local", path },
     });
-    const workspace = payloadRecord(payload.workspace ?? payload);
+    const { workspace } = workspaceResolutionResponseSchema.parse(payload);
     if (
-      typeof workspace.id !== "string"
-      || typeof workspace.path !== "string"
-      || typeof workspace.label !== "string"
+      workspace.hostId !== "local"
+      || workspace.hostKind !== "local"
+      || !isAbsolute(workspace.path)
+      || workspace.remoteWorkspaceId !== null
     ) throw new Error("Remote node returned an invalid workspace");
     return {
       path: workspace.path,
       label: workspace.label,
       remoteWorkspaceId: workspace.id,
+      workspaceIdentity: structuredClone(workspace.workspaceIdentity),
     };
   }
 
@@ -206,7 +269,8 @@ export class RemoteHostManager {
       path: "/api/v1/sessions",
       body: { ...input, workspaceId: remoteWorkspaceId },
     }, 120_000);
-    const raw = payload.session ?? payload;
+    const envelope = exactRecord(payload, ["session"], "created session response");
+    const raw = sessionRecordSchema.parse(envelope.session);
     const mapped = this.#mapSessions(hostId, [raw])[0];
     if (!mapped) throw new Error("Remote node returned an invalid created session");
     return mapped;
@@ -282,51 +346,40 @@ export class RemoteHostManager {
   }
 
   acquireActivity(localId: string, hub: ActivityHub, provider: Provider): () => void {
-    const existing = this.#activityPollers.get(localId);
+    const existing = this.#activityStreams.get(localId);
     if (existing) {
+      if (existing.provider !== provider) throw new Error("Remote activity provider cannot change");
       existing.count += 1;
       return () => this.#releaseActivity(localId);
     }
-    const hashes = new Map<string, string>();
-    const poll = async (): Promise<void> => {
-      try {
-        const reference = this.#reference(localId);
-        const payload = await this.#request<Record<string, unknown>>(reference.hostId, {
-          method: "GET",
-          path: `/api/v1/sessions/${encodeURIComponent(reference.remoteId)}/activity?limit=400`,
-        });
-        const items = Array.isArray(payload.items) ? payload.items : [];
-        for (const raw of items) {
-          const item = payloadRecord(raw) as unknown as ActivityItem;
-          if (typeof item.id !== "string" || typeof item.kind !== "string") continue;
-          const fingerprint = JSON.stringify(item);
-          if (hashes.get(item.id) === fingerprint) continue;
-          hashes.set(item.id, fingerprint);
-          hub.ingest(localId, provider, {
-            type: "upsert",
-            item: {
-              ...item,
-              sessionId: localId,
-            } as unknown as ActivityItemDraft,
-          });
-        }
-      } catch {
-        // The host status poll reports connectivity; keep the last safe view.
-      }
+    const reference = this.#reference(localId);
+    const active: ActiveRemoteActivity = {
+      count: 1,
+      provider,
+      mirror: new RemoteActivityMirror({
+        hub,
+        localSessionId: localId,
+        remoteSessionId: reference.remoteId,
+        provider,
+      }),
+      stream: null,
+      retry: null,
+      attempt: null,
     };
-    void poll();
-    const timer = setInterval(() => void poll(), 1_000);
-    timer.unref();
-    this.#activityPollers.set(localId, { count: 1, timer, hashes });
+    this.#activityStreams.set(localId, active);
+    this.#openActivity(localId, active);
     return () => this.#releaseActivity(localId);
   }
 
   dispose(): void {
     for (const timer of this.#pollers.values()) clearInterval(timer);
-    for (const activity of this.#activityPollers.values()) clearInterval(activity.timer);
+    for (const activity of this.#activityStreams.values()) {
+      if (activity.retry) clearTimeout(activity.retry);
+      activity.stream?.close();
+    }
     for (const client of this.#clients.values()) client.close();
     this.#pollers.clear();
-    this.#activityPollers.clear();
+    this.#activityStreams.clear();
     this.#clients.clear();
     this.#callbacks = null;
   }
@@ -364,22 +417,22 @@ export class RemoteHostManager {
     this.#pollers.set(hostId, timer);
   }
 
-  #mapSessions(hostId: string, values: unknown[]): SessionView[] {
+  #mapSessions(hostId: string, values: readonly unknown[]): SessionView[] {
     const definition = this.#definition(hostId);
-    const valid = values.flatMap((raw): Array<{ raw: SessionView; remoteId: string; localId: string }> => {
-      const value = payloadRecord(raw);
-      const remoteId = typeof value.id === "string" ? value.id : null;
-      if (!remoteId || (value.provider !== "codex" && value.provider !== "claude")) return [];
-      return [{ raw: value as unknown as SessionView, remoteId, localId: encodedRemoteId(hostId, remoteId) }];
+    const valid = values.map((value) => {
+      const raw = sessionRecordSchema.parse(value);
+      return {
+        raw,
+        remoteId: raw.id,
+        localId: sessionRecordId(hostId, raw.provider, raw.providerThreadId),
+      };
     });
     const ids = new Map<string, string>();
     for (const item of valid) {
       ids.set(item.remoteId, item.localId);
-      if (item.raw.sessionId) ids.set(item.raw.sessionId, item.localId);
-      if (item.raw.sessionId) ids.set(`${item.raw.provider}:${item.raw.sessionId}`, item.localId);
     }
     return valid.map(({ raw, remoteId, localId }) => {
-      const parent = raw.parentSessionId ? ids.get(raw.parentSessionId) ?? null : null;
+      const parent = remapParentId(hostId, raw, ids);
       this.#sessionReferences.set(localId, {
         hostId,
         remoteId,
@@ -391,7 +444,7 @@ export class RemoteHostManager {
         id: localId,
         hostId,
         hostLabel: definition.label,
-        parentSessionId: parent,
+        parentId: parent,
       };
     });
   }
@@ -421,13 +474,67 @@ export class RemoteHostManager {
     return next;
   }
 
+  #openActivity(localId: string, active: ActiveRemoteActivity): void {
+    if (
+      this.#activityStreams.get(localId) !== active
+      || active.count < 1
+      || active.stream
+      || active.attempt
+    ) return;
+    let reference: RemoteSessionReference;
+    try {
+      reference = this.#reference(localId);
+    } catch {
+      return;
+    }
+    const attempt = {};
+    active.attempt = attempt;
+    const path = `/api/v1/sessions/${encodeURIComponent(reference.remoteId)}/activity/events?clientId=${encodeURIComponent(this.#clientId)}`;
+    const lastEventId = active.mirror.resumeCursor;
+    void this.#client(reference.hostId).openActivityStream({
+      path,
+      ...(lastEventId ? { lastEventId } : {}),
+      onFrame: (frame) => active.mirror.accept(frame),
+      onClose: (error) => {
+        if (this.#activityStreams.get(localId) !== active || active.attempt !== attempt) return;
+        active.attempt = null;
+        active.stream = null;
+        if (error) active.mirror.requireSnapshot();
+        this.#retryActivity(localId, active);
+      },
+    }).then((stream) => {
+      if (this.#activityStreams.get(localId) !== active || active.attempt !== attempt) {
+        stream.close();
+        return;
+      }
+      active.stream = stream;
+    }).catch(() => {
+      if (this.#activityStreams.get(localId) !== active || active.attempt !== attempt) return;
+      active.attempt = null;
+      active.stream = null;
+      active.mirror.requireSnapshot();
+      this.#retryActivity(localId, active);
+    });
+  }
+
+  #retryActivity(localId: string, active: ActiveRemoteActivity): void {
+    if (this.#activityStreams.get(localId) !== active || active.retry || active.count < 1) return;
+    active.retry = setTimeout(() => {
+      active.retry = null;
+      this.#openActivity(localId, active);
+    }, 1_000);
+    active.retry.unref();
+  }
+
   #releaseActivity(localId: string): void {
-    const current = this.#activityPollers.get(localId);
+    const current = this.#activityStreams.get(localId);
     if (!current) return;
     current.count -= 1;
     if (current.count > 0) return;
-    clearInterval(current.timer);
-    this.#activityPollers.delete(localId);
+    current.attempt = null;
+    if (current.retry) clearTimeout(current.retry);
+    current.stream?.close();
+    this.#activityStreams.delete(localId);
   }
 
   #reference(localId: string): RemoteSessionReference {

@@ -1,7 +1,11 @@
 import {
   emptyChildSummary,
+  providerEffort,
+  sessionRecordId,
   type AttentionDetails,
   type AttentionQuestion,
+  type ExecutionProfile,
+  type ReasoningEffort,
   type SessionStatus,
   type SessionView,
 } from "../../core/types.ts";
@@ -13,24 +17,32 @@ import type {
   ProviderControlAdapter,
   RequestContext,
   SessionAction,
+  SessionSettingsOptions,
 } from "../../server/contracts.ts";
+import { sessionSettingsOptionsSchema } from "../../server/contracts.ts";
 import { ClaudeManagedSession } from "./managed-session.ts";
 import { ClaudeActivityProjector } from "./activity-projector.ts";
 import { loadClaudeSdkRuntime } from "./runtime.ts";
-import type {
-  ClaudeManagedSessionSnapshot,
-  ClaudePendingRequest,
-  ClaudePermissionMode,
-  ClaudeRequestResponse,
-  ClaudeSdkRuntime,
+import type { ClaudeHookSourceArbiter } from "../hooks/claude-source.ts";
+import {
+  CLAUDE_CODE_VERSION,
+  type ClaudeEffortLevel,
+  type ClaudeManagedSessionSnapshot,
+  type ClaudePendingRequest,
+  type ClaudePermissionMode,
+  type ClaudeRequestResponse,
+  type ClaudeSdkRuntime,
 } from "./types.ts";
 
 interface ManagedEntry {
   session: ClaudeManagedSession;
   name: string | null;
-  executionMode: Exclude<ClaudePermissionMode, "plan">;
+  projector: ClaudeActivityProjector;
+  publishActivity(mutations: readonly ActivityMutation[]): void;
   unsubscribe: () => void;
 }
+
+const CLAUDE_SETTINGS_LOOKUP_TIMEOUT_MS = 2_000;
 
 export interface ClaudeProviderAdapterOptions {
   resolveWorkspace?(
@@ -40,6 +52,35 @@ export interface ClaudeProviderAdapterOptions {
   runtime?: ClaudeSdkRuntime | (() => Promise<ClaudeSdkRuntime>);
   onSessionChanged?: (session: SessionView) => void;
   onActivity?: (managerSessionId: string, mutation: ActivityMutation) => void;
+  hookSourceArbiter?: ClaudeHookSourceArbiter;
+}
+
+function profileMode(profile: ExecutionProfile): ClaudePermissionMode {
+  switch (profile) {
+    case "ask-first": return "default";
+    case "plan": return "plan";
+    case "execute": return "acceptEdits";
+    case "full-access": return "bypassPermissions";
+  }
+}
+
+function modeProfile(mode: ClaudePermissionMode): ExecutionProfile {
+  switch (mode) {
+    case "plan": return "plan";
+    case "acceptEdits": return "execute";
+    case "bypassPermissions": return "full-access";
+    case "default":
+    case "dontAsk":
+    case "auto":
+      return "ask-first";
+  }
+}
+
+function claudeEffort(effort: ReasoningEffort): ClaudeEffortLevel {
+  if (effort === "minimal" || effort === "ultra") {
+    throw new Error(`Claude does not expose the ${effort} effort level`);
+  }
+  return effort;
 }
 
 function activityStatus(snapshot: ClaudeManagedSessionSnapshot): SessionStatus {
@@ -60,11 +101,70 @@ function activityStatus(snapshot: ClaudeManagedSessionSnapshot): SessionStatus {
   }
 }
 
+function nativeHandoffReadiness(
+  snapshot: ClaudeManagedSessionSnapshot,
+): { ready: boolean; reason: string } {
+  if (snapshot.owner !== "manager") {
+    return {
+      ready: false,
+      reason: "The native Claude CLI already owns this session; another resume would race it",
+    };
+  }
+  if (
+    snapshot.activity !== "idle"
+    && snapshot.activity !== "closed"
+    && snapshot.activity !== "failed"
+  ) {
+    return {
+      ready: false,
+      reason: "Native handoff requires an idle or ended Claude session",
+    };
+  }
+  if (snapshot.pendingRequests.length > 0) {
+    return {
+      ready: false,
+      reason: "Native handoff cannot abandon a pending Claude request",
+    };
+  }
+  if (
+    snapshot.stagedMessages.length > 0
+    || snapshot.outstandingMessageIds.length > 0
+    || snapshot.stillQueuedMessageIds.length > 0
+    || snapshot.queueKnowledge !== "known"
+  ) {
+    return {
+      ready: false,
+      reason: "Native handoff requires a provider-confirmed empty Claude input queue",
+    };
+  }
+  return { ready: true, reason: "Native handoff is ready" };
+}
+
 function actionFailure(code: string, message: string): ActionDispatchResult {
   return {
     status: "failed",
     error: { code, message },
   };
+}
+
+function boundedSettingsLookup<T>(promise: Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error("Claude settings lookup timed out")),
+      CLAUDE_SETTINGS_LOOKUP_TIMEOUT_MS,
+    );
+    timer.unref();
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }
 
 function objectValue(value: unknown): Record<string, unknown> | null {
@@ -117,15 +217,17 @@ function attentionQuestions(request: ClaudePendingRequest): AttentionQuestion[] 
     if (!question || typeof question.question !== "string") return [];
     const options = Array.isArray(question.options)
       ? question.options.flatMap((rawOption) => {
-          if (typeof rawOption === "string") return [{ label: rawOption }];
+          if (typeof rawOption === "string") {
+            return [{ label: rawOption, description: null }];
+          }
           const option = objectValue(rawOption);
           if (!option || typeof option.label !== "string") return [];
           return [
             {
               label: option.label,
-              ...(typeof option.description === "string"
-                ? { description: option.description }
-                : {}),
+              description: typeof option.description === "string"
+                ? option.description
+                : null,
             },
           ];
         })
@@ -136,12 +238,14 @@ function attentionQuestions(request: ClaudePendingRequest): AttentionQuestion[] 
           typeof question.header === "string" && question.header.length > 0
             ? question.header
             : `question-${index + 1}`,
+        header: typeof question.header === "string" ? question.header : null,
         text: question.question,
         options,
         multiSelect: question.multiSelect === true,
-        // Claude's AskUserQuestion always supplies an automatic "Other"
-        // answer. Preserve an explicit false for forward-compatible providers.
+        // Claude's AskUserQuestion normally supplies an automatic "Other"
+        // answer, but an explicit provider false remains authoritative.
         allowFreeText: question.allowFreeText !== false,
+        isSecret: question.isSecret === true,
       },
     ];
   });
@@ -152,12 +256,12 @@ function attentionDetails(request: ClaudePendingRequest): AttentionDetails {
   const questions = attentionQuestions(request);
   return {
     title: request.title,
-    ...(request.kind === "elicitation" ? { respondable: false } : {}),
-    ...(questions.length > 0 ? { questions } : {}),
-    ...(request.toolName ? { toolName: request.toolName } : {}),
-    ...(request.kind !== "question" && input
-      ? { inputSummary: boundedInputSummary(input) }
-      : {}),
+    questions: questions.length > 0 ? questions : null,
+    toolName: request.toolName,
+    inputSummary: request.kind !== "question" && input
+      ? boundedInputSummary(input)
+      : null,
+    respondable: request.kind !== "elicitation",
   };
 }
 
@@ -168,6 +272,12 @@ function parseRequestResponse(
   const response = objectValue(value);
   if (!response) {
     throw new Error("Claude response must contain a decision");
+  }
+  if (response.persist !== undefined && typeof response.persist !== "boolean") {
+    throw new Error("Claude approval persistence must be boolean");
+  }
+  if (response.persist === true && response.decision !== "allow") {
+    throw new Error("Claude persistence can only accompany an allow decision");
   }
   if (response.kind === "answer") {
     if (pending?.kind !== "question") {
@@ -267,9 +377,12 @@ function parseRequestResponse(
     }
     case "allow": {
       const updatedInput = objectValue(response.updatedInput);
-      return updatedInput
-        ? { decision: "allow", updatedInput }
-        : { decision: "allow" };
+      const persist = response.persist === true;
+      return {
+        decision: "allow",
+        ...(updatedInput ? { updatedInput } : {}),
+        ...(persist ? { persist: true } : {}),
+      };
     }
     case "deny":
       return {
@@ -301,6 +414,7 @@ function parseRequestResponse(
 export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
   readonly #options: ClaudeProviderAdapterOptions;
   readonly #entries = new Map<string, ManagedEntry>();
+  readonly #settingsLookups = new Map<ManagedEntry, Promise<SessionSettingsOptions>>();
   #runtime: Promise<ClaudeSdkRuntime> | null = null;
 
   constructor(options: ClaudeProviderAdapterOptions) {
@@ -325,13 +439,16 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
     if (context.signal.aborted) throw new Error("Claude session creation was cancelled");
 
     const runtime = await this.#getRuntime();
-    const executionMode: Exclude<ClaudePermissionMode, "plan"> =
-      input.accessMode === "bypass-permissions" ? "bypassPermissions" : "default";
+    const effort = input.effort ? claudeEffort(input.effort) : undefined;
     const session = await ClaudeManagedSession.start(runtime, {
       cwd,
-      mode: input.mode === "planning" ? "plan" : executionMode,
+      mode: profileMode(input.profile),
       initialMessage: input.initialMessage,
-      allowDangerouslySkipPermissions: input.accessMode === "bypass-permissions",
+      ...(input.model ? { model: input.model } : {}),
+      ...(effort ? { effort } : {}),
+      // This enables a later explicit full-access profile selection. The
+      // active permission mode still controls access and starts narrow.
+      allowDangerouslySkipPermissions: true,
     });
     if (context.signal.aborted) {
       session.dispose();
@@ -343,14 +460,7 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
       throw new Error("Claude SDK initialized without a session id");
     }
 
-    const entry: ManagedEntry = {
-      session,
-      name: input.name ?? null,
-      executionMode,
-      unsubscribe: () => undefined,
-    };
-    this.#entries.set(id, entry);
-    const managerSessionId = `claude:${id}`;
+    const managerSessionId = sessionRecordId("local", "claude", id);
     const projector = new ClaudeActivityProjector();
     const publishActivity = (mutations: readonly ActivityMutation[]): void => {
       for (const mutation of mutations) {
@@ -361,10 +471,25 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
         }
       }
     };
+    const entry: ManagedEntry = {
+      session,
+      name: input.name ?? null,
+      projector,
+      publishActivity,
+      unsubscribe: () => undefined,
+    };
+    this.#entries.set(id, entry);
+    this.#options.hookSourceArbiter?.markManagerOwned(id);
     const unsubscribeMessages = session.onMessage((message) => {
       publishActivity(projector.projectMessage(message));
     });
     const unsubscribeSession = session.subscribe((snapshot) => {
+      this.#options.hookSourceArbiter?.markManagerOwned(
+        id,
+        snapshot.owner === "manager"
+          && snapshot.activity !== "closed"
+          && snapshot.activity !== "failed",
+      );
       publishActivity(projector.projectSnapshot(snapshot));
       try {
         this.#options.onSessionChanged?.(this.#toSessionView(entry, snapshot));
@@ -387,7 +512,7 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
     if (context.signal.aborted) {
       return actionFailure("REQUEST_ABORTED", "Claude action was cancelled");
     }
-    if (view.provider !== "claude" || view.ownership !== "manager") {
+    if (view.provider !== "claude" || view.control.authority !== "manager") {
       return actionFailure(
         "NOT_MANAGER_OWNED",
         "Claude semantic controls require a manager-owned session",
@@ -399,7 +524,7 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
         `Expected generation ${action.expectedGeneration}, current generation is ${view.generation}`,
       );
     }
-    const entry = this.#entries.get(view.sessionId) ?? this.#entries.get(view.id);
+    const entry = this.#entries.get(view.providerThreadId);
     if (!entry) {
       return actionFailure(
         "SESSION_NOT_OWNED",
@@ -420,20 +545,43 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
           const pending = entry.session.snapshot.pendingRequests.find(
             (request) => request.id === action.requestId,
           );
+          const response = parseRequestResponse(action.response, pending);
           entry.session.respondToRequest(
             action.requestId,
-            parseRequestResponse(action.response, pending),
+            response,
           );
+          if (pending?.kind === "plan-approval" && response.decision === "allow") {
+            entry.publishActivity(entry.projector.projectPlanApproval(
+              pending,
+              entry.session.snapshot.updatedAt,
+            ));
+          }
           return { status: "succeeded", result: { requestId: action.requestId } };
         }
         case "interrupt":
           return { status: "succeeded", result: await entry.session.interrupt() };
-        case "set-mode": {
-          const providerMode =
-            action.mode === "planning" ? "plan" : entry.executionMode;
-          await entry.session.setMode(providerMode);
-          return { status: "succeeded", result: { mode: providerMode } };
-        }
+        case "set-profile":
+          await entry.session.setMode(profileMode(action.profile));
+          return { status: "succeeded", result: { profile: action.profile } };
+        case "set-model":
+          await entry.session.setModel(action.model);
+          return { status: "succeeded", result: { model: action.model } };
+        case "set-effort":
+          await entry.session.setEffort(claudeEffort(action.effort));
+          return { status: "succeeded", result: { effort: action.effort } };
+        case "remove-queued":
+          if (!entry.session.removeStagedMessage(action.messageId)) {
+            throw new Error("Claude queued message is already dispatching or no longer exists");
+          }
+          return { status: "succeeded", result: { messageId: action.messageId } };
+        case "end":
+          entry.session.end();
+          return { status: "succeeded" };
+        case "archive":
+        case "delete":
+          throw new Error(`Claude does not support ${action.type}`);
+        case "open-editor":
+          throw new Error("Claude provider does not own editor launch operations");
       }
     } catch (error) {
       return actionFailure(
@@ -448,23 +596,59 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
     context: RequestContext,
   ): Promise<AttachInstruction | null> {
     if (context.signal.aborted) return null;
-    const entry = this.#entries.get(view.sessionId) ?? this.#entries.get(view.id);
+    const entry = this.#entries.get(view.providerThreadId);
     if (!entry) return null;
-    let handoff = entry.session.snapshot.handoff;
-    if (entry.session.snapshot.owner === "manager") {
-      handoff = entry.session.prepareCliHandoff();
-    }
-    if (!handoff || handoff.state === "exited") return null;
+    const snapshot = entry.session.snapshot;
+    if (!nativeHandoffReadiness(snapshot).ready) return null;
+    const handoff = entry.session.prepareCliHandoff();
     return {
       kind: "claude-resume",
       argv: [handoff.command.executable, ...handoff.command.args],
       cwd: handoff.command.cwd,
       handoffId: handoff.id,
-      warning:
-        handoff.state === "attached"
-          ? "Claude CLI already owns this session; cockpit writes remain disabled."
-          : "Starting this command transfers exclusive write ownership to Claude CLI until it exits.",
+      warning: "Starting this command transfers exclusive write ownership to Claude CLI until it exits.",
     };
+  }
+
+  async getSettingsOptions(
+    view: SessionView,
+    context: RequestContext,
+  ): Promise<SessionSettingsOptions> {
+    if (context.signal.aborted) {
+      throw new Error("Claude settings lookup was cancelled");
+    }
+    if (
+      view.provider !== "claude"
+      || view.hostId !== "local"
+      || view.control.authority !== "manager"
+    ) {
+      throw new Error("Claude settings require a local manager-owned SDK query");
+    }
+    const entry = this.#entries.get(view.providerThreadId);
+    if (!entry) {
+      throw new Error("This manager process does not own the Claude SDK query");
+    }
+    this.#assertLiveSettingsEntry(view.providerThreadId, entry);
+    let lookup = this.#settingsLookups.get(entry);
+    if (!lookup) {
+      lookup = boundedSettingsLookup(
+        this.#loadSettingsOptions(view.providerThreadId, entry),
+      );
+      this.#settingsLookups.set(entry, lookup);
+      const activeLookup = lookup;
+      const clearLookup = (): void => {
+        if (this.#settingsLookups.get(entry) === activeLookup) {
+          this.#settingsLookups.delete(entry);
+        }
+      };
+      void lookup.then(clearLookup, clearLookup);
+    }
+    const options = await lookup;
+    if (context.signal.aborted) {
+      throw new Error("Claude settings lookup was cancelled");
+    }
+    this.#assertLiveSettingsEntry(view.providerThreadId, entry);
+    return options;
   }
 
   markCliAttached(sessionId: string, handoffId: string, wrapperPid: number): void {
@@ -486,6 +670,7 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
   async reclaimFromCli(sessionId: string, handoffId: string): Promise<SessionView> {
     const entry = this.#requireEntry(sessionId);
     await entry.session.reclaimFromCli(handoffId);
+    this.#options.hookSourceArbiter?.markManagerOwned(sessionId);
     return this.#toSessionView(entry, entry.session.snapshot);
   }
 
@@ -495,11 +680,55 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
   }
 
   dispose(): void {
-    for (const entry of this.#entries.values()) {
+    for (const [sessionId, entry] of this.#entries) {
       entry.unsubscribe();
       entry.session.dispose();
+      this.#options.hookSourceArbiter?.forget(sessionId);
     }
     this.#entries.clear();
+    this.#settingsLookups.clear();
+  }
+
+  async #loadSettingsOptions(
+    providerSessionId: string,
+    entry: ManagedEntry,
+  ): Promise<SessionSettingsOptions> {
+    const generation = entry.session.snapshot.generation;
+    const models = await entry.session.supportedModels();
+    this.#assertLiveSettingsEntry(providerSessionId, entry, generation);
+    return sessionSettingsOptionsSchema.parse({
+      source: "provider-api",
+      models: models.map((model) => ({
+        value: model.value,
+        label: model.displayName,
+        description: model.description,
+      })),
+    });
+  }
+
+  #assertLiveSettingsEntry(
+    providerSessionId: string,
+    entry: ManagedEntry,
+    expectedGeneration?: number,
+  ): void {
+    if (this.#entries.get(providerSessionId) !== entry) {
+      throw new Error("The managed Claude session changed during settings lookup");
+    }
+    const snapshot = entry.session.snapshot;
+    if (
+      snapshot.owner !== "manager"
+      || snapshot.activity === "closed"
+      || snapshot.activity === "failed"
+      || snapshot.activity === "native"
+    ) {
+      throw new Error("Claude settings require a live manager-owned SDK query");
+    }
+    if (
+      expectedGeneration !== undefined
+      && snapshot.generation !== expectedGeneration
+    ) {
+      throw new Error("The managed Claude session changed during settings lookup");
+    }
   }
 
   #requireEntry(sessionId: string): ManagedEntry {
@@ -525,65 +754,117 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
     snapshot: ClaudeManagedSessionSnapshot,
   ): SessionView {
     const providerSessionId = snapshot.sessionId ?? snapshot.localId;
-    const id = `claude:${providerSessionId}`;
+    const id = sessionRecordId("local", "claude", providerSessionId);
     const status = activityStatus(snapshot);
-    const waitingKind = snapshot.pendingRequests[0]?.kind;
     const managerControls = snapshot.owner === "manager";
     const writableManagerControls = managerControls
       && snapshot.activity !== "closed"
       && snapshot.activity !== "failed";
-    const capabilities: SessionView["control"]["capabilities"] = writableManagerControls
-      ? [
-          "queue",
-          "interrupt",
-          "set-mode",
-          "attach",
-          ...(snapshot.canSteer ? (["steer"] as const) : []),
-          ...(snapshot.pendingRequests.some((request) => request.kind !== "elicitation")
-            ? (["respond"] as const)
-            : []),
-        ]
-      : ["resume", "attach"];
-    const runtimeAlive =
-      snapshot.owner === "manager"
-        ? snapshot.activity !== "closed" && snapshot.activity !== "failed"
-        : snapshot.handoff?.state === "attached";
+    const handoffReadiness = nativeHandoffReadiness(snapshot);
+    const canAttach = handoffReadiness.ready;
+    const canResume = !writableManagerControls && handoffReadiness.ready;
+    const capabilities: SessionView["control"]["capabilities"] = [];
+    if (writableManagerControls) {
+      capabilities.push(
+        "queue",
+        "interrupt",
+        "set-profile",
+        "set-model",
+        "set-effort",
+        "end",
+      );
+      if (snapshot.canSteer) capabilities.push("steer");
+      if (snapshot.pendingRequests.some((request) => request.kind !== "elicitation")) {
+        capabilities.push("respond");
+      }
+      if (snapshot.stagedMessages.length > 0) capabilities.push("remove-queued");
+    }
+    if (canResume) capabilities.push("resume");
+    if (canAttach) capabilities.push("attach");
+
+    const withheld: SessionView["control"]["withheld"] = [];
+    if (!writableManagerControls) {
+      const reason = snapshot.owner === "native"
+        ? "The native Claude CLI currently owns this session"
+        : "The Claude SDK query has ended; resume it before changing the session";
+      for (const capability of [
+        "queue",
+        "steer",
+        "interrupt",
+        "respond",
+        "set-profile",
+        "set-model",
+        "set-effort",
+        "remove-queued",
+        "end",
+      ] as const) {
+        withheld.push({ capability, reason });
+      }
+    } else {
+      if (!snapshot.canSteer) {
+        withheld.push({
+          capability: "steer",
+          reason: `Steering requires Claude Code ${CLAUDE_CODE_VERSION}`,
+        });
+      }
+      if (!snapshot.pendingRequests.some((request) => request.kind !== "elicitation")) {
+        withheld.push({ capability: "respond", reason: "Claude is not waiting for a respondable request" });
+      }
+      if (snapshot.stagedMessages.length === 0) {
+        withheld.push({ capability: "remove-queued", reason: "There are no staged messages" });
+      }
+    }
+    if (!canAttach) withheld.push({ capability: "attach", reason: handoffReadiness.reason });
+    if (!canResume) {
+      withheld.push({
+        capability: "resume",
+        reason: writableManagerControls
+          ? "Resume is available only after the managed Claude query ends"
+          : handoffReadiness.reason,
+      });
+    }
+    withheld.push(
+      { capability: "archive", reason: "Claude does not expose session archive" },
+      { capability: "delete", reason: "Claude does not expose session deletion" },
+    );
 
     return {
       id,
       provider: "claude",
-      sessionId: providerSessionId,
-      parentSessionId: null,
-      rootSessionId: providerSessionId,
+      providerThreadId: providerSessionId,
+      providerTreeId: providerSessionId,
+      parentId: null,
+      providerTurnId: null,
       depth: 0,
+      hostId: "local",
+      hostLabel: "This Mac",
       name: entry.name,
       cwd: snapshot.cwd,
       kind: "interactive",
-      lifecycle: status === "completed" ? "recent" : "live",
+      presence: status === "completed" ? "recent" : "live",
       status,
       providerStatus: snapshot.activity,
-      waitingReason:
-        waitingKind === "question" || waitingKind === "elicitation"
-          ? "user-input"
-          : waitingKind
-            ? "approval"
-            : null,
       pid: null,
       runtimePid: snapshot.handoff?.wrapperPid ?? null,
       startedAt: snapshot.startedAt,
       updatedAt: snapshot.updatedAt,
       childSummary: emptyChildSummary(),
-      statusSource: "inferred",
+      statusSource: "provider-api",
       source: "claude-sdk",
-      ownership: "manager",
-      runtimeAlive,
-      mode: {
-        value: snapshot.mode === "plan" ? "planning" : "execution",
+      profile: {
+        value: modeProfile(snapshot.mode),
         providerValue: snapshot.mode,
         source: "provider-api",
         confidence: "exact",
       },
-      activity: status,
+      model: {
+        value: snapshot.model,
+        providerValue: snapshot.model,
+        source: "provider-api",
+        confidence: snapshot.model === null ? "heuristic" : "exact",
+      },
+      effort: providerEffort("claude", snapshot.effort, "provider-api"),
+      todoProgress: null,
       attention: snapshot.pendingRequests.map((request) => ({
         id: request.id,
         kind:
@@ -597,20 +878,14 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
         confidence: "exact",
         details: attentionDetails(request),
       })),
-      effectiveAccess: {
-        accessMode: entry.executionMode === "bypassPermissions"
-          ? "bypass-permissions"
-          : "sandboxed",
-        permissionMode: snapshot.mode,
-        sandboxMode: null,
-      },
       terminal: null,
       control: {
         plane: writableManagerControls ? "claude-sdk" : "resume-only",
+        authority: managerControls ? "manager" : "foreign",
         capabilities,
-        managerOwned: true,
-        writableLease: false,
+        withheld,
       },
+      workspaceIdentity: null,
       generation: snapshot.generation,
     };
   }

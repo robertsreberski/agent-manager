@@ -1,6 +1,6 @@
 # 04 — Workspace model: repositories and worktrees
 
-**Status:** Draft · **Depends on:** nothing · **Blocks:** 05 · **Design frames:** `7a`
+**Status:** Accepted · **Depends on:** 01 · **Blocks:** 05 · **Design frames:** `7a`
 
 ## Purpose
 
@@ -79,18 +79,16 @@ is not free.
 
 ### R3 — Extend the session record
 
-Add to `SessionRecord` / `SessionView` (`src/core/types.ts:170-215`), all optional so a
-non-repo or remote session is representable:
+Add the same required-nullable field to the shared session contract so a non-repo or remote
+session is explicit rather than omitted:
 
 ```ts
-workspaceIdentity?: WorkspaceIdentity | null;
+workspaceIdentity: WorkspaceIdentity | null;
 ```
 
 A single nested object rather than six loose fields — it is one fact resolved atomically, and
-partial mixtures (branch from one refresh, dirty from another) would be a lie.
-
-Normalize defensively in `web/src/lib/normalize.ts`, matching how every other server field is
-treated there.
+partial mixtures (branch from one refresh, dirty from another) would be a lie. The web client
+strictly parses the shared wire schema; it does not normalize old or malformed variants.
 
 ### R4 — Remote hosts
 

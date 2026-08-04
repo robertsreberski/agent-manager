@@ -5,7 +5,9 @@ import { AsyncInbox } from "./async-inbox.ts";
 import { ClaudeManagedSession } from "./managed-session.ts";
 import {
   CLAUDE_AGENT_SDK_VERSION,
+  type ClaudeEffortLevel,
   type ClaudeInterruptReceipt,
+  type ClaudeModelInfo,
   type ClaudePermissionMode,
   type ClaudeSdkQuery,
   type ClaudeSdkQueryParams,
@@ -19,6 +21,8 @@ class FakeQuery implements ClaudeSdkQuery, AsyncIterator<ClaudeSdkMessage> {
   readonly output = new AsyncInbox<ClaudeSdkMessage>();
   readonly input: ClaudeSdkUserMessage[] = [];
   readonly modeChanges: ClaudePermissionMode[] = [];
+  readonly modelChanges: Array<string | undefined> = [];
+  readonly effortChanges: Array<ClaudeEffortLevel | null> = [];
   interruptResult: ClaudeInterruptReceipt | undefined = {
     still_queued: [],
   };
@@ -44,6 +48,26 @@ class FakeQuery implements ClaudeSdkQuery, AsyncIterator<ClaudeSdkMessage> {
     return Promise.resolve();
   }
 
+  setModel(model?: string): Promise<void> {
+    this.modelChanges.push(model);
+    return Promise.resolve();
+  }
+
+  applyFlagSettings(settings: { effortLevel?: ClaudeEffortLevel | null }): Promise<void> {
+    if (settings.effortLevel !== undefined) this.effortChanges.push(settings.effortLevel);
+    return Promise.resolve();
+  }
+
+  supportedModels(): Promise<ClaudeModelInfo[]> {
+    return Promise.resolve([{
+      value: "sonnet",
+      displayName: "Sonnet",
+      description: "Balanced",
+      supportsEffort: true,
+      supportedEffortLevels: ["low", "high"],
+    }]);
+  }
+
   close(): void {
     this.closed = true;
     this.output.close();
@@ -65,7 +89,7 @@ class FakeQuery implements ClaudeSdkQuery, AsyncIterator<ClaudeSdkMessage> {
 class FakeRuntime implements ClaudeSdkRuntime {
   readonly queries: FakeQuery[] = [];
   sdkVersion = CLAUDE_AGENT_SDK_VERSION;
-  codeVersion = "2.1.220";
+  codeVersion = "2.1.221";
   initMode: ClaudePermissionMode | null = null;
   #uuid = 0;
   #time = Date.parse("2026-08-03T12:00:00.000Z");
@@ -79,6 +103,7 @@ class FakeRuntime implements ClaudeSdkRuntime {
       subtype: "init",
       session_id: sessionId,
       claude_code_version: this.codeVersion,
+      model: params.options.model ?? "default-model",
       permissionMode: this.initMode ?? params.options.permissionMode,
       capabilities: ["interrupt_receipt_v1"],
     });
@@ -107,7 +132,7 @@ async function eventually(
   throw new Error(message);
 }
 
-test("keeps a streaming query and maps queue, steer, and mode controls", async () => {
+test("keeps a streaming query, stages removable queue work, and maps steer and mode", async () => {
   const runtime = new FakeRuntime();
   const session = await ClaudeManagedSession.start(runtime, {
     cwd: "/workspace",
@@ -130,19 +155,47 @@ test("keeps a streaming query and maps queue, steer, and mode controls", async (
 
   const queuedId = session.send("Do this after the plan", "queue");
   const steeredId = session.send("Correct course now", "steer");
-  await eventually(() => query.input.length === 3);
+  await eventually(() => query.input.length === 2);
   assert.deepEqual(
     query.input.slice(1).map(({ priority, uuid }) => ({ priority, uuid })),
-    [
-      { priority: "later", uuid: queuedId },
-      { priority: "now", uuid: steeredId },
-    ],
+    [{ priority: "now", uuid: steeredId }],
   );
+  assert.deepEqual(session.snapshot.stagedMessages.map(({ id }) => id), [queuedId]);
+  assert.equal(session.removeStagedMessage(queuedId), true);
+  assert.equal(session.removeStagedMessage(queuedId), false);
+  assert.deepEqual(session.snapshot.stagedMessages, []);
 
   await session.setMode("default");
   assert.deepEqual(query.modeChanges, ["default"]);
   assert.equal(session.snapshot.mode, "default");
+  await session.setModel("sonnet");
+  await session.setEffort("high");
+  assert.deepEqual(query.modelChanges, ["sonnet"]);
+  assert.deepEqual(query.effortChanges, ["high"]);
+  assert.equal(session.snapshot.model, "sonnet");
+  assert.equal(session.snapshot.effort, "high");
+  assert.equal((await session.supportedModels())[0]?.value, "sonnet");
   session.dispose();
+});
+
+test("end closes only the owned SDK query and discards manager-side staging", async () => {
+  const runtime = new FakeRuntime();
+  const session = await ClaudeManagedSession.start(runtime, {
+    cwd: "/workspace",
+    mode: "default",
+    initialMessage: "active turn",
+  });
+  const query = runtime.queries[0];
+  assert.ok(query);
+  session.send("later", "queue");
+  assert.equal(session.snapshot.stagedMessages.length, 1);
+
+  session.end();
+  assert.equal(query.closed, true);
+  assert.equal(session.snapshot.activity, "closed");
+  assert.deepEqual(session.snapshot.stagedMessages, []);
+  assert.deepEqual(session.snapshot.outstandingMessageIds, []);
+  assert.throws(() => session.send("must not run"), /disposed/);
 });
 
 test("replays messages emitted before the first observer can register", async () => {
@@ -363,6 +416,47 @@ test("retains exact tool requests, answers questions, and replays duplicate resp
     toolUseID: "tool-2",
     decisionClassification: "user_temporary",
   });
+
+  const suggestions = [{
+    type: "addRules" as const,
+    rules: [{ toolName: "Write", ruleContent: "/workspace/**" }],
+    behavior: "allow" as const,
+    destination: "session" as const,
+  }];
+  const persistent = query.params.options.canUseTool(
+    "Write",
+    { file_path: "/workspace/output.txt", content: "done" },
+    {
+      signal: new AbortController().signal,
+      requestId: "request-3",
+      toolUseID: "tool-3",
+      suggestions,
+    },
+  );
+  session.respondToRequest("request-3", { decision: "allow", persist: true });
+  assert.deepEqual(await persistent, {
+    behavior: "allow",
+    updatedInput: { file_path: "/workspace/output.txt", content: "done" },
+    updatedPermissions: suggestions,
+    toolUseID: "tool-3",
+    decisionClassification: "user_permanent",
+  });
+
+  const temporaryOnly = query.params.options.canUseTool(
+    "Bash",
+    { command: "pwd" },
+    {
+      signal: new AbortController().signal,
+      requestId: "request-4",
+      toolUseID: "tool-4",
+    },
+  );
+  assert.throws(
+    () => session.respondToRequest("request-4", { decision: "allow", persist: true }),
+    /did not expose a persistent permission choice/,
+  );
+  session.respondToRequest("request-4", { decision: "allow" });
+  await temporaryOnly;
   session.dispose();
 });
 

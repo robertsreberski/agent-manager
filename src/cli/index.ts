@@ -2,37 +2,32 @@
 
 import { spawn } from "node:child_process";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { createInterface } from "node:readline/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
-  buildListing,
-  formatTable,
-  parseArgs,
-  type CliOptions,
-} from "../core/discovery.ts";
-import type { ListingResult } from "../core/types.ts";
-import {
   addWorkspace,
   addSshHost,
-  assertPanicUnlocked,
   buildControlledServicePath,
+  IncompatibleConfigError,
   defaultPaths,
   executeAttach,
-  engagePanicLock,
   inspectTailscaleRoute,
   installLaunchAgentFile,
   installTailscaleRoute,
   loadConfig,
   mutateConfig,
-  panicLockPath,
+  resetOwnedState,
   removeTailscaleRoute,
   removeSshHost,
   removeWorkspace,
-  releasePanicLock,
+  reloadLaunchAgent,
   renderLaunchAgent,
   resolveServiceExecutables,
   runDoctor,
+  saveConfig,
+  stopLaunchAgent,
   type AgentManagerConfig,
   type AttachSpec,
   type DoctorReport,
@@ -42,17 +37,35 @@ import {
   type TailscaleInstallResult,
 } from "../ops/index.ts";
 import {
+  runClaudeHookOperation,
+  type ClaudeHookInstallRecord,
+  type ClaudeHookOperationDependencies,
+  type ClaudeHookOperationInput,
+  type ClaudeHookOperationResult,
+} from "../ops/hooks.ts";
+import {
+  runCodexHookOperation,
+  type CodexHookInstallRecord,
+  type CodexHookOperationDependencies,
+  type CodexHookOperationInput,
+  type CodexHookOperationResult,
+} from "../ops/codex-hooks.ts";
+import {
+  probeCodexHookStatus,
+  type CodexHookStatus,
+} from "../providers/codex/codex-hook.ts";
+import {
   requestAttachFromControlSocket,
   requestAttachExitedFromControlSocket,
   requestAttachFailedFromControlSocket,
   requestAttachAuthorizeSpawnFromControlSocket,
   requestAttachStartedFromControlSocket,
   requestBootstrapFromControlSocket,
-  requestPanicLockFromControlSocket,
+  requestHooksReloadFromControlSocket,
   type BootstrapTokenReply,
 } from "../server/control-socket.ts";
 import type { AttachInstruction } from "../server/contracts.ts";
-import { ManagerDatabase } from "../server/persistence.ts";
+import { IncompatibleDatabaseError, ManagerDatabase } from "../server/persistence.ts";
 import { installRemoteNode, runNodeBridge } from "../remote/index.ts";
 import {
   attachSpecFromInstruction,
@@ -61,25 +74,8 @@ import {
 } from "./client.ts";
 import { CLI_HELP, parseCliCommand } from "./args.ts";
 
-const LIST_HELP = `Usage: agent-manager list [options]
-
-List live and recently active local Codex and Claude sessions.
-
-Options:
-  --json                  Output the stable JSON envelope instead of a table
-  --since <duration>      Include ended sessions updated within this window (default: 15m; 0 = live only)
-  --provider <name>       codex, claude, all, or a comma-separated list (default: all)
-  --status <statuses>     Filter by comma-separated normalized statuses
-  --children              Expand nested subagents; parents show child counts by default
-  -h, --help              Show this help`;
-
 interface TextWriter {
   write(value: string): unknown;
-}
-
-interface ListingWithOutcome extends ListingResult {
-  selectedProviderCount: number;
-  successfulProviderCount: number;
 }
 
 interface StartedServer {
@@ -104,19 +100,11 @@ interface ServerModule {
 export interface CliDependencies {
   stdout: TextWriter;
   stderr: TextWriter;
-  stdoutColumns: number;
   homeDirectory: string;
   cliEntrypoint: string;
   controlSocketPath: string;
+  currentDirectory: string;
   serviceExecutables(): ServiceExecutables;
-  parseListArgs(args: string[]): CliOptions;
-  buildListing(options: CliOptions): ListingWithOutcome;
-  formatTable(
-    sessions: ListingResult["sessions"],
-    nowMs: number,
-    homeDirectory: string,
-    columns: number,
-  ): string;
   doctor(): Promise<DoctorReport>;
   loadConfig(): AgentManagerConfig;
   mutateConfig<T>(mutator: (config: AgentManagerConfig) => T): T;
@@ -134,6 +122,31 @@ export interface CliDependencies {
   removeTailscale(config: AgentManagerConfig): { changed: boolean };
   renderService(options: LaunchAgentOptions): string;
   installService(options: LaunchAgentOptions): string;
+  prepareServiceState(config: AgentManagerConfig): void;
+  stopService(): void;
+  resetOwnedState(): readonly string[];
+  recreateOwnedState(): AgentManagerConfig;
+  reloadService(destination: string): void;
+  waitForService(port: number): Promise<void>;
+  operateClaudeHook(
+    input: ClaudeHookOperationInput,
+    dependencies: ClaudeHookOperationDependencies,
+  ): Promise<ClaudeHookOperationResult>;
+  loadClaudeHookRecord(settingsPath: string): ClaudeHookInstallRecord | null;
+  saveClaudeHookRecord(record: ClaudeHookInstallRecord): void;
+  removeClaudeHookRecord(recordId: string): void;
+  claudeHookLastSeen(recordId: string): string | null;
+  operateCodexHook(
+    input: CodexHookOperationInput,
+    dependencies: CodexHookOperationDependencies,
+  ): Promise<CodexHookOperationResult>;
+  loadCodexHookRecord(settingsPath: string): CodexHookInstallRecord | null;
+  saveCodexHookRecord(record: CodexHookInstallRecord): void;
+  removeCodexHookRecord(recordId: string): void;
+  codexHookLastSeen(recordId: string): string | null;
+  codexHookStatus(settingsPath: string, expectedCommand: string): Promise<CodexHookStatus>;
+  reloadHookAuthorizations(path: string): Promise<{ ok: true }>;
+  confirmHookChange(): Promise<boolean>;
   startServer(options: { host: "127.0.0.1"; port: number }): Promise<StartedServer>;
   requestBootstrap(path: string): Promise<BootstrapTokenReply>;
   requestAttach(path: string, sessionId: string): Promise<{ instruction: AttachInstruction }>;
@@ -153,9 +166,6 @@ export interface CliDependencies {
   ): Promise<{ ok: true }>;
   requestAttachExited(path: string, sessionId: string, handoffId: string, exitCode: number | null): Promise<{ ok: true }>;
   requestAttachFailed(path: string, sessionId: string, handoffId: string, error: string): Promise<{ ok: true }>;
-  requestPanicLock(path: string): Promise<{ ok: true }>;
-  engagePanicLock(): boolean;
-  releasePanicLock(): boolean;
   executeAttach(spec: AttachSpec): Promise<number>;
   executeLifecycleAttach(spec: AttachSpec, lifecycle: AttachLifecycle): Promise<number>;
   openBrowser(url: string): Promise<void>;
@@ -203,7 +213,6 @@ function syncConfiguredWorkspaces(config: AgentManagerConfig): void {
 async function defaultStartServer(
   options: { host: "127.0.0.1"; port: number },
 ): Promise<StartedServer> {
-  assertPanicUnlocked(defaultPaths());
   const moduleUrl = import.meta.url.endsWith(".ts")
     ? new URL("../server/index.ts", import.meta.url).href
     : new URL("../server/index.js", import.meta.url).href;
@@ -276,22 +285,80 @@ function defaultOpenBrowser(url: string): Promise<void> {
   });
 }
 
+interface ServiceHealthResponse {
+  ok: boolean;
+  status: number;
+  json(): Promise<unknown>;
+}
+
+export interface WaitForStableServiceOptions {
+  request?: (url: string) => Promise<ServiceHealthResponse>;
+  now?: () => number;
+  sleep?: (milliseconds: number) => Promise<void>;
+  timeoutMs?: number;
+  stableMs?: number;
+  pollMs?: number;
+}
+
+/** Require a healthy window so an asynchronous startup crash cannot pass deploy. */
+export async function waitForStableService(
+  port: number,
+  options: WaitForStableServiceOptions = {},
+): Promise<void> {
+  const now = options.now ?? Date.now;
+  const sleep = options.sleep
+    ?? ((milliseconds: number) => new Promise<void>((resolveDelay) => setTimeout(resolveDelay, milliseconds)));
+  const pollMs = options.pollMs ?? 125;
+  // launchd may honor the LaunchAgent throttle window after replacing a
+  // previously crash-looping build. Deployment should wait through that
+  // bounded OS handoff instead of reporting failure just before recovery.
+  const deadline = now() + (options.timeoutMs ?? 30_000);
+  const requiredStableMs = options.stableMs ?? 1_500;
+  const request = options.request ?? (async (url: string) => await fetch(url, {
+    cache: "no-store",
+    signal: AbortSignal.timeout(750),
+  }));
+  let healthySince: number | null = null;
+  let lastError = "service did not answer";
+  while (now() < deadline) {
+    try {
+      const response = await request(`http://127.0.0.1:${String(port)}/api/v1/healthz`);
+      if (response.ok) {
+        const body = await response.json();
+        if (typeof body === "object" && body !== null && "ok" in body && body.ok === true) {
+          healthySince ??= now();
+          if (now() - healthySince >= requiredStableMs) return;
+          await sleep(pollMs);
+          continue;
+        }
+      }
+      lastError = `health returned ${String(response.status)}`;
+    } catch (error) {
+      lastError = errorMessage(error);
+    }
+    healthySince = null;
+    await sleep(pollMs);
+  }
+  throw new Error(`Agent Manager did not remain healthy after restart: ${lastError}`);
+}
+
+async function defaultWaitForService(port: number): Promise<void> {
+  await waitForStableService(port);
+}
+
 function defaultDependencies(): CliDependencies {
   const paths = defaultPaths();
   const cliEntrypoint = resolve(process.argv[1] ?? fileURLToPath(import.meta.url));
   return {
     stdout: process.stdout,
     stderr: process.stderr,
-    stdoutColumns: process.stdout.columns ?? 160,
     homeDirectory: homedir(),
     cliEntrypoint,
     controlSocketPath: join(paths.runtimeDirectory, "control.sock"),
+    currentDirectory: process.cwd(),
     serviceExecutables: () => resolveServiceExecutables({
       nodeExecutable: process.execPath,
     }),
-    parseListArgs: parseArgs,
-    buildListing,
-    formatTable,
     doctor: () => {
       const executables = resolveServiceExecutables({ nodeExecutable: process.execPath });
       return runDoctor({
@@ -365,6 +432,103 @@ function defaultDependencies(): CliDependencies {
     },
     renderService: renderLaunchAgent,
     installService: installLaunchAgentFile,
+    prepareServiceState: syncConfiguredWorkspaces,
+    stopService: stopLaunchAgent,
+    resetOwnedState: () => resetOwnedState(paths),
+    recreateOwnedState: () => {
+      const config = loadConfig(paths);
+      saveConfig(config, paths);
+      syncConfiguredWorkspaces(config);
+      return config;
+    },
+    reloadService: (destination) => reloadLaunchAgent(destination),
+    waitForService: defaultWaitForService,
+    operateClaudeHook: runClaudeHookOperation,
+    loadClaudeHookRecord: (settingsPath) => {
+      const database = new ManagerDatabase(paths.databaseFile);
+      try {
+        return database.getClaudeHookInstallRecord(settingsPath);
+      } finally {
+        database.close();
+      }
+    },
+    saveClaudeHookRecord: (record) => {
+      const database = new ManagerDatabase(paths.databaseFile);
+      try {
+        database.upsertClaudeHookInstallRecord(record);
+      } finally {
+        database.close();
+      }
+    },
+    removeClaudeHookRecord: (recordId) => {
+      const database = new ManagerDatabase(paths.databaseFile);
+      try {
+        database.removeClaudeHookInstallRecord(recordId);
+      } finally {
+        database.close();
+      }
+    },
+    claudeHookLastSeen: (recordId) => {
+      const database = new ManagerDatabase(paths.databaseFile);
+      try {
+        return database.listClaudeHookInstallRecords()
+          .find((record) => record.id === recordId)?.lastSeenAt ?? null;
+      } finally {
+        database.close();
+      }
+    },
+    operateCodexHook: runCodexHookOperation,
+    loadCodexHookRecord: (settingsPath) => {
+      const database = new ManagerDatabase(paths.databaseFile);
+      try {
+        return database.getCodexHookInstallRecord(settingsPath);
+      } finally {
+        database.close();
+      }
+    },
+    saveCodexHookRecord: (record) => {
+      const database = new ManagerDatabase(paths.databaseFile);
+      try {
+        database.upsertCodexHookInstallRecord(record);
+      } finally {
+        database.close();
+      }
+    },
+    removeCodexHookRecord: (recordId) => {
+      const database = new ManagerDatabase(paths.databaseFile);
+      try {
+        database.removeCodexHookInstallRecord(recordId);
+      } finally {
+        database.close();
+      }
+    },
+    codexHookLastSeen: (recordId) => {
+      const database = new ManagerDatabase(paths.databaseFile);
+      try {
+        return database.listCodexHookInstallRecords()
+          .find((record) => record.id === recordId)?.lastSeenAt ?? null;
+      } finally {
+        database.close();
+      }
+    },
+    codexHookStatus: (settingsPath, expectedCommand) => probeCodexHookStatus({
+      codexExecutable: resolveServiceExecutables({ nodeExecutable: process.execPath }).codex,
+      cwds: [dirname(dirname(settingsPath))],
+      expectedCommand,
+    }),
+    reloadHookAuthorizations: requestHooksReloadFromControlSocket,
+    confirmHookChange: async () => {
+      if (!process.stdin.isTTY || !process.stderr.isTTY) {
+        throw new Error("Hook settings changes require an interactive terminal or explicit --yes");
+      }
+      const prompt = createInterface({ input: process.stdin, output: process.stderr });
+      try {
+        const answer = await prompt.question("Apply this exact settings change? [y/N] ");
+        return /^(?:y|yes)$/iu.test(answer.trim());
+      } finally {
+        prompt.close();
+      }
+    },
     startServer: defaultStartServer,
     requestBootstrap: requestBootstrapFromControlSocket,
     requestAttach: requestAttachFromControlSocket,
@@ -372,13 +536,109 @@ function defaultDependencies(): CliDependencies {
     requestAttachStarted: requestAttachStartedFromControlSocket,
     requestAttachExited: requestAttachExitedFromControlSocket,
     requestAttachFailed: requestAttachFailedFromControlSocket,
-    requestPanicLock: requestPanicLockFromControlSocket,
-    engagePanicLock,
-    releasePanicLock,
     executeAttach,
     executeLifecycleAttach,
     openBrowser: defaultOpenBrowser,
   };
+}
+
+async function dispatchClaudeHook(
+  command: Extract<ReturnType<typeof parseCliCommand>, { name: "hooks" }>,
+  deps: CliDependencies,
+): Promise<void> {
+  const common = {
+    operation: command.operation,
+    scope: command.scope,
+    homeDirectory: deps.homeDirectory,
+    ...(command.scope === "project" ? { projectDirectory: deps.currentDirectory } : {}),
+  } as const;
+  const input: ClaudeHookOperationInput = command.operation === "install"
+    ? {
+        ...common,
+        operation: "install",
+        endpoint: `http://127.0.0.1:${String(deps.loadConfig().backend.port)}/api/v1/hooks/claude`,
+      }
+    : command.operation === "uninstall"
+      ? { ...common, operation: "uninstall" }
+      : { ...common, operation: "status" };
+  const result = await deps.operateClaudeHook(input, {
+    loadRecord: deps.loadClaudeHookRecord,
+    saveRecord: deps.saveClaudeHookRecord,
+    removeRecord: deps.removeClaudeHookRecord,
+    lastSeenAt: deps.claudeHookLastSeen,
+    showPreview: (plan) => {
+      const exactDiff = plan.diff.trimEnd();
+      if (exactDiff.length > 0) writeLine(deps.stdout, exactDiff);
+    },
+    confirm: () => command.yes ? true : deps.confirmHookChange(),
+  });
+  writeLine(deps.stdout, `Claude hooks (${command.scope}): ${result.status.state}`);
+  writeLine(deps.stdout, `Settings: ${result.status.settingsPath}`);
+  if (result.status.lastSeenAt) writeLine(deps.stdout, `Last event: ${result.status.lastSeenAt}`);
+  if (result.operation !== "status") writeLine(deps.stdout, `Outcome: ${result.outcome}`);
+  if (result.operation !== "status" && result.outcome !== "cancelled") {
+    try {
+      await deps.reloadHookAuthorizations(deps.controlSocketPath);
+    } catch {
+      writeLine(
+        deps.stderr,
+        "Hook settings are saved; start or restart Agent Manager before expecting cockpit events.",
+      );
+    }
+  }
+}
+
+async function dispatchCodexHook(
+  command: Extract<ReturnType<typeof parseCliCommand>, { name: "hooks" }>,
+  deps: CliDependencies,
+): Promise<void> {
+  const common = {
+    operation: command.operation,
+    scope: command.scope,
+    homeDirectory: deps.homeDirectory,
+    ...(command.scope === "project" ? { projectDirectory: deps.currentDirectory } : {}),
+  } as const;
+  const input: CodexHookOperationInput = command.operation === "install"
+    ? {
+        ...common,
+        operation: "install",
+        endpoint: `http://127.0.0.1:${String(deps.loadConfig().backend.port)}/api/v1/hooks/codex`,
+      }
+    : command.operation === "uninstall"
+      ? { ...common, operation: "uninstall" }
+      : { ...common, operation: "status" };
+  const result = await deps.operateCodexHook(input, {
+    loadRecord: deps.loadCodexHookRecord,
+    saveRecord: deps.saveCodexHookRecord,
+    removeRecord: deps.removeCodexHookRecord,
+    trustStatus: deps.codexHookStatus,
+    lastSeenAt: deps.codexHookLastSeen,
+    nodeExecutable: process.execPath,
+    showPreview: (plan) => {
+      const exactDiff = plan.diff.trimEnd();
+      if (exactDiff.length > 0) writeLine(deps.stdout, exactDiff);
+      writeLine(deps.stdout, plan.shimNotice);
+    },
+    confirm: () => command.yes ? true : deps.confirmHookChange(),
+  });
+  writeLine(deps.stdout, `Codex hooks (${command.scope}): ${result.status.state}`);
+  writeLine(deps.stdout, `Settings: ${result.status.settingsPath}`);
+  writeLine(deps.stdout, `Shim: ${result.status.shimPath}`);
+  if (result.status.lastSeenAt) writeLine(deps.stdout, `Last event: ${result.status.lastSeenAt}`);
+  if (result.status.state === "awaiting-trust") {
+    writeLine(deps.stdout, "Open /hooks in Codex and trust the exact Agent Manager command hook.");
+  }
+  if (result.operation !== "status") writeLine(deps.stdout, `Outcome: ${result.outcome}`);
+  if (result.operation !== "status" && result.outcome !== "cancelled") {
+    try {
+      await deps.reloadHookAuthorizations(deps.controlSocketPath);
+    } catch {
+      writeLine(
+        deps.stderr,
+        "Hook settings are saved; start or restart Agent Manager before expecting cockpit events.",
+      );
+    }
+  }
 }
 
 function dependencies(overrides: Partial<CliDependencies>): CliDependencies {
@@ -393,42 +653,6 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function publicListing(listing: ListingWithOutcome): ListingResult {
-  return {
-    version: listing.version,
-    generatedAt: listing.generatedAt,
-    recentWindowSeconds: listing.recentWindowSeconds,
-    sessions: listing.sessions,
-    diagnostics: listing.diagnostics,
-  };
-}
-
-function runList(args: string[], deps: CliDependencies): number {
-  const options = deps.parseListArgs(args);
-  if (options.help) {
-    writeLine(deps.stdout, LIST_HELP);
-    return 0;
-  }
-  const listing = deps.buildListing(options);
-  if (options.json) {
-    writeLine(deps.stdout, JSON.stringify(publicListing(listing), null, 2));
-  } else {
-    writeLine(
-      deps.stdout,
-      deps.formatTable(
-        listing.sessions,
-        Date.parse(listing.generatedAt),
-        deps.homeDirectory,
-        deps.stdoutColumns,
-      ),
-    );
-    for (const diagnostic of listing.diagnostics) {
-      writeLine(deps.stderr, `${diagnostic.level} [${diagnostic.provider}] ${diagnostic.message}`);
-    }
-  }
-  return listing.selectedProviderCount > 0 && listing.successfulProviderCount === 0 ? 2 : 0;
-}
-
 function printDoctor(report: DoctorReport, deps: CliDependencies): void {
   for (const check of report.checks) {
     const suffix = check.blocksControl ? " (controls blocked)" : "";
@@ -438,14 +662,35 @@ function printDoctor(report: DoctorReport, deps: CliDependencies): void {
 }
 
 function serviceOptions(config: AgentManagerConfig, deps: CliDependencies): LaunchAgentOptions {
-  const paths = defaultPaths(deps.homeDirectory);
   return {
     executables: deps.serviceExecutables(),
     cliEntrypoint: deps.cliEntrypoint,
     homeDirectory: deps.homeDirectory,
-    panicLockFile: panicLockPath(paths),
     backendPort: config.backend.port,
   };
+}
+
+function isColdCutoverError(error: unknown): error is IncompatibleConfigError | IncompatibleDatabaseError {
+  return error instanceof IncompatibleConfigError || error instanceof IncompatibleDatabaseError;
+}
+
+function prepareInstalledServiceState(deps: CliDependencies): {
+  config: AgentManagerConfig;
+  coldCutover: boolean;
+} {
+  try {
+    const config = deps.loadConfig();
+    deps.prepareServiceState(config);
+    return { config, coldCutover: false };
+  } catch (error) {
+    if (!isColdCutoverError(error)) throw error;
+  }
+
+  // The old process may still own SQLite handles. Unload only this tool's
+  // exact per-user LaunchAgent before deleting its bounded state files.
+  deps.stopService();
+  deps.resetOwnedState();
+  return { config: deps.recreateOwnedState(), coldCutover: true };
 }
 
 async function dispatch(argv: readonly string[], deps: CliDependencies): Promise<number> {
@@ -454,8 +699,6 @@ async function dispatch(argv: readonly string[], deps: CliDependencies): Promise
     case "help":
       writeLine(deps.stdout, CLI_HELP);
       return 0;
-    case "list":
-      return runList(command.args, deps);
     case "serve": {
       const server = await deps.startServer({ host: command.host, port: command.port });
       writeLine(deps.stdout, `Agent Manager listening at ${server.address}`);
@@ -665,37 +908,42 @@ async function dispatch(argv: readonly string[], deps: CliDependencies): Promise
       writeLine(deps.stdout, "Restart Agent Manager to remove the Tailscale identity from its allowlist.");
       return 0;
     }
+    case "hooks": {
+      if (command.scope === "project") {
+        writeLine(
+          deps.stderr,
+          "Project hooks point at this machine-local Agent Manager service and will not work on another machine.",
+        );
+      }
+      if (command.provider === "claude") {
+        await dispatchClaudeHook(command, deps);
+      } else if (command.provider === "codex") {
+        await dispatchCodexHook(command, deps);
+      } else {
+        await dispatchClaudeHook(command, deps);
+        await dispatchCodexHook(command, deps);
+      }
+      return 0;
+    }
     case "service": {
-      const config = deps.loadConfig();
-      const options = serviceOptions(config, deps);
       if (command.operation === "print") {
+        const config = deps.loadConfig();
+        const options = serviceOptions(config, deps);
         deps.stdout.write(deps.renderService(options));
         return 0;
       }
+      const prepared = prepareInstalledServiceState(deps);
+      const config = prepared.config;
+      const options = serviceOptions(config, deps);
       const destination = deps.installService(options);
-      writeLine(deps.stdout, `Installed ${destination}`);
-      writeLine(deps.stdout, `Load it explicitly with: launchctl bootstrap gui/${String(process.getuid?.() ?? 0)} ${JSON.stringify(destination)}`);
+      deps.reloadService(destination);
+      await deps.waitForService(config.backend.port);
+      if (prepared.coldCutover) {
+        writeLine(deps.stdout, "Recreated incompatible Agent Manager config and database state for the current schema.");
+      }
+      writeLine(deps.stdout, `Installed, restarted, and healthy: ${destination}`);
       return 0;
     }
-    case "panic-lock": {
-      deps.engagePanicLock();
-      try {
-        await deps.requestPanicLock(deps.controlSocketPath);
-      } catch (error) {
-        throw new Error(
-          `Persistent panic lock is engaged, but live control-plane cleanup was incomplete: ${errorMessage(error)}`,
-        );
-      }
-      writeLine(deps.stdout, "Agent Manager control plane locked persistently. Agent sessions were left running.");
-      return 0;
-    }
-    case "panic-unlock":
-      if (deps.releasePanicLock()) {
-        writeLine(deps.stdout, "Released the persistent panic lock; launchd may restart Agent Manager.");
-      } else {
-        writeLine(deps.stdout, "Agent Manager panic lock was not engaged.");
-      }
-      return 0;
   }
 }
 

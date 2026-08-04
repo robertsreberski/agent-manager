@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 
+import type { TodoProgress } from "../shared/session.ts";
 import { encodeActivityCursor, parseActivityCursor } from "./cursor.ts";
 import {
   ACTIVITY_SCHEMA_VERSION,
@@ -44,6 +45,9 @@ interface ActivitySession {
   appendOffsets: Map<string, number>;
   appendSources: Map<string, AppendSourceState>;
   truncated: boolean;
+  /** Content-free state retained across todo rewrites for exact stall metadata. */
+  todoSemantic: string | null;
+  todoProgress: TodoProgress | null;
 }
 
 interface AppendSourceState {
@@ -52,6 +56,11 @@ interface AppendSourceState {
   /** Once saturated, later source bytes are accepted but never rendered. */
   saturated: boolean;
 }
+
+export type TodoProgressListener = (
+  sessionId: string,
+  progress: TodoProgress | null,
+) => void;
 
 function clone<T>(value: T): T {
   return structuredClone(value);
@@ -79,11 +88,24 @@ function finite(value: number | null | undefined): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+function nonnegativeInteger(value: number | undefined, fallback: number): number {
+  return Number.isSafeInteger(value) && (value ?? -1) >= 0 ? value! : fallback;
+}
+
+function nonnegativeIntegerOrNull(value: number | null | undefined): number | null {
+  return Number.isSafeInteger(value) && (value ?? -1) >= 0 ? value! : null;
+}
+
+function positiveIntegerOrNull(value: number | null | undefined): number | null {
+  return Number.isSafeInteger(value) && (value ?? 0) > 0 ? value! : null;
+}
+
 export class ActivityHub {
   readonly streamEpoch: string;
   readonly #limits: ActivityHubLimits;
   readonly #now: () => number;
   readonly #sessions = new Map<string, ActivitySession>();
+  readonly #todoProgressListeners = new Set<TodoProgressListener>();
 
   constructor(options: ActivityHubOptions = {}) {
     this.#limits = {
@@ -114,12 +136,15 @@ export class ActivityHub {
       appendOffsets: new Map(),
       appendSources: new Map(),
       truncated: false,
+      todoSemantic: null,
+      todoProgress: null,
     });
   }
 
   ingest(sessionId: string, provider: Provider, mutation: ActivityMutation): ActivityFrame {
     this.ensureSession(sessionId, provider);
     const session = this.#sessions.get(sessionId)!;
+    const previousTodoProgress = clone(session.todoProgress);
     const seq = ++session.seq;
     const at = new Date(this.#now()).toISOString();
     let frame: ActivityFrame;
@@ -247,7 +272,7 @@ export class ActivityHub {
         session.items.clear();
         session.appendOffsets.clear();
         session.appendSources.clear();
-        session.truncated = false;
+        session.truncated = mutation.truncated ?? false;
         for (const draft of mutation.items ?? []) {
           const existing = session.items.get(draft.id);
           const item = this.#materialize(
@@ -268,7 +293,13 @@ export class ActivityHub {
       }
     }
 
+    this.#advanceTodoProgress(session, at);
     this.#record(session, frame);
+    this.#publishTodoProgress(
+      sessionId,
+      previousTodoProgress,
+      session.todoProgress,
+    );
     for (const listener of session.listeners) {
       try {
         listener(clone(frame));
@@ -330,15 +361,37 @@ export class ActivityHub {
     return () => session.listeners.delete(listener);
   }
 
+  todoProgress(sessionId: string): TodoProgress | null {
+    const session = this.#sessions.get(sessionId);
+    return session ? clone(session.todoProgress) : null;
+  }
+
+  /**
+   * Emits content-free progress when the authoritative todo changes. Existing
+   * non-empty summaries are emitted on subscribe so late server composition
+   * does not miss provider activity that already arrived.
+   */
+  subscribeTodoProgress(listener: TodoProgressListener): () => void {
+    this.#todoProgressListeners.add(listener);
+    for (const [sessionId, session] of this.#sessions) {
+      const progress = session.todoProgress;
+      if (progress) this.#callTodoProgressListener(listener, sessionId, progress);
+    }
+    return () => this.#todoProgressListeners.delete(listener);
+  }
+
   clearSession(sessionId: string): void {
     const session = this.#sessions.get(sessionId);
     if (!session) return;
+    const previousTodoProgress = clone(session.todoProgress);
     const listeners = [...session.listeners];
     const seq = ++session.seq;
     session.items.clear();
     session.appendOffsets.clear();
     session.appendSources.clear();
     session.truncated = false;
+    session.todoSemantic = null;
+    session.todoProgress = null;
     const frame = this.#resetFrame(
       sessionId,
       session,
@@ -347,6 +400,7 @@ export class ActivityHub {
       "cleared",
     );
     this.#record(session, frame);
+    this.#publishTodoProgress(sessionId, previousTodoProgress, null);
     for (const listener of listeners) listener(clone(frame));
     this.#sessions.delete(sessionId);
   }
@@ -354,6 +408,7 @@ export class ActivityHub {
   dispose(): void {
     for (const session of this.#sessions.values()) session.listeners.clear();
     this.#sessions.clear();
+    this.#todoProgressListeners.clear();
   }
 
   #cursor(sessionId: string, seq: number): string {
@@ -364,6 +419,71 @@ export class ActivityHub {
     return [...session.items.values()]
       .sort((left, right) => left.seq - right.seq || left.id.localeCompare(right.id))
       .map((item) => clone(item));
+  }
+
+  #currentTodo(session: ActivitySession): Extract<ActivityItem, { kind: "todo" }> | null {
+    let current: Extract<ActivityItem, { kind: "todo" }> | null = null;
+    for (const item of session.items.values()) {
+      if (item.kind !== "todo") continue;
+      if (current === null || item.seq >= current.seq) current = item;
+    }
+    return current && current.steps.length > 0 ? current : null;
+  }
+
+  #advanceTodoProgress(session: ActivitySession, observedAt: string): void {
+    const current = this.#currentTodo(session);
+    if (!current) {
+      session.todoSemantic = null;
+      session.todoProgress = null;
+      return;
+    }
+    // IDs and provider statuses are the only semantic fields. Text and detail
+    // may be rewritten without indicating progress and never cross this edge.
+    const semantic = JSON.stringify(current.steps.map((step) => [step.id, step.status]));
+    const live = current.steps.filter((step) => step.status !== "removed");
+    const completed = live.filter((step) => step.status === "completed").length;
+    const active = completed < live.length
+      && live.some((step) => step.status === "in_progress");
+    const transitioned = session.todoSemantic !== null && session.todoSemantic !== semantic;
+    session.todoProgress = {
+      completed,
+      total: live.length,
+      hasMoved: transitioned || (session.todoProgress?.hasMoved ?? false),
+      lastTransitionAt: transitioned
+        ? observedAt
+        : session.todoProgress?.lastTransitionAt ?? null,
+      active,
+    };
+    session.todoSemantic = semantic;
+  }
+
+  #publishTodoProgress(
+    sessionId: string,
+    previous: TodoProgress | null,
+    next: TodoProgress | null,
+  ): void {
+    if (
+      previous?.completed === next?.completed
+      && previous?.total === next?.total
+      && previous?.hasMoved === next?.hasMoved
+      && previous?.lastTransitionAt === next?.lastTransitionAt
+      && previous?.active === next?.active
+    ) return;
+    for (const listener of this.#todoProgressListeners) {
+      this.#callTodoProgressListener(listener, sessionId, next);
+    }
+  }
+
+  #callTodoProgressListener(
+    listener: TodoProgressListener,
+    sessionId: string,
+    progress: TodoProgress | null,
+  ): void {
+    try {
+      listener(sessionId, clone(progress));
+    } catch {
+      // Metadata observers cannot interrupt provider activity ingestion.
+    }
   }
 
   #resetFrame(
@@ -490,7 +610,7 @@ export class ActivityHub {
       confidence: draft.confidence ?? previous?.confidence ?? "exact",
       exposure: draft.exposure ?? previous?.exposure ?? "provider-exposed",
     } as const;
-    let truncated = previous?.truncated ?? false;
+    let truncated = draft.truncated ?? previous?.truncated ?? false;
     const text = (value: string): string => {
       const bounded = this.#boundedText(value);
       truncated ||= bounded.truncated;
@@ -508,8 +628,36 @@ export class ActivityHub {
       }
       case "plan": {
         const old = previous?.kind === "plan" ? previous : undefined;
-        const steps = (draft.steps ?? old?.steps ?? []).map((step) => ({ id: text(step.id), text: text(step.text), status: step.status }));
-        return { ...common, kind: "plan", text: text(draft.text ?? old?.text ?? ""), steps, truncated };
+        return {
+          ...common,
+          kind: "plan",
+          path: draft.path === undefined ? old?.path ?? null : draft.path === null ? null : text(draft.path),
+          version: draft.version === undefined ? old?.version ?? null : positiveIntegerOrNull(draft.version),
+          markdown: text(draft.markdown ?? old?.markdown ?? ""),
+          supersededBy: draft.supersededBy === undefined ? old?.supersededBy ?? null : draft.supersededBy === null ? null : text(draft.supersededBy),
+          approvalRequestId: draft.approvalRequestId === undefined ? old?.approvalRequestId ?? null : draft.approvalRequestId === null ? null : text(draft.approvalRequestId),
+          approvedAt: draft.approvedAt === undefined ? old?.approvedAt ?? null : draft.approvedAt === null ? null : text(draft.approvedAt),
+          truncated,
+        };
+      }
+      case "todo": {
+        const old = previous?.kind === "todo" ? previous : undefined;
+        const steps = (draft.steps ?? old?.steps ?? []).map((step) => ({
+          id: text(step.id),
+          text: text(step.text),
+          status: step.status,
+          detail: step.detail === null ? null : text(step.detail),
+          addedAfterStart: step.addedAfterStart,
+          removedReason: step.removedReason === null ? null : text(step.removedReason),
+        }));
+        return {
+          ...common,
+          kind: "todo",
+          steps,
+          added: nonnegativeInteger(draft.added, old?.added ?? 0),
+          removed: nonnegativeInteger(draft.removed, old?.removed ?? 0),
+          truncated,
+        };
       }
       case "tool": {
         const old = previous?.kind === "tool" ? previous : undefined;
@@ -520,7 +668,12 @@ export class ActivityHub {
       }
       case "file-change": {
         const old = previous?.kind === "file-change" ? previous : undefined;
-        const changes = (draft.changes ?? old?.changes ?? []).map((change) => ({ path: text(change.path), operation: change.operation, diff: text(change.diff) }));
+        const changes = (draft.changes ?? old?.changes ?? []).map((change) => ({
+          path: text(change.path),
+          previousPath: change.previousPath === null ? null : text(change.previousPath),
+          operation: change.operation,
+          diff: text(change.diff),
+        }));
         return { ...common, kind: "file-change", summary: text(draft.summary ?? old?.summary ?? "File changes"), changes, truncated };
       }
       case "subagent": {
@@ -529,8 +682,21 @@ export class ActivityHub {
       }
       case "attention": {
         const old = previous?.kind === "attention" ? previous : undefined;
-        const questions = (draft.questions ?? old?.questions ?? []).map((question) => ({ id: text(question.id), ...(question.header === undefined ? {} : { header: text(question.header) }), text: text(question.text), options: question.options.map((option) => ({ label: text(option.label), description: option.description === null ? null : text(option.description) })), multiSelect: question.multiSelect, allowFreeText: question.allowFreeText, isSecret: question.isSecret }));
-        return { ...common, kind: "attention", requestId: text(draft.requestId), attentionKind: draft.attentionKind, title: draft.title === undefined ? old?.title ?? null : draft.title === null ? null : text(draft.title), summary: draft.summary === undefined ? old?.summary ?? null : draft.summary === null ? null : text(draft.summary), questions, respondable: draft.respondable ?? old?.respondable ?? false, resolved: draft.resolved ?? old?.resolved ?? false, isSecret: draft.isSecret ?? old?.isSecret ?? questions.some((question) => question.isSecret), truncated };
+        const questions = (draft.questions ?? old?.questions ?? []).map((question) => ({ id: text(question.id), ...(question.header === undefined ? {} : { header: text(question.header) }), text: text(question.text), options: question.options.map((option) => ({ label: text(option.label), description: option.description === null ? null : text(option.description), recommended: option.recommended === true ? true : option.recommended === false ? false : null })), multiSelect: question.multiSelect, allowFreeText: question.allowFreeText, isSecret: question.isSecret }));
+        const rawApprovalFacts = draft.approvalFacts === undefined
+          ? old?.approvalFacts ?? null
+          : draft.approvalFacts;
+        const approvalFacts = rawApprovalFacts === null ? null : {
+          command: rawApprovalFacts.command === null ? null : text(rawApprovalFacts.command),
+          paths: rawApprovalFacts.paths === null
+            ? null
+            : rawApprovalFacts.paths.map(text),
+          writes: rawApprovalFacts.writes.map(text),
+          network: rawApprovalFacts.network,
+          canPersist: rawApprovalFacts.canPersist,
+          deleteCount: nonnegativeIntegerOrNull(rawApprovalFacts.deleteCount),
+        };
+        return { ...common, kind: "attention", requestId: text(draft.requestId), attentionKind: draft.attentionKind, title: draft.title === undefined ? old?.title ?? null : draft.title === null ? null : text(draft.title), summary: draft.summary === undefined ? old?.summary ?? null : draft.summary === null ? null : text(draft.summary), questions, approvalFacts, respondable: draft.respondable ?? old?.respondable ?? false, resolved: draft.resolved ?? old?.resolved ?? false, isSecret: draft.isSecret ?? old?.isSecret ?? questions.some((question) => question.isSecret), truncated };
       }
       case "queue": {
         const old = previous?.kind === "queue" ? previous : undefined;
@@ -575,8 +741,10 @@ export class ActivityHub {
     const delta = replacement ? "" : rendered.value.slice(current.length);
 
     let next: ActivityItem | null = null;
-    if (channel === "text" && (item.kind === "message" || item.kind === "reasoning" || item.kind === "plan")) {
+    if (channel === "text" && (item.kind === "message" || item.kind === "reasoning")) {
       next = { ...item, text: rendered.value };
+    } else if (channel === "markdown" && item.kind === "plan") {
+      next = { ...item, markdown: rendered.value };
     } else if (channel === "arguments" && item.kind === "tool") {
       next = { ...item, arguments: rendered.value };
     } else if (channel === "result" && item.kind === "tool") {
@@ -588,7 +756,7 @@ export class ActivityHub {
     } else if (channel === "diff" && item.kind === "file-change") {
       const changes = [...item.changes];
       const index = Math.max(0, changes.length - 1);
-      const current = changes[index] ?? { path: "", operation: "update" as const, diff: "" };
+      const current = changes[index] ?? { path: "", previousPath: null, operation: "update" as const, diff: "" };
       changes[index] = { ...current, diff: rendered.value };
       next = { ...item, changes };
     }
@@ -620,9 +788,10 @@ export class ActivityHub {
   }
 
   #channelValue(item: ActivityItem, channel: ActivityAppendChannel): string | null {
-    if (channel === "text" && (item.kind === "message" || item.kind === "reasoning" || item.kind === "plan")) {
+    if (channel === "text" && (item.kind === "message" || item.kind === "reasoning")) {
       return item.text;
     }
+    if (channel === "markdown" && item.kind === "plan") return item.markdown;
     if (channel === "arguments" && item.kind === "tool") {
       return typeof item.arguments === "string"
         ? item.arguments
@@ -647,8 +816,10 @@ export class ActivityHub {
 
   #displayOffset(item: ActivityItem, channel: ActivityAppendChannel): number | null {
     let value: string | null = null;
-    if (channel === "text" && (item.kind === "message" || item.kind === "reasoning" || item.kind === "plan")) {
+    if (channel === "text" && (item.kind === "message" || item.kind === "reasoning")) {
       value = item.text;
+    } else if (channel === "markdown" && item.kind === "plan") {
+      value = item.markdown;
     } else if (channel === "arguments" && item.kind === "tool") {
       value = typeof item.arguments === "string"
         ? item.arguments
@@ -694,10 +865,13 @@ export class ActivityHub {
     const serialized = (value: ActivityJsonValue | string | null): string =>
       typeof value === "string" ? value : value === null ? "" : JSON.stringify(value);
     if (
-      (item.kind === "message" || item.kind === "reasoning" || item.kind === "plan")
-      && (draft.kind === "message" || draft.kind === "reasoning" || draft.kind === "plan")
+      (item.kind === "message" || item.kind === "reasoning")
+      && (draft.kind === "message" || draft.kind === "reasoning")
     ) {
       set("text", item.text, draft.text);
+    }
+    if (item.kind === "plan" && draft.kind === "plan") {
+      set("markdown", item.markdown, draft.markdown);
     }
     if (item.kind === "tool" && draft.kind === "tool") {
       set(

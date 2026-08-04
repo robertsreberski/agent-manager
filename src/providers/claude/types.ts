@@ -1,14 +1,20 @@
 import type {
   CanUseTool,
+  EffortLevel,
   ElicitationRequest,
+  ModelInfo,
+  PermissionUpdate,
   PermissionMode,
   SDKMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 
 export const CLAUDE_AGENT_SDK_VERSION = "0.3.220";
-export const CLAUDE_CODE_VERSION = "2.1.220";
+export const CLAUDE_CODE_VERSION = "2.1.221";
 
 export type ClaudePermissionMode = PermissionMode;
+export type ClaudeEffortLevel = EffortLevel;
+export type ClaudeModelInfo = ModelInfo;
+export type ClaudePermissionUpdate = PermissionUpdate;
 
 export type ClaudeActivity =
   | "starting"
@@ -41,8 +47,9 @@ export type ClaudeSdkMessage = SDKMessage;
 export interface ClaudePermissionResultAllow {
   behavior: "allow";
   updatedInput: Record<string, unknown>;
+  updatedPermissions?: ClaudePermissionUpdate[];
   toolUseID: string;
-  decisionClassification: "user_temporary";
+  decisionClassification: "user_temporary" | "user_permanent";
 }
 
 export interface ClaudePermissionResultDeny {
@@ -70,6 +77,7 @@ export interface ClaudeSdkQueryOptions {
   forwardSubagentText: true;
   permissionMode: ClaudePermissionMode;
   allowDangerouslySkipPermissions: boolean;
+  effort?: ClaudeEffortLevel;
   env: Record<string, string | undefined>;
   resume?: string;
   model?: string;
@@ -97,6 +105,11 @@ export interface ClaudeInterruptReceipt {
 export interface ClaudeSdkQuery extends AsyncIterable<ClaudeSdkMessage> {
   interrupt(): Promise<ClaudeInterruptReceipt | undefined>;
   setPermissionMode(mode: ClaudePermissionMode): Promise<void>;
+  setModel(model?: string): Promise<void>;
+  applyFlagSettings(settings: {
+    effortLevel?: ClaudeEffortLevel | null;
+  }): Promise<void>;
+  supportedModels(): Promise<ClaudeModelInfo[]>;
   close(): void;
 }
 
@@ -117,6 +130,7 @@ export interface ClaudeManagedSessionConfig {
   mode: ClaudePermissionMode;
   initialMessage?: string;
   model?: string;
+  effort?: ClaudeEffortLevel;
   environment?: Record<string, string | undefined>;
   allowDangerouslySkipPermissions?: boolean;
 }
@@ -134,6 +148,12 @@ export interface ClaudePendingRequest {
   toolUseId: string | null;
   payload: Record<string, unknown>;
   createdAt: string;
+}
+
+export interface ClaudeStagedMessage {
+  id: string;
+  text: string;
+  enqueuedAt: string;
 }
 
 export type ClaudeCliHandoffState = "prepared" | "attached" | "exited";
@@ -165,11 +185,15 @@ export interface ClaudeManagedSessionSnapshot {
   activity: ClaudeActivity;
   mode: ClaudePermissionMode;
   desiredMode: ClaudePermissionMode;
+  model: string | null;
+  desiredModel: string | null;
+  effort: ClaudeEffortLevel | null;
   sdkVersion: string;
   claudeCodeVersion: string | null;
   capabilities: string[];
   canSteer: boolean;
   pendingRequests: ClaudePendingRequest[];
+  stagedMessages: ClaudeStagedMessage[];
   outstandingMessageIds: string[];
   stillQueuedMessageIds: string[];
   queueKnowledge: "known" | "unknown";
@@ -188,6 +212,7 @@ export type ClaudeRequestResponse =
   | {
       decision: "allow";
       updatedInput?: Record<string, unknown>;
+      persist?: boolean;
     }
   | {
       decision: "deny";

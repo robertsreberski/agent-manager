@@ -1,15 +1,21 @@
+import { createHash } from "node:crypto";
+
 import type {
   ActivityAttentionQuestion,
   ActivityItemDraft,
   ActivityJsonValue,
   ActivityMutation,
   ActivityState,
+  ActivityTodoInputStep,
+  ActivityTodoRewriteState,
 } from "../../activity/index.ts";
+import { reconcileTodoRewrite } from "../../activity/index.ts";
 import type {
   ClaudeManagedSessionSnapshot,
   ClaudePendingRequest,
   ClaudeSdkMessage,
 } from "./types.ts";
+import { toolApprovalFacts } from "../approval-facts.ts";
 
 interface StreamBlock {
   id: string;
@@ -72,6 +78,10 @@ function stableSegment(value: string): string {
 
 function itemId(kind: string, value: string): string {
   return `claude:${kind}:${stableSegment(value)}`;
+}
+
+function digestText(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex").slice(0, 20);
 }
 
 function contentText(value: unknown): string {
@@ -174,7 +184,7 @@ function requestQuestions(request: ClaudePendingRequest): ActivityAttentionQuest
     const options = Array.isArray(question.options)
       ? question.options.flatMap((rawOption) => {
           if (typeof rawOption === "string") {
-            return [{ label: rawOption, description: null }];
+            return [{ label: rawOption, description: null, recommended: null }];
           }
           const option = objectValue(rawOption);
           if (!option || typeof option.label !== "string") return [];
@@ -182,6 +192,9 @@ function requestQuestions(request: ClaudePendingRequest): ActivityAttentionQuest
             label: option.label,
             description: typeof option.description === "string"
               ? option.description
+              : null,
+            recommended: typeof option.recommended === "boolean"
+              ? option.recommended
               : null,
           }];
         })
@@ -270,11 +283,15 @@ export class ClaudeActivityProjector {
     string,
     Extract<ActivityItemDraft, { kind: "usage" }>
   >();
+  readonly #todos = new Map<string, ActivityTodoRewriteState>();
+  readonly #planApprovalRequests = new Map<string, string>();
+  readonly #approvedPlans = new Map<string, string>();
   #currentTurnId: string | null = null;
-  #legacySequence = 0;
+  #syntheticSequence = 0;
   #lastSnapshotActivity: ClaudeManagedSessionSnapshot["activity"] | null = null;
   #lastSnapshotError: string | null = null;
   #requestStatusActive = false;
+  #cwd: string | null = null;
 
   projectMessage(message: ClaudeSdkMessage): ActivityMutation[] {
     switch (message.type) {
@@ -307,10 +324,40 @@ export class ClaudeActivityProjector {
   }
 
   projectSnapshot(snapshot: ClaudeManagedSessionSnapshot): ActivityMutation[] {
+    this.#cwd = snapshot.cwd;
     const mutations: ActivityMutation[] = [];
+    const stagedMessages = snapshot.stagedMessages ?? [];
+    mutations.push({
+      type: "upsert",
+      item: {
+        id: "claude:queue:staged",
+        kind: "queue",
+        messages: stagedMessages.map((message) => ({
+          id: message.id,
+          text: message.text,
+          status: "queued",
+          enqueuedAt: message.enqueuedAt,
+          turnId: null,
+        })),
+        state: stagedMessages.length > 0 ? "waiting" : "complete",
+        source: "provider-api",
+        confidence: "exact",
+        exposure: "provider-exposed",
+      },
+    });
     const current = new Map(snapshot.pendingRequests.map((request) => [request.id, request]));
     for (const request of snapshot.pendingRequests) {
       this.#pendingRequests.set(request.id, structuredClone(request));
+      if (request.kind === "plan-approval" && request.toolUseId) {
+        const plan = this.#planMutation(
+          request.toolUseId,
+          request.payload.input,
+          this.#currentTurnId,
+          null,
+          request.id,
+        );
+        if (plan) mutations.push(plan);
+      }
       mutations.push({ type: "upsert", item: this.#attentionDraft(request, false) });
     }
     for (const [id, request] of this.#pendingRequests) {
@@ -370,6 +417,36 @@ export class ClaudeActivityProjector {
     }
     this.#lastSnapshotError = snapshot.lastError;
     return mutations;
+  }
+
+  /**
+   * Projects the exact approval Agent Manager just returned for one held
+   * Claude ExitPlanMode request. The request's toolUseId is the provider edge
+   * back to the plan document; no turn/time proximity is consulted.
+   */
+  projectPlanApproval(
+    request: ClaudePendingRequest,
+    approvedAt: string,
+  ): ActivityMutation[] {
+    if (request.kind !== "plan-approval" || !request.toolUseId) return [];
+    this.#planApprovalRequests.set(request.toolUseId, request.id);
+    this.#approvedPlans.set(request.toolUseId, approvedAt);
+    const plan = this.#planMutation(
+      request.toolUseId,
+      request.payload.input,
+      this.#currentTurnId,
+      this.#tools.get(request.toolUseId)?.parentId ?? null,
+      request.id,
+    );
+    if (!plan || plan.type !== "upsert" || plan.item.kind !== "plan") return [];
+    return [{
+      type: "upsert",
+      item: {
+        ...plan.item,
+        approvedAt,
+        state: "complete",
+      },
+    }];
   }
 
   #projectStreamEvent(
@@ -559,6 +636,7 @@ export class ClaudeActivityProjector {
     if (event.type === "content_block_stop") {
       const block = lane.blocks.get(event.index);
       if (block?.kind === "tool") {
+        const argumentsValue = parseJsonOrText(block.partialJson);
         mutations.push({
           type: "upsert",
           item: {
@@ -566,7 +644,7 @@ export class ClaudeActivityProjector {
             kind: "tool",
             toolCallId: block.toolCallId as string,
             name: block.toolName as string,
-            arguments: parseJsonOrText(block.partialJson),
+            arguments: argumentsValue,
             state: "pending",
             turnId: lane.turnId,
             parentId: this.#parentId(lane.parentToolUseId),
@@ -575,6 +653,13 @@ export class ClaudeActivityProjector {
             exposure: "provider-exposed",
           },
         });
+        mutations.push(...this.#artifactMutations(
+          block.toolCallId as string,
+          block.toolName as string,
+          argumentsValue,
+          lane.turnId,
+          this.#parentId(lane.parentToolUseId),
+        ));
       } else if (block?.kind === "text") {
         mutations.push({ type: "upsert", item: this.#textDraft(lane, block, "complete") });
       } else if (block?.kind === "thinking" && block.text.length > 0) {
@@ -711,6 +796,13 @@ export class ClaudeActivityProjector {
             exposure: "provider-exposed",
           },
         });
+        mutations.push(...this.#artifactMutations(
+          toolCallId,
+          name,
+          content.input,
+          turnId,
+          this.#parentId(message.parent_tool_use_id),
+        ));
         this.#linkChild(message.parent_tool_use_id, id, mutations, {
           ...(message.subagent_type ? { name: message.subagent_type } : {}),
           ...(message.task_description
@@ -780,7 +872,7 @@ export class ClaudeActivityProjector {
       projectedToolResult = true;
       this.#projectToolResultBlock(
         block,
-        message.uuid ?? `legacy-${++this.#legacySequence}`,
+        message.uuid ?? `provider-missing-id-${++this.#syntheticSequence}`,
         this.#currentTurnId ?? message.uuid ?? "unknown-turn",
         mutations,
         message.tool_use_result,
@@ -790,7 +882,7 @@ export class ClaudeActivityProjector {
     if (!projectedToolResult && !message.isSynthetic) {
       const text = contentText(content);
       if (text.length > 0) {
-        const uuid = message.uuid ?? `legacy-${++this.#legacySequence}`;
+        const uuid = message.uuid ?? `provider-missing-id-${++this.#syntheticSequence}`;
         const turnId = uuid;
         this.#currentTurnId = turnId;
         const id = itemId("message", uuid);
@@ -1013,10 +1105,21 @@ export class ClaudeActivityProjector {
       },
     }];
     this.#linkChild(message.parent_tool_use_id, itemId("tool", message.tool_use_id), mutations);
-    if (message.task_id) {
+    const knownSubagent = message.task_id
+      ? this.#knownSubagent(message.task_id)
+      : undefined;
+    if (knownSubagent) {
+      mutations.push({
+        type: "upsert",
+        item: this.#subagentDraft(knownSubagent, "running"),
+      });
+    } else if (message.task_id && message.parent_tool_use_id) {
+      // The child tool id identifies this particular step, not the Task/Agent
+      // invocation which owns the subagent. parent_tool_use_id is the exact
+      // provider edge back to that invocation.
       const record = this.#ensureSubagent(
         message.task_id,
-        message.tool_use_id,
+        message.parent_tool_use_id,
         message.subagent_type,
         null,
       );
@@ -1141,29 +1244,57 @@ export class ClaudeActivityProjector {
         });
         break;
       case "task_started": {
-        const record = this.#ensureSubagent(
-          message.task_id,
-          message.tool_use_id,
-          message.subagent_type ?? message.workflow_name ?? message.task_type,
-          message.description,
-        );
-        mutations.push({ type: "upsert", item: this.#subagentDraft(record, "running") });
+        if (message.subagent_type) {
+          const record = this.#ensureSubagent(
+            message.task_id,
+            message.tool_use_id,
+            message.subagent_type,
+            message.description,
+          );
+          mutations.push({ type: "upsert", item: this.#subagentDraft(record, "running") });
+        } else {
+          mutations.push({
+            type: "upsert",
+            item: this.#taskLifecycleDraft(
+              message.task_id,
+              message.description,
+              "running",
+              message.workflow_name ?? message.task_type ?? null,
+            ),
+          });
+        }
         break;
       }
       case "task_progress": {
-        const record = this.#ensureSubagent(
-          message.task_id,
-          message.tool_use_id,
-          message.subagent_type,
-          message.description,
-        );
-        mutations.push({
-          type: "upsert",
-          item: {
-            ...this.#subagentDraft(record, "running"),
-            ...(message.summary ? { output: message.summary } : {}),
-          },
-        });
+        const existing = this.#knownSubagent(message.task_id, message.tool_use_id);
+        const record = existing ?? (message.subagent_type
+          ? this.#ensureSubagent(
+            message.task_id,
+            message.tool_use_id,
+            message.subagent_type,
+            message.description,
+          )
+          : undefined);
+        const parentId = record?.itemId ?? itemId("task", message.task_id);
+        if (record) {
+          mutations.push({
+            type: "upsert",
+            item: {
+              ...this.#subagentDraft(record, "running"),
+              ...(message.summary ? { output: message.summary } : {}),
+            },
+          });
+        } else {
+          mutations.push({
+            type: "upsert",
+            item: this.#taskLifecycleDraft(
+              message.task_id,
+              message.description,
+              "running",
+              message.summary ?? null,
+            ),
+          });
+        }
         mutations.push({
           type: "upsert",
           item: {
@@ -1171,7 +1302,7 @@ export class ClaudeActivityProjector {
             kind: "usage",
             scope: "turn",
             turnId: this.#currentTurnId,
-            parentId: record.itemId,
+            parentId,
             totalTokens: message.usage.total_tokens,
             state: "running",
             source: "provider-api",
@@ -1182,26 +1313,53 @@ export class ClaudeActivityProjector {
         break;
       }
       case "task_updated": {
-        const record = this.#ensureSubagent(message.task_id);
-        if (message.patch.description) record.description = message.patch.description;
-        mutations.push({
-          type: "upsert",
-          item: {
-            ...this.#subagentDraft(record, taskState(message.patch.status ?? "running")),
-            ...(message.patch.error ? { output: message.patch.error } : {}),
-          },
-        });
+        const state = taskState(message.patch.status ?? "running");
+        const record = this.#knownSubagent(message.task_id);
+        if (record) {
+          if (message.patch.description) record.description = message.patch.description;
+          mutations.push({
+            type: "upsert",
+            item: {
+              ...this.#subagentDraft(record, state),
+              ...(message.patch.error ? { output: message.patch.error } : {}),
+            },
+          });
+        } else {
+          mutations.push({
+            type: "upsert",
+            item: this.#taskLifecycleDraft(
+              message.task_id,
+              message.patch.description ?? `Task ${message.task_id}`,
+              state,
+              message.patch.error ?? null,
+            ),
+          });
+        }
         break;
       }
       case "task_notification": {
-        const record = this.#ensureSubagent(message.task_id, message.tool_use_id);
-        mutations.push({
-          type: "upsert",
-          item: {
-            ...this.#subagentDraft(record, taskState(message.status)),
-            output: message.summary,
-          },
-        });
+        const state = taskState(message.status);
+        const record = this.#knownSubagent(message.task_id, message.tool_use_id);
+        const parentId = record?.itemId ?? itemId("task", message.task_id);
+        if (record) {
+          mutations.push({
+            type: "upsert",
+            item: {
+              ...this.#subagentDraft(record, state),
+              output: message.summary,
+            },
+          });
+        } else {
+          mutations.push({
+            type: "upsert",
+            item: this.#taskLifecycleDraft(
+              message.task_id,
+              `Task ${message.status}`,
+              state,
+              message.summary,
+            ),
+          });
+        }
         if (message.usage) {
           mutations.push({
             type: "upsert",
@@ -1210,7 +1368,7 @@ export class ClaudeActivityProjector {
               kind: "usage",
               scope: "turn",
               turnId: this.#currentTurnId,
-              parentId: record.itemId,
+              parentId,
               totalTokens: message.usage.total_tokens,
               state: taskState(message.status),
               source: "provider-api",
@@ -1239,10 +1397,9 @@ export class ClaudeActivityProjector {
             exposure: "provider-exposed",
           },
         });
-        for (const task of message.tasks) {
-          const record = this.#ensureSubagent(task.task_id, undefined, task.task_type, task.description);
-          mutations.push({ type: "upsert", item: this.#subagentDraft(record, "running") });
-        }
+        // This is a replacement-style level signal with ids only. The SDK
+        // explicitly forbids correlating it with task edge events, so it must
+        // never manufacture subagent identities or hierarchy edges.
         break;
       case "thinking_tokens": {
         const turnId = this.#currentTurnId ?? message.uuid;
@@ -1577,6 +1734,9 @@ export class ClaudeActivityProjector {
           ? `${request.toolName} requires approval`
           : null);
     const questions = requestQuestions(request);
+    const suggestions = Array.isArray(request.payload.suggestions)
+      ? request.payload.suggestions
+      : [];
     return {
       id: itemId("attention", request.id),
       kind: "attention",
@@ -1585,6 +1745,13 @@ export class ClaudeActivityProjector {
       title: request.title,
       summary: description,
       questions,
+      approvalFacts: request.kind === "permission" || request.kind === "plan-approval"
+        ? toolApprovalFacts(request.toolName, request.payload.input, {
+            cwd: this.#cwd,
+            blockedPath: stringValue(request.payload.blockedPath),
+            canPersist: suggestions.length > 0,
+          })
+        : null,
       respondable: request.kind !== "elicitation",
       resolved,
       isSecret: questions.some((question) => question.isSecret),
@@ -1663,6 +1830,103 @@ export class ClaudeActivityProjector {
     };
   }
 
+  #artifactMutations(
+    toolCallId: string,
+    name: string,
+    input: unknown,
+    turnId: string | null,
+    parentId: string | null,
+  ): ActivityMutation[] {
+    if (name === "ExitPlanMode") {
+      const plan = this.#planMutation(toolCallId, input, turnId, parentId);
+      return plan ? [plan] : [];
+    }
+    if (name !== "TodoWrite") return [];
+    const value = objectValue(input);
+    if (!Array.isArray(value?.todos)) return [];
+
+    const occurrence = new Map<string, number>();
+    const nextSteps: ActivityTodoInputStep[] = value.todos.flatMap((rawTodo): ActivityTodoInputStep[] => {
+      const todo = objectValue(rawTodo);
+      const content = stringValue(todo?.content);
+      const status = todo?.status;
+      if (
+        !content
+        || (status !== "pending" && status !== "in_progress" && status !== "completed")
+      ) return [];
+      const count = occurrence.get(content) ?? 0;
+      occurrence.set(content, count + 1);
+      return [{
+        id: `claude-todo-${digestText(`${content}\0${count}`)}`,
+        text: content,
+        status,
+        detail: status === "in_progress" ? stringValue(todo?.activeForm) : null,
+      }];
+    });
+    const todoKey = turnId ?? "session";
+    const previous = this.#todos.get(todoKey);
+    const rewrite = reconcileTodoRewrite(previous ?? null, nextSteps);
+    this.#todos.set(todoKey, rewrite);
+    const complete = nextSteps.length > 0 && nextSteps.every((step) => step.status === "completed");
+    const running = nextSteps.some((step) => step.status === "in_progress");
+    return [{
+      type: "upsert",
+      item: {
+        id: itemId("todo", todoKey),
+        kind: "todo",
+        steps: rewrite.steps,
+        added: rewrite.added,
+        removed: rewrite.removed,
+        state: complete ? "complete" : running ? "running" : "pending",
+        turnId,
+        parentId,
+        source: "provider-api",
+        confidence: "exact",
+        exposure: "provider-exposed",
+      },
+    }];
+  }
+
+  #planMutation(
+    toolCallId: string,
+    input: unknown,
+    turnId: string | null,
+    parentId: string | null,
+    approvalRequestId: string | null = null,
+  ): ActivityMutation | null {
+    const value = objectValue(input);
+    const markdown = stringValue(value?.plan);
+    if (!markdown) return null;
+    const rawVersion = value?.version;
+    const version = Number.isSafeInteger(rawVersion) && (rawVersion as number) > 0
+      ? rawVersion as number
+      : null;
+    if (approvalRequestId) {
+      this.#planApprovalRequests.set(toolCallId, approvalRequestId);
+    }
+    const linkedRequestId = this.#planApprovalRequests.get(toolCallId) ?? null;
+    const approvedAt = this.#approvedPlans.get(toolCallId) ?? null;
+    return {
+      type: "upsert",
+      item: {
+        id: itemId("plan", toolCallId),
+        kind: "plan",
+        path: stringValue(value?.planFilePath),
+        version,
+        markdown,
+        supersededBy: null,
+        approvalRequestId: linkedRequestId,
+        approvedAt,
+        state: approvedAt ? "complete" : "waiting",
+        turnId,
+        parentId,
+        source: "provider-api",
+        confidence: "exact",
+        exposure: "provider-exposed",
+      },
+    };
+  }
+
   #fallbackLane(
     message: Extract<ClaudeSdkMessage, { type: "stream_event" }>,
   ): StreamLane {
@@ -1722,6 +1986,35 @@ export class ClaudeActivityProjector {
     this.#subagentsByTask.set(taskId, record);
     if (toolUseId) this.#subagentsByTool.set(toolUseId, record);
     return record;
+  }
+
+  #knownSubagent(
+    taskId: string,
+    toolUseId?: string,
+  ): SubagentRecord | undefined {
+    return this.#subagentsByTask.get(taskId)
+      ?? (toolUseId ? this.#subagentsByTool.get(toolUseId) : undefined);
+  }
+
+  #taskLifecycleDraft(
+    taskId: string,
+    title: string,
+    state: ActivityState,
+    details: string | null,
+  ): Extract<ActivityItemDraft, { kind: "lifecycle" }> {
+    return {
+      id: itemId("task", taskId),
+      kind: "lifecycle",
+      event: "status",
+      level: state === "failed" ? "error" : "info",
+      title,
+      details,
+      state,
+      turnId: this.#currentTurnId,
+      source: "provider-api",
+      confidence: "exact",
+      exposure: "provider-exposed",
+    };
   }
 
   #subagentForTool(
@@ -1787,7 +2080,11 @@ export class ClaudeActivityProjector {
 
   #rememberProviderItems(uuid: string, mutations: readonly ActivityMutation[]): void {
     for (const mutation of mutations) {
-      if (mutation.type === "upsert") this.#rememberProviderId(uuid, mutation.item.id);
+      if (
+        mutation.type === "upsert"
+        && mutation.item.kind !== "plan"
+        && mutation.item.kind !== "todo"
+      ) this.#rememberProviderId(uuid, mutation.item.id);
     }
   }
 
@@ -1822,6 +2119,9 @@ export class ClaudeActivityProjector {
     this.#subagentsByTool.clear();
     this.#tools.clear();
     this.#usage.clear();
+    this.#todos.clear();
+    this.#planApprovalRequests.clear();
+    this.#approvedPlans.clear();
     this.#currentTurnId = null;
     this.#lastSnapshotActivity = null;
     this.#lastSnapshotError = null;

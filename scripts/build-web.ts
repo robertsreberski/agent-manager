@@ -1,9 +1,24 @@
-import { randomUUID } from "node:crypto";
-import { copyFile, mkdir, mkdtemp, readdir, rename, rm } from "node:fs/promises";
-import { dirname, join, resolve, sep } from "node:path";
+import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, readdir, rename, rm } from "node:fs/promises";
+import { join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
+const execFileAsync = promisify(execFile);
+const MACOS_ATOMIC_DIRECTORY_SWAP = String.raw`import Darwin
+let staged = CommandLine.arguments[1]
+let live = CommandLine.arguments[2]
+let result = staged.withCString { stagedPath in
+  live.withCString { livePath in
+    renameatx_np(AT_FDCWD, stagedPath, AT_FDCWD, livePath, UInt32(RENAME_SWAP))
+  }
+}
+if result != 0 {
+  perror("renameatx_np")
+  exit(1)
+}`;
 
 export interface PublishWebBuildOptions {
   beforeCommit?: (relativePath: string) => Promise<void> | void;
@@ -13,12 +28,6 @@ export interface BuildAndPublishWebOptions extends PublishWebBuildOptions {
   configFile?: string;
   distDir?: string;
   runBuild?: (stageDir: string, configFile: string) => Promise<void>;
-}
-
-interface PreparedFile {
-  destinationPath: string;
-  relativePath: string;
-  temporaryPath: string;
 }
 
 async function listBuildFiles(root: string, directory = ""): Promise<string[]> {
@@ -49,38 +58,30 @@ function isServiceWorker(relativePath: string): boolean {
   return path === "sw.js" || path === "service-worker.js";
 }
 
-async function prepareFile(
-  stageDir: string,
-  liveDir: string,
-  relativePath: string,
-): Promise<PreparedFile> {
-  const destinationPath = join(liveDir, relativePath);
-  await mkdir(dirname(destinationPath), { recursive: true });
-
-  // Keeping the temporary file beside its destination guarantees that rename()
-  // is a same-filesystem atomic replacement, even when dist itself is mounted.
-  const temporaryPath = join(
-    dirname(destinationPath),
-    `.${relativePath.split(sep).at(-1)}.publish-${process.pid}-${randomUUID()}`,
-  );
-  await copyFile(join(stageDir, relativePath), temporaryPath);
-  return { destinationPath, relativePath, temporaryPath };
-}
-
-async function commitFile(
-  file: PreparedFile,
-  beforeCommit: PublishWebBuildOptions["beforeCommit"],
-): Promise<void> {
-  await beforeCommit?.(portablePath(file.relativePath));
-  await rename(file.temporaryPath, file.destinationPath);
+/**
+ * Exchange two same-filesystem directories in one macOS rename operation.
+ * Node does not expose renameatx_np/RENAME_SWAP, so the build invokes the
+ * platform SDK's pinned Swift entrypoint instead of creating a missing-root
+ * window with two ordinary renames.
+ */
+export async function atomicSwapWebDirectories(stagedDir: string, liveDir: string): Promise<void> {
+  if (process.platform !== "darwin") {
+    throw new Error("Atomic web publication requires macOS renameatx_np");
+  }
+  await execFileAsync("/usr/bin/swift", [
+    "-e",
+    MACOS_ATOMIC_DIRECTORY_SWAP,
+    stagedDir,
+    liveDir,
+  ], {
+    timeout: 15_000,
+    maxBuffer: 256 * 1_024,
+  });
 }
 
 /**
- * Publish a complete Vite output without ever emptying the live directory.
- *
- * Ordinary files are exposed first, index.html is the atomic application
- * cutover, and service workers are exposed last so a polling browser can never
- * install a worker whose new precache targets are not all live yet.
+ * Replace the complete Vite output as one directory generation. Old hashed
+ * assets never survive a successful build.
  */
 export async function publishStagedWebBuild(
   stageDir: string,
@@ -98,23 +99,21 @@ export async function publishStagedWebBuild(
     throw new Error("Staged web build is missing a service worker entry");
   }
 
-  const ordinaryPaths = relativePaths.filter(
-    (path) => path !== indexPath && !isServiceWorker(path),
-  );
-  const commitOrder = [...ordinaryPaths, indexPath, ...workerPaths];
-  const preparedFiles: PreparedFile[] = [];
+  const commitOrder = [
+    ...relativePaths.filter((path) => path !== indexPath && !isServiceWorker(path)),
+    indexPath,
+    ...workerPaths,
+  ];
+  for (const relativePath of commitOrder) await options.beforeCommit?.(portablePath(relativePath));
 
-  try {
-    // Finish every potentially partial copy before changing any live pathname.
-    for (const relativePath of commitOrder) {
-      preparedFiles.push(await prepareFile(stageDir, liveDir, relativePath));
-    }
-    for (const file of preparedFiles) {
-      await commitFile(file, options.beforeCommit);
-    }
-  } finally {
-    await Promise.all(preparedFiles.map((file) => rm(file.temporaryPath, { force: true })));
+  if (!existsSync(liveDir)) {
+    // First build has no live generation to exchange.
+    await rename(stageDir, liveDir);
+    return;
   }
+  await atomicSwapWebDirectories(stageDir, liveDir);
+  // After RENAME_SWAP the old complete generation is at the staging path.
+  await rm(stageDir, { recursive: true, force: true });
 }
 
 async function runViteBuild(stageDir: string, configFile: string): Promise<void> {
@@ -136,8 +135,8 @@ export async function buildAndPublishWeb(
   const liveDir = join(distDir, "web");
   await mkdir(distDir, { recursive: true });
 
-  // mkdtemp makes concurrent/aborted compiles independent. Only this private
-  // directory is ever recursively cleaned; dist/web is an append-only overlay.
+  // mkdtemp makes concurrent/aborted compiles independent. The successful
+  // stage becomes dist/web; failed stages are removed.
   const stageDir = await mkdtemp(join(distDir, ".web-stage-"));
   try {
     await (options.runBuild ?? runViteBuild)(stageDir, configFile);

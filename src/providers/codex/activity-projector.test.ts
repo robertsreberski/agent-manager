@@ -9,9 +9,11 @@ import {
   projectCodexRequestResolved,
   projectCodexServerRequest,
   recordCodexActivityOffsets,
+  recordCodexTodoProjectionState,
+  type CodexTodoProjectionState,
 } from "./activity-projector.ts";
 import type { JsonRpcNotification, JsonRpcServerRequest } from "./rpc.ts";
-import type { JsonObject } from "./types.ts";
+import type { JsonObject, JsonValue } from "./types.ts";
 
 function notification(
   method: string,
@@ -96,7 +98,7 @@ test("assistant deltas use UTF-8 offsets and completed snapshots remain authorit
   }
 });
 
-test("reasoning summary/raw streams and prose/structured plans use distinct stable IDs", () => {
+test("reasoning streams stay distinct and only structured Codex plans become todos", () => {
   const part = onlyItem(projectCodexNotification(notification(
     "item/reasoning/summaryPartAdded",
     { threadId: "t", turnId: "turn", itemId: "reason", summaryIndex: 1 },
@@ -135,14 +137,20 @@ test("reasoning summary/raw streams and prose/structured plans use distinct stab
     ["reasoning", "reasoning", "reasoning"],
   );
 
-  const prose = onlyItem(projectCodexNotification(notification("item/completed", {
+  const prose = projectCodexNotification(notification("item/completed", {
     threadId: "t",
     turnId: "turn",
     completedAtMs: 1_787_500_000_000,
     item: { type: "plan", id: "plan-item", text: "Prose plan" },
-  })));
-  assert.equal(prose.kind, "plan");
-  if (prose.kind === "plan") assert.equal(prose.text, "Prose plan");
+  }));
+  const proseDelta = projectCodexNotification(notification("item/plan/delta", {
+    threadId: "t",
+    turnId: "turn",
+    itemId: "plan-item",
+    delta: "Draft prose",
+  }));
+  assert.equal(prose, null);
+  assert.equal(proseDelta, null);
 
   const structured = onlyItem(projectCodexNotification(notification("turn/plan/updated", {
     threadId: "t",
@@ -154,16 +162,61 @@ test("reasoning summary/raw streams and prose/structured plans use distinct stab
       { step: "Verify", status: "pending" },
     ],
   })));
-  assert.equal(structured.kind, "plan");
+  assert.equal(structured.kind, "todo");
   assert.equal(structured.state, "running");
-  if (structured.kind === "plan") {
-    assert.equal(structured.text, "Why this order");
+  if (structured.kind === "todo") {
     assert.deepEqual(structured.steps?.map((step) => step.status), [
       "completed",
       "in_progress",
       "pending",
     ]);
-    assert.equal(structured.steps?.[0]?.id, "codex/plan-step/t/turn/0");
+    assert.ok(structured.steps?.every((step) => step.detail === null));
+    assert.ok(structured.steps?.every((step) => !step.addedAfterStart && step.removedReason === null));
+    assert.match(structured.steps?.[0]?.id ?? "", /^codex\/todo-step\/t\/turn\//u);
+    assert.equal(structured.added, 0);
+    assert.equal(structured.removed, 0);
+  }
+});
+
+test("structured Codex todo rewrites retain stable steps and count churn", () => {
+  const states = new Map<string, CodexTodoProjectionState>();
+  const first = projectCodexNotification(notification("turn/plan/updated", {
+    threadId: "t",
+    turnId: "turn",
+    plan: [
+      { step: "Inspect", status: "inProgress" },
+      { step: "Verify", status: "pending" },
+    ],
+  }), undefined, (id) => states.get(id) ?? null);
+  assert.ok(first);
+  recordCodexTodoProjectionState(states, first.mutations[0] as ActivityMutation);
+
+  const second = onlyItem(projectCodexNotification(notification("turn/plan/updated", {
+    threadId: "t",
+    turnId: "turn",
+    plan: [
+      { step: "Verify", status: "inProgress" },
+      { step: "Ship", status: "pending" },
+    ],
+  }), undefined, (id) => states.get(id) ?? null));
+  assert.equal(second.kind, "todo");
+  if (second.kind === "todo") {
+    assert.equal(second.added, 1);
+    assert.equal(second.removed, 1);
+    assert.equal(second.steps?.[0]?.id, first.mutations[0]?.type === "upsert" &&
+        first.mutations[0].item.kind === "todo"
+      ? first.mutations[0].item.steps?.[1]?.id
+      : null);
+    assert.deepEqual(second.steps?.map((step) => ({
+      text: step.text,
+      status: step.status,
+      addedAfterStart: step.addedAfterStart,
+      removedReason: step.removedReason,
+    })), [
+      { text: "Verify", status: "in_progress", addedAfterStart: false, removedReason: null },
+      { text: "Ship", status: "pending", addedAfterStart: true, removedReason: null },
+      { text: "Inspect", status: "removed", addedAfterStart: false, removedReason: null },
+    ]);
   }
 });
 
@@ -216,7 +269,18 @@ test("commands and file changes expose lifecycle snapshots, output, and normaliz
   assert.equal(files.kind, "file-change");
   if (files.kind === "file-change") {
     assert.deepEqual(files.changes?.map((change) => change.operation), ["add", "rename"]);
-    assert.equal(files.changes?.[1]?.path, "src/old.ts → src/moved.ts");
+    assert.deepEqual(files.changes?.[0], {
+      path: "src/new.ts",
+      previousPath: null,
+      operation: "add",
+      diff: "+new",
+    });
+    assert.deepEqual(files.changes?.[1], {
+      path: "src/moved.ts",
+      previousPath: "src/old.ts",
+      operation: "rename",
+      diff: "rename",
+    });
   }
 
   const aggregate = onlyItem(projectCodexNotification(notification("turn/diff/updated", {
@@ -227,11 +291,27 @@ test("commands and file changes expose lifecycle snapshots, output, and normaliz
   assert.equal(aggregate.kind, "file-change");
   if (aggregate.kind === "file-change") {
     assert.equal(aggregate.changes?.[0]?.path, "a.ts");
+    assert.equal(aggregate.changes?.[0]?.previousPath, null);
     assert.equal(aggregate.changes?.[0]?.operation, "update");
+  }
+
+  const aggregateRename = onlyItem(projectCodexNotification(notification("turn/diff/updated", {
+    threadId: "t",
+    turnId: "rename-turn",
+    diff: "diff --git a/old.ts b/new.ts\nsimilarity index 100%\nrename from old.ts\nrename to new.ts\n",
+  })));
+  assert.equal(aggregateRename.kind, "file-change");
+  if (aggregateRename.kind === "file-change") {
+    assert.deepEqual(aggregateRename.changes?.[0], {
+      path: "new.ts",
+      previousPath: "old.ts",
+      operation: "rename",
+      diff: "diff --git a/old.ts b/new.ts\nsimilarity index 100%\nrename from old.ts\nrename to new.ts\n",
+    });
   }
 });
 
-test("provider tools map to explicit categories and subagent activity stays separate", () => {
+test("provider tools map to explicit categories", () => {
   const cases: Array<[JsonObject, ActivityItemDraft["kind"], string | null]> = [
     [{
       type: "mcpToolCall",
@@ -253,16 +333,6 @@ test("provider tools map to explicit categories and subagent activity stays sepa
       contentItems: [],
     }, "tool", "dynamic"],
     [{
-      type: "collabAgentToolCall",
-      id: "collab",
-      tool: "spawnAgent",
-      status: "completed",
-      senderThreadId: "t",
-      receiverThreadIds: ["child"],
-      prompt: "inspect",
-      agentsStates: {},
-    }, "tool", "collaboration"],
-    [{
       type: "webSearch",
       id: "web",
       query: "query",
@@ -270,13 +340,6 @@ test("provider tools map to explicit categories and subagent activity stays sepa
       results: [],
     }, "tool", "web-search"],
     [{ type: "imageView", id: "image", path: "/tmp/image.png" }, "tool", "image-view"],
-    [{
-      type: "subAgentActivity",
-      id: "subagent-event",
-      kind: "started",
-      agentThreadId: "child",
-      agentPath: "reviewer",
-    }, "subagent", null],
   ];
   for (const [item, kind, category] of cases) {
     const projected = onlyItem(projectCodexNotification(notification("item/completed", {
@@ -287,7 +350,117 @@ test("provider tools map to explicit categories and subagent activity stays sepa
     })));
     assert.equal(projected.kind, kind);
     if (projected.kind === "tool") assert.equal(projected.category, category);
-    if (projected.kind === "subagent") assert.equal(projected.taskId, "child");
+  }
+});
+
+test("spawn and subagent activity share one child-thread hierarchy item", () => {
+  const spawned = projectCodexNotification(notification("item/completed", {
+    threadId: "t",
+    turnId: "turn",
+    completedAtMs: 1_787_500_000_000,
+    item: {
+      type: "collabAgentToolCall",
+      id: "collab",
+      tool: "spawnAgent",
+      status: "completed",
+      senderThreadId: "t",
+      receiverThreadIds: ["child/thread"],
+      prompt: "inspect",
+      agentsStates: { "child/thread": { status: "completed", message: "Inspection complete" } },
+    },
+  }));
+  assert.ok(spawned);
+  assert.equal(spawned.mutations.length, 2);
+  const tool = upsertItem(spawned.mutations[0] as ActivityMutation);
+  const child = upsertItem(spawned.mutations[1] as ActivityMutation);
+  assert.equal(tool.kind, "tool");
+  if (tool.kind === "tool") assert.equal(tool.category, "collaboration");
+  assert.equal(child.kind, "subagent");
+  assert.equal(child.id, "codex/subagent/child%2Fthread");
+  assert.equal(child.parentId, tool.id);
+  assert.equal(child.state, "complete");
+  if (child.kind === "subagent") {
+    assert.equal(child.taskId, "child/thread");
+    assert.equal(child.output, "Inspection complete");
+  }
+
+  const activity = onlyItem(projectCodexNotification(notification("item/completed", {
+    threadId: "t",
+    turnId: "later-turn",
+    completedAtMs: 1_787_500_000_000,
+    item: {
+      type: "subAgentActivity",
+      id: "subagent-event",
+      kind: "started",
+      agentThreadId: "child/thread",
+      agentPath: "reviewer",
+    },
+  })));
+  assert.equal(activity.kind, "subagent");
+  assert.equal(activity.id, child.id);
+  assert.equal(activity.parentId, undefined);
+  if (activity.kind === "subagent") assert.equal(activity.taskId, "child/thread");
+});
+
+test("spawn projects exact child states and defaults absent state to pending", () => {
+  const cases: Array<[JsonValue | undefined, ActivityItemDraft["state"]]> = [
+    [undefined, "pending"],
+    ["pendingInit", "pending"],
+    ["running", "running"],
+    ["interrupted", "interrupted"],
+    ["completed", "complete"],
+    ["shutdown", "complete"],
+    ["errored", "failed"],
+    ["notFound", "failed"],
+  ];
+  for (const [providerState, expected] of cases) {
+    const projection = projectCodexNotification(notification("item/completed", {
+      threadId: "t",
+      turnId: "turn",
+      item: {
+        type: "collabAgentToolCall",
+        id: `spawn-${String(providerState)}`,
+        tool: "spawnAgent",
+        status: "completed",
+        senderThreadId: "t",
+        receiverThreadIds: ["child"],
+        prompt: "inspect",
+        agentsStates: providerState === undefined
+          ? {}
+          : { child: { status: providerState, message: "exact child message" } },
+      },
+    }));
+    assert.ok(projection);
+    const child = upsertItem(projection.mutations[1] as ActivityMutation);
+    assert.equal(child.state, expected);
+    if (child.kind === "subagent") {
+      assert.equal(child.output, providerState === undefined ? "" : "exact child message");
+    }
+  }
+});
+
+test("non-spawn collaboration tools do not create subagent hierarchy edges", () => {
+  for (const tool of ["sendInput", "wait", "resumeAgent", "closeAgent"]) {
+    const projection = projectCodexNotification(notification("item/completed", {
+      threadId: "t",
+      turnId: "turn",
+      completedAtMs: 1_787_500_000_000,
+      item: {
+        type: "collabAgentToolCall",
+        id: `collab-${tool}`,
+        tool,
+        status: "completed",
+        senderThreadId: "t",
+        receiverThreadIds: ["child/thread"],
+        prompt: null,
+        agentsStates: {},
+      },
+    }));
+    assert.ok(projection);
+    assert.equal(projection.mutations.length, 1);
+    const projected = upsertItem(projection.mutations[0] as ActivityMutation);
+    assert.equal(projected.kind, "tool");
+    assert.equal(projected.parentId, null);
   }
 });
 
@@ -422,6 +595,115 @@ test("attention preserves provider IDs, marks secrets, resolves, and queue upser
   assert.equal(secondQueue.state, "complete");
 });
 
+test("approval projections preserve only exact Codex request facts", () => {
+  const command = projectCodexServerRequest({
+    id: "command-approval",
+    method: "item/commandExecution/requestApproval",
+    emittedAtMs: 1_787_500_000_000,
+    params: {
+      threadId: "t",
+      turnId: "turn",
+      itemId: "command-item",
+      startedAtMs: 1_787_500_000_000,
+      command: "cat README.md",
+      cwd: "/work/app",
+      commandActions: [{ type: "read", command: "cat README.md", name: "README.md", path: "README.md" }],
+      networkApprovalContext: { host: "example.com", protocol: "https" },
+      proposedNetworkPolicyAmendments: [{ action: "allow", host: "example.com" }],
+      deleteCount: 7,
+    },
+  });
+  assert.ok(command);
+  const commandItem = upsertItem(command.mutations[0] as ActivityMutation);
+  assert.equal(commandItem.kind, "attention");
+  if (commandItem.kind === "attention") {
+    assert.deepEqual(commandItem.approvalFacts, {
+      command: "cat README.md",
+      paths: ["/work/app/README.md"],
+      writes: [],
+      network: true,
+      canPersist: true,
+      deleteCount: null,
+    });
+  }
+
+  const ambiguous = projectCodexServerRequest({
+    id: "ambiguous-command",
+    method: "item/commandExecution/requestApproval",
+    emittedAtMs: 1_787_500_000_000,
+    params: {
+      threadId: "t",
+      turnId: "turn",
+      itemId: "ambiguous-item",
+      startedAtMs: 1_787_500_000_000,
+      command: "pnpm test",
+      cwd: "/work/app",
+      commandActions: [{ type: "unknown", command: "pnpm test" }],
+    },
+  });
+  assert.ok(ambiguous);
+  const ambiguousItem = upsertItem(ambiguous.mutations[0] as ActivityMutation);
+  assert.equal(ambiguousItem.kind, "attention");
+  if (ambiguousItem.kind === "attention") {
+    assert.equal(ambiguousItem.approvalFacts?.paths, null);
+    assert.deepEqual(ambiguousItem.approvalFacts?.writes, []);
+    assert.equal(ambiguousItem.approvalFacts?.network, null);
+    assert.equal(ambiguousItem.approvalFacts?.deleteCount, null);
+  }
+
+  const lookalikeNetwork = projectCodexServerRequest({
+    id: "lookalike-network",
+    method: "item/commandExecution/requestApproval",
+    emittedAtMs: 1_787_500_000_000,
+    params: {
+      threadId: "t",
+      turnId: "turn",
+      itemId: "lookalike-item",
+      startedAtMs: 1_787_500_000_000,
+      networkApprovalContext: {},
+      proposedNetworkPolicyAmendments: [{}],
+    },
+  });
+  assert.ok(lookalikeNetwork);
+  const lookalikeItem = upsertItem(lookalikeNetwork.mutations[0] as ActivityMutation);
+  assert.equal(
+    lookalikeItem.kind === "attention" ? lookalikeItem.approvalFacts?.network : true,
+    null,
+  );
+
+  const permissions = projectCodexServerRequest({
+    id: "permission-approval",
+    method: "item/permissions/requestApproval",
+    emittedAtMs: 1_787_500_000_000,
+    params: {
+      threadId: "t",
+      turnId: "turn",
+      itemId: "permission-item",
+      startedAtMs: 1_787_500_000_000,
+      cwd: "/work/app",
+      permissions: {
+        fileSystem: {
+          entries: [{ access: "write", path: { type: "glob_pattern", pattern: "../cache/**" } }],
+        },
+        network: { enabled: false },
+      },
+    },
+  });
+  assert.ok(permissions);
+  const permissionItem = upsertItem(permissions.mutations[0] as ActivityMutation);
+  assert.equal(permissionItem.kind, "attention");
+  if (permissionItem.kind === "attention") {
+    assert.deepEqual(permissionItem.approvalFacts, {
+      command: null,
+      paths: null,
+      writes: ["../cache/**"],
+      network: false,
+      canPersist: false,
+      deleteCount: null,
+    });
+  }
+});
+
 test("Random pick projects one structured question without repeating its prompt", () => {
   const projection = projectCodexServerRequest({
     id: "random-pick",
@@ -441,6 +723,7 @@ test("Random pick projects one structured question without repeating its prompt"
           {
             label: "Moon cabin (Recommended)",
             description: "Quiet views, low gravity, and maximum novelty.",
+            recommended: true,
           },
           { label: "Undersea hotel", description: "Ocean life outside every window." },
           { label: "Cloud city", description: "Endless sunsets and dramatic scenery." },
@@ -462,9 +745,10 @@ test("Random pick projects one structured question without repeating its prompt"
         {
           label: "Moon cabin (Recommended)",
           description: "Quiet views, low gravity, and maximum novelty.",
+          recommended: true,
         },
-        { label: "Undersea hotel", description: "Ocean life outside every window." },
-        { label: "Cloud city", description: "Endless sunsets and dramatic scenery." },
+        { label: "Undersea hotel", description: "Ocean life outside every window.", recommended: null },
+        { label: "Cloud city", description: "Endless sunsets and dramatic scenery.", recommended: null },
       ],
       multiSelect: false,
       allowFreeText: true,

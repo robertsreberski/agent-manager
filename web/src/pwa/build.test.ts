@@ -47,8 +47,8 @@ it("builds a private prompt-update PWA without production source maps", async ()
     };
     expect(manifest).toMatchObject({ id: "/", scope: "/", start_url: "/", display: "standalone" });
     expect(manifest.shortcuts.map((shortcut) => shortcut.url)).toEqual([
-      "/?scope=attention",
-      "/?launch=1",
+      "/?scope=wants-you",
+      "/?draft=1",
     ]);
     expect(manifest.icons).toEqual(expect.arrayContaining([
       expect.objectContaining({ src: "/icon.svg", sizes: "any" }),

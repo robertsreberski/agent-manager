@@ -11,8 +11,8 @@ function navigation(url: string, overrides: Partial<{ method: string; mode: stri
 describe("service-worker route policy", () => {
   it("handles only same-origin root-shell navigations", () => {
     expect(shouldHandleAppNavigation(navigation(`${origin}/`), origin)).toBe(true);
-    expect(shouldHandleAppNavigation(navigation(`${origin}/?scope=attention`), origin)).toBe(true);
-    expect(shouldHandleAppNavigation(navigation(`${origin}/?launch=1`), origin)).toBe(true);
+    expect(shouldHandleAppNavigation(navigation(`${origin}/?scope=wants-you`), origin)).toBe(true);
+    expect(shouldHandleAppNavigation(navigation(`${origin}/?draft=1`), origin)).toBe(true);
     expect(shouldHandleAppNavigation(navigation(`${origin}/index.html`), origin)).toBe(true);
 
     expect(shouldHandleAppNavigation(navigation(`${origin}/sessions/unknown`), origin)).toBe(false);

@@ -80,7 +80,7 @@ export class CodexRpcClient {
 
   async request(
     method: string,
-    params: JsonObject = {},
+    params?: JsonObject,
   ): Promise<JsonValue> {
     if (this.#closed) {
       throw new Error("Codex RPC connection is closed");
@@ -102,7 +102,7 @@ export class CodexRpcClient {
         jsonrpc: "2.0",
         id,
         method,
-        params,
+        ...(params === undefined ? {} : { params }),
       }));
     } catch (error) {
       const pending = this.#pending.get(key);

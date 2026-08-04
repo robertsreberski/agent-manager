@@ -2,6 +2,16 @@ import { readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize } from "node:path";
 
+import {
+  WorkspaceIdentityResolver,
+  type WorkspaceIdentity,
+} from "../core/worktree.ts";
+import {
+  workspaceResolutionResponseSchema,
+  type WorkspaceResolutionResponse,
+} from "../shared/workspace.ts";
+import type { WorkspaceRecord } from "./persistence.ts";
+
 function expandedPath(input: string): string {
   const trimmed = input.trim();
   if (trimmed === "~") return homedir();
@@ -53,4 +63,63 @@ export function localDirectoryCompletions(input: string, limit = 30): string[] {
 
 export function workspaceLabel(path: string): string {
   return basename(path) || path;
+}
+
+export interface ResolvedWorkspace {
+  path: string;
+  label: string;
+  remoteWorkspaceId: string | null;
+  workspaceIdentity: WorkspaceIdentity | null;
+}
+
+export interface RemoteWorkspaceIdentityResolver {
+  resolveWorkspace(hostId: string, path: string): Promise<{
+    path: string;
+    label: string;
+    remoteWorkspaceId: string;
+    workspaceIdentity: WorkspaceIdentity | null;
+  }>;
+}
+
+/**
+ * Resolves Git facts on the host that owns the path. The local resolver is
+ * deliberately unreachable in the SSH branch so a remote cwd can never be
+ * interpreted against the controller's parent filesystem.
+ */
+export async function resolveWorkspaceForHost(options: {
+  hostId: string;
+  hostKind: "local" | "ssh";
+  path: string;
+  localResolver: WorkspaceIdentityResolver;
+  remote: RemoteWorkspaceIdentityResolver;
+}): Promise<ResolvedWorkspace> {
+  if (options.hostKind === "ssh") {
+    const resolved = await options.remote.resolveWorkspace(options.hostId, options.path);
+    return {
+      path: resolved.path,
+      label: resolved.label,
+      remoteWorkspaceId: resolved.remoteWorkspaceId,
+      workspaceIdentity: structuredClone(resolved.workspaceIdentity),
+    };
+  }
+  const path = resolveLocalWorkspacePath(options.path);
+  return {
+    path,
+    label: workspaceLabel(path),
+    remoteWorkspaceId: null,
+    workspaceIdentity: await options.localResolver.resolve(path, { selected: true }),
+  };
+}
+
+/** Exact public workspace envelope shared by local and remote resolution. */
+export function workspaceResolutionResponse(
+  workspace: WorkspaceRecord,
+  workspaceIdentity: WorkspaceIdentity | null,
+): WorkspaceResolutionResponse {
+  return workspaceResolutionResponseSchema.parse({
+    workspace: {
+      ...workspace,
+      workspaceIdentity: structuredClone(workspaceIdentity),
+    },
+  });
 }

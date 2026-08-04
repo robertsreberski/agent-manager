@@ -56,9 +56,9 @@ function codexFixture(
 function codexSession(sessionId = CODEX_ID) {
   return {
     provider: "codex" as const,
-    sessionId,
-    parentSessionId: null,
-    rootSessionId: sessionId,
+    providerThreadId: sessionId,
+    parentId: null,
+    providerTreeId: sessionId,
   };
 }
 
@@ -94,9 +94,9 @@ function claudeHome(): { home: string; projects: string } {
 function claudeRootSession(sessionId = CLAUDE_ID) {
   return {
     provider: "claude" as const,
-    sessionId,
-    parentSessionId: null,
-    rootSessionId: sessionId,
+    providerThreadId: sessionId,
+    parentId: null,
+    providerTreeId: sessionId,
   };
 }
 
@@ -189,6 +189,27 @@ test("Codex excludes injected context envelopes while preserving the actual user
   ]);
 });
 
+test("selected-session search is literal, bounded, and redacts snippets", () => {
+  const secret = "sk-proj-abcdefghijklmnopqrstuv";
+  const fixture = codexFixture([
+    codexMeta(),
+    codexMessage("user", `Find the literal [bracket] value and keep ${secret} private`, { id: "search-one" }),
+    codexMessage("assistant", "The [bracket] value appears again", { id: "search-two" }),
+  ]);
+  const reader = new LocalSessionTranscriptReader({ codexHome: fixture.home });
+  const result = reader.search(codexSession(), "[bracket]", 1);
+  assert.equal(result.matches.length, 1);
+  assert.equal(result.truncated, true);
+  assert.equal(result.matches[0]?.messageId, "codex:search-one");
+  assert.equal(result.matches[0]?.snippet.slice(
+    result.matches[0]?.matchStart,
+    result.matches[0]?.matchEnd,
+  ), "[bracket]");
+  assert.equal(JSON.stringify(result).includes(secret), false);
+  assert.equal(reader.search(codexSession(), secret).matches.length, 0);
+  assert.deepEqual(reader.search(codexSession(), "[").matches, []);
+});
+
 test("Codex tolerates malformed and partial JSONL while reporting omitted content", () => {
   const root = temporaryRoot();
   const home = join(root, ".codex");
@@ -268,45 +289,14 @@ test("Claude resolves a nested individual subagent transcript and rejects parent
   const reader = new LocalSessionTranscriptReader({ claudeHome: fixture.home });
   const child = reader.read({
     provider: "claude",
-    sessionId: childId,
-    parentSessionId: CLAUDE_ID,
-    rootSessionId: CLAUDE_ID,
+    providerThreadId: childId,
+    parentId: `local:claude:${CLAUDE_ID}`,
+    providerTreeId: CLAUDE_ID,
   });
   assert.deepEqual(child.messages.map((message) => message.text), ["Child task", "Child result"]);
 
   const parent = reader.read(claudeRootSession());
   assert.deepEqual(parent.messages.map((message) => message.text), ["Parent message"]);
-});
-
-test("Claude resolves the legacy project-root individual agent file but never a workflow journal", () => {
-  const fixture = claudeHome();
-  const childId = "legacy123";
-  const project = join(fixture.projects, "-fixture-project");
-  mkdirSync(join(project, CLAUDE_ID, "subagents", "workflows", "wf"), { recursive: true });
-  writeFileSync(join(project, `agent-${childId}.jsonl`), jsonl([
-    claudeRow({ uuid: "legacy", type: "assistant", content: [{ type: "text", text: "Legacy child" }], messageId: "legacy-msg", agentId: childId, sidechain: true }),
-  ]));
-  writeFileSync(join(project, CLAUDE_ID, "subagents", "workflows", "wf", "journal.jsonl"), jsonl([
-    claudeRow({ uuid: "journal-one", type: "assistant", content: [{ type: "text", text: "Journal one" }], messageId: "journal-one", agentId: "missing", sidechain: true }),
-    claudeRow({ uuid: "journal-two", parentUuid: "journal-one", type: "assistant", content: [{ type: "text", text: "Journal two" }], messageId: "journal-two", agentId: "other", sidechain: true }),
-  ]));
-
-  const reader = new LocalSessionTranscriptReader({ claudeHome: fixture.home });
-  const child = reader.read({
-    provider: "claude",
-    sessionId: childId,
-    parentSessionId: CLAUDE_ID,
-    rootSessionId: CLAUDE_ID,
-  });
-  assert.deepEqual(child.messages.map((message) => message.text), ["Legacy child"]);
-  const journalOnly = reader.read({
-    provider: "claude",
-    sessionId: "missing",
-    parentSessionId: CLAUDE_ID,
-    rootSessionId: CLAUDE_ID,
-  });
-  assert.equal(journalOnly.transcript.state, "unavailable");
-  assert.equal(journalOnly.transcript.reason, "not-found");
 });
 
 test("message count, per-message UTF-8, and aggregate byte caps retain the newest content", () => {

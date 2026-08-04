@@ -1,6 +1,7 @@
 export interface NormalizedCodexQuestionOption {
   label: string;
   description: string | null;
+  recommended: boolean | null;
 }
 
 export interface NormalizedCodexQuestion {
@@ -47,6 +48,9 @@ export function normalizeCodexQuestion(value: unknown): NormalizedCodexQuestion 
           label: boundedText(option.label, 300),
           description: typeof option.description === "string"
             ? boundedText(option.description, 500)
+            : null,
+          recommended: typeof option.recommended === "boolean"
+            ? option.recommended
             : null,
         }];
       })

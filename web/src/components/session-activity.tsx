@@ -1,255 +1,94 @@
 import type { ReactNode } from "react";
-import {
-  MessagePrimitive,
-  type DataMessagePartProps,
-  type MessagePartStatus,
-  type MessageStatus,
-  type ReasoningMessagePartProps,
-  type ThreadMessageLike,
-  type ToolCallMessagePartProps,
+import type {
+  MessagePartStatus,
+  MessageStatus,
+  ThreadMessageLike,
 } from "@assistant-ui/react";
-import {
-  Brain,
-  Check,
-  CircleAlert,
-  CircleDashed,
-  CircleX,
-  FileDiff,
-  Gauge,
-  ListChecks,
-  ListPlus,
-  MessageSquareText,
-  Radio,
-  Users,
-  Wrench,
-} from "lucide-react";
-import { MarkdownText } from "./assistant-ui/markdown-text";
-import { QuestionRequestForm } from "./pending-requests";
-import { cn } from "../lib/utils";
+import { AlertTriangle, CircleAlert, Gauge, Radio } from "lucide-react";
+import { DiffViewer, diffIdentityKey, fileChangeIsUpserting, relativeEditorPath, type FileChangeView } from "./diffs";
+import { PlanArtifact, TodoList, type PlanArtifactView, type TodoListView } from "./plans";
+import { ApprovalRequest, QuestionRequest, type ExactQuestionRequest } from "./requests";
+import { QueuedMessages } from "./composer";
+import { buildSubagentHierarchy, TurnMarker, type SubagentFrameData, type TurnFacts } from "./thread";
 import { jsonForDisplay } from "../lib/session-activity";
 import type {
+  ActivityAttentionItem,
   ActivityFileChangeItem,
   ActivityItem,
-  ActivityItemState,
   ActivityJsonValue,
-  ActivityLifecycleItem,
-  ActivitySubagentItem,
-  AttentionRequest,
+  ActivityState,
+  ActivityTodoItem,
   RequestResponse,
+  SessionActivityView,
+  SessionView,
 } from "../types";
+import type { PlanFileResponse } from "../lib/api";
 
-const ACTIVITY_DATA_PART = "agent-manager.activity";
-const ACTIVITY_GROUP_DATA_PART = "agent-manager.activity-group";
-
-export interface ActivityTurnGroup {
-  kind: "activity-group";
-  id: string;
-  turnId: string | null;
-  seq: number;
-  state: ActivityItemState;
-  items: ActivityItem[];
-}
-
-export type ActivityTimelineItem = ActivityItem | ActivityTurnGroup;
+const DATA_PREFIX = "agent-manager.";
+type ThreadContent = Exclude<ThreadMessageLike["content"], string>;
+type ThreadContentPart = ThreadContent extends readonly (infer Part)[] ? Part : never;
 
 export interface ActivityAttentionControls {
   exactRequestIds: ReadonlySet<string>;
   mutationsReady: boolean;
   canRespond: boolean;
   busy: boolean;
+  workspaceRoot: string | null;
+  remoteHost: string | null;
+  sessionsOnHost: number | null;
   onRespond: (requestId: string, response: RequestResponse) => Promise<void>;
 }
 
-function isActive(state: ActivityItemState): boolean {
-  return state === "pending" || state === "running" || state === "waiting";
+export interface ActivityFileControls {
+  sessionId: string;
+  canOpenEditor: boolean;
+  workspaceRoot: string | null;
+  readKeys: ReadonlySet<string>;
+  onReadChange: (readKey: string, read: boolean) => void;
+  onOpenEditor?: (relativePath: string) => void;
 }
 
-function isDirectProse(item: ActivityItem): boolean {
-  if (item.kind !== "message") return false;
-  if (item.role === "user") return true;
-  return item.role === "assistant" && item.phase !== "commentary";
+export interface ActivityPlanControls {
+  requestIds: ReadonlyMap<string, string>;
+  mutationsReady: boolean;
+  canRespond: boolean;
+  busy: boolean;
+  loadFile: (itemId: string) => Promise<PlanFileResponse>;
+  onRespond: (requestId: string, response: RequestResponse) => Promise<void>;
 }
 
-function isInitialUserMessage(item: ActivityItem): boolean {
-  return item.kind === "message" && item.role === "user";
+export interface ActivityQueueControls {
+  canRemove: boolean;
+  busy: boolean;
+  onRemove: (messageId: string) => Promise<void>;
 }
 
-function isFinalAssistantMessage(item: ActivityItem): boolean {
-  return item.kind === "message" && item.role === "assistant" && item.phase === "final";
+export interface ActivityDataControls {
+  attention: ActivityAttentionControls;
+  files: ActivityFileControls;
+  plans: ActivityPlanControls;
+  queue: ActivityQueueControls;
 }
 
-function groupState(items: ActivityItem[]): ActivityItemState {
-  // Provider lifecycle events are the authoritative end of a turn. A stream
-  // can retain a running child item after the terminal event arrives, so the
-  // child state must not mask a failed or interrupted outcome.
-  const terminal = [...items].reverse().find((item): item is ActivityLifecycleItem => (
-    item.kind === "lifecycle"
-    && (item.event === "turn-completed" || item.event === "turn-failed" || item.event === "turn-interrupted")
-  ));
-  if (terminal?.event === "turn-failed") return "failed";
-  if (terminal?.event === "turn-interrupted") return "interrupted";
-  if (terminal?.event === "turn-completed") return "complete";
-  if (items.some((item) => item.state === "running" || item.state === "pending")) return "running";
-  if (items.some((item) => item.state === "waiting")) return "waiting";
-  if (items.some((item) => item.state === "failed")) return "failed";
-  if (items.some((item) => item.state === "interrupted")) return "interrupted";
-  return "complete";
-}
-
-function turnTimeline(turnId: string, items: ActivityItem[]): ActivityTimelineItem[] {
-  const ordered = [...items].sort((left, right) => left.seq - right.seq || left.id.localeCompare(right.id));
-
-  // Provider notification order is not conversational order. Codex, for
-  // example, reports turn/started before the userMessage item and reports
-  // terminal usage after the final answer. Keep the initiating user message
-  // first and the explicit final answer last, while leaving any later user
-  // messages in place so steering naturally splits the activity disclosure.
-  const initialUser = ordered.find(isInitialUserMessage);
-  const finals = ordered.filter(isFinalAssistantMessage);
-  const finalIds = new Set(finals.map((item) => item.id));
-  const semantic = [
-    ...(initialUser ? [initialUser] : []),
-    ...ordered.filter((item) => item.id !== initialUser?.id && !finalIds.has(item.id)),
-    ...finals,
-  ];
-
-  const timeline: ActivityTimelineItem[] = [];
-  let segment: ActivityItem[] = [];
-  const flush = () => {
-    if (segment.length === 0) return;
-    const first = segment[0]!;
-    timeline.push({
-      kind: "activity-group",
-      id: `activity:turn:${turnId}:segment:${encodeURIComponent(first.id)}`,
-      turnId,
-      seq: first.seq,
-      state: groupState(segment),
-      items: segment,
-    });
-    segment = [];
-  };
-
-  for (const item of semantic) {
-    if (isDirectProse(item)) {
-      flush();
-      timeline.push(item);
-    } else {
-      segment.push(item);
-    }
-  }
-  flush();
-  return timeline;
-}
-
-/**
- * Keeps prose and activity in conversational order. Items in one authoritative
- * provider turn stay together, but direct messages split activity into stable
- * segments. Items without a turnId are deliberately not associated.
- */
-export function buildActivityTimeline(items: ActivityItem[]): ActivityTimelineItem[] {
-  const ordered = [...items].sort((left, right) => left.seq - right.seq || left.id.localeCompare(right.id));
-  const turns = new Map<string, { seq: number; order: number; items: ActivityItem[] }>();
-  const entries: Array<{
-    seq: number;
-    order: number;
-    values: ActivityTimelineItem[];
-  }> = [];
-
-  ordered.forEach((item, order) => {
-    if (!item.turnId) {
-      entries.push({
-        seq: item.seq,
-        order,
-        values: isDirectProse(item)
-          ? [item]
-          : [{
-              kind: "activity-group",
-              id: `activity:item:${encodeURIComponent(item.id)}`,
-              turnId: null,
-              seq: item.seq,
-              state: item.state,
-              items: [item],
-            }],
-      });
-      return;
-    }
-    const existing = turns.get(item.turnId);
-    if (existing) {
-      existing.items.push(item);
-      return;
-    }
-    const turn = { seq: item.seq, order, items: [item] };
-    turns.set(item.turnId, turn);
-    entries.push({ seq: item.seq, order, values: turn.items });
-  });
-
-  for (const [turnId, turn] of turns) {
-    const entry = entries.find((candidate) => candidate.values === turn.items);
-    if (entry) entry.values = turnTimeline(turnId, turn.items);
-  }
-
-  return entries
-    .sort((left, right) => left.seq - right.seq || left.order - right.order)
-    .flatMap((entry) => entry.values);
-}
-
-function stateLabel(state: ActivityItemState): string {
-  return state === "complete" ? "completed" : state.replaceAll("_", " ");
-}
-
-function stateClasses(state: ActivityItemState): string {
-  if (state === "failed") return "border-red-500/30 bg-red-500/5 text-red-700 dark:text-red-300";
-  if (state === "interrupted") return "border-amber-500/30 bg-amber-500/5 text-amber-800 dark:text-amber-200";
-  if (isActive(state)) return "border-primary/25 bg-primary/5 text-primary";
-  return "border-border bg-muted/35 text-muted-foreground";
-}
-
-function ActivityState({ state }: { state: ActivityItemState }) {
-  const Icon = state === "complete"
-    ? Check
-    : state === "failed" || state === "interrupted"
-      ? CircleX
-      : CircleDashed;
-  return (
-    <span className={cn("inline-flex shrink-0 items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] font-medium capitalize", stateClasses(state))}>
-      <Icon className={cn("size-3", isActive(state) && "animate-pulse motion-reduce:animate-none")} />
-      {stateLabel(state)}
-    </span>
-  );
-}
-
-function activityMessageStatus(state: ActivityItemState): MessageStatus {
+function messageStatus(state: ActivityState): MessageStatus {
   if (state === "pending" || state === "running") return { type: "running" };
   if (state === "waiting") return { type: "requires-action", reason: "interrupt" };
   if (state === "complete") return { type: "complete", reason: "stop" };
   if (state === "interrupted") return { type: "incomplete", reason: "cancelled" };
-  return { type: "incomplete", reason: "error", error: "Activity failed" };
+  return { type: "incomplete", reason: "error", error: "Provider activity failed" };
 }
 
-function activityPartStatus(state: ActivityItemState): MessagePartStatus {
+function partStatus(state: ActivityState): MessagePartStatus {
   if (state === "pending" || state === "running" || state === "waiting") return { type: "running" };
   if (state === "complete") return { type: "complete" };
   return { type: "incomplete", reason: state === "interrupted" ? "cancelled" : "error" };
 }
 
-function activityDate(item: ActivityItem): Date | undefined {
+function itemDate(item: ActivityItem): Date | undefined {
   const raw = item.startedAt ?? item.updatedAt ?? item.completedAt;
   if (!raw) return undefined;
   const date = new Date(raw);
   return Number.isNaN(date.getTime()) ? undefined : date;
-}
-
-function metadata(item: ActivityItem): NonNullable<ReasoningMessagePartProps["providerMetadata"]> {
-  return {
-    "agent-manager": {
-      item: item as unknown as Record<string, unknown>,
-    },
-  } as unknown as NonNullable<ReasoningMessagePartProps["providerMetadata"]>;
-}
-
-function itemFromMetadata(value: ReasoningMessagePartProps["providerMetadata"]): ActivityItem | null {
-  const candidate = value?.["agent-manager"]?.item;
-  return candidate && typeof candidate === "object" ? candidate as unknown as ActivityItem : null;
 }
 
 function toolArguments(item: Extract<ActivityItem, { kind: "tool" }>): Record<string, ActivityJsonValue> {
@@ -259,488 +98,453 @@ function toolArguments(item: Extract<ActivityItem, { kind: "tool" }>): Record<st
   return item.arguments === null ? {} : { input: item.arguments };
 }
 
-export function activityToThreadMessage(item: ActivityTimelineItem): ThreadMessageLike {
-  if (item.kind === "activity-group") {
-    return {
-      id: item.id,
-      role: "assistant",
-      status: activityMessageStatus(item.state),
-      content: [{ type: "data", name: ACTIVITY_GROUP_DATA_PART, data: item }],
-    };
-  }
-  const common = {
-    id: item.id,
-    ...(activityDate(item) ? { createdAt: activityDate(item) } : {}),
-  };
+function itemTiming(item: ActivityItem): { startedAt: number; completedAt?: number } | undefined {
+  if (!item.startedAt) return undefined;
+  const startedAt = Date.parse(item.startedAt);
+  if (!Number.isFinite(startedAt)) return undefined;
+  if (!item.completedAt) return { startedAt };
+  const completedAt = Date.parse(item.completedAt);
+  return Number.isFinite(completedAt) && completedAt >= startedAt
+    ? { startedAt, completedAt }
+    : { startedAt };
+}
+
+function activityPart(
+  item: ActivityItem,
+  subagents: ReadonlyMap<string, SubagentFrameData>,
+  groupItems: readonly ActivityItem[],
+): ThreadContentPart {
   if (item.kind === "message") {
-    const prefix = item.role === "system"
-      ? "[System] "
-      : item.role === "tool"
-        ? `[Tool${item.label ? `: ${item.label}` : ""}] `
-        : "";
-    return {
-      ...common,
-      role: item.role === "user" ? "user" : "assistant",
-      content: [{ type: "text", text: `${prefix}${item.text}`, status: activityPartStatus(item.state) }],
-      ...(item.role === "user" ? {} : { status: activityMessageStatus(item.state) }),
-    };
+    return { type: "text", text: item.text, status: partStatus(item.state) };
   }
   if (item.kind === "reasoning") {
-    return {
-      ...common,
-      role: "assistant",
-      status: activityMessageStatus(item.state),
-      content: [{
-        type: "reasoning",
-        text: item.text,
-        status: activityPartStatus(item.state),
-        providerMetadata: metadata(item),
-      }],
-    };
+    return { type: "reasoning", text: item.text, status: partStatus(item.state) };
   }
   if (item.kind === "tool") {
-    const hasResult = item.result !== null || item.output.length > 0 || !isActive(item.state);
+    const hasResult = item.result !== null || item.output.length > 0 || !["pending", "running", "waiting"].includes(item.state);
+    const timing = itemTiming(item);
     return {
-      ...common,
-      role: "assistant",
-      status: activityMessageStatus(item.state),
-      content: [{
-        type: "tool-call",
-        toolCallId: item.toolCallId,
-        toolName: item.name,
-        args: toolArguments(item),
-        argsText: jsonForDisplay(item.arguments),
-        ...(hasResult ? { result: item.result ?? item.output } : {}),
-        ...(item.state === "failed" ? { isError: true } : {}),
-        artifact: item,
-        providerMetadata: metadata(item),
-      }],
+      type: "tool-call",
+      toolCallId: item.toolCallId,
+      toolName: item.name,
+      args: toolArguments(item),
+      argsText: jsonForDisplay(item.arguments),
+      ...(hasResult ? { result: item.result ?? item.output } : {}),
+      ...(item.state === "failed" ? { isError: true } : {}),
+      ...(timing ? { timing } : {}),
     };
   }
+  if (item.kind === "subagent") {
+    const frame = subagents.get(item.id);
+    if (!frame) throw new Error(`Missing subagent frame for ${item.id}`);
+    return { type: "data", name: `${DATA_PREFIX}${item.kind}`, data: frame };
+  }
+  if (item.kind === "file-change") {
+    return {
+      type: "data",
+      name: `${DATA_PREFIX}${item.kind}`,
+      data: { ...item, upserting: fileChangeIsUpserting(item, groupItems) },
+    };
+  }
+  return { type: "data", name: `${DATA_PREFIX}${item.kind}`, data: item };
+}
+
+export function preferredFileChangeItems(items: readonly ActivityItem[]): ActivityFileChangeItem[] {
+  const turns = new Map<string, ActivityFileChangeItem[]>();
+  for (const item of items) {
+    if (item.kind !== "file-change") continue;
+    const key = item.turnId ?? `unassociated:${item.id}`;
+    const existing = turns.get(key);
+    if (existing) existing.push(item); else turns.set(key, [item]);
+  }
+  return [...turns.values()].flatMap((files) => {
+    const ordered = [...files].sort((left, right) => left.seq - right.seq || left.id.localeCompare(right.id));
+    const aggregate = [...ordered].reverse().find((item) => item.summary === "Turn diff");
+    return [aggregate ?? ordered.at(-1)!];
+  }).sort((left, right) => left.seq - right.seq || left.id.localeCompare(right.id));
+}
+
+function groupState(items: readonly ActivityItem[]): ActivityState {
+  const terminal = [...items].reverse().find((item) => item.kind === "lifecycle"
+    && ["turn-completed", "turn-failed", "turn-interrupted"].includes(item.event));
+  if (terminal?.kind === "lifecycle") {
+    if (terminal.event === "turn-failed") return "failed";
+    if (terminal.event === "turn-interrupted") return "interrupted";
+    return "complete";
+  }
+  if (items.some((item) => item.state === "running" || item.state === "pending")) return "running";
+  if (items.some((item) => item.state === "waiting")) return "waiting";
+  if (items.some((item) => item.state === "failed")) return "failed";
+  if (items.some((item) => item.state === "interrupted")) return "interrupted";
+  return "complete";
+}
+
+function duration(start: string | null, end: string | null): string | null {
+  if (!start || !end) return null;
+  const milliseconds = Date.parse(end) - Date.parse(start);
+  if (!Number.isFinite(milliseconds) || milliseconds < 0) return null;
+  return milliseconds < 1_000 ? `${milliseconds}ms` : `${(milliseconds / 1_000).toFixed(milliseconds < 10_000 ? 1 : 0)}s`;
+}
+
+function diffCounts(items: readonly ActivityItem[]): { additions: number | null; removals: number | null } {
+  const changes = preferredFileChangeItems(items).flatMap((item) => item.changes);
+  if (changes.length === 0) return { additions: null, removals: null };
+  let additions = 0;
+  let removals = 0;
+  for (const change of changes) {
+    for (const line of change.diff.split(/\r?\n/u)) {
+      if (line.startsWith("+") && !line.startsWith("+++")) additions += 1;
+      if (line.startsWith("-") && !line.startsWith("---")) removals += 1;
+    }
+  }
+  return { additions, removals };
+}
+
+function turnFacts(items: readonly ActivityItem[]): TurnFacts | null {
+  const terminal = [...items].reverse().find((item) => item.kind === "lifecycle"
+    && ["turn-completed", "turn-failed", "turn-interrupted"].includes(item.event));
+  if (!terminal) return null;
+  const startedAt = items.map((item) => item.startedAt).filter((value): value is string => value !== null).sort()[0] ?? null;
+  const endedAt = terminal.completedAt ?? terminal.updatedAt;
+  const usage = [...items].reverse().find((item) => item.kind === "usage");
+  const counts = diffCounts(items);
   return {
-    ...common,
+    endedAt,
+    duration: duration(startedAt, endedAt),
+    subagents: items.filter((item) => item.kind === "subagent").length || null,
+    additions: counts.additions,
+    removals: counts.removals,
+    tokens: usage?.kind === "usage" ? usage.totalTokens : null,
+    costUsd: usage?.kind === "usage" ? usage.costUsd : null,
+  };
+}
+
+function assistantMessage(
+  id: string,
+  items: readonly ActivityItem[],
+  subagents: ReadonlyMap<string, SubagentFrameData>,
+  factItems: readonly ActivityItem[] = items,
+): ThreadMessageLike | null {
+  if (items.length === 0) return null;
+  const state = groupState(items);
+  const facts = turnFacts(factItems);
+  return {
+    id,
     role: "assistant",
-    status: activityMessageStatus(item.state),
-    content: [{ type: "data", name: ACTIVITY_DATA_PART, data: item }],
+    status: messageStatus(state),
+    content: [
+      ...items.map((item) => activityPart(item, subagents, items)),
+      ...(facts ? [{ type: "data" as const, name: `${DATA_PREFIX}turn-marker`, data: facts }] : []),
+    ] satisfies ThreadContent,
+    ...(itemDate(items[0]!) ? { createdAt: itemDate(items[0]!) } : {}),
   };
 }
 
-function ActivityCard({
-  item,
-  label,
-  icon,
-  children,
-}: {
-  item: ActivityItem;
-  label: string;
-  icon: ReactNode;
-  children: ReactNode;
-}) {
-  return (
-    <section
-      className={cn(
-        "w-full min-w-0 rounded-lg border bg-card text-card-foreground shadow-sm",
-        item.state === "failed" && "border-red-500/35",
-      )}
-      data-activity-kind={item.kind}
-      data-activity-state={item.state}
-    >
-      <div className="flex min-w-0 items-center gap-2 px-3 py-2 text-xs">
-        <span className="shrink-0 text-muted-foreground">{icon}</span>
-        <span className="min-w-0 flex-1 truncate font-medium">{label}</span>
-        <ActivityState state={item.state} />
-      </div>
-      <div className="min-w-0 border-t px-3 py-2.5 text-xs leading-5">{children}</div>
-    </section>
-  );
-}
-
-function Pre({ children, label }: { children: string; label: string }) {
-  if (!children) return null;
-  return (
-    <div className="min-w-0">
-      <p className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">{label}</p>
-      <pre className="max-w-full overflow-x-auto rounded-md bg-muted/70 p-2 font-mono text-[11px] leading-5 [tab-size:2]">{children}</pre>
-    </div>
-  );
-}
-
-function ActivityReasoningPart({ text, status, providerMetadata }: ReasoningMessagePartProps) {
-  const item = itemFromMetadata(providerMetadata);
-  if (!item || item.kind !== "reasoning") return <p className="whitespace-pre-wrap break-words">{text}</p>;
-  const provenance = item.exposure === "provider-exposed" ? "Provider reasoning" : "Transcript reasoning";
-  const label = item.label
-    ? `${provenance}: ${item.label}`
-    : item.reasoningKind === "summary" ? `${provenance} summary` : provenance;
-  return (
-    <ActivityCard
-      item={item}
-      label={label}
-      icon={<Brain className="size-3.5" />}
-    >
-      <p className={cn("whitespace-pre-wrap break-words [overflow-wrap:anywhere]", status.type === "running" && "text-foreground")}>{text || "Thinking…"}</p>
-    </ActivityCard>
-  );
-}
-
-function ActivityToolPart(props: ToolCallMessagePartProps) {
-  const item = props.artifact as ActivityItem | undefined;
-  if (!item || item.kind !== "tool") {
-    return <Pre label={props.toolName}>{props.result ? jsonForDisplay(props.result as never) : props.argsText}</Pre>;
-  }
-  return <ActivityToolCard item={item} />;
-}
-
-function ActivityToolCard({ item }: { item: Extract<ActivityItem, { kind: "tool" }> }) {
-  const argumentsText = jsonForDisplay(item.arguments);
-  const resultText = jsonForDisplay(item.result);
-  return (
-    <ActivityCard item={item} label={item.name || "Tool call"} icon={<Wrench className="size-3.5" />}>
-      <div className="grid min-w-0 gap-2.5">
-        <div className="flex flex-wrap items-center gap-2 text-[10px] uppercase tracking-wide text-muted-foreground">
-          <span>{item.category.replaceAll("-", " ")}</span>
-          <span>·</span>
-          <span>{item.confidence}</span>
-          {item.truncated && <span>· truncated</span>}
-        </div>
-        <Pre label="Arguments">{argumentsText}</Pre>
-        <Pre label="Result">{resultText}</Pre>
-        <Pre label="Output">{item.output}</Pre>
-      </div>
-    </ActivityCard>
-  );
-}
-
-function PlanRow({ item }: { item: Extract<ActivityItem, { kind: "plan" }> }) {
-  return (
-    <section className="w-full min-w-0 rounded-lg border bg-card px-3 py-2.5 text-xs shadow-sm" data-activity-kind="plan">
-      <div className="flex items-center gap-2">
-        <ListChecks className="size-3.5 shrink-0 text-muted-foreground" />
-        <span className="min-w-0 flex-1 font-medium">Plan</span>
-        <ActivityState state={item.state} />
-      </div>
-      {item.text && <p className="mt-2 whitespace-pre-wrap break-words leading-5 [overflow-wrap:anywhere]">{item.text}</p>}
-      {item.steps.length > 0 && (
-        <ol className="mt-2 grid gap-1.5">
-          {item.steps.map((step) => (
-            <li key={step.id} className="flex min-w-0 items-start gap-2">
-              <span className={cn(
-                "mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-full border text-[9px]",
-                step.status === "completed" && "border-primary/30 bg-primary/10 text-primary",
-                step.status === "in_progress" && "border-primary/40 text-primary",
-              )}>
-                {step.status === "completed" ? <Check className="size-2.5" /> : "·"}
-              </span>
-              <span className={cn("min-w-0 break-words [overflow-wrap:anywhere]", step.status === "completed" && "text-muted-foreground line-through")}>{step.text}</span>
-            </li>
-          ))}
-        </ol>
-      )}
-    </section>
-  );
-}
-
-function LifecycleRow({ item }: { item: ActivityLifecycleItem }) {
-  if (item.details) {
-    return (
-      <ActivityCard item={item} label={item.title} icon={<Radio className="size-3.5" />}>
-        <p className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{item.details}</p>
-      </ActivityCard>
+function messagesForTurn(turnKey: string, source: readonly ActivityItem[]): ThreadMessageLike[] {
+  const hierarchy = buildSubagentHierarchy(source);
+  const turnFactFileIds = new Set(preferredFileChangeItems(source).map((item) => item.id));
+  const turnFactItems = source.filter((item) => item.kind !== "file-change" || turnFactFileIds.has(item.id));
+  const preferredFileIds = new Set(preferredFileChangeItems(hierarchy.topLevelItems).map((item) => item.id));
+  const ordered = hierarchy.topLevelItems
+    .filter((item) => item.kind !== "file-change" || preferredFileIds.has(item.id))
+    .sort((left, right) => left.seq - right.seq || left.id.localeCompare(right.id));
+  const initialUser = ordered.find((item) => item.kind === "message" && item.role === "user");
+  const finals = ordered.filter((item) => item.kind === "message" && item.role === "assistant" && item.phase === "final");
+  const finalIds = new Set(finals.map((item) => item.id));
+  const semantic = [
+    ...(initialUser ? [initialUser] : []),
+    ...ordered.filter((item) => item.id !== initialUser?.id && !finalIds.has(item.id)),
+    ...finals,
+  ];
+  const result: ThreadMessageLike[] = [];
+  let assistantItems: ActivityItem[] = [];
+  let segment = 0;
+  const flush = () => {
+    const includesTurnEnd = assistantItems.some((item) => item.kind === "lifecycle"
+      && ["turn-completed", "turn-failed", "turn-interrupted"].includes(item.event));
+    const message = assistantMessage(
+      `turn:${encodeURIComponent(turnKey)}:assistant:${segment++}`,
+      assistantItems,
+      hierarchy.frames,
+      includesTurnEnd ? turnFactItems : assistantItems,
     );
-  }
-  return (
-    <section className={cn(
-      "flex w-full min-w-0 items-center gap-2 rounded-lg border px-3 py-2 text-xs",
-      item.level === "error" && "border-red-500/30 bg-red-500/5",
-      item.level === "warning" && "border-amber-500/30 bg-amber-500/5",
-    )} data-activity-kind="lifecycle">
-      <Radio className="size-3.5 shrink-0 text-muted-foreground" />
-      <span className="min-w-0 flex-1 break-words font-medium [overflow-wrap:anywhere]">{item.title}</span>
-      <ActivityState state={item.state} />
-    </section>
-  );
-}
-
-function QueueRow({ item }: { item: Extract<ActivityItem, { kind: "queue" }> }) {
-  return (
-    <section className="w-full min-w-0 rounded-lg border bg-muted/25 px-3 py-2.5 text-xs" data-activity-kind="queue">
-      <div className="flex items-center gap-2">
-        <ListPlus className="size-3.5 shrink-0 text-muted-foreground" />
-        <span className="min-w-0 flex-1 font-medium">Queued messages</span>
-        <span className="text-muted-foreground">{item.messages.length}</span>
-      </div>
-      {item.messages.length > 0 && (
-        <ul className="mt-2 grid gap-1.5">
-          {item.messages.map((message) => (
-            <li key={message.id} className="flex min-w-0 items-start gap-2 rounded-md bg-background/70 px-2 py-1.5">
-              <span className="min-w-0 flex-1 whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{message.text}</span>
-              <span className={cn("shrink-0 capitalize text-muted-foreground", message.status === "failed" && "text-red-600 dark:text-red-300")}>{message.status}</span>
-            </li>
-          ))}
-        </ul>
-      )}
-    </section>
-  );
-}
-
-function UsageRow({ item }: { item: Extract<ActivityItem, { kind: "usage" }> }) {
-  const number = new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 });
-  const entries = [
-    ["input", item.inputTokens],
-    ["output", item.outputTokens],
-    ["cached", item.cachedInputTokens],
-    ["reasoning", item.reasoningTokens],
-    ["total", item.totalTokens],
-  ] as const;
-  return (
-    <section className="flex w-full min-w-0 flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border bg-muted/20 px-3 py-2 text-[11px] text-muted-foreground" data-activity-kind="usage">
-      <span className="flex items-center gap-1.5 font-medium text-foreground"><Gauge className="size-3.5" /> {item.scope} usage</span>
-      {entries.map(([label, value]) => value === null ? null : <span key={label}>{label} {number.format(value)}</span>)}
-      {item.costUsd !== null && <span>${item.costUsd.toFixed(4)}</span>}
-    </section>
-  );
-}
-
-function FileChangeRow({ item }: { item: ActivityFileChangeItem }) {
-  return (
-    <ActivityCard item={item} label={item.summary || `${item.changes.length} file changes`} icon={<FileDiff className="size-3.5" />}>
-      <div className="grid min-w-0 gap-3">
-        {item.changes.map((change, index) => (
-          <div key={`${change.path}:${index}`} className="min-w-0">
-            <div className="mb-1 flex min-w-0 gap-2">
-              <span className="shrink-0 uppercase text-muted-foreground">{change.operation}</span>
-              <span className="min-w-0 break-words font-mono [overflow-wrap:anywhere]">{change.path}</span>
-            </div>
-            <Pre label="Diff">{change.diff}</Pre>
-          </div>
-        ))}
-      </div>
-    </ActivityCard>
-  );
-}
-
-function SubagentRow({ item }: { item: ActivitySubagentItem }) {
-  return (
-    <ActivityCard item={item} label={item.name || "Subagent"} icon={<Users className="size-3.5" />}>
-      <div className="grid min-w-0 gap-2">
-        {item.description && <p className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{item.description}</p>}
-        <Pre label="Output">{item.output}</Pre>
-        {item.childItemIds.length > 0 && <p className="text-muted-foreground">{item.childItemIds.length} child activit{item.childItemIds.length === 1 ? "y" : "ies"}</p>}
-      </div>
-    </ActivityCard>
-  );
-}
-
-function questionRequest(item: Extract<ActivityItem, { kind: "attention" }>): AttentionRequest {
-  return {
-    id: item.requestId || null,
-    kind: item.attentionKind,
-    summary: item.summary,
-    ...(item.title ? { title: item.title } : {}),
-    questions: item.questions.map((question) => ({
-      id: question.id,
-      ...(question.header ? { header: question.header } : {}),
-      text: question.text,
-      options: question.options.map((option) => ({
-        label: option.label,
-        ...(option.description ? { description: option.description } : {}),
-      })),
-      multiSelect: question.multiSelect,
-      allowFreeText: question.allowFreeText,
-      isSecret: question.isSecret,
-    })),
-    respondable: item.respondable,
-    isSecret: item.isSecret,
-    source: item.source,
-    confidence: item.confidence,
+    if (message) result.push(message);
+    assistantItems = [];
   };
+  for (const item of semantic) {
+    if (item.kind === "message" && item.role === "user") {
+      flush();
+      result.push({
+        id: item.id,
+        role: "user",
+        content: [{ type: "text", text: item.text, status: partStatus(item.state) }],
+        ...(itemDate(item) ? { createdAt: itemDate(item) } : {}),
+      });
+    } else if (item.kind === "message" && item.role === "system") {
+      flush();
+      result.push({
+        id: item.id,
+        role: "system",
+        content: [{ type: "text", text: item.text, status: partStatus(item.state) }],
+        ...(itemDate(item) ? { createdAt: itemDate(item) } : {}),
+      });
+    } else {
+      assistantItems.push(item);
+    }
+  }
+  flush();
+  return result;
 }
 
-function normalizedPrompt(value: string): string {
-  return value.trim().replaceAll(/\s+/gu, " ").toLocaleLowerCase();
-}
-
-function summaryRepeatsQuestion(item: Extract<ActivityItem, { kind: "attention" }>): boolean {
-  if (!item.summary || item.questions.length === 0) return false;
-  const summary = normalizedPrompt(item.summary);
-  return item.questions.some((question) => {
-    const prompt = normalizedPrompt(question.text);
-    const headedPrompt = question.header
-      ? normalizedPrompt(`${question.header}: ${question.text}`)
-      : prompt;
-    return summary === prompt || summary === headedPrompt;
+/** Projects only the canonical selected-session activity stream. */
+export function activityToThreadMessages(items: readonly ActivityItem[]): ThreadMessageLike[] {
+  const ordered = [...items].sort((left, right) => left.seq - right.seq || left.id.localeCompare(right.id));
+  const turns = new Map<string, ActivityItem[]>();
+  const entries: Array<{ seq: number; order: number; key: string; items: ActivityItem[] }> = [];
+  ordered.forEach((item, order) => {
+    const key = item.turnId ?? `unassociated:${item.id}`;
+    const previous = turns.get(key);
+    if (previous) previous.push(item);
+    else {
+      const grouped = [item];
+      turns.set(key, grouped);
+      entries.push({ seq: item.seq, order, key, items: grouped });
+    }
   });
+  return entries
+    .sort((left, right) => left.seq - right.seq || left.order - right.order)
+    .flatMap((entry) => messagesForTurn(entry.key, entry.items));
 }
 
-function isInlineQuestion(
-  item: Extract<ActivityItem, { kind: "attention" }>,
-  controls: ActivityAttentionControls | undefined,
-): controls is ActivityAttentionControls {
-  return Boolean(
-    controls
-      && item.requestId
-      && controls.exactRequestIds.has(item.requestId)
-      && item.attentionKind === "question"
+export function exactCurrentActivityRequestIds(items: readonly ActivityItem[]): ReadonlySet<string> {
+  const resolved = new Set(items.flatMap((item) => item.kind === "attention" && item.resolved ? [item.requestId] : []));
+  return new Set(items.flatMap((item) => item.kind === "attention"
+      && item.state === "waiting"
+      && item.source === "provider-api"
+      && item.confidence === "exact"
+      && item.exposure === "provider-exposed"
+      && !item.truncated
       && item.respondable
       && !item.resolved
-      && item.questions.length > 0,
-  );
+      && !resolved.has(item.requestId)
+    ? [item.requestId]
+    : []));
 }
 
-function AttentionRow({
-  item,
-  controls,
-}: {
-  item: Extract<ActivityItem, { kind: "attention" }>;
-  controls: ActivityAttentionControls | undefined;
-}) {
-  const interactive = isInlineQuestion(item, controls);
-  const showSummary = Boolean(item.summary) && !(item.attentionKind === "question" && summaryRepeatsQuestion(item));
+export function exactPlanApprovalRequestIds(
+  items: readonly ActivityItem[],
+  exactRequestIds: ReadonlySet<string>,
+): ReadonlyMap<string, string> {
+  const result = new Map<string, string>();
+  for (const plan of items) {
+    if (
+      plan.kind !== "plan"
+      || plan.approvedAt !== null
+      || plan.supersededBy !== null
+      || plan.source !== "provider-api"
+      || plan.confidence !== "exact"
+      || plan.exposure !== "provider-exposed"
+      || plan.truncated
+    ) continue;
+    const requestId = plan.approvalRequestId;
+    if (requestId && exactRequestIds.has(requestId)) result.set(plan.id, requestId);
+  }
+  return result;
+}
+
+export function currentQueue(activity: SessionActivityView) {
+  const queue = [...activity.items].reverse().find((item) => item.kind === "queue");
+  return queue?.kind === "queue" ? queue.messages.filter((message) => message.status !== "dispatched") : [];
+}
+
+export function currentTodo(activity: SessionActivityView): ActivityTodoItem | null {
+  return [...activity.items].reverse().find((item): item is ActivityTodoItem => item.kind === "todo") ?? null;
+}
+
+export function todoView(item: ActivityTodoItem, progress: SessionView["todoProgress"] = null): TodoListView {
+  return {
+    id: item.id,
+    steps: item.steps.map((step) => ({
+      id: step.id,
+      text: step.text,
+      status: step.status === "in_progress" ? "in-progress" : step.status,
+      detail: step.detail,
+      removedReason: step.removedReason,
+      addedAfterStart: step.addedAfterStart,
+    })),
+    added: item.added,
+    removed: item.removed,
+    running: item.state === "pending" || item.state === "running" || item.state === "waiting",
+    active: progress?.active ?? false,
+    hasMoved: progress?.hasMoved ?? false,
+    duration: duration(item.startedAt, item.completedAt),
+    lastTransitionAt: progress?.lastTransitionAt ?? null,
+  };
+}
+
+export function questionView(item: ActivityAttentionItem): ExactQuestionRequest {
+  return {
+    id: item.requestId || null,
+    label: item.title ?? item.summary ?? item.attentionKind.replaceAll("-", " "),
+    state: item.resolved ? "resolved" : item.state === "waiting" ? "waiting" : "pending",
+    source: item.source,
+    confidence: item.confidence,
+    exposure: item.exposure,
+    truncated: item.truncated,
+    respondable: item.respondable,
+    questions: item.questions.map((question) => ({
+      id: question.id,
+      header: question.header ?? null,
+      prompt: question.text,
+      options: question.options.map((option, index) => ({
+        id: `${question.id}:${index}`,
+        label: option.label,
+        description: option.description,
+        recommended: option.recommended === true,
+      })),
+      multiple: question.multiSelect,
+      allowFreeText: question.allowFreeText,
+      secret: question.isSecret,
+    })),
+  };
+}
+
+function FileChanges({ item, controls }: { item: ActivityFileChangeItem & { upserting?: boolean }; controls: ActivityFileControls }) {
+  const upserting = item.upserting ?? fileChangeIsUpserting(item, [item]);
+  const changes: FileChangeView[] = item.changes.map((change) => ({
+    path: change.path,
+    previousPath: change.previousPath,
+    operation: change.operation,
+    diff: change.diff,
+    truncated: item.truncated,
+    readKey: diffIdentityKey(controls.sessionId, item.turnId ?? "unassociated", change.path, change.operation, change.diff),
+    upserting,
+  }));
   return (
-    <section
-      id={item.requestId ? `attention-request-${item.requestId}` : undefined}
-      className="w-full min-w-0 scroll-mt-4 rounded-lg border border-amber-500/35 bg-amber-500/5 px-3 py-2.5 text-xs focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-      data-activity-kind="attention"
-      data-attention-request-id={item.requestId || undefined}
-      tabIndex={interactive ? -1 : undefined}
-    >
-      <div className="flex items-center gap-2">
-        <CircleAlert className="size-3.5 shrink-0 text-amber-700 dark:text-amber-300" />
-        <span className="min-w-0 flex-1 break-words font-medium [overflow-wrap:anywhere]">{item.title ?? item.attentionKind.replaceAll("-", " ")}</span>
-        <ActivityState state={item.state} />
-      </div>
-      {showSummary && <p className="mt-2 whitespace-pre-wrap break-words leading-5 [overflow-wrap:anywhere]">{item.summary}</p>}
-      {interactive ? (
-        <QuestionRequestForm
-          request={questionRequest(item)}
-          mutationsReady={controls.mutationsReady}
-          canRespond={controls.canRespond}
-          busy={controls.busy}
-          onRespond={controls.onRespond}
-        />
-      ) : item.questions.length > 0 && (
-        <ul className="mt-2 grid gap-1.5">
-          {item.questions.map((question) => (
-            <li key={question.id} className="break-words [overflow-wrap:anywhere]">
-              {question.header && <span className="mr-1 font-medium">{question.header}:</span>}
-              {question.text}
-            </li>
-          ))}
-        </ul>
-      )}
+    <section className="my-3 grid gap-2" aria-label={item.summary || "File changes"}>
+      {changes.map((change, index) => {
+        const relativePath = relativeEditorPath(controls.workspaceRoot, change.path);
+        const stableKey = `${item.id}:${change.operation}:${change.previousPath ?? ""}:${change.path}:${String(index)}`;
+        return <DiffViewer key={stableKey} change={change} read={controls.readKeys.has(change.readKey)} onReadChange={controls.onReadChange} {...(controls.canOpenEditor && relativePath && controls.onOpenEditor ? { onOpenEditor: () => controls.onOpenEditor!(relativePath) } : {})} />;
+      })}
+      {item.truncated && <p className="text-[11.5px] text-[var(--warning)]">The provider truncated this change.</p>}
     </section>
   );
 }
 
-function CommentaryRow({ item }: { item: Extract<ActivityItem, { kind: "message" }> }) {
-  const label = item.role === "assistant"
-    ? "Commentary"
-    : item.role === "system"
-      ? "System update"
-      : "Tool message";
-  return (
-    <section className="w-full min-w-0 rounded-lg border bg-muted/20 px-3 py-2.5 text-xs" data-activity-kind="message">
-      <div className="flex items-center gap-2">
-        <MessageSquareText className="size-3.5 shrink-0 text-muted-foreground" />
-        <span className="min-w-0 flex-1 font-medium">{item.label || label}</span>
-        <ActivityState state={item.state} />
-      </div>
-      <p className="mt-2 whitespace-pre-wrap break-words leading-5 [overflow-wrap:anywhere]">{item.text}</p>
-    </section>
-  );
-}
-
-function ActivityItemRow({ item, controls }: { item: ActivityItem; controls: ActivityAttentionControls | undefined }) {
-  switch (item.kind) {
-    case "message": return <CommentaryRow item={item} />;
-    case "reasoning": return (
-      <ActivityReasoningPart
-        type="reasoning"
-        text={item.text}
-        status={activityPartStatus(item.state)}
-        providerMetadata={metadata(item)}
+function Attention({ item, controls }: { item: ActivityAttentionItem; controls: ActivityAttentionControls }) {
+  const exact = controls.exactRequestIds.has(item.requestId);
+  if ((item.attentionKind === "question" || item.attentionKind === "elicitation") && item.questions.length > 0) {
+    return <QuestionRequest request={questionView(item)} disabled={!exact || !controls.mutationsReady || !controls.canRespond || controls.busy} onSubmit={controls.onRespond} />;
+  }
+  if (["approval", "permission", "sandbox"].includes(item.attentionKind) && exact) {
+    return (
+      <ApprovalRequest
+        request={{
+          id: item.requestId,
+          label: item.title ?? item.summary ?? "Approval requested",
+          command: item.approvalFacts?.command ?? null,
+          reason: item.summary,
+          workspaceRoot: controls.workspaceRoot,
+          paths: item.approvalFacts?.paths ?? null,
+          writes: item.approvalFacts?.writes ?? [],
+          network: item.approvalFacts?.network ?? null,
+          deleteCount: item.approvalFacts?.deleteCount ?? null,
+          remoteHost: controls.remoteHost,
+          sessionsOnHost: controls.sessionsOnHost,
+          canPersist: item.approvalFacts?.canPersist ?? false,
+        }}
+        disabled={!controls.mutationsReady || !controls.canRespond || controls.busy}
+        onDecision={(requestId, decision) => controls.onRespond(requestId, {
+          kind: "decision",
+          decision: decision.decision,
+          ...(decision.decision === "allow" && decision.persist ? { persist: true } : {}),
+          ...(decision.decision === "deny" && decision.reason ? { reason: decision.reason } : {}),
+        })}
       />
     );
-    case "tool": return <ActivityToolCard item={item} />;
-    case "plan": return <PlanRow item={item} />;
-    case "lifecycle": return <LifecycleRow item={item} />;
-    case "queue": return <QueueRow item={item} />;
-    case "usage": return <UsageRow item={item} />;
-    case "file-change": return <FileChangeRow item={item} />;
-    case "subagent": return <SubagentRow item={item} />;
-    case "attention": return <AttentionRow item={item} controls={controls} />;
   }
-}
-
-function ActivityTurnDisclosure({
-  group,
-  controls,
-}: {
-  group: ActivityTurnGroup;
-  controls: ActivityAttentionControls | undefined;
-}) {
-  const live = isActive(group.state);
-  const expanded = live || group.state === "failed" || group.state === "interrupted";
-  const itemLabel = `${group.items.length} update${group.items.length === 1 ? "" : "s"}`;
   return (
-    <details
-      className="group/turn w-full min-w-0 rounded-xl border bg-muted/20 shadow-sm"
-      open={expanded ? true : undefined}
-      data-activity-turn={group.turnId ?? group.id}
-      data-activity-state={group.state}
-    >
-      <summary className="flex min-w-0 cursor-pointer list-none items-center gap-2 px-3 py-2.5 text-xs marker:content-none [&::-webkit-details-marker]:hidden">
-        <Brain className={cn("size-3.5 shrink-0 text-muted-foreground", live && "animate-pulse motion-reduce:animate-none")} />
-        <span className="font-medium">Activity</span>
-        <span className="min-w-0 flex-1 truncate text-muted-foreground">{itemLabel}</span>
-        <ActivityState state={group.state} />
-        <span aria-hidden="true" className="text-muted-foreground transition-transform group-open/turn:rotate-90 motion-reduce:transition-none">›</span>
-      </summary>
-      <div className="grid min-w-0 gap-2 border-t p-2.5">
-        {group.items.map((item) => <ActivityItemRow key={item.id} item={item} controls={controls} />)}
-      </div>
-    </details>
+    <section className="my-2 border-l-2 border-dashed border-[var(--accent)] bg-[var(--surface-raised)] p-3" data-attention-confidence={item.confidence}>
+      <p className="flex items-start gap-2 text-[13px]"><CircleAlert size={15} className="mt-0.5 text-[var(--accent)]" /><strong>{item.title ?? item.attentionKind.replaceAll("-", " ")}</strong></p>
+      {item.summary && <p className="mt-1 text-[12.5px] leading-5 text-[var(--text-muted)]">{item.summary}</p>}
+      <p className="mt-2 text-[11.5px] text-[var(--text-faint)]">{item.resolved ? "Resolved in the harness." : "Open the native harness to respond; this request is not safely representable here."}</p>
+    </section>
   );
 }
 
-function ActivityDataPart({
-  data,
-  controls,
-}: DataMessagePartProps<ActivityItem> & { controls: ActivityAttentionControls | undefined }) {
-  switch (data.kind) {
-    case "plan": return <PlanRow item={data} />;
-    case "lifecycle": return <LifecycleRow item={data} />;
-    case "queue": return <QueueRow item={data} />;
-    case "usage": return <UsageRow item={data} />;
-    case "file-change": return <FileChangeRow item={data} />;
-    case "subagent": return <SubagentRow item={data} />;
-    case "attention": return <AttentionRow item={data} controls={controls} />;
+function Lifecycle({ item }: { item: Extract<ActivityItem, { kind: "lifecycle" }> }) {
+  return (
+    <section className={`my-2 border-l-2 p-3 text-[12.5px] ${item.level === "error" ? "border-[var(--danger)] bg-[var(--danger-field)]" : item.level === "warning" ? "border-[var(--warning)] bg-[var(--warning-field)]" : "border-[var(--border)] bg-[var(--surface-raised)]"}`}>
+      <p className="flex items-center gap-2"><Radio size={13} /><strong>{item.title}</strong></p>
+      {item.details && <p className="mt-1 whitespace-pre-wrap text-[var(--text-muted)]">{item.details}</p>}
+      {item.truncated && <p className="mt-1 text-[var(--warning)]">Details were truncated by the provider.</p>}
+    </section>
+  );
+}
+
+function Usage({ item }: { item: Extract<ActivityItem, { kind: "usage" }> }) {
+  const facts = [
+    item.inputTokens === null ? null : `${item.inputTokens} input`,
+    item.outputTokens === null ? null : `${item.outputTokens} output`,
+    item.reasoningTokens === null ? null : `${item.reasoningTokens} reasoning`,
+    item.totalTokens === null ? null : `${item.totalTokens} total`,
+    item.costUsd === null ? null : `$${item.costUsd.toFixed(4)}`,
+  ].filter((value): value is string => value !== null);
+  return <p className="my-2 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[10.5px] text-[var(--text-faint)]"><Gauge size={13} />{facts.map((fact) => <span key={fact}>{fact}</span>)}</p>;
+}
+
+function Plan({ item, controls }: { item: Extract<ActivityItem, { kind: "plan" }>; controls: ActivityPlanControls }) {
+  const plan: PlanArtifactView = {
+    id: item.id,
+    path: item.path,
+    version: item.version,
+    markdown: item.markdown,
+    writtenAt: item.updatedAt,
+    supersededBy: item.supersededBy,
+    approvedAt: item.approvedAt,
+  };
+  const requestId = controls.requestIds.get(item.id) ?? null;
+  const actionable = requestId !== null && controls.canRespond;
+  const disabled = !controls.mutationsReady || controls.busy;
+  return <div className="my-3"><PlanArtifact plan={plan} disabled={disabled} loadFile={controls.loadFile} {...(actionable ? {
+    onExecute: () => controls.onRespond(requestId, { kind: "decision", decision: "allow" }),
+    onSendBack: (_plan: PlanArtifactView, notes: string) => controls.onRespond(requestId, { kind: "decision", decision: "deny", reason: notes }),
+  } : {})} />{item.truncated && <p className="mt-1 text-[11.5px] text-[var(--warning)]">The plan is truncated.</p>}</div>;
+}
+
+export function renderActivityData(name: string, data: unknown, controls: ActivityDataControls): ReactNode {
+  if (name === `${DATA_PREFIX}turn-marker`) return <TurnMarker facts={data as TurnFacts} />;
+  const item = data as ActivityItem;
+  if (!item || typeof item !== "object" || !("kind" in item)) return null;
+  switch (item.kind) {
+    case "plan": return <Plan item={item} controls={controls.plans} />;
+    case "todo": return <div className="my-3"><TodoList list={todoView(item)} /></div>;
+    case "file-change": return <FileChanges item={item} controls={controls.files} />;
+    case "attention": return <Attention item={item} controls={controls.attention} />;
+    case "queue": return <div className="my-3"><QueuedMessages messages={item.messages.flatMap((message) => message.status === "dispatched" ? [] : [{ id: message.id, text: message.text, status: message.status }])} canRemove={controls.queue.canRemove && !controls.queue.busy} onRemove={(id) => void controls.queue.onRemove(id)} /></div>;
+    case "lifecycle": return <Lifecycle item={item} />;
+    case "usage": return <Usage item={item} />;
+    case "subagent": return null; // GroupedActivityParts owns the subagent frame.
     default: return null;
   }
 }
 
-export function ActivityMessageParts({ controls }: { controls: ActivityAttentionControls | undefined }) {
-  return (
-    <MessagePrimitive.Parts>
-      {({ part }) => {
-        switch (part.type) {
-          case "text":
-            return <MarkdownText />;
-          case "reasoning":
-            return <ActivityReasoningPart {...part} />;
-          case "tool-call":
-            return part.toolUI ?? <ActivityToolPart {...part} />;
-          case "data":
-            if (part.name === ACTIVITY_GROUP_DATA_PART) {
-              return <ActivityTurnDisclosure group={part.data as ActivityTurnGroup} controls={controls} />;
-            }
-            return part.name === ACTIVITY_DATA_PART
-              ? <ActivityDataPart {...part} data={part.data as ActivityItem} controls={controls} />
-              : part.dataRendererUI;
-          default:
-            return null;
-        }
-      }}
-    </MessagePrimitive.Parts>
-  );
+export function sessionTodoProgress(activity: SessionActivityView) {
+  const todo = currentTodo(activity);
+  if (!todo) return null;
+  const visible = todo.steps.filter((step) => step.status !== "removed");
+  return {
+    completed: visible.filter((step) => step.status === "completed").length,
+    total: visible.length,
+    current: visible.find((step) => step.status === "in_progress")?.text ?? null,
+  };
+}
+
+export function remoteHostLabel(session: SessionView, remote: boolean): string | null {
+  return remote ? session.hostLabel : null;
+}
+
+export function ActivityRetentionBoundary() {
+  return <p className="mb-4 border-l-2 border-[var(--warning)] bg-[var(--warning-field)] p-3 text-[12.5px] text-[var(--warning)]"><AlertTriangle size={14} className="mr-2 inline" />Earlier provider activity is outside the retained stream window.</p>;
 }

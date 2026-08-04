@@ -1,101 +1,90 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import type { SessionView } from "../core/types.ts";
+import type { SessionRecord } from "../shared/session.ts";
+import { AGENT_MANAGER_BUILD_ID, WIRE_SCHEMA_VERSION } from "../shared/wire.ts";
 import { SessionStateStore } from "./state.ts";
 
-function transcriptBearingSession() {
+function strictSession(overrides: Partial<SessionRecord> = {}): SessionRecord {
   return {
-    id: "codex:thread-1",
-    provider: "codex" as const,
-    sessionId: "thread-1",
-    parentSessionId: null,
-    rootSessionId: "thread-1",
+    id: "local:codex:thread-1",
+    provider: "codex",
+    providerThreadId: "thread-1",
+    providerTreeId: "thread-1",
+    parentId: null,
+    providerTurnId: null,
     depth: 0,
+    hostId: "local",
+    hostLabel: "This Mac",
     name: "Private conversation",
     cwd: "/tmp/workspace",
-    kind: "interactive" as const,
-    lifecycle: "live" as const,
-    status: "idle" as const,
+    kind: "interactive",
+    presence: "live",
+    status: "idle",
     providerStatus: "idle",
-    waitingReason: null,
     pid: null,
     runtimePid: null,
     startedAt: null,
     updatedAt: "2026-08-03T00:00:00.000Z",
     childSummary: { total: 0, running: 0, waiting: 0, idle: 0, completed: 0, failed: 0, interrupted: 0, unknown: 0 },
-    statusSource: "transcript" as const,
+    statusSource: "transcript",
     source: "fixture",
-    ownership: "external" as const,
-    runtimeAlive: false,
-    mode: { value: "unknown" as const, providerValue: null, source: "inferred" as const, confidence: "heuristic" as const },
-    activity: "idle" as const,
+    profile: { value: null, providerValue: null, source: "inferred", confidence: "heuristic" },
+    model: { value: null, providerValue: null, source: "inferred", confidence: "heuristic" },
+    effort: { value: null, providerValue: null, source: "inferred", confidence: "heuristic" },
+    todoProgress: null,
     attention: [],
-    effectiveAccess: { accessMode: "unknown" as const, permissionMode: null, sandboxMode: null },
     terminal: null,
-    control: { plane: "observe-only" as const, capabilities: [], managerOwned: false, writableLease: false },
+    control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [] },
+    workspaceIdentity: null,
     generation: 0,
-    messages: [{
-      id: "private-message",
-      role: "user" as const,
-      text: "must stay out of global state",
-      createdAt: null,
-      status: "complete" as const,
-      label: null,
-    }],
-    transcript: {
-      state: "available" as const,
-      truncated: false,
-      source: "codex-rollout" as const,
-      messageCount: 1,
-      reason: null,
-    },
+    ...overrides,
   };
 }
 
-test("never retains transcript content in snapshots or replay events", () => {
+test("snapshot and replay use the strict shared wire epoch", () => {
   const state = new SessionStateStore();
-  state.upsert(transcriptBearingSession());
+  state.upsert(strictSession());
 
-  const stored = state.snapshot().sessions[0]!;
-  assert.equal("messages" in stored, false);
-  assert.equal("transcript" in stored, false);
+  assert.equal(state.snapshot().schemaVersion, WIRE_SCHEMA_VERSION);
+  assert.equal(state.snapshot().buildId, AGENT_MANAGER_BUILD_ID);
   const event = state.events.replayAfter(0).events[0]!;
-  assert.equal(JSON.stringify(event).includes("must stay out of global state"), false);
+  assert.equal(event.schemaVersion, WIRE_SCHEMA_VERSION);
+  assert.equal(event.buildId, AGENT_MANAGER_BUILD_ID);
+  assert.equal(event.type, "session.upsert");
 });
 
-test("global state and replay retain attention metadata without exact request content", () => {
+test("global state retains request identity but strips selected-session content", () => {
   const state = new SessionStateStore();
-  const exactQuestion = "Which production credential should I use?";
-  const exactOption = "The secret production token";
-  const record: SessionView = {
-    ...transcriptBearingSession(),
+  state.upsert(strictSession({
     attention: [{
       id: "request-sensitive-1",
       kind: "question",
-      summary: exactQuestion,
+      summary: "Which production credential should I use?",
       source: "provider-api",
       confidence: "exact",
       details: {
         title: "Sensitive choice",
         inputSummary: "authorization=Bearer should-not-leak",
+        toolName: "request_user_input",
         respondable: true,
         questions: [{
           id: "credential",
-          text: exactQuestion,
-          options: [{ label: exactOption, description: "Exact provider detail" }],
+          header: "Credential",
+          text: "Which production credential should I use?",
+          options: [{ label: "The secret production token", description: "Exact provider detail" }],
           multiSelect: false,
           allowFreeText: true,
+          isSecret: true,
         }],
       },
     }],
-  };
+  }));
 
-  state.upsert(record);
-
-  const snapshotText = JSON.stringify(state.snapshot());
-  const replayText = JSON.stringify(state.events.replayAfter(0));
-  for (const serialized of [snapshotText, replayText]) {
+  for (const serialized of [
+    JSON.stringify(state.snapshot()),
+    JSON.stringify(state.events.replayAfter(0)),
+  ]) {
     assert.doesNotMatch(serialized, /production credential|secret production token|Bearer|Sensitive choice/);
     assert.match(serialized, /request-sensitive-1/);
     assert.match(serialized, /"respondable":true/);
@@ -118,7 +107,92 @@ test("runtime diagnostics survive discovery diagnostic replacement", () => {
   state.addDiagnostic(runtime);
   state.replace([], [discovery]);
   assert.deepEqual(state.snapshot().diagnostics, [discovery, runtime]);
-
   state.replace([], []);
   assert.deepEqual(state.snapshot().diagnostics, [runtime]);
+});
+
+test("activity todo metadata survives discovery refresh and never carries content", () => {
+  const state = new SessionStateStore();
+  const movingProgress = {
+    completed: 1,
+    total: 3,
+    hasMoved: true,
+    lastTransitionAt: "2026-08-03T00:00:30.000Z",
+    active: true,
+  } as const;
+  state.setTodoProgress("local:codex:thread-1", movingProgress);
+  state.replace([strictSession()]);
+  assert.deepEqual(state.get("local:codex:thread-1")?.todoProgress, {
+    completed: 1,
+    total: 3,
+    hasMoved: true,
+    lastTransitionAt: "2026-08-03T00:00:30.000Z",
+    active: true,
+  });
+
+  state.replace([strictSession({
+    updatedAt: "2026-08-03T00:01:00.000Z",
+    todoProgress: null,
+  })]);
+  assert.deepEqual(state.get("local:codex:thread-1")?.todoProgress, {
+    completed: 1,
+    total: 3,
+    hasMoved: true,
+    lastTransitionAt: "2026-08-03T00:00:30.000Z",
+    active: true,
+  });
+  for (const serialized of [
+    JSON.stringify(state.snapshot()),
+    JSON.stringify(state.events.replayAfter(0)),
+  ]) {
+    assert.match(serialized, /"todoProgress":\{"completed":1,"total":3,"hasMoved":true,"lastTransitionAt":"2026-08-03T00:00:30.000Z","active":true\}/);
+    assert.doesNotMatch(serialized, /steps|private todo|detail/);
+  }
+
+  state.setTodoProgress("local:codex:thread-1", null);
+  state.replace([strictSession({
+    todoProgress: {
+      completed: 3,
+      total: 3,
+      hasMoved: true,
+      lastTransitionAt: "2026-08-03T00:01:30.000Z",
+      active: false,
+    },
+  })]);
+  assert.equal(state.get("local:codex:thread-1")?.todoProgress, null);
+  assert.throws(
+    () => state.setTodoProgress("local:codex:thread-1", {
+      completed: 4,
+      total: 3,
+      hasMoved: false,
+      lastTransitionAt: null,
+      active: false,
+    }),
+    /cannot exceed/,
+  );
+  assert.throws(
+    () => state.setTodoProgress("local:codex:thread-1", {
+      ...movingProgress,
+      current: "private todo",
+    } as typeof movingProgress),
+    /exact metadata fields/,
+  );
+  assert.throws(
+    () => state.setTodoProgress("local:codex:thread-1", {
+      ...movingProgress,
+      hasMoved: false,
+    }),
+    /must agree/,
+  );
+
+  state.setTodoProgress("local:codex:thread-1", {
+    completed: 2,
+    total: 4,
+    hasMoved: false,
+    lastTransitionAt: null,
+    active: false,
+  });
+  state.replace([]);
+  state.replace([strictSession()]);
+  assert.equal(state.get("local:codex:thread-1")?.todoProgress, null);
 });

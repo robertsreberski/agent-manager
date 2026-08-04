@@ -9,6 +9,9 @@ import test from "node:test";
 
 import { ActivityHub, type ActivityFrame } from "../activity/index.ts";
 import type { SessionView } from "../core/types.ts";
+import { REMOTE_BRIDGE_PROTOCOL_VERSION } from "../remote/protocol.ts";
+import { AGENT_MANAGER_BUILD_ID, WIRE_SCHEMA_VERSION } from "../shared/wire.ts";
+import { workspaceResolutionResponseSchema } from "../shared/workspace.ts";
 import type {
   PanePreviewAdapter,
   ProviderControlAdapter,
@@ -62,19 +65,21 @@ function temporaryControlSocket() {
 
 function session(overrides: Partial<SessionView> = {}): SessionView {
   return {
-    id: "codex:thread-1",
+    id: "local:codex:thread-1",
     provider: "codex",
-    sessionId: "thread-1",
-    parentSessionId: null,
-    rootSessionId: "thread-1",
+    providerThreadId: "thread-1",
+    providerTreeId: "thread-1",
+    parentId: null,
+    providerTurnId: null,
     depth: 0,
+    hostId: "local",
+    hostLabel: "This Mac",
     name: "Test session",
     cwd: "/tmp/workspace",
     kind: "interactive",
-    lifecycle: "live",
+    presence: "live",
     status: "idle",
     providerStatus: "idle",
-    waitingReason: null,
     pid: 123,
     runtimePid: 123,
     startedAt: "2026-08-03T00:00:00.000Z",
@@ -91,21 +96,26 @@ function session(overrides: Partial<SessionView> = {}): SessionView {
     },
     statusSource: "provider-cli",
     source: "fixture",
-    ownership: "manager",
-    runtimeAlive: true,
-    mode: {
-      value: "execution",
+    profile: {
+      value: "execute",
       providerValue: "default",
       source: "provider-api",
       confidence: "exact",
     },
-    activity: "idle",
-    attention: [],
-    effectiveAccess: {
-      accessMode: "sandboxed",
-      permissionMode: "default",
-      sandboxMode: "workspace-write",
+    model: {
+      value: "gpt-5.6",
+      providerValue: "gpt-5.6",
+      source: "provider-api",
+      confidence: "exact",
     },
+    effort: {
+      value: "high",
+      providerValue: "high",
+      source: "provider-api",
+      confidence: "exact",
+    },
+    todoProgress: null,
+    attention: [],
     terminal: {
       attachAvailable: true,
       socketName: "fixture",
@@ -119,11 +129,12 @@ function session(overrides: Partial<SessionView> = {}): SessionView {
       attachedClients: 0,
     },
     control: {
-      plane: "codex-app-server",
-      capabilities: ["queue", "steer", "interrupt", "respond", "set-mode", "preview", "attach"],
-      managerOwned: true,
-      writableLease: false,
+      plane: "codex-private",
+      authority: "manager",
+      capabilities: ["queue", "steer", "interrupt", "respond", "set-profile", "preview", "attach"],
+      withheld: [],
     },
+    workspaceIdentity: null,
     generation: 0,
     ...overrides,
   };
@@ -150,15 +161,14 @@ async function authenticatedHeaders(backend: Awaited<ReturnType<typeof createAge
   };
 }
 
-test("publishes the active managed run ID in session snapshots", async (t) => {
+test("publishes the active provider turn ID in strict session snapshots", async (t) => {
   const backend = await createAgentManagerServer({
     discovery: false,
     staticDir: false,
     initialSessions: [session({
       status: "running",
       providerStatus: "running",
-      activity: "running",
-      runId: "turn-active",
+      providerTurnId: "turn-active",
     })],
   });
   t.after(() => backend.close());
@@ -172,99 +182,337 @@ test("publishes the active managed run ID in session snapshots", async (t) => {
   });
 
   assert.equal(response.statusCode, 200, response.body);
+  const snapshotBody = response.json<{
+    schemaVersion: number;
+    buildId: string;
+    sessions: Array<{ providerTurnId: string | null }>;
+  }>();
+  assert.equal(snapshotBody.schemaVersion, WIRE_SCHEMA_VERSION);
+  assert.equal(snapshotBody.buildId, AGENT_MANAGER_BUILD_ID);
   assert.equal(
-    response.json<{ sessions: Array<{ runId?: string | null }> }>().sessions[0]?.runId,
+    snapshotBody.sessions[0]?.providerTurnId,
     "turn-active",
   );
 });
 
-test("returns bounded transcript only from the authenticated session detail route", async (t) => {
-  const privateText = "selected-session transcript detail";
-  let reads = 0;
+test("hydrates exact current manager attention only through the bounded per-session detail route", async (t) => {
+  const activityHub = new ActivityHub({ streamEpoch: "selected-attention-details" });
+  const requestBySession = new Map([
+    ["local:codex:thread-1", "codex-request"],
+    ["local:claude:thread-2", "claude-request"],
+  ]);
+  const sessions = [...requestBySession.entries()].map(([id, requestId]) => {
+    const provider = id.includes(":claude:") ? "claude" as const : "codex" as const;
+    const providerThreadId = id.split(":").at(-1)!;
+    return session({
+      id,
+      provider,
+      providerThreadId,
+      providerTreeId: providerThreadId,
+      status: "waiting",
+      providerStatus: "waiting",
+      attention: [{
+        id: requestId,
+        kind: "question",
+        summary: `GLOBAL-PRIVATE-${provider}`,
+        source: "provider-api",
+        confidence: "exact",
+        details: {
+          title: `${provider} private title`,
+          questions: [{
+            id: "surface",
+            header: null,
+            text: `Which ${provider} surface?`,
+            options: [],
+            multiSelect: false,
+            allowFreeText: true,
+            isSecret: false,
+          }],
+          toolName: `${provider}-private-tool`,
+          inputSummary: `PRIVATE-INPUT-${provider}`,
+          respondable: true,
+        },
+      }],
+      control: {
+        plane: provider === "codex" ? "codex-private" : "claude-sdk",
+        authority: "manager",
+        capabilities: ["respond"],
+        withheld: [],
+      },
+    });
+  });
+  for (const [sessionId, requestId] of requestBySession) {
+    const provider = sessionId.includes(":claude:") ? "claude" as const : "codex" as const;
+    if (provider === "claude") {
+      activityHub.ingest(sessionId, provider, {
+        type: "upsert",
+        item: {
+          id: "claude-parent-tool",
+          kind: "tool",
+          toolCallId: "claude-parent-tool-call",
+          name: "AskUserQuestion",
+          state: "waiting",
+          source: "provider-api",
+          confidence: "exact",
+          exposure: "provider-exposed",
+        },
+      });
+    }
+    activityHub.ingest(sessionId, provider, {
+      type: "upsert",
+      item: {
+        id: `${provider}-attention-item`,
+        kind: "attention",
+        parentId: provider === "claude" ? "claude-parent-tool" : null,
+        requestId,
+        attentionKind: "question",
+        title: `${provider} exact title`,
+        summary: `PRIVATE-SUMMARY-${provider}`,
+        questions: [{
+          id: "surface",
+          text: `Which ${provider} surface?`,
+          options: [],
+          multiSelect: false,
+          allowFreeText: true,
+          isSecret: false,
+        }],
+        respondable: true,
+        resolved: false,
+        isSecret: false,
+        state: "waiting",
+        source: "provider-api",
+        confidence: "exact",
+        exposure: "provider-exposed",
+      },
+    });
+    activityHub.ingest(sessionId, provider, {
+      type: "upsert",
+      item: {
+        id: `${provider}-unrequested-attention-item`,
+        kind: "attention",
+        requestId: `${provider}-unrequested-private`,
+        attentionKind: "question",
+        title: "PRIVATE UNREQUESTED TITLE",
+        questions: [{
+          id: "private",
+          text: "PRIVATE UNREQUESTED QUESTION",
+          options: [],
+          multiSelect: false,
+          allowFreeText: true,
+          isSecret: false,
+        }],
+        respondable: true,
+        resolved: false,
+        isSecret: false,
+        state: "waiting",
+        source: "provider-api",
+        confidence: "exact",
+        exposure: "provider-exposed",
+      },
+    });
+  }
+
   const backend = await createAgentManagerServer({
     discovery: false,
     staticDir: false,
-    transcriptReader: {
-      read(selected) {
-        reads += 1;
-        assert.equal(selected.sessionId, "thread-1");
-        return {
-          messages: [{
-            id: "message-1",
-            role: "assistant",
-            text: privateText,
-            createdAt: "2026-08-03T00:00:01.000Z",
-            status: "complete",
-            label: null,
-          }],
-          transcript: {
-            state: "available",
-            truncated: false,
-            source: "codex-rollout",
-            messageCount: 1,
-            reason: null,
-          },
-        };
-      },
-    },
-    initialSessions: [session()],
+    activityHub,
+    initialSessions: sessions,
   });
   t.after(() => backend.close());
   await backend.app.ready();
   const headers = await authenticatedHeaders(backend);
 
-  const collection = await backend.app.inject({
-    method: "GET",
-    url: "/api/v1/sessions",
-    headers: { host, cookie: headers.cookie },
-  });
-  assert.equal(collection.statusCode, 200, collection.body);
-  assert.equal(collection.body.includes(privateText), false);
-  assert.equal(collection.body.includes('"messages"'), false);
-  assert.equal(collection.body.includes('"transcript"'), false);
-  assert.equal(reads, 0);
+  const global = await backend.app.inject({ method: "GET", url: "/api/v1/sessions", headers });
+  assert.equal(global.statusCode, 200, global.body);
+  assert.equal(global.body.includes("Which codex surface?"), false);
+  assert.equal(global.body.includes("Which claude surface?"), false);
+  assert.equal(global.body.includes("GLOBAL-PRIVATE"), false);
 
-  const detail = await backend.app.inject({
+  for (const [sessionId, requestId] of requestBySession) {
+    const provider = sessionId.includes(":claude:") ? "claude" : "codex";
+    const ordinaryDetail = await backend.app.inject({
+      method: "GET",
+      url: `/api/v1/sessions/${encodeURIComponent(sessionId)}`,
+      headers,
+    });
+    assert.equal(ordinaryDetail.statusCode, 200, ordinaryDetail.body);
+    assert.equal(ordinaryDetail.body.includes(`Which ${provider} surface?`), false);
+    assert.equal(ordinaryDetail.body.includes("PRIVATE-INPUT"), false);
+
+    const selectedDetail = await backend.app.inject({
+      method: "GET",
+      url: `/api/v1/sessions/${encodeURIComponent(sessionId)}/attention-details?requestId=${encodeURIComponent(requestId)}`,
+      headers,
+    });
+    assert.equal(selectedDetail.statusCode, 200, selectedDetail.body);
+    assert.equal(selectedDetail.headers["cache-control"], "no-store");
+    assert.deepEqual(selectedDetail.json(), {
+      sessionId,
+      generation: backend.state.get(sessionId)!.generation,
+      details: [{
+        requestId,
+        kind: "question",
+        title: `${provider} exact title`,
+        toolName: provider === "claude" ? "AskUserQuestion" : null,
+        questions: [{ id: "surface", text: `Which ${provider} surface?` }],
+        truncated: false,
+      }],
+    });
+    assert.equal(selectedDetail.body.includes("PRIVATE UNREQUESTED QUESTION"), false);
+    assert.equal(selectedDetail.body.includes(`PRIVATE-SUMMARY-${provider}`), false);
+
+    const wrongRequest = await backend.app.inject({
+      method: "GET",
+      url: `/api/v1/sessions/${encodeURIComponent(sessionId)}/attention-details?requestId=${encodeURIComponent(`${provider}-unrequested-private`)}`,
+      headers,
+    });
+    assert.equal(wrongRequest.statusCode, 200, wrongRequest.body);
+    assert.deepEqual(wrongRequest.json<{ details: unknown[] }>().details, []);
+    assert.equal(wrongRequest.body.includes("PRIVATE UNREQUESTED QUESTION"), false);
+  }
+
+  const duplicate = await backend.app.inject({
     method: "GET",
-    url: "/api/v1/sessions/codex:thread-1",
-    headers: { host, cookie: headers.cookie },
+    url: "/api/v1/sessions/local%3Acodex%3Athread-1/attention-details?requestId=codex-request&requestId=codex-request",
+    headers,
   });
-  assert.equal(detail.statusCode, 200, detail.body);
-  const selected = detail.json<{ session: SessionView }>().session;
-  assert.equal(selected.messages?.[0]?.text, privateText);
-  assert.equal(selected.transcript?.state, "available");
-  assert.equal(reads, 1);
+  assert.equal(duplicate.statusCode, 400, duplicate.body);
+  const unauthenticated = await backend.app.inject({
+    method: "GET",
+    url: "/api/v1/sessions/local%3Acodex%3Athread-1/attention-details?requestId=codex-request",
+    headers: { host },
+  });
+  assert.equal(unauthenticated.statusCode, 401, unauthenticated.body);
+
+  activityHub.ingest("local:codex:thread-1", "codex", {
+    type: "upsert",
+    item: {
+      id: "codex-attention-item",
+      kind: "attention",
+      requestId: "codex-request",
+      attentionKind: "question",
+      respondable: false,
+      resolved: true,
+      isSecret: false,
+      state: "complete",
+      source: "provider-api",
+      confidence: "exact",
+      exposure: "provider-exposed",
+    },
+  });
+  const resolved = await backend.app.inject({
+    method: "GET",
+    url: "/api/v1/sessions/local%3Acodex%3Athread-1/attention-details?requestId=codex-request",
+    headers,
+  });
+  assert.equal(resolved.statusCode, 200, resolved.body);
+  assert.deepEqual(resolved.json<{ details: unknown[] }>().details, []);
+  assert.equal(resolved.body.includes("Which codex surface?"), false);
 });
 
-test("sanitizes transcript reader failures", async (t) => {
+test("hydrates only the exact current todo through the bounded per-session detail route", async (t) => {
+  const activityHub = new ActivityHub({ streamEpoch: "selected-todo-detail" });
+  const sessionId = "local:codex:thread-1";
+  activityHub.ingest(sessionId, "codex", {
+    type: "upsert",
+    item: {
+      id: "todo-current",
+      kind: "todo",
+      steps: [
+        { id: "done", text: "PRIVATE DONE TODO", status: "completed", detail: null, addedAfterStart: false, removedReason: null },
+        { id: "current", text: "Implement the bounded projection", status: "in_progress", detail: "PRIVATE CURRENT DETAIL", addedAfterStart: false, removedReason: null },
+        { id: "pending", text: "PRIVATE PENDING TODO", status: "pending", detail: null, addedAfterStart: false, removedReason: null },
+      ],
+      added: 3,
+      removed: 0,
+      source: "provider-api",
+      confidence: "exact",
+      exposure: "provider-exposed",
+    },
+  });
+
   const backend = await createAgentManagerServer({
     discovery: false,
     staticDir: false,
-    transcriptReader: {
-      read() {
-        throw new Error("/private/path/that-must-not-leak");
-      },
-    },
-    initialSessions: [session()],
+    activityHub,
+    initialSessions: [session({ id: sessionId })],
   });
   t.after(() => backend.close());
   await backend.app.ready();
   const headers = await authenticatedHeaders(backend);
 
+  const global = await backend.app.inject({ method: "GET", url: "/api/v1/sessions", headers });
+  assert.equal(global.statusCode, 200, global.body);
+  assert.equal(global.body.includes("Implement the bounded projection"), false);
+  assert.equal(global.body.includes("PRIVATE PENDING TODO"), false);
+  assert.deepEqual(global.json<{ sessions: Array<{ todoProgress: unknown }> }>().sessions[0]!.todoProgress, {
+    completed: 1,
+    total: 3,
+    hasMoved: false,
+    lastTransitionAt: null,
+    active: true,
+  });
+
+  const ordinary = await backend.app.inject({
+    method: "GET",
+    url: `/api/v1/sessions/${encodeURIComponent(sessionId)}`,
+    headers,
+  });
+  assert.equal(ordinary.statusCode, 200, ordinary.body);
+  assert.equal(ordinary.body.includes("Implement the bounded projection"), false);
+
   const detail = await backend.app.inject({
     method: "GET",
-    url: "/api/v1/sessions/codex:thread-1",
-    headers: { host, cookie: headers.cookie },
+    url: `/api/v1/sessions/${encodeURIComponent(sessionId)}/todo-detail`,
+    headers,
   });
   assert.equal(detail.statusCode, 200, detail.body);
-  assert.equal(detail.body.includes("/private/path"), false);
-  assert.deepEqual(detail.json<{ session: SessionView }>().session.transcript, {
-    state: "unavailable",
-    truncated: false,
-    source: null,
-    messageCount: 0,
-    reason: "unreadable",
+  assert.equal(detail.headers["cache-control"], "no-store");
+  assert.deepEqual(detail.json(), {
+    sessionId,
+    generation: backend.state.get(sessionId)!.generation,
+    todo: {
+      completed: 1,
+      total: 3,
+      current: "Implement the bounded projection",
+    },
   });
+  assert.equal(detail.body.includes("PRIVATE DONE TODO"), false);
+  assert.equal(detail.body.includes("PRIVATE CURRENT DETAIL"), false);
+  assert.equal(detail.body.includes("PRIVATE PENDING TODO"), false);
+
+  const unauthenticated = await backend.app.inject({
+    method: "GET",
+    url: `/api/v1/sessions/${encodeURIComponent(sessionId)}/todo-detail`,
+    headers: { host },
+  });
+  assert.equal(unauthenticated.statusCode, 401, unauthenticated.body);
+
+  activityHub.ingest(sessionId, "codex", {
+    type: "upsert",
+    item: {
+      id: "transcript-todo",
+      kind: "todo",
+      steps: [
+        { id: "done", text: "PRIVATE INFERRED DONE", status: "completed", detail: null, addedAfterStart: false, removedReason: null },
+        { id: "current", text: "PRIVATE INFERRED CURRENT", status: "in_progress", detail: null, addedAfterStart: false, removedReason: null },
+        { id: "pending", text: "PRIVATE INFERRED PENDING", status: "pending", detail: null, addedAfterStart: false, removedReason: null },
+      ],
+      added: 3,
+      removed: 0,
+      source: "transcript",
+      confidence: "inferred",
+      exposure: "transcript-derived",
+    },
+  });
+  const inferred = await backend.app.inject({
+    method: "GET",
+    url: `/api/v1/sessions/${encodeURIComponent(sessionId)}/todo-detail`,
+    headers,
+  });
+  assert.equal(inferred.statusCode, 200, inferred.body);
+  assert.equal(inferred.body.includes("PRIVATE INFERRED"), false);
+  assert.equal(inferred.json<{ todo: unknown }>().todo, null);
 });
 
 test("enforces bootstrap, CSRF, leases, stale generations and idempotency", async (t) => {
@@ -301,7 +549,7 @@ test("enforces bootstrap, CSRF, leases, stale generations and idempotency", asyn
 
   const withoutCsrf = await backend.app.inject({
     method: "POST",
-    url: "/api/v1/sessions/codex:thread-1/control-lease",
+    url: "/api/v1/sessions/local:codex:thread-1/control-lease",
     headers: { host, origin, cookie: headers.cookie, "content-type": "application/json" },
     payload: { clientId: "browser-client" },
   });
@@ -309,13 +557,13 @@ test("enforces bootstrap, CSRF, leases, stale generations and idempotency", asyn
 
   const leaseResponse = await backend.app.inject({
     method: "POST",
-    url: "/api/v1/sessions/codex:thread-1/control-lease",
+    url: "/api/v1/sessions/local:codex:thread-1/control-lease",
     headers,
     payload: { clientId: "browser-client" },
   });
   assert.equal(leaseResponse.statusCode, 200, leaseResponse.body);
   const lease = leaseResponse.json<{ lease: { token: string } }>().lease;
-  const generation = backend.state.get("codex:thread-1")!.generation;
+  const generation = backend.state.get("local:codex:thread-1")!.generation;
   const actionHeaders = { ...headers, "x-control-lease": lease.token };
   const payload = {
     type: "send" as const,
@@ -326,7 +574,7 @@ test("enforces bootstrap, CSRF, leases, stale generations and idempotency", asyn
   };
   const first = await backend.app.inject({
     method: "POST",
-    url: "/api/v1/sessions/codex:thread-1/actions",
+    url: "/api/v1/sessions/local:codex:thread-1/actions",
     headers: actionHeaders,
     payload,
   });
@@ -337,7 +585,7 @@ test("enforces bootstrap, CSRF, leases, stale generations and idempotency", asyn
 
   const duplicate = await backend.app.inject({
     method: "POST",
-    url: "/api/v1/sessions/codex:thread-1/actions",
+    url: "/api/v1/sessions/local:codex:thread-1/actions",
     headers: actionHeaders,
     payload,
   });
@@ -346,7 +594,7 @@ test("enforces bootstrap, CSRF, leases, stale generations and idempotency", asyn
 
   const conflict = await backend.app.inject({
     method: "POST",
-    url: "/api/v1/sessions/codex:thread-1/actions",
+    url: "/api/v1/sessions/local:codex:thread-1/actions",
     headers: actionHeaders,
     payload: { ...payload, text: "Different" },
   });
@@ -354,7 +602,7 @@ test("enforces bootstrap, CSRF, leases, stale generations and idempotency", asyn
 
   const stale = await backend.app.inject({
     method: "POST",
-    url: "/api/v1/sessions/codex:thread-1/actions",
+    url: "/api/v1/sessions/local:codex:thread-1/actions",
     headers: actionHeaders,
     payload: { ...payload, expectedGeneration: generation + 1, idempotencyKey: "idem-key-0002" },
   });
@@ -373,7 +621,7 @@ test("retries a lost control-lease release response without accepting an active 
   const headers = await authenticatedHeaders(backend);
   const acquired = await backend.app.inject({
     method: "POST",
-    url: "/api/v1/sessions/codex:thread-1/control-lease",
+    url: "/api/v1/sessions/local:codex:thread-1/control-lease",
     headers,
     payload: { clientId: "browser-client" },
   });
@@ -388,139 +636,20 @@ test("retries a lost control-lease release response without accepting an active 
 
   const mismatched = await backend.app.inject({
     method: "DELETE",
-    url: "/api/v1/sessions/codex:thread-1/control-lease",
+    url: "/api/v1/sessions/local:codex:thread-1/control-lease",
     headers: { ...deleteHeaders, "x-control-lease": "mismatched-token" },
   });
   assert.equal(mismatched.statusCode, 409, mismatched.body);
-  assert.equal(backend.state.get("codex:thread-1")?.control.writableLease, true);
 
   const release = () => backend.app.inject({
     method: "DELETE",
-    url: "/api/v1/sessions/codex:thread-1/control-lease",
+    url: "/api/v1/sessions/local:codex:thread-1/control-lease",
     headers: { ...deleteHeaders, "x-control-lease": lease.token },
   });
   const first = await release();
   assert.equal(first.statusCode, 204, first.body);
   const lostResponseRetry = await release();
   assert.equal(lostResponseRetry.statusCode, 204, lostResponseRetry.body);
-  assert.equal(backend.state.get("codex:thread-1")?.control.writableLease, false);
-});
-
-test("browser-wide lease release is CSRF-protected, auth-session scoped and idempotent", async (t) => {
-  const database = new ManagerDatabase();
-  const audits: OperationalAuditInput[] = [];
-  const originalAudit = database.auditOperation.bind(database);
-  database.auditOperation = ((input: OperationalAuditInput) => {
-    audits.push(input);
-    originalAudit(input);
-  }) as ManagerDatabase["auditOperation"];
-  const backend = await createAgentManagerServer({
-    discovery: false,
-    staticDir: false,
-    database,
-    initialSessions: [
-      session(),
-      session({ id: "codex:thread-2", sessionId: "thread-2", rootSessionId: "thread-2" }),
-      session({ id: "codex:thread-3", sessionId: "thread-3", rootSessionId: "thread-3" }),
-    ],
-  });
-  t.after(() => backend.close());
-  await backend.app.ready();
-  const firstHeaders = await authenticatedHeaders(backend);
-  backend.auth.issueBootstrapToken();
-  const secondHeaders = await authenticatedHeaders(backend);
-  const acquire = async (id: string, headers: Awaited<ReturnType<typeof authenticatedHeaders>>) => {
-    const response = await backend.app.inject({
-      method: "POST",
-      url: `/api/v1/sessions/${id}/control-lease`,
-      headers,
-      payload: { clientId: `browser-${id}` },
-    });
-    assert.equal(response.statusCode, 200, response.body);
-  };
-  await acquire("codex:thread-1", firstHeaders);
-  await acquire("codex:thread-2", firstHeaders);
-  await acquire("codex:thread-3", secondHeaders);
-  const deleteHeaders = {
-    host,
-    origin,
-    cookie: firstHeaders.cookie,
-    "x-csrf-token": firstHeaders["x-csrf-token"],
-  };
-
-  const withoutCsrf = await backend.app.inject({
-    method: "DELETE",
-    url: "/api/v1/control-leases",
-    headers: { host, origin, cookie: firstHeaders.cookie },
-  });
-  assert.equal(withoutCsrf.statusCode, 403, withoutCsrf.body);
-  assert.equal(backend.state.get("codex:thread-1")?.control.writableLease, true);
-
-  const release = () => backend.app.inject({
-    method: "DELETE",
-    url: "/api/v1/control-leases",
-    headers: deleteHeaders,
-  });
-  const first = await release();
-  assert.equal(first.statusCode, 204, first.body);
-  assert.equal(backend.state.get("codex:thread-1")?.control.writableLease, false);
-  assert.equal(backend.state.get("codex:thread-2")?.control.writableLease, false);
-  assert.equal(backend.state.get("codex:thread-3")?.control.writableLease, true);
-
-  const retry = await release();
-  assert.equal(retry.statusCode, 204, retry.body);
-  const releaseAudits = audits.filter((audit) => audit.operation === "lease.release-all");
-  assert.deepEqual(releaseAudits.map((audit) => [audit.phase, audit.outcome]), [
-    ["attempt", "requested"],
-    ["outcome", "succeeded"],
-    ["attempt", "requested"],
-    ["outcome", "succeeded"],
-  ]);
-  assert.deepEqual(
-    releaseAudits.filter((audit) => audit.phase === "outcome").map((audit) => audit.details),
-    [{ releasedCount: 2 }, { releasedCount: 0 }],
-  );
-});
-
-test("browser-wide lease release does not mutate leases when its attempt audit fails", async (t) => {
-  const database = new ManagerDatabase();
-  const originalAudit = database.auditOperation.bind(database);
-  database.auditOperation = ((input: OperationalAuditInput) => {
-    if (input.operation === "lease.release-all" && input.phase === "attempt") {
-      throw new Error("injected lease release audit failure");
-    }
-    originalAudit(input);
-  }) as ManagerDatabase["auditOperation"];
-  const backend = await createAgentManagerServer({
-    discovery: false,
-    staticDir: false,
-    database,
-    initialSessions: [session()],
-  });
-  t.after(() => backend.close());
-  await backend.app.ready();
-  const headers = await authenticatedHeaders(backend);
-  const acquired = await backend.app.inject({
-    method: "POST",
-    url: "/api/v1/sessions/codex:thread-1/control-lease",
-    headers,
-    payload: { clientId: "browser-client" },
-  });
-  assert.equal(acquired.statusCode, 200, acquired.body);
-
-  const response = await backend.app.inject({
-    method: "DELETE",
-    url: "/api/v1/control-leases",
-    headers: {
-      host,
-      origin,
-      cookie: headers.cookie,
-      "x-csrf-token": headers["x-csrf-token"],
-    },
-  });
-  assert.equal(response.statusCode, 500, response.body);
-  assert.equal(response.json<{ error: { code: string } }>().error.code, "LEASE_AUDIT_FAILED");
-  assert.equal(backend.state.get("codex:thread-1")?.control.writableLease, true);
 });
 
 test("dispatches every provider response without retaining answer bytes in SQLite", async () => {
@@ -529,7 +658,7 @@ test("dispatches every provider response without retaining answer bytes in SQLit
   const secret = "correct-horse-secret-answer-needle";
   const requestId = "secret-question-request";
   const activityHub = new ActivityHub({ streamEpoch: "secret-answer-test", maxItems: 1 });
-  activityHub.ingest("codex:thread-1", "codex", {
+  activityHub.ingest("local:codex:thread-1", "codex", {
     type: "upsert",
     item: {
       id: "secret-attention",
@@ -555,7 +684,7 @@ test("dispatches every provider response without retaining answer bytes in SQLit
       exposure: "provider-exposed",
     },
   });
-  activityHub.ingest("codex:thread-1", "codex", {
+  activityHub.ingest("local:codex:thread-1", "codex", {
     type: "upsert",
     item: {
       id: "newer-running-item",
@@ -566,7 +695,7 @@ test("dispatches every provider response without retaining answer bytes in SQLit
     },
   });
   assert.equal(
-    activityHub.snapshot("codex:thread-1")!.items.some((item) => item.kind === "attention"),
+    activityHub.snapshot("local:codex:thread-1")!.items.some((item) => item.kind === "attention"),
     false,
   );
   const dispatched: SessionAction[] = [];
@@ -590,7 +719,21 @@ test("dispatches every provider response without retaining answer bytes in SQLit
         summary: "Enter the credential",
         source: "provider-api",
         confidence: "exact",
-        details: { respondable: true },
+        details: {
+          title: "Credential",
+          questions: [{
+            id: "credential",
+            header: null,
+            text: "Credential",
+            options: [],
+            multiSelect: false,
+            allowFreeText: true,
+            isSecret: true,
+          }],
+          toolName: null,
+          inputSummary: null,
+          respondable: true,
+        },
       }],
     })],
   });
@@ -599,7 +742,7 @@ test("dispatches every provider response without retaining answer bytes in SQLit
     const headers = await authenticatedHeaders(backend);
     const leaseResponse = await backend.app.inject({
       method: "POST",
-      url: "/api/v1/sessions/codex:thread-1/control-lease",
+      url: "/api/v1/sessions/local:codex:thread-1/control-lease",
       headers,
       payload: { clientId: "secret-answer-client" },
     });
@@ -608,21 +751,21 @@ test("dispatches every provider response without retaining answer bytes in SQLit
     const idempotencyKey = "secret-answer-idempotency";
     const response = await backend.app.inject({
       method: "POST",
-      url: "/api/v1/sessions/codex:thread-1/actions",
+      url: "/api/v1/sessions/local:codex:thread-1/actions",
       headers: { ...headers, "x-control-lease": lease.token },
       payload: {
         type: "respond",
         requestId,
         response: { kind: "answer", value: secret, selectedOptions: [] },
-        expectedGeneration: backend.state.get("codex:thread-1")!.generation,
+        expectedGeneration: backend.state.get("local:codex:thread-1")!.generation,
         idempotencyKey,
       },
     });
     assert.equal(response.statusCode, 200, response.body);
     assert.equal(response.json<{ action: { status: string } }>().action.status, "succeeded");
     assert.equal(dispatched[0]?.type, "respond");
-    assert.equal(backend.database.getPersistedActionStatus("codex:thread-1", idempotencyKey), null);
-    assert.equal(backend.database.getActionReceipt("codex:thread-1", idempotencyKey), null);
+    assert.equal(backend.database.getPersistedActionStatus("local:codex:thread-1", idempotencyKey), null);
+    assert.equal(backend.database.getActionReceipt("local:codex:thread-1", idempotencyKey), null);
   } finally {
     await backend.close().catch(() => undefined);
   }
@@ -652,14 +795,14 @@ test("bounds pane previews and never accepts browser-supplied tmux targets", asy
   const headers = await authenticatedHeaders(backend);
   const response = await backend.app.inject({
     method: "GET",
-    url: "/api/v1/sessions/codex:thread-1/preview?lines=999&bytes=999999&paneId=%2599",
+    url: "/api/v1/sessions/local:codex:thread-1/preview?lines=999&bytes=999999&paneId=%2599",
     headers: { host, cookie: headers.cookie },
   });
   assert.equal(response.statusCode, 400, response.body);
 
   const bounded = await backend.app.inject({
     method: "GET",
-    url: "/api/v1/sessions/codex:thread-1/preview?lines=200&bytes=65536&paneId=%2599",
+    url: "/api/v1/sessions/local:codex:thread-1/preview?lines=200&bytes=65536&paneId=%2599",
     headers: { host, cookie: headers.cookie },
   });
   assert.equal(bounded.statusCode, 200, bounded.body);
@@ -694,18 +837,83 @@ test("browser attach exposes only the guarded manager CLI wrapper", async (t) =>
 
   const response = await backend.app.inject({
     method: "GET",
-    url: "/api/v1/sessions/codex:thread-1/attach",
+    url: "/api/v1/sessions/local:codex:thread-1/attach",
     headers: { host, cookie: headers.cookie },
   });
 
   assert.equal(response.statusCode, 200, response.body);
   assert.deepEqual(response.json<{ instruction: { kind: string; argv: string[] } }>().instruction, {
     kind: "manager-cli",
-    argv: ["agent-manager", "attach", "codex:thread-1"],
+    argv: ["agent-manager", "attach", "local:codex:thread-1"],
     cwd: "/tmp/workspace",
     warning: "Run this command locally to perform a guarded ownership handoff through Agent Manager.",
   });
   assert.equal(rawInstructionRequests, 0);
+});
+
+test("browser resume exposes the guarded manager CLI wrapper without requiring attach", async (t) => {
+  const temporary = temporaryControlSocket();
+  const resumeOnly = session({
+    status: "completed",
+    terminal: null,
+    control: {
+      plane: "resume-only",
+      authority: "manager",
+      capabilities: ["resume"],
+      withheld: [{ capability: "attach", reason: "This provider can resume but not attach" }],
+    },
+  });
+  const backend = await createAgentManagerServer({
+    discovery: false,
+    staticDir: false,
+    controlSocketPath: temporary.socketPath,
+    adapters: {
+      codex: {
+        async createSession() { return resumeOnly; },
+        async performAction() { return { status: "succeeded" }; },
+        async getAttachInstruction() {
+          return {
+            kind: "codex-remote",
+            argv: ["codex", "resume", "thread-1", "--remote", "unix:///tmp/codex.sock"],
+            cwd: resumeOnly.cwd,
+            warning: null,
+          };
+        },
+      },
+    },
+    initialSessions: [resumeOnly],
+  });
+  t.after(async () => {
+    await backend.close().catch(() => undefined);
+    rmSync(temporary.root, { recursive: true, force: true });
+  });
+  await backend.app.ready();
+  const headers = await authenticatedHeaders(backend);
+
+  const response = await backend.app.inject({
+    method: "GET",
+    url: `/api/v1/sessions/${encodeURIComponent(resumeOnly.id)}/attach`,
+    headers: { host, cookie: headers.cookie },
+  });
+
+  assert.equal(response.statusCode, 200, response.body);
+  assert.deepEqual(response.json<{ instruction: { kind: string; argv: string[] } }>().instruction, {
+    kind: "manager-cli",
+    argv: ["agent-manager", "attach", resumeOnly.id],
+    cwd: resumeOnly.cwd,
+    warning: "Run this command locally to perform a guarded ownership handoff through Agent Manager.",
+  });
+
+  const native = await requestAttachFromControlSocket(temporary.socketPath, resumeOnly.id);
+  assert.deepEqual(native.instruction.argv, [
+    "codex",
+    "resume",
+    "thread-1",
+    "--remote",
+    "unix:///tmp/codex.sock",
+  ]);
+  assert.ok(native.instruction.handoffId);
+  assert.ok(native.instruction.spawnNonce);
 });
 
 test("pre-spawn authorization leaves ownership fail-closed when its wrapper dies before reporting a child", async (t) => {
@@ -740,7 +948,7 @@ test("pre-spawn authorization leaves ownership fail-closed when its wrapper dies
     rmSync(temporary.root, { recursive: true, force: true });
   });
 
-  const reply = await requestAttachFromControlSocket(temporary.socketPath, "codex:thread-1");
+  const reply = await requestAttachFromControlSocket(temporary.socketPath, "local:codex:thread-1");
   assert.ok(reply.instruction.handoffId);
   assert.ok(reply.instruction.spawnNonce);
   const wrapper = spawn(process.execPath, ["-e", "setTimeout(() => {}, 250)"], {
@@ -749,7 +957,7 @@ test("pre-spawn authorization leaves ownership fail-closed when its wrapper dies
   await once(wrapper, "spawn");
   await requestAttachAuthorizeSpawnFromControlSocket(
     temporary.socketPath,
-    "codex:thread-1",
+    "local:codex:thread-1",
     reply.instruction.handoffId!,
     reply.instruction.spawnNonce!,
     wrapper.pid!,
@@ -759,7 +967,7 @@ test("pre-spawn authorization leaves ownership fail-closed when its wrapper dies
 
   assert.equal(reclaimCalls, 0);
   await assert.rejects(
-    requestAttachFromControlSocket(temporary.socketPath, "codex:thread-1"),
+    requestAttachFromControlSocket(temporary.socketPath, "local:codex:thread-1"),
     /attach-unavailable/,
   );
   assert.equal(
@@ -813,26 +1021,26 @@ test("provider-attached state survives audit failure and classifies a later fail
     rmSync(temporary.root, { recursive: true, force: true });
   });
 
-  const reply = await requestAttachFromControlSocket(temporary.socketPath, "codex:thread-1");
+  const reply = await requestAttachFromControlSocket(temporary.socketPath, "local:codex:thread-1");
   const handoffId = reply.instruction.handoffId!;
   const spawnNonce = reply.instruction.spawnNonce!;
   await requestAttachAuthorizeSpawnFromControlSocket(
     temporary.socketPath,
-    "codex:thread-1",
+    "local:codex:thread-1",
     handoffId,
     spawnNonce,
     process.pid,
   );
   await requestAttachStartedFromControlSocket(
     temporary.socketPath,
-    "codex:thread-1",
+    "local:codex:thread-1",
     handoffId,
     spawnNonce,
     process.pid,
   );
   await requestAttachFailedFromControlSocket(
     temporary.socketPath,
-    "codex:thread-1",
+    "local:codex:thread-1",
     handoffId,
     "lost wrapper acknowledgement",
   );
@@ -880,19 +1088,19 @@ test("timed-out native reclaim observes one shared provider transition until eve
     rmSync(temporary.root, { recursive: true, force: true });
   });
 
-  const reply = await requestAttachFromControlSocket(temporary.socketPath, "codex:thread-1");
+  const reply = await requestAttachFromControlSocket(temporary.socketPath, "local:codex:thread-1");
   const handoffId = reply.instruction.handoffId!;
   const spawnNonce = reply.instruction.spawnNonce!;
   await requestAttachAuthorizeSpawnFromControlSocket(
     temporary.socketPath,
-    "codex:thread-1",
+    "local:codex:thread-1",
     handoffId,
     spawnNonce,
     process.pid,
   );
   await requestAttachStartedFromControlSocket(
     temporary.socketPath,
-    "codex:thread-1",
+    "local:codex:thread-1",
     handoffId,
     spawnNonce,
     process.pid,
@@ -900,7 +1108,7 @@ test("timed-out native reclaim observes one shared provider transition until eve
   await assert.rejects(
     requestAttachExitedFromControlSocket(
       temporary.socketPath,
-      "codex:thread-1",
+      "local:codex:thread-1",
       handoffId,
       0,
     ),
@@ -908,14 +1116,14 @@ test("timed-out native reclaim observes one shared provider transition until eve
   );
   assert.equal(reclaimCalls, 1);
   await assert.rejects(
-    requestAttachFromControlSocket(temporary.socketPath, "codex:thread-1"),
+    requestAttachFromControlSocket(temporary.socketPath, "local:codex:thread-1"),
     /attach-unavailable/,
   );
 
   resolveReclaim(session());
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(reclaimCalls, 1);
-  const next = await requestAttachFromControlSocket(temporary.socketPath, "codex:thread-1");
+  const next = await requestAttachFromControlSocket(temporary.socketPath, "local:codex:thread-1");
   assert.ok(next.instruction.spawnNonce);
 });
 
@@ -944,8 +1152,9 @@ test("session creation reserves a durable idempotency intent before provider dis
     provider: "codex" as const,
     workspaceId: "workspace-one",
     initialMessage: "Private initial task",
-    mode: "planning" as const,
-    accessMode: "sandboxed" as const,
+    profile: "plan" as const,
+    model: null,
+    effort: null,
     idempotencyKey: "create-idempotency-one",
   };
   const first = await backend.app.inject({
@@ -980,7 +1189,25 @@ test("session creation reserves a durable idempotency intent before provider dis
 test("validates, completes, and remembers arbitrary local workspace paths", async (t) => {
   const workspaceDirectory = mkdtempSync(join(tmpdir(), "agent-manager-custom-workspace-"));
   t.after(() => rmSync(workspaceDirectory, { recursive: true, force: true }));
-  const backend = await createAgentManagerServer({ discovery: false, staticDir: false });
+  let createdWorkspaceId: string | null = null;
+  const backend = await createAgentManagerServer({
+    discovery: false,
+    staticDir: false,
+    adapters: {
+      codex: {
+        async createSession(input) {
+          createdWorkspaceId = input.workspaceId;
+          return session({
+            id: "local:codex:workspace-resolution-test",
+            providerThreadId: "workspace-resolution-test",
+            providerTreeId: "workspace-resolution-test",
+            cwd: workspaceDirectory,
+          });
+        },
+        async performAction() { return { status: "succeeded" }; },
+      },
+    },
+  });
   t.after(() => backend.close());
   await backend.app.ready();
   const headers = await authenticatedHeaders(backend);
@@ -1007,9 +1234,11 @@ test("validates, completes, and remembers arbitrary local workspace paths", asyn
     payload: { hostId: "local", path: workspaceDirectory },
   });
   assert.equal(resolved.statusCode, 200, resolved.body);
-  const workspace = resolved.json<{ workspace: { id: string; hostId: string; path: string } }>().workspace;
+  const resolvedPayload = workspaceResolutionResponseSchema.parse(resolved.json());
+  const workspace = resolvedPayload.workspace;
   assert.equal(workspace.hostId, "local");
   assert.equal(workspace.path, realpathSync(workspaceDirectory));
+  assert.equal(workspace.workspaceIdentity, null);
 
   const repeated = await backend.app.inject({
     method: "POST",
@@ -1019,74 +1248,121 @@ test("validates, completes, and remembers arbitrary local workspace paths", asyn
   });
   assert.equal(repeated.json<{ workspace: { id: string } }>().workspace.id, workspace.id);
   assert.equal(backend.database.listWorkspaces().length, 1);
+
+  const created = await backend.app.inject({
+    method: "POST",
+    url: "/api/v1/sessions",
+    headers,
+    payload: {
+      provider: "codex",
+      workspaceId: workspace.id,
+      initialMessage: "Contract-only managed session test",
+      profile: "plan",
+      model: null,
+      effort: null,
+      idempotencyKey: "resolved-workspace-create-session",
+    },
+  });
+  assert.equal(created.statusCode, 201, created.body);
+  assert.equal(createdWorkspaceId, workspace.id);
 });
 
 test("proxies remote sessions through SSH and reserves takeover for a real writer conflict", async (t) => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "agent-manager-ssh-bridge-"));
   const fakeSsh = join(fixtureRoot, "fake-ssh.cjs");
   const remoteSession = session({
-    id: "codex:remote-thread",
-    sessionId: "remote-thread",
+    id: "local:codex:remote-thread",
+    providerThreadId: "remote-thread",
+    providerTreeId: "remote-tree",
     name: "Remote session",
     cwd: "/srv/project",
   });
   const remoteCreatedSession = session({
-    id: "codex:remote-created",
-    sessionId: "remote-created",
+    id: "local:codex:remote-created",
+    providerThreadId: "remote-created",
+    providerTreeId: "remote-created",
     name: "Created remotely",
     cwd: "/srv/project",
   });
+  const remoteSnapshot = {
+    schemaVersion: WIRE_SCHEMA_VERSION,
+    buildId: AGENT_MANAGER_BUILD_ID,
+    generatedAt: "2026-08-04T12:00:00.000Z",
+    seq: 1,
+    stale: false,
+    sessions: [remoteSession],
+    diagnostics: [],
+  };
+  const remoteWorkspace = {
+    id: "remote-workspace",
+    label: "project",
+    path: "/srv/project",
+    hostId: "local",
+    hostLabel: "This Mac",
+    hostKind: "local",
+    remoteWorkspaceId: null,
+    createdAt: "2026-08-04T12:00:00.000Z",
+    workspaceIdentity: null,
+  };
   writeFileSync(fakeSsh, `#!/usr/bin/env node
 const readline = require("node:readline");
 if (process.argv.at(-1) !== "/bin/zsh -lc 'exec agent-manager node bridge'") process.exit(64);
 const remoteSession = ${JSON.stringify(remoteSession)};
 const remoteCreatedSession = ${JSON.stringify(remoteCreatedSession)};
+const remoteSnapshot = ${JSON.stringify(remoteSnapshot)};
+const remoteWorkspace = ${JSON.stringify(remoteWorkspace)};
 let owner = "other-controller";
 let leaseToken = null;
 const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
-send({ type: "ready", protocol: 1 });
+const respond = (request, status, body) => send({ type: "response", id: request.id, status, body });
+send({
+  type: "hello",
+  protocolVersion: ${String(REMOTE_BRIDGE_PROTOCOL_VERSION)},
+  wireSchemaVersion: ${String(WIRE_SCHEMA_VERSION)},
+  buildId: ${JSON.stringify(AGENT_MANAGER_BUILD_ID)},
+});
 const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 lines.on("line", (line) => {
   const request = JSON.parse(line);
   if (request.method === "GET" && request.path === "/api/v1/sessions") {
-    send({ id: request.id, status: 200, body: { sessions: [remoteSession], diagnostics: [] } });
+    respond(request, 200, remoteSnapshot);
     return;
   }
   if (request.method === "GET" && request.path.startsWith("/api/v1/hosts/local/directories?")) {
-    send({ id: request.id, status: 200, body: { hostId: "local", paths: ["/srv/project", "/srv/project-two"] } });
+    respond(request, 200, { paths: ["/srv/project", "/srv/project-two"] });
     return;
   }
   if (request.method === "POST" && request.path === "/api/v1/workspaces/resolve") {
-    send({ id: request.id, status: 200, body: { workspace: { id: "remote-workspace", label: "project", path: "/srv/project" } } });
+    respond(request, 200, { workspace: remoteWorkspace });
     return;
   }
   if (request.method === "POST" && request.path === "/api/v1/sessions") {
     const valid = request.body?.workspaceId === "remote-workspace";
-    send({ id: request.id, status: valid ? 201 : 400, body: valid ? { session: remoteCreatedSession } : { error: { code: "WORKSPACE_UNKNOWN", message: "unknown workspace" } } });
+    respond(request, valid ? 201 : 400, valid
+      ? { session: remoteCreatedSession }
+      : { error: { code: "WORKSPACE_UNKNOWN", message: "unknown workspace" } });
     return;
   }
   if (request.method === "GET" && request.path.endsWith("/attach")) {
-    send({ id: request.id, status: 200, body: { instruction: { kind: "manager-cli", argv: ["agent-manager", "attach", remoteSession.id], cwd: remoteSession.cwd, warning: null } } });
+    respond(request, 200, { instruction: { kind: "manager-cli", argv: ["agent-manager", "attach", remoteSession.id], cwd: remoteSession.cwd, warning: null } });
     return;
   }
   if (request.method === "POST" && request.path.endsWith("/control-lease")) {
     if (owner !== null && owner !== "controller" && request.body?.takeover !== true) {
-      send({ id: request.id, status: 409, body: { error: { code: "LEASE_CONFLICT", message: "another writer is active", details: { expiresAt: "2099-01-01T00:00:00.000Z" } } } });
+      respond(request, 409, { error: { code: "LEASE_CONFLICT", message: "another writer is active", details: { expiresAt: "2099-01-01T00:00:00.000Z" } } });
       return;
     }
     owner = "controller";
     leaseToken = "remote-lease-token";
-    remoteSession.control.writableLease = true;
-    send({ id: request.id, status: 200, body: { lease: { token: leaseToken, expiresAt: "2099-01-01T00:00:00.000Z" } } });
+    respond(request, 200, { lease: { token: leaseToken, expiresAt: "2099-01-01T00:00:00.000Z" } });
     return;
   }
   if (request.method === "DELETE" && request.path.endsWith("/control-lease")) {
     if (request.controlLease === leaseToken) {
       owner = null;
       leaseToken = null;
-      remoteSession.control.writableLease = false;
     }
-    send({ id: request.id, status: 204, body: null });
+    respond(request, 204, null);
     return;
   }
   if (request.method === "POST" && request.path.endsWith("/actions")) {
@@ -1094,10 +1370,10 @@ lines.on("line", (line) => {
     const body = status === 200
       ? { action: { status: "succeeded" } }
       : { error: { code: "LEASE_INVALID", message: "remote lease missing" } };
-    send({ id: request.id, status, body });
+    respond(request, status, body);
     return;
   }
-  send({ id: request.id, status: 404, body: { error: { code: "NOT_FOUND", message: "not found" } } });
+  respond(request, 404, { error: { code: "NOT_FOUND", message: "not found" } });
 });
 `, { mode: 0o700 });
   chmodSync(fakeSsh, 0o700);
@@ -1160,8 +1436,9 @@ lines.on("line", (line) => {
       provider: "codex",
       workspaceId: workspace.id,
       initialMessage: "Start on the build host",
-      mode: "execution",
-      accessMode: "sandboxed",
+      profile: "execute",
+      model: null,
+      effort: null,
       idempotencyKey: "remote-create-0001",
     },
   });
@@ -1189,7 +1466,6 @@ lines.on("line", (line) => {
   });
   assert.equal(conflict.statusCode, 409, conflict.body);
   assert.equal(conflict.json<{ error: { code: string } }>().error.code, "LEASE_CONFLICT");
-  assert.equal(backend.state.get(selected.id)?.control.writableLease, false);
 
   const takeover = await backend.app.inject({
     method: "POST",
@@ -1242,7 +1518,7 @@ lines.on("line", (line) => {
   assert.equal(backend.state.get(selected.id), null);
 });
 
-test("keeps bypass-permissions access independent from automatic writer leases", async (t) => {
+test("keeps full-access profile independent from automatic writer coordination", async (t) => {
   let calls = 0;
   const backend = await createAgentManagerServer({
     discovery: false,
@@ -1254,10 +1530,11 @@ test("keeps bypass-permissions access independent from automatic writer leases",
       },
     },
     initialSessions: [session({
-      effectiveAccess: {
-        accessMode: "bypass-permissions",
-        permissionMode: "never",
-        sandboxMode: "danger-full-access",
+      profile: {
+        value: "full-access",
+        providerValue: "danger-full-access",
+        source: "provider-api",
+        confidence: "exact",
       },
     })],
   });
@@ -1266,18 +1543,18 @@ test("keeps bypass-permissions access independent from automatic writer leases",
   const headers = await authenticatedHeaders(backend);
   const leaseResponse = await backend.app.inject({
     method: "POST",
-    url: "/api/v1/sessions/codex:thread-1/control-lease",
+    url: "/api/v1/sessions/local:codex:thread-1/control-lease",
     headers,
     payload: { clientId: "browser-client" },
   });
   const lease = leaseResponse.json<{ lease: { token: string } }>().lease;
   const response = await backend.app.inject({
     method: "POST",
-    url: "/api/v1/sessions/codex:thread-1/actions",
+    url: "/api/v1/sessions/local:codex:thread-1/actions",
     headers: { ...headers, "x-control-lease": lease.token },
     payload: {
       type: "interrupt",
-      expectedGeneration: backend.state.get("codex:thread-1")!.generation,
+      expectedGeneration: backend.state.get("local:codex:thread-1")!.generation,
       idempotencyKey: "idem-key-bypass",
     },
   });
@@ -1286,7 +1563,7 @@ test("keeps bypass-permissions access independent from automatic writer leases",
 
   const conflict = await backend.app.inject({
     method: "POST",
-    url: "/api/v1/sessions/codex:thread-1/control-lease",
+    url: "/api/v1/sessions/local:codex:thread-1/control-lease",
     headers,
     payload: { clientId: "other-browser" },
   });
@@ -1294,7 +1571,7 @@ test("keeps bypass-permissions access independent from automatic writer leases",
 
   const takeoverResponse = await backend.app.inject({
     method: "POST",
-    url: "/api/v1/sessions/codex:thread-1/control-lease",
+    url: "/api/v1/sessions/local:codex:thread-1/control-lease",
     headers,
     payload: { clientId: "other-browser", takeover: true },
   });
@@ -1304,11 +1581,11 @@ test("keeps bypass-permissions access independent from automatic writer leases",
 
   const oldToken = await backend.app.inject({
     method: "POST",
-    url: "/api/v1/sessions/codex:thread-1/actions",
+    url: "/api/v1/sessions/local:codex:thread-1/actions",
     headers: { ...headers, "x-control-lease": lease.token },
     payload: {
       type: "interrupt",
-      expectedGeneration: backend.state.get("codex:thread-1")!.generation,
+      expectedGeneration: backend.state.get("local:codex:thread-1")!.generation,
       idempotencyKey: "idem-key-old-token",
     },
   });
@@ -1316,11 +1593,11 @@ test("keeps bypass-permissions access independent from automatic writer leases",
 
   const takeoverAction = await backend.app.inject({
     method: "POST",
-    url: "/api/v1/sessions/codex:thread-1/actions",
+    url: "/api/v1/sessions/local:codex:thread-1/actions",
     headers: { ...headers, "x-control-lease": takeover.token },
     payload: {
       type: "interrupt",
-      expectedGeneration: backend.state.get("codex:thread-1")!.generation,
+      expectedGeneration: backend.state.get("local:codex:thread-1")!.generation,
       idempotencyKey: "idem-key-takeover-success",
     },
   });
@@ -1412,6 +1689,17 @@ test("serves SSE with EventSource-compatible headers over a real HTTP response",
   response.destroy();
 
   assert.match(firstChunk, /^id: \d+\nevent: snapshot\ndata: /);
+  const data = firstChunk.match(/\ndata: ([^\n]+)\n/);
+  assert.ok(data?.[1]);
+  const envelope = JSON.parse(data[1]) as {
+    schemaVersion: number;
+    buildId: string;
+    payload: { schemaVersion: number; buildId: string };
+  };
+  assert.equal(envelope.schemaVersion, WIRE_SCHEMA_VERSION);
+  assert.equal(envelope.buildId, AGENT_MANAGER_BUILD_ID);
+  assert.equal(envelope.payload.schemaVersion, WIRE_SCHEMA_VERSION);
+  assert.equal(envelope.payload.buildId, AGENT_MANAGER_BUILD_ID);
 });
 
 test("replaces a stale SSE stream from the same authenticated browser client", async (t) => {
@@ -1425,25 +1713,32 @@ test("replaces a stale SSE stream from the same authenticated browser client", a
     staticDir: false,
     initialSessions: [session()],
   });
-  t.after(() => backend.close());
+  const streams = new Set<import("node:http").IncomingMessage>();
+  t.after(async () => {
+    for (const stream of streams) stream.destroy();
+    await backend.close();
+  });
   const address = new URL(await backend.listen());
   const headers = await authenticatedHeaders(backend);
-  const openStream = () => new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
-    const request = httpGet({
-      hostname: address.hostname,
-      port: Number(address.port),
-      path: "/api/v1/events?clientId=web-reconnect-test",
-      headers: {
-        host,
-        cookie: headers.cookie,
-        accept: "text/event-stream",
-      },
-    }, resolve);
-    request.once("error", reject);
-  });
+  const openStream = async () => {
+    const stream = await new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
+      const request = httpGet({
+        hostname: address.hostname,
+        port: Number(address.port),
+        path: "/api/v1/events?clientId=web-reconnect-test",
+        headers: {
+          host,
+          cookie: headers.cookie,
+          accept: "text/event-stream",
+        },
+      }, resolve);
+      request.once("error", reject);
+    });
+    streams.add(stream);
+    return stream;
+  };
 
   const first = await openStream();
-  t.after(() => first.destroy());
   assert.equal(first.statusCode, 200);
   await once(first, "data");
   const firstClosed = new Promise<void>((resolve) => {
@@ -1453,7 +1748,6 @@ test("replaces a stale SSE stream from the same authenticated browser client", a
   });
 
   const second = await openStream();
-  t.after(() => second.destroy());
   assert.equal(second.statusCode, 200);
   await Promise.race([
     firstClosed,
@@ -1461,161 +1755,62 @@ test("replaces a stale SSE stream from the same authenticated browser client", a
   ]);
 });
 
-test("serves bounded authenticated activity history without crossing session boundaries", async (t) => {
-  const activityHub = new ActivityHub({ streamEpoch: "activity-history-test" });
-  activityHub.ingest("codex:thread-1", "codex", {
-    type: "upsert",
-    item: {
-      id: "message-a",
-      kind: "message",
-      role: "assistant",
-      phase: "final",
-      text: "selected-session-a-private",
-      state: "complete",
-      source: "provider-api",
-      confidence: "exact",
-      exposure: "provider-exposed",
-    },
-  });
-  activityHub.ingest("claude:thread-2", "claude", {
-    type: "upsert",
-    item: {
-      id: "message-b",
-      kind: "message",
-      role: "assistant",
-      phase: "final",
-      text: "other-session-b-private",
-      state: "complete",
-      source: "provider-api",
-      confidence: "exact",
-      exposure: "provider-exposed",
-    },
-  });
+test("admits two same-auth browser clients with global and activity streams up to the exact cap", async (t) => {
   const backend = await createAgentManagerServer({
+    host: "127.0.0.1",
+    port: 0,
+    allowedHosts: [host],
+    allowedOrigins: [origin],
+    maxSseClientsPerAuthSession: 4,
     discovery: false,
     staticDir: false,
-    activityHub,
-    initialSessions: [
-      session(),
-      session({
-        id: "claude:thread-2",
-        provider: "claude",
-        sessionId: "thread-2",
-        rootSessionId: "thread-2",
-        control: {
-          plane: "claude-sdk",
-          capabilities: [],
-          managerOwned: true,
-          writableLease: false,
+    initialSessions: [session()],
+  });
+  const streams = new Set<import("node:http").IncomingMessage>();
+  t.after(async () => {
+    for (const stream of streams) stream.destroy();
+    await backend.close();
+  });
+  const address = new URL(await backend.listen());
+  const headers = await authenticatedHeaders(backend);
+  const openStream = async (path: string) => {
+    const stream = await new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
+      const request = httpGet({
+        hostname: address.hostname,
+        port: Number(address.port),
+        path,
+        headers: {
+          host,
+          cookie: headers.cookie,
+          accept: "text/event-stream",
         },
-      }),
-    ],
-  });
-  t.after(() => backend.close());
-  await backend.app.ready();
+      }, resolve);
+      request.once("error", reject);
+    });
+    streams.add(stream);
+    return stream;
+  };
 
-  const rejected = await backend.app.inject({
-    method: "GET",
-    url: "/api/v1/sessions/codex:thread-1/activity",
-    headers: { host },
-  });
-  assert.equal(rejected.statusCode, 401);
+  for (const clientId of ["browser-one", "browser-two"]) {
+    const global = await openStream(`/api/v1/events?clientId=${clientId}`);
+    assert.equal(global.statusCode, 200);
+    assert.match(await nextSseChunk(global, `${clientId} global snapshot`), /event: snapshot/);
 
-  const headers = await authenticatedHeaders(backend);
-  const response = await backend.app.inject({
-    method: "GET",
-    url: "/api/v1/sessions/codex:thread-1/activity?limit=1",
-    headers: { host, cookie: headers.cookie },
-  });
-  assert.equal(response.statusCode, 200, response.body);
-  assert.match(response.body, /selected-session-a-private/);
-  assert.doesNotMatch(response.body, /other-session-b-private/);
+    const activity = await openStream(
+      `/api/v1/sessions/local:codex:thread-1/activity/events?clientId=${clientId}`,
+    );
+    assert.equal(activity.statusCode, 200);
+    assert.equal(
+      sseFrame(await nextSseChunk(activity, `${clientId} activity snapshot`)).type,
+      "activity.snapshot",
+    );
+  }
 
-  const staleCursor = await backend.app.inject({
-    method: "GET",
-    url: "/api/v1/sessions/codex:thread-1/activity?before=old-epoch:1",
-    headers: { host, cookie: headers.cookie },
-  });
-  assert.equal(staleCursor.statusCode, 409);
-  assert.equal(
-    staleCursor.json<{ error: { code: string } }>().error.code,
-    "ACTIVITY_CURSOR_STALE",
-  );
-
-  const collection = await backend.app.inject({
-    method: "GET",
-    url: "/api/v1/sessions",
-    headers: { host, cookie: headers.cookie },
-  });
-  assert.doesNotMatch(collection.body, /selected-session-a-private|other-session-b-private/);
-
-  const missing = await backend.app.inject({
-    method: "GET",
-    url: "/api/v1/sessions/codex:missing/activity",
-    headers: { host, cookie: headers.cookie },
-  });
-  assert.equal(missing.statusCode, 404);
-});
-
-test("seeds selected external-session activity from its bounded transcript", async (t) => {
-  const privateText = "external-selected-transcript-live";
-  let reads = 0;
-  const backend = await createAgentManagerServer({
-    discovery: false,
-    staticDir: false,
-    transcriptReader: {
-      read() {
-        reads += 1;
-        return {
-          messages: [{
-            id: "external-message",
-            role: "assistant",
-            text: privateText,
-            createdAt: "2026-08-03T00:00:01.000Z",
-            status: "complete",
-            label: null,
-          }],
-          transcript: {
-            state: "available",
-            truncated: false,
-            source: "codex-rollout",
-            messageCount: 1,
-            reason: null,
-          },
-        };
-      },
-    },
-    initialSessions: [session({
-      ownership: "external",
-      control: {
-        plane: "observe-only",
-        capabilities: [],
-        managerOwned: false,
-        writableLease: false,
-      },
-    })],
-  });
-  t.after(() => backend.close());
-  await backend.app.ready();
-  const headers = await authenticatedHeaders(backend);
-
-  const collection = await backend.app.inject({
-    method: "GET",
-    url: "/api/v1/sessions",
-    headers: { host, cookie: headers.cookie },
-  });
-  assert.equal(reads, 0);
-  assert.doesNotMatch(collection.body, new RegExp(privateText));
-
-  const activity = await backend.app.inject({
-    method: "GET",
-    url: "/api/v1/sessions/codex:thread-1/activity",
-    headers: { host, cookie: headers.cookie },
-  });
-  assert.equal(activity.statusCode, 200, activity.body);
-  assert.equal(reads, 1);
-  assert.match(activity.body, new RegExp(privateText));
-  assert.match(activity.body, /"source":"transcript"/);
+  const overCap = await openStream("/api/v1/events?clientId=browser-three");
+  assert.equal(overCap.statusCode, 429);
+  let body = "";
+  for await (const chunk of overCap) body += chunk.toString("utf8");
+  assert.equal(JSON.parse(body).error.code, "SSE_LIMIT_REACHED");
 });
 
 test("streams selected activity live while retaining a separate global stream", async (t) => {
@@ -1631,11 +1826,15 @@ test("streams selected activity live while retaining a separate global stream", 
     activityHub,
     initialSessions: [session()],
   });
-  t.after(() => backend.close());
+  const streams = new Set<import("node:http").IncomingMessage>();
+  t.after(async () => {
+    for (const stream of streams) stream.destroy();
+    await backend.close();
+  });
   const address = new URL(await backend.listen());
   const headers = await authenticatedHeaders(backend);
-  const openStream = (path: string, extraHeaders: Record<string, string> = {}) =>
-    new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
+  const openStream = async (path: string, extraHeaders: Record<string, string> = {}) => {
+    const stream = await new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
       const request = httpGet({
         hostname: address.hostname,
         port: Number(address.port),
@@ -1649,24 +1848,25 @@ test("streams selected activity live while retaining a separate global stream", 
       }, resolve);
       request.once("error", reject);
     });
+    streams.add(stream);
+    return stream;
+  };
 
   const global = await openStream("/api/v1/events?clientId=dual-stream-client");
-  t.after(() => global.destroy());
   await nextSseChunk(global, "global snapshot");
 
   const activity = await openStream(
-    "/api/v1/sessions/codex:thread-1/activity/events?clientId=dual-stream-client",
+    "/api/v1/sessions/local:codex:thread-1/activity/events?clientId=dual-stream-client",
   );
-  t.after(() => activity.destroy());
   assert.equal(activity.statusCode, 200);
   assert.equal(activity.headers["content-type"], "text/event-stream; charset=utf-8");
   assert.equal(activity.headers["cache-control"], "no-store");
   const initial = sseFrame(await nextSseChunk(activity, "activity snapshot"));
   assert.equal(initial.type, "activity.snapshot");
-  assert.equal(initial.sessionId, "codex:thread-1");
+  assert.equal(initial.sessionId, "local:codex:thread-1");
 
   const liveFrame = nextSseChunk(activity, "live activity upsert");
-  activityHub.ingest("codex:thread-1", "codex", {
+  activityHub.ingest("local:codex:thread-1", "codex", {
     type: "upsert",
     item: {
       id: "live-message",
@@ -1682,11 +1882,11 @@ test("streams selected activity live while retaining a separate global stream", 
   });
   const streamed = sseFrame(await liveFrame);
   assert.equal(streamed.type, "activity.upsert");
-  assert.equal(streamed.sessionId, "codex:thread-1");
+  assert.equal(streamed.sessionId, "local:codex:thread-1");
   assert.equal(streamed.type === "activity.upsert" ? streamed.item.id : null, "live-message");
 
   activity.destroy();
-  activityHub.ingest("codex:thread-1", "codex", {
+  activityHub.ingest("local:codex:thread-1", "codex", {
     type: "upsert",
     item: {
       id: "replayed-message",
@@ -1701,10 +1901,9 @@ test("streams selected activity live while retaining a separate global stream", 
     },
   });
   const resumed = await openStream(
-    "/api/v1/sessions/codex:thread-1/activity/events?clientId=dual-stream-client",
+    "/api/v1/sessions/local:codex:thread-1/activity/events?clientId=dual-stream-client",
     { "last-event-id": streamed.cursor },
   );
-  t.after(() => resumed.destroy());
   const replayed = sseFrame(await nextSseChunk(resumed, "activity replay"));
   assert.equal(replayed.type, "activity.upsert");
   assert.equal(
@@ -1715,7 +1914,7 @@ test("streams selected activity live while retaining a separate global stream", 
   // The activity stream must not displace the metadata stream using the same
   // browser client id. A state update still arrives on the global channel.
   const globalUpdate = nextSseChunk(global, "global metadata update");
-  backend.state.setWritableLease("codex:thread-1", true);
+  backend.state.upsert(session({ name: "Updated while both streams are open" }));
   assert.match(await globalUpdate, /event: session\.upsert/);
 });
 
@@ -1731,14 +1930,22 @@ test("rejects cross-session activity cursors with an atomic reset", async (t) =>
     activityHub,
     initialSessions: [
       session(),
-      session({ id: "codex:thread-2", sessionId: "thread-2", rootSessionId: "thread-2" }),
+      session({
+        id: "local:codex:thread-2",
+        providerThreadId: "thread-2",
+        providerTreeId: "thread-2",
+      }),
     ],
   });
-  t.after(() => backend.close());
+  const streams = new Set<import("node:http").IncomingMessage>();
+  t.after(async () => {
+    for (const stream of streams) stream.destroy();
+    await backend.close();
+  });
   const address = new URL(await backend.listen());
   const headers = await authenticatedHeaders(backend);
-  const open = (sessionId: string, lastEventId?: string) =>
-    new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
+  const open = async (sessionId: string, lastEventId?: string) => {
+    const stream = await new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
       const request = httpGet({
         hostname: address.hostname,
         port: Number(address.port),
@@ -1752,16 +1959,18 @@ test("rejects cross-session activity cursors with an atomic reset", async (t) =>
       }, resolve);
       request.once("error", reject);
     });
+    streams.add(stream);
+    return stream;
+  };
 
-  const first = await open("codex:thread-1");
+  const first = await open("local:codex:thread-1");
   const firstFrame = sseFrame(await nextSseChunk(first, "first activity snapshot"));
   first.destroy();
 
-  const second = await open("codex:thread-2", firstFrame.cursor);
-  t.after(() => second.destroy());
+  const second = await open("local:codex:thread-2", firstFrame.cursor);
   const reset = sseFrame(await nextSseChunk(second, "cross-session reset"));
   assert.equal(reset.type, "activity.reset");
-  assert.equal(reset.sessionId, "codex:thread-2");
+  assert.equal(reset.sessionId, "local:codex:thread-2");
 });
 
 test("durable idempotency receipts prevent replay after a server restart", async () => {
@@ -1792,14 +2001,14 @@ test("durable idempotency receipts prevent replay after a server restart", async
       const headers = await authenticatedHeaders(backend);
       const leaseResponse = await backend.app.inject({
         method: "POST",
-        url: "/api/v1/sessions/codex:thread-1/control-lease",
+        url: "/api/v1/sessions/local:codex:thread-1/control-lease",
         headers,
         payload: { clientId: `browser-${run}` },
       });
       const lease = leaseResponse.json<{ lease: { token: string } }>().lease;
       const response = await backend.app.inject({
         method: "POST",
-        url: "/api/v1/sessions/codex:thread-1/actions",
+        url: "/api/v1/sessions/local:codex:thread-1/actions",
         headers: { ...headers, "x-control-lease": lease.token },
         payload,
       });

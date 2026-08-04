@@ -7,15 +7,18 @@ import { ActivityHub } from "../activity/index.ts";
 import {
   ClaudeProviderControlAdapter,
 } from "../providers/claude/index.ts";
+import { ClaudeHookSourceArbiter } from "../providers/hooks/index.ts";
 import {
   CodexAppServerSupervisor,
   CodexProviderBridge,
+  readCodexHookStatus,
 } from "../providers/codex/index.ts";
 import type { Diagnostic } from "../core/types.ts";
 import type { WorkerPort } from "../discovery/index.ts";
 import { ensurePrivateRuntimeDirectory, type AgentManagerPaths } from "../ops/config.ts";
 import type { ProviderControlAdapters } from "./contracts.ts";
 import { ManagerDatabase } from "./persistence.ts";
+import { LocalPlanFileReader } from "./plan-file.ts";
 import {
   createAgentManagerServer as createRawServer,
   type AgentManagerBackend,
@@ -30,6 +33,7 @@ export * from "./contracts.ts";
 export * from "./control-socket.ts";
 export * from "./controls.ts";
 export * from "./persistence.ts";
+export * from "./plan-file.ts";
 export * from "./preview.ts";
 export * from "./server.ts";
 export * from "./state.ts";
@@ -124,12 +128,17 @@ export async function createAgentManagerServer(
   const database = serverOptions.database
     ?? new ManagerDatabase(serverOptions.databasePath ?? paths.databasePath);
   const adapters: ProviderControlAdapters = { ...(serverOptions.adapters ?? {}) };
+  const claudeHookSourceArbiter = serverOptions.claudeHookSourceArbiter
+    ?? new ClaudeHookSourceArbiter();
+  const planFileReader = serverOptions.planFileReader ?? new LocalPlanFileReader({ runtimeDirectory });
   const transcriptReader = serverOptions.transcriptReader ?? new LocalSessionTranscriptReader();
   const diagnostics: Diagnostic[] = [...(serverOptions.initialDiagnostics ?? [])];
   let codexSupervisor: CodexAppServerSupervisor | null = null;
+  let codexHookTrustStatus = serverOptions.codexHookTrustStatus;
 
   if (managedProviders && !adapters.claude) {
     adapters.claude = new ClaudeProviderControlAdapter({
+      hookSourceArbiter: claudeHookSourceArbiter,
       onSessionChanged: (session) => state.upsert(session),
       onActivity: (managerSessionId, mutation) => {
         activityHub.ingest(managerSessionId, "claude", mutation);
@@ -152,6 +161,11 @@ export async function createAgentManagerServer(
     });
     try {
       const managedAdapter = await codexSupervisor.start();
+      codexHookTrustStatus ??= (settingsPath, expectedCommand) => readCodexHookStatus(
+        managedAdapter.rpc,
+        [dirname(dirname(settingsPath))],
+        expectedCommand,
+      );
       adapters.codex = new CodexProviderBridge({
         adapter: managedAdapter,
         resolveWorkspace: (workspaceId, context) => {
@@ -159,6 +173,19 @@ export async function createAgentManagerServer(
           return database.getWorkspace(workspaceId)?.path ?? null;
         },
         onSessionChanged: (session) => state.upsert(session),
+        onSessionRemoved: (managerSessionId, reason) => {
+          try {
+            database.removeManagedSession(managerSessionId);
+          } catch (error) {
+            state.addDiagnostic({
+              provider: "codex",
+              level: "error",
+              message: `Codex session ${managerSessionId} reached lifecycle state ${reason}, but its durable manager identity could not be removed: ${error instanceof Error ? error.message : String(error)}`,
+            });
+          }
+          state.remove(managerSessionId);
+          activityHub.clearSession(managerSessionId);
+        },
         onActivity: (managerSessionId, mutation) => {
           activityHub.ingest(managerSessionId, "codex", mutation);
         },
@@ -200,14 +227,17 @@ export async function createAgentManagerServer(
       ...serverOptions,
       state,
       activityHub,
+      claudeHookSourceArbiter,
       database,
       adapters,
+      planFileReader,
       transcriptReader,
       databasePath: serverOptions.databasePath ?? paths.databasePath,
       controlSocketPath,
       staticDir: serverOptions.staticDir ?? paths.staticDirectory,
       initialDiagnostics: diagnostics,
       discovery,
+      ...(codexHookTrustStatus ? { codexHookTrustStatus } : {}),
       onShutdown: async () => {
         await codexSupervisor?.stop();
         await serverOptions.onShutdown?.();
