@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { normalizeSession } from "../lib/normalize";
 import { emptySessionActivity } from "../lib/session-activity";
 import type { ActivityItem, SessionActivityView, SessionView } from "../types";
+import { buildActivityTimeline } from "./session-activity";
 import { SessionThread } from "./session-thread";
 
 const useSessionActivityMock = vi.hoisted(() => vi.fn());
@@ -117,6 +118,78 @@ function rawSession(overrides: Record<string, unknown> = {}) {
     ...overrides,
   });
 }
+
+describe("activity turn grouping", () => {
+  it("groups only by authoritative turnId and leaves user/final prose direct", () => {
+    const directUser: ActivityItem = {
+      ...activityBase("user", 1),
+      kind: "message",
+      role: "user",
+      phase: null,
+      text: "Question",
+      label: null,
+    };
+    const commentary: ActivityItem = {
+      ...activityBase("commentary", 2),
+      kind: "message",
+      role: "assistant",
+      phase: "commentary",
+      text: "Progress",
+      label: null,
+    };
+    const final: ActivityItem = {
+      ...activityBase("final", 3),
+      kind: "message",
+      role: "assistant",
+      phase: "final",
+      text: "Answer",
+      label: null,
+    };
+    const otherTurn: ActivityItem = {
+      ...activityBase("other-turn", 4),
+      turnId: "turn-2",
+      kind: "lifecycle",
+      event: "turn-completed",
+      level: "info",
+      title: "Other turn",
+      details: null,
+    };
+    const unscopedOne: ActivityItem = {
+      ...activityBase("unscoped-1", 5),
+      turnId: null,
+      kind: "lifecycle",
+      event: "status",
+      level: "info",
+      title: "Unscoped one",
+      details: null,
+    };
+    const unscopedTwo: ActivityItem = {
+      ...activityBase("unscoped-2", 6),
+      turnId: null,
+      kind: "lifecycle",
+      event: "status",
+      level: "info",
+      title: "Unscoped two",
+      details: null,
+    };
+
+    const timeline = buildActivityTimeline([
+      directUser,
+      commentary,
+      final,
+      otherTurn,
+      unscopedOne,
+      unscopedTwo,
+    ]);
+    const directIds = timeline.flatMap((item) => item.kind === "message" ? [item.id] : []);
+    const groups = timeline.filter((item) => item.kind === "activity-group");
+
+    expect(directIds).toEqual(["user", "final"]);
+    expect(groups).toHaveLength(4);
+    expect(groups.find((group) => group.turnId === "turn-1")?.items.map((item) => item.id)).toEqual(["commentary"]);
+    expect(groups.filter((group) => group.turnId === null)).toHaveLength(2);
+  });
+});
 
 describe("SessionThread transcript states", () => {
   it("shows a transcript loading state before selected detail arrives", () => {
@@ -280,6 +353,22 @@ describe("SessionThread live activity", () => {
       resolved: false,
       isSecret: false,
     },
+    {
+      ...activityBase("commentary", 11, "running"),
+      kind: "message",
+      role: "assistant",
+      phase: "commentary",
+      text: "Implementation progress",
+      label: null,
+    },
+    {
+      ...activityBase("final", 12),
+      kind: "message",
+      role: "assistant",
+      phase: "final",
+      text: "Finished result",
+      label: null,
+    },
   ];
 
   it("replaces the legacy transcript after the first snapshot and renders the full typed timeline", () => {
@@ -292,6 +381,8 @@ describe("SessionThread live activity", () => {
     expect(screen.queryByText("Legacy only")).not.toBeInTheDocument();
     expect(screen.getByRole("log", { name: "Live session activity" })).toHaveAttribute("aria-live", "polite");
     expect(screen.getByText("Live prompt")).toBeInTheDocument();
+    expect(screen.getByText("Implementation progress").closest("[data-activity-turn='turn-1']")).not.toBeNull();
+    expect(screen.getByText("Finished result").closest("[data-activity-turn]")).toBeNull();
     expect(screen.getByText("Analyzing the repository")).toBeInTheDocument();
     expect(screen.getByText("read_files")).toBeInTheDocument();
     expect(screen.getByText("Wire the stream")).toBeInTheDocument();
@@ -303,27 +394,49 @@ describe("SessionThread live activity", () => {
     expect(screen.getAllByText("Need a decision").length).toBeGreaterThan(0);
     expect(document.querySelector("[data-activity-kind='plan']")).toHaveClass("w-full");
     expect(document.querySelector("pre")).toHaveClass("overflow-x-auto");
+    expect(document.querySelectorAll("details[data-activity-turn='turn-1']")).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: "Expand all" })).not.toBeInTheDocument();
   });
 
-  it("expands active work and failures, collapses completed work, and honors bulk controls", () => {
-    useSessionActivityMock.mockReturnValue(liveActivity(items));
-    renderThread(rawSession({ transcript: { state: "available", source: "provider-api", messageCount: 0 } }));
+  it("opens one disclosure for live turn activity and collapses it once settled", async () => {
+    let activityView = liveActivity(items);
+    useSessionActivityMock.mockImplementation(() => activityView);
+    const session = rawSession({ transcript: { state: "available", source: "provider-api", messageCount: 0 } });
+    const rendered = renderThread(session);
 
-    const reasoning = document.querySelector("details[data-activity-kind='reasoning']") as HTMLDetailsElement;
-    const tool = document.querySelector("details[data-activity-kind='tool']") as HTMLDetailsElement;
-    const failure = document.querySelector("details[data-activity-kind='lifecycle']") as HTMLDetailsElement;
-    expect(reasoning.open).toBe(true);
-    expect(tool.open).toBe(false);
-    expect(failure.open).toBe(true);
+    const liveTurn = document.querySelector("details[data-activity-turn='turn-1']") as HTMLDetailsElement;
+    expect(liveTurn.open).toBe(true);
+    expect(document.querySelectorAll("details")).toHaveLength(1);
 
-    fireEvent.click(screen.getByRole("button", { name: "Expand all" }));
-    for (const detail of document.querySelectorAll("details[data-activity-kind]")) {
-      expect((detail as HTMLDetailsElement).open).toBe(true);
-    }
-    fireEvent.click(screen.getByRole("button", { name: "Collapse all" }));
-    for (const detail of document.querySelectorAll("details[data-activity-kind]")) {
-      expect((detail as HTMLDetailsElement).open).toBe(false);
-    }
+    const settled = items.map((item) => ({
+      ...item,
+      state: "complete" as const,
+      completedAt: "2026-08-03T12:00:03.000Z",
+    })) as ActivityItem[];
+    activityView = liveActivity(settled, 2);
+    rendered.rerender(
+      <SessionThread
+        session={session}
+        lease={null}
+        busy={false}
+        onAcquire={vi.fn()}
+        onRelease={vi.fn()}
+        onSend={vi.fn()}
+        onRespond={vi.fn()}
+        onInterrupt={vi.fn()}
+        onSetMode={vi.fn()}
+        loadPreview={vi.fn()}
+        loadAttach={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const settledTurns = document.querySelectorAll("details[data-activity-turn='turn-1']");
+      expect(settledTurns).toHaveLength(1);
+      const settledTurn = settledTurns[0] as HTMLDetailsElement;
+      expect(settledTurn).toHaveAttribute("data-activity-state", "complete");
+      expect(settledTurn.open).toBe(false);
+    });
   });
 
   it("does not follow while scrolled away and offers a counted jump back to live", () => {
@@ -433,10 +546,12 @@ describe("SessionThread live activity", () => {
     const pending = screen.getByRole("region", { name: "Pending requests" });
     expect(within(pending).getByText("Activity-only question")).toBeInTheDocument();
     expect(within(pending).queryByText("Already resolved")).not.toBeInTheDocument();
-    const secretInput = within(pending).getByLabelText("Where should this deploy? answer");
+    fireEvent.click(within(pending).getByRole("button", { name: /Needs you/u }));
+    const requestSheet = screen.getByRole("dialog", { name: "Needs you" });
+    const secretInput = within(requestSheet).getByLabelText("Where should this deploy? answer");
     expect(secretInput).toHaveAttribute("type", "password");
-    fireEvent.click(within(pending).getByRole("button", { name: /Staging/u }));
-    fireEvent.click(within(pending).getByRole("button", { name: "Send answer" }));
+    fireEvent.click(within(requestSheet).getByRole("button", { name: /Staging/u }));
+    fireEvent.click(within(requestSheet).getByRole("button", { name: "Send answer" }));
 
     await waitFor(() => expect(onRespond).toHaveBeenCalledWith("activity-request-1", {
       kind: "answer",
@@ -504,10 +619,12 @@ describe("SessionThread live activity", () => {
     }));
 
     const pending = screen.getByRole("region", { name: "Pending requests" });
-    expect(within(pending).getByText("Live approval")).toBeInTheDocument();
-    expect(within(pending).getByText("shell")).toBeInTheDocument();
-    expect(within(pending).getByText("External session question")).toBeInTheDocument();
-    expect(within(pending).queryByText("Stale metadata request")).not.toBeInTheDocument();
+    fireEvent.click(within(pending).getByRole("button", { name: /Needs you/u }));
+    const requestSheet = screen.getByRole("dialog", { name: "Needs you" });
+    expect(within(requestSheet).getByText("Live approval")).toBeInTheDocument();
+    expect(within(requestSheet).getByText("shell")).toBeInTheDocument();
+    expect(within(requestSheet).getByText("External session question")).toBeInTheDocument();
+    expect(within(requestSheet).queryByText("Stale metadata request")).not.toBeInTheDocument();
   });
 });
 
@@ -519,8 +636,9 @@ describe("SessionThread asymmetric composer capabilities", () => {
       transcript: { state: "available", source: "provider-api", messageCount: 0 },
     }));
 
-    expect(screen.getByText("Queued")).toBeInTheDocument();
-    expect(screen.getByText("Run this after the active turn")).toBeInTheDocument();
+    const queue = screen.getByLabelText("Queued messages");
+    expect(queue).toHaveClass("flex-wrap");
+    expect(within(queue).getByText("Run this after the active turn")).toBeInTheDocument();
   });
 
   it("does not dispatch or clear a queue-only draft when the steer hotkey is pressed", () => {
@@ -528,7 +646,7 @@ describe("SessionThread asymmetric composer capabilities", () => {
       control: { capabilities: ["queue"] },
       transcript: { state: "available", source: "provider-api", messageCount: 0 },
     }));
-    const input = screen.getByPlaceholderText("Send work to this session…");
+    const input = screen.getByPlaceholderText("Message this session…");
 
     fireEvent.change(input, { target: { value: "Keep this queue draft" } });
     fireEvent.keyDown(input, { key: "Enter", ctrlKey: true, shiftKey: true });
@@ -557,7 +675,7 @@ describe("SessionThread asymmetric composer capabilities", () => {
       control: { capabilities: ["queue"] },
       transcript: { state: "available", source: "provider-api", messageCount: 0 },
     }), queueSend);
-    const queueInput = screen.getByPlaceholderText("Send work to this session…");
+    const queueInput = screen.getByPlaceholderText("Message this session…");
     fireEvent.change(queueInput, { target: { value: "Queue this" } });
     fireEvent.keyDown(queueInput, { key: "Enter" });
     await waitFor(() => expect(queueSend).toHaveBeenCalledWith("Queue this", "queue"));
@@ -572,5 +690,50 @@ describe("SessionThread asymmetric composer capabilities", () => {
     fireEvent.change(steerInput, { target: { value: "Steer this" } });
     fireEvent.keyDown(steerInput, { key: "Enter", metaKey: true, shiftKey: true });
     await waitFor(() => expect(steerSend).toHaveBeenCalledWith("Steer this", "steer"));
+  });
+
+  it("makes steer primary while running and only shows Stop when interrupt is supported", () => {
+    renderWritableThread(rawSession({
+      status: "running",
+      control: { capabilities: ["queue", "steer", "interrupt"] },
+      transcript: { state: "available", source: "provider-api", messageCount: 0 },
+    }));
+
+    expect(screen.getByPlaceholderText("Steer the running turn…")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Steer" })).toHaveClass("bg-primary");
+    expect(screen.getByRole("button", { name: "Queue" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Stop" })).toBeEnabled();
+  });
+
+  it("keeps the cockpit read-only and preserves the draft while reconnecting", () => {
+    const onSend = vi.fn(async () => undefined);
+    render(
+      <SessionThread
+        session={rawSession({
+          status: "running",
+          control: { capabilities: ["queue", "steer", "interrupt"] },
+          transcript: { state: "available", source: "provider-api", messageCount: 0 },
+        })}
+        lease={WRITABLE_LEASE}
+        busy={false}
+        mutationsReady={false}
+        onAcquire={vi.fn()}
+        onRelease={vi.fn()}
+        onSend={onSend}
+        onRespond={vi.fn()}
+        onInterrupt={vi.fn()}
+        onSetMode={vi.fn()}
+        loadPreview={vi.fn()}
+        loadAttach={vi.fn()}
+      />,
+    );
+
+    const input = screen.getByPlaceholderText("Reconnect to continue");
+    expect(input).toBeDisabled();
+    expect(screen.getByText("Read-only while reconnecting")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Stop" })).toBeDisabled();
+    fireEvent.change(input, { target: { value: "Do not send" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onSend).not.toHaveBeenCalled();
   });
 });

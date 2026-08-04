@@ -1,21 +1,52 @@
 import { useEffect, useState } from "react";
-import { Check, Copy, ExternalLink, LoaderCircle, Monitor, TerminalSquare } from "lucide-react";
+import { Check, Copy, KeyRound, LoaderCircle, Monitor, TerminalSquare } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "./ui/alert";
 import { Button } from "./ui/button";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "./ui/sheet";
 import { copyText } from "../lib/utils";
-import type { AttachInstruction, PanePreview, SessionView } from "../types";
+import type { AttachInstruction, ControlLease, PanePreview, SessionView } from "../types";
+
+function displayValue(value: string | null | undefined): string {
+  return value || "Not reported";
+}
+
+function leaseExpiry(expiresAt: string): string {
+  const date = new Date(expiresAt);
+  if (Number.isNaN(date.getTime())) return expiresAt;
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(date);
+}
+
+function Detail({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="grid min-w-0 gap-0.5">
+      <dt className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">{label}</dt>
+      <dd className="min-w-0 break-words text-sm [overflow-wrap:anywhere]">{children}</dd>
+    </div>
+  );
+}
 
 export function AccessSheet({
   session,
   open,
   onOpenChange,
+  lease,
+  busy,
+  mutationsReady,
+  onRelease,
   loadPreview,
   loadAttach,
 }: {
   session: SessionView;
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  lease: ControlLease | null;
+  busy: boolean;
+  mutationsReady: boolean;
+  onRelease: () => Promise<void>;
   loadPreview: (session: SessionView) => Promise<PanePreview>;
   loadAttach: (session: SessionView) => Promise<AttachInstruction>;
 }) {
@@ -60,30 +91,80 @@ export function AccessSheet({
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent className="overflow-y-auto">
         <SheetHeader>
-          <SheetTitle>Native access</SheetTitle>
+          <SheetTitle>Session details</SheetTitle>
           <SheetDescription>
-            Inspect a bounded pane snapshot or continue through the provider’s normal terminal interface.
+            Identity, access, control, and terminal handoff for this session.
           </SheetDescription>
         </SheetHeader>
 
+        <section className="grid gap-3 rounded-xl border bg-muted/15 p-4" aria-labelledby="implementation-details-title">
+          <h3 id="implementation-details-title" className="text-sm font-semibold">Implementation</h3>
+          <dl className="grid gap-3 sm:grid-cols-2">
+            <Detail label="Provider"><span className="uppercase">{session.provider}</span></Detail>
+            <Detail label="Session ID"><code className="font-mono text-xs">{session.id}</code></Detail>
+            <Detail label="Workspace"><code className="font-mono text-xs">{displayValue(session.cwd)}</code></Detail>
+            <Detail label="Owner">{session.ownership === "manager" ? "Agent Manager" : "External"}</Detail>
+            <Detail label="Control plane">{displayValue(session.control.plane)}</Detail>
+            <Detail label="Provider mode">{displayValue(session.mode.providerValue)}</Detail>
+          </dl>
+        </section>
+
+        <section className="grid gap-3 rounded-xl border bg-muted/15 p-4" aria-labelledby="access-details-title">
+          <h3 id="access-details-title" className="text-sm font-semibold">Access</h3>
+          <dl className="grid gap-3 sm:grid-cols-2">
+            <Detail label="Permission">{displayValue(session.effectiveAccess.permissionMode)}</Detail>
+            <Detail label="Sandbox">{displayValue(session.effectiveAccess.sandboxMode)}</Detail>
+            <Detail label="Full host">{session.effectiveAccess.fullHostAccess ? "Yes — not sandboxed" : "No"}</Detail>
+            <Detail label="Mode">{session.mode.value === "planning" ? "Plan" : session.mode.value === "execution" ? "Execute" : "Unknown"}</Detail>
+            <Detail label="Mode evidence">{session.mode.confidence} · {session.mode.source}</Detail>
+          </dl>
+        </section>
+
+        <section className="grid gap-3 rounded-xl border bg-muted/15 p-4" aria-labelledby="control-details-title">
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <h3 id="control-details-title" className="text-sm font-semibold">Browser control</h3>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {lease ? `Writable until ${leaseExpiry(lease.expiresAt)}.` : "This browser is read-only."}
+              </p>
+            </div>
+            {lease && (
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={busy || !mutationsReady}
+                onClick={() => void onRelease().catch(() => undefined)}
+              >
+                <KeyRound /> Release control
+              </Button>
+            )}
+          </div>
+          {!mutationsReady && <p className="text-xs text-amber-700 dark:text-amber-300">Reconnect before changing control.</p>}
+        </section>
+
+        <div className="border-t pt-4">
+          <h3 className="text-sm font-semibold">Terminal</h3>
+          <p className="mt-1 text-xs text-muted-foreground">Preview recent output or copy a native attach command.</p>
+        </div>
+
         {loading && (
           <div className="flex flex-1 items-center justify-center gap-2 py-16 text-sm text-muted-foreground">
-            <LoaderCircle className="size-4 animate-spin" /> Loading safe access details…
+            <LoaderCircle className="size-4 animate-spin" /> Loading terminal details…
           </div>
         )}
 
         {error && !loading && (
           <Alert>
-            <AlertTitle>Read-only session</AlertTitle>
+            <AlertTitle>Terminal unavailable</AlertTitle>
             <AlertDescription>{error}</AlertDescription>
           </Alert>
         )}
 
         {attach && (!attach.available || !attach.command) && !loading && (
           <Alert>
-            <AlertTitle>Native attachment unavailable</AlertTitle>
+            <AlertTitle>Attach unavailable</AlertTitle>
             <AlertDescription>
-              {attach.description || "The provider does not expose a safe native attachment for this session."}
+              {attach.description || "This provider does not offer a native attach command for the session."}
             </AlertDescription>
           </Alert>
         )}
@@ -91,10 +172,10 @@ export function AccessSheet({
         {attach?.available && attach.command && (
           <section className="grid gap-3 rounded-xl border bg-muted/20 p-4">
             <div className="flex items-center gap-2">
-              <ExternalLink className="size-4 text-primary" />
+              <TerminalSquare className="size-4 text-primary" />
               <div>
                 <h3 className="text-sm font-medium">
-                  {attach.requiresHandoff ? "Handoff to the native CLI" : "Open in the native CLI"}
+                  {attach.requiresHandoff ? "Continue in terminal" : "Attach in terminal"}
                 </h3>
                 <p className="text-xs text-muted-foreground">{attach.kind}</p>
               </div>
@@ -116,7 +197,7 @@ export function AccessSheet({
               </Button>
             </div>
             <p className="text-xs text-muted-foreground">
-              Run this exact command in your terminal. The browser never executes shell commands.
+              Copy this command into your terminal. Agent Manager does not run it in the browser.
             </p>
           </section>
         )}
@@ -126,7 +207,7 @@ export function AccessSheet({
             <div className="flex items-center justify-between gap-3">
               <div className="flex items-center gap-2">
                 {session.terminal ? <TerminalSquare className="size-4" /> : <Monitor className="size-4" />}
-                <h3 className="text-sm font-medium">Read-only pane preview</h3>
+                <h3 className="text-sm font-medium">Terminal preview</h3>
               </div>
               <span className="text-xs text-muted-foreground">
                 {preview.lines ?? "≤200"} lines{preview.truncated ? " · truncated" : ""}
@@ -140,7 +221,7 @@ export function AccessSheet({
               {preview.content || "No visible pane output."}
             </pre>
             <p className="text-xs text-muted-foreground">
-              This is a bounded snapshot. It does not accept keyboard input and strips terminal control sequences on the server.
+              Read-only snapshot; terminal control sequences are removed.
             </p>
           </section>
         )}

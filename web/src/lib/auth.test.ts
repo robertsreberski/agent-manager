@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { establishBrowserSession } from "./auth";
+import { BrowserSessionError, establishBrowserSession } from "./auth";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -38,5 +38,28 @@ describe("establishBrowserSession", () => {
 
     await expect(establishBrowserSession()).rejects.toThrow("invalid or has expired");
     expect(window.location.hash).toBe("");
+  });
+
+  it("classifies a transport failure as an offline shell state", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      throw new TypeError("fetch failed");
+    }));
+
+    const failure = await establishBrowserSession().catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(BrowserSessionError);
+    expect(failure).toMatchObject({ kind: "offline", status: null });
+  });
+
+  it("classifies the panic boundary without treating it as an offline response", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+      error: { code: "CONTROL_PLANE_LOCKED", message: "Agent Manager is locked" },
+    }), {
+      status: 423,
+      headers: { "content-type": "application/json" },
+    })));
+
+    const failure = await establishBrowserSession().catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(BrowserSessionError);
+    expect(failure).toMatchObject({ kind: "locked", status: 423 });
   });
 });

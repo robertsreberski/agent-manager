@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { CockpitApi } from "../lib/api";
-import { establishBrowserSession } from "../lib/auth";
+import { ApiError, CockpitApi } from "../lib/api";
+import { BrowserSessionError, establishBrowserSession } from "../lib/auth";
 import { connectCockpitEvents, type CockpitEvent } from "../lib/sse";
 import { SessionStateGuard } from "../lib/session-state";
 import { idempotencyKey } from "../lib/utils";
@@ -25,6 +25,37 @@ const EMPTY_SNAPSHOT: SessionsSnapshot = {
   seq: null,
   stale: false,
 };
+
+export type CockpitAvailability =
+  | "connecting"
+  | "online"
+  | "offline"
+  | "locked"
+  | "auth-required"
+  | "error";
+
+export function mutationsAreReady(
+  authenticated: boolean,
+  connection: ConnectionState,
+  stale: boolean,
+  availability: CockpitAvailability,
+): boolean {
+  return authenticated && connection === "open" && !stale && availability === "online";
+}
+
+export function sensitiveBoundaryStatus(error: unknown): 401 | 423 | null {
+  if (error instanceof ApiError && (error.status === 401 || error.status === 423)) {
+    return error.status;
+  }
+  if (error instanceof BrowserSessionError && (error.status === 401 || error.status === 423)) {
+    return error.status;
+  }
+  return null;
+}
+
+function staleSnapshot(value: SessionsSnapshot): SessionsSnapshot {
+  return value.stale ? value : { ...value, stale: true };
+}
 
 export const BROWSER_CLIENT_ID_STORAGE_KEY = "agent-manager.browser-client-id.v1";
 const SAFE_BROWSER_CLIENT_ID = /^web-[A-Za-z0-9._:-]{4,124}$/;
@@ -132,6 +163,7 @@ export async function autoAcquireCreatedSession(
 export function useCockpit() {
   const [auth, setAuth] = useState<AuthSession | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [availability, setAvailability] = useState<CockpitAvailability>("connecting");
   const [snapshot, setSnapshot] = useState(EMPTY_SNAPSHOT);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [workspaces, setWorkspaces] = useState<WorkspaceOption[]>([]);
@@ -147,6 +179,7 @@ export function useCockpit() {
   apiRef.current = api;
   const snapshotRef = useRef<SessionsSnapshot>(EMPTY_SNAPSHOT);
   const stateGuardRef = useRef(new SessionStateGuard());
+  const recoveryRef = useRef<Promise<boolean> | null>(null);
 
   const commitSnapshot = useCallback((next: SessionsSnapshot) => {
     snapshotRef.current = next;
@@ -161,26 +194,106 @@ export function useCockpit() {
     window.history.replaceState(null, "", `${url.pathname}${url.search}`);
   }, []);
 
+  const clearSensitiveState = useCallback(() => {
+    commitSnapshot(EMPTY_SNAPSHOT);
+    stateGuardRef.current = new SessionStateGuard();
+    setWorkspaces([]);
+    setLeases({});
+    setBusy({});
+    setNotice(null);
+    setActionError(null);
+    setSelectedId(null);
+  }, [commitSnapshot, setSelectedId]);
+
+  const markDisconnected = useCallback(() => {
+    if (snapshotRef.current.sessions.length > 0) {
+      commitSnapshot(staleSnapshot(snapshotRef.current));
+    }
+  }, [commitSnapshot]);
+
+  const handleFailure = useCallback((error: unknown): boolean => {
+    const boundary = sensitiveBoundaryStatus(error);
+    if (boundary !== null) {
+      clearSensitiveState();
+      setAuth(null);
+      setConnection("offline");
+      setAvailability(boundary === 423 ? "locked" : "auth-required");
+      setAuthError(error instanceof Error ? error.message : "This browser session is no longer valid.");
+      return true;
+    }
+    if (
+      (error instanceof BrowserSessionError && error.kind === "offline")
+      || error instanceof TypeError
+      || (typeof navigator !== "undefined" && navigator.onLine === false)
+    ) {
+      markDisconnected();
+      setConnection("offline");
+      setAvailability("offline");
+      setAuthError(null);
+      return true;
+    }
+    return false;
+  }, [clearSensitiveState, markDisconnected]);
+
+  const recoverBrowserSession = useCallback((): Promise<boolean> => {
+    if (recoveryRef.current) return recoveryRef.current;
+    const recovery = establishBrowserSession()
+      .then((session) => {
+        setAuth(session);
+        setAuthError(null);
+        setAvailability("online");
+        return true;
+      })
+      .catch((error: unknown) => {
+        if (!handleFailure(error)) {
+          setAvailability("error");
+          setAuthError(error instanceof Error ? error.message : "Authentication failed.");
+        }
+        return false;
+      })
+      .finally(() => {
+        recoveryRef.current = null;
+      });
+    recoveryRef.current = recovery;
+    return recovery;
+  }, [handleFailure]);
+
   const refresh = useCallback(async () => {
     if (!apiRef.current) return;
     const request = stateGuardRef.current.beginRequest();
-    const next = await apiRef.current.sessions();
-    commitSnapshot(stateGuardRef.current.applyRestSnapshot(snapshotRef.current, next, request));
-  }, [commitSnapshot]);
+    try {
+      const next = await apiRef.current.sessions();
+      commitSnapshot(stateGuardRef.current.applyRestSnapshot(snapshotRef.current, next, request));
+    } catch (error) {
+      handleFailure(error);
+      throw error;
+    }
+  }, [commitSnapshot, handleFailure]);
 
   useEffect(() => {
-    let cancelled = false;
-    void establishBrowserSession()
-      .then((session) => {
-        if (!cancelled) setAuth(session);
-      })
-      .catch((error: unknown) => {
-        if (!cancelled) setAuthError(error instanceof Error ? error.message : "Authentication failed.");
-      });
-    return () => {
-      cancelled = true;
+    void recoverBrowserSession();
+  }, [recoverBrowserSession]);
+
+  useEffect(() => {
+    const onOffline = () => {
+      markDisconnected();
+      setConnection("offline");
+      setAvailability("offline");
     };
-  }, []);
+    const onResume = () => {
+      if (document.visibilityState === "visible" && navigator.onLine !== false) {
+        void recoverBrowserSession();
+      }
+    };
+    window.addEventListener("online", onResume);
+    window.addEventListener("offline", onOffline);
+    document.addEventListener("visibilitychange", onResume);
+    return () => {
+      window.removeEventListener("online", onResume);
+      window.removeEventListener("offline", onOffline);
+      document.removeEventListener("visibilitychange", onResume);
+    };
+  }, [markDisconnected, recoverBrowserSession]);
 
   useEffect(() => {
     if (!api) return;
@@ -198,9 +311,15 @@ export function useCockpit() {
           sessionsRequest,
         ));
         setWorkspaces(nextWorkspaces);
+        setAvailability("online");
+        setAuthError(null);
       })
       .catch((error: unknown) => {
-        if (!cancelled) setAuthError(error instanceof Error ? error.message : "Could not load local sessions.");
+        if (cancelled) return;
+        if (!handleFailure(error)) {
+          setAvailability("error");
+          setAuthError(error instanceof Error ? error.message : "Could not load local sessions.");
+        }
       });
 
     function onEvent(event: CockpitEvent) {
@@ -251,14 +370,32 @@ export function useCockpit() {
     const disconnect = connectCockpitEvents({
       clientId: BROWSER_CLIENT_ID,
       onEvent,
-      onConnection: setConnection,
+      onConnection: (nextConnection) => {
+        setConnection(nextConnection);
+        if (nextConnection === "open") {
+          setAvailability("online");
+        } else if (nextConnection === "retrying" || nextConnection === "offline") {
+          markDisconnected();
+          if (nextConnection === "offline") setAvailability("offline");
+        }
+      },
       onReconnect: () => void refresh().catch(() => undefined),
     });
     return () => {
       cancelled = true;
       disconnect();
     };
-  }, [api, commitSnapshot, refresh]);
+  }, [api, commitSnapshot, handleFailure, markDisconnected, refresh]);
+
+  useEffect(() => {
+    if (!auth || (connection !== "retrying" && connection !== "offline")) return;
+    const timer = window.setTimeout(() => {
+      if (document.visibilityState === "visible" && navigator.onLine !== false) {
+        void recoverBrowserSession();
+      }
+    }, 5_000);
+    return () => window.clearTimeout(timer);
+  }, [auth, connection, recoverBrowserSession]);
 
   const selectedGeneration = selectedId
     ? snapshot.sessions.find((session) => session.id === selectedId)?.generation ?? null
@@ -278,11 +415,13 @@ export function useCockpit() {
           ));
         }
       })
-      .catch(() => undefined);
+      .catch((error: unknown) => {
+        if (!cancelled) handleFailure(error);
+      });
     return () => {
       cancelled = true;
     };
-  }, [api, commitSnapshot, selectedGeneration, selectedId]);
+  }, [api, commitSnapshot, handleFailure, selectedGeneration, selectedId]);
 
   useEffect(() => {
     if (Object.keys(leases).length === 0) return;
@@ -309,6 +448,7 @@ export function useCockpit() {
   }, [selectedId, sessions, setSelectedId]);
 
   const selectedSession = sessions.find((session) => session.id === selectedId) ?? null;
+  const mutationsReady = mutationsAreReady(auth !== null, connection, snapshot.stale, availability);
 
   const withBusy = useCallback(async <T,>(key: string, operation: () => Promise<T>): Promise<T> => {
     setBusy((current) => ({ ...current, [key]: true }));
@@ -316,16 +456,19 @@ export function useCockpit() {
     try {
       return await operation();
     } catch (error) {
-      const message = error instanceof Error ? error.message : "The action failed.";
-      setActionError(message);
+      const handled = handleFailure(error);
+      if (!handled || sensitiveBoundaryStatus(error) === null) {
+        const message = error instanceof Error ? error.message : "The action failed.";
+        setActionError(message);
+      }
       throw error;
     } finally {
       setBusy((current) => ({ ...current, [key]: false }));
     }
-  }, []);
+  }, [handleFailure]);
 
   const acquireLease = useCallback(async (session: SessionView) => {
-    if (!api) throw new Error("The cockpit is not connected.");
+    if (!api || !mutationsReady) throw new Error("Reconnect to control this session.");
     const lease = await withBusy(`lease:${session.id}`, async () => {
       return acquireLeaseInStages(
         api,
@@ -338,10 +481,10 @@ export function useCockpit() {
     setLeases((current) => ({ ...current, [session.id]: lease }));
     setNotice(session.effectiveAccess.fullHostAccess ? "Full-host controls armed for five minutes." : "Control acquired for five minutes.");
     return lease;
-  }, [api, leases, withBusy]);
+  }, [api, leases, mutationsReady, withBusy]);
 
   const releaseLease = useCallback(async (session: SessionView) => {
-    if (!api) return;
+    if (!api || !mutationsReady) throw new Error("Reconnect before releasing control.");
     const lease = leases[session.id];
     if (!lease) return;
     await withBusy(`lease:${session.id}`, () => api.releaseLease(session.id, lease.token));
@@ -351,7 +494,7 @@ export function useCockpit() {
       return next;
     });
     setNotice("Control released.");
-  }, [api, leases, withBusy]);
+  }, [api, leases, mutationsReady, withBusy]);
 
   const validLease = useCallback((session: SessionView): ControlLease | null => {
     const lease = leases[session.id];
@@ -369,7 +512,7 @@ export function useCockpit() {
     session: SessionView,
     action: Parameters<CockpitApi["action"]>[1],
   ) => {
-    if (!api) throw new Error("The cockpit is not connected.");
+    if (!api || !mutationsReady) throw new Error("Reconnect before sending an action.");
     const lease = validLease(session);
     if (!lease) {
       const message = "Take control of this session before sending an action.";
@@ -377,7 +520,7 @@ export function useCockpit() {
       throw new Error(message);
     }
     await withBusy(`action:${session.id}`, () => api.action(session.id, action, lease.token));
-  }, [api, validLease, withBusy]);
+  }, [api, mutationsReady, validLease, withBusy]);
 
   const sendMessage = useCallback(async (session: SessionView, text: string, delivery: "queue" | "steer") => {
     const trimmed = text.trim();
@@ -425,7 +568,7 @@ export function useCockpit() {
   }, [perform]);
 
   const createSession = useCallback(async (input: CreateSessionInput) => {
-    if (!api) throw new Error("The cockpit is not connected.");
+    if (!api || !mutationsReady) throw new Error("Reconnect before creating a session.");
     const session = await withBusy("create", () => api.createSession(input));
     commitSnapshot(stateGuardRef.current.applyLocalSession(snapshotRef.current, session));
     setSelectedId(session.id);
@@ -440,28 +583,62 @@ export function useCockpit() {
       ? "Managed session created with control ready for five minutes."
       : "Managed session created.");
     return session;
-  }, [acquireLease, api, commitSnapshot, setSelectedId, withBusy]);
+  }, [acquireLease, api, commitSnapshot, mutationsReady, setSelectedId, withBusy]);
+
+  const releaseAllLeases = useCallback(async (): Promise<void> => {
+    if (Object.values(busy).some(Boolean)) {
+      throw new Error("Wait for the current action before updating.");
+    }
+    const active = Object.entries(leases).filter(([, lease]) => (
+      new Date(lease.expiresAt).getTime() > Date.now()
+    ));
+    if (active.length === 0) return;
+    if (!api || !mutationsReady) {
+      throw new Error("Reconnect before releasing control for an update.");
+    }
+    const results = await Promise.allSettled(active.map(([sessionId, lease]) => (
+      api.releaseLease(sessionId, lease.token)
+    )));
+    const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failure) {
+      handleFailure(failure.reason);
+      throw failure.reason;
+    }
+    setLeases({});
+  }, [api, busy, handleFailure, leases, mutationsReady]);
 
   const loadPreview = useCallback(async (session: SessionView): Promise<PanePreview> => {
     if (!api) throw new Error("The cockpit is not connected.");
-    return api.preview(session.id);
-  }, [api]);
+    try {
+      return await api.preview(session.id);
+    } catch (error) {
+      handleFailure(error);
+      throw error;
+    }
+  }, [api, handleFailure]);
 
   const loadAttach = useCallback(async (session: SessionView): Promise<AttachInstruction> => {
     if (!api) throw new Error("The cockpit is not connected.");
-    return api.attach(session.id);
-  }, [api]);
+    try {
+      return await api.attach(session.id);
+    } catch (error) {
+      handleFailure(error);
+      throw error;
+    }
+  }, [api, handleFailure]);
 
   return {
     ready: auth !== null,
     actor: auth?.actor ?? null,
     authError,
+    availability,
     snapshot,
     sessions,
     selectedSession,
     selectedId,
     setSelectedId,
     connection,
+    mutationsReady,
     workspaces,
     leases,
     validLease,
@@ -471,8 +648,12 @@ export function useCockpit() {
     actionError,
     clearActionError: () => setActionError(null),
     refresh,
+    retryConnection: recoverBrowserSession,
     acquireLease,
     releaseLease,
+    releaseAllLeases,
+    hasActiveLeases: Object.values(leases).some((lease) => new Date(lease.expiresAt).getTime() > Date.now()),
+    hasBusyAction: Object.values(busy).some(Boolean),
     sendMessage,
     respond,
     interrupt,

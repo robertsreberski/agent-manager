@@ -158,6 +158,28 @@ agent sessions. The sentinel keeps future starts blocked even if live cleanup
 is incomplete; `panic-unlock` explicitly releases it after you have inspected
 the host.
 
+## Web cockpit and PWA
+
+The web cockpit uses a compact scope rail, hierarchical session list, and one
+active session workspace. Scope and selected-session filters are URL-backed, so
+installed-app shortcuts and copied links open the same view. The transcript
+renders provider-reported messages, safe reasoning, plans, tool calls, file
+changes, subagents, usage, and attention requests as live activity arrives.
+Writable controls remain capability- and lease-gated.
+
+Agent Manager is installable as a PWA over its private HTTPS Tailscale URL.
+Supported browsers expose an **Install Agent Manager** action in the session
+footer; on iPhone and iPad the cockpit shows the Safari Share → Add to Home
+Screen instructions. Updates are prompt-based. Applying one releases this
+browser's active writer leases before reloading, while the agent processes keep
+running.
+
+Only the versioned public app shell is precached. API, authentication, SSE,
+action, health, source-map, and session data responses are never placed in a
+service-worker cache. If the host is unreachable, the installed app can show an
+offline shell but cannot show or mutate session data. Moving the app into the
+background immediately covers the cockpit to reduce task-switcher leakage.
+
 ## Private Tailscale access
 
 Agent Manager never binds to a LAN or tailnet address. Optional remote access

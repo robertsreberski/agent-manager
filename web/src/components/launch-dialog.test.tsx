@@ -80,4 +80,35 @@ describe("LaunchDialog", () => {
     expect(onCreate.mock.calls[1]![0].idempotencyKey).not.toBe(firstKey);
     expect(localStorage.getItem(CREATE_ATTEMPT_STORAGE_KEY)).not.toContain("Changed request");
   });
+
+  it("keeps provider, mode, naming, and access behind advanced options", async () => {
+    const onCreate = vi.fn(async () => ({}));
+    render(
+      <LaunchDialog
+        open
+        onOpenChange={() => undefined}
+        workspaces={[{ id: "workspace-1", label: "Workspace" }]}
+        creating={false}
+        onCreate={onCreate}
+      />,
+    );
+
+    expect(screen.getByText("New session")).toBeInTheDocument();
+    const advanced = screen.getByText("Advanced options").closest("details");
+    expect(advanced).not.toHaveAttribute("open");
+    fireEvent.click(screen.getByText("Advanced options"));
+    fireEvent.click(screen.getByRole("button", { name: "Full host" }));
+    fireEvent.change(screen.getByPlaceholderText("Describe the outcome you want…"), {
+      target: { value: "Inspect the host" },
+    });
+
+    expect(screen.getByRole("button", { name: "Launch session" })).toBeDisabled();
+    fireEvent.click(screen.getByLabelText("I understand this session is not sandboxed."));
+    fireEvent.click(screen.getByRole("button", { name: "Launch session" }));
+
+    await waitFor(() => expect(onCreate).toHaveBeenCalledWith(expect.objectContaining({
+      permissionPreset: "full-host",
+      initialMessage: "Inspect the host",
+    })));
+  });
 });

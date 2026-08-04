@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
+import type { ReactNode } from "react";
 import {
   MessagePrimitive,
   type DataMessagePartProps,
@@ -18,6 +18,7 @@ import {
   Gauge,
   ListChecks,
   ListPlus,
+  MessageSquareText,
   Radio,
   Users,
   Wrench,
@@ -35,30 +36,78 @@ import type {
 } from "../types";
 
 const ACTIVITY_DATA_PART = "agent-manager.activity";
+const ACTIVITY_GROUP_DATA_PART = "agent-manager.activity-group";
 
-export interface ExpansionCommand {
-  mode: "auto" | "expand" | "collapse";
-  revision: number;
+export interface ActivityTurnGroup {
+  kind: "activity-group";
+  id: string;
+  turnId: string | null;
+  seq: number;
+  state: ActivityItemState;
+  items: ActivityItem[];
 }
 
-const ExpansionContext = createContext<ExpansionCommand>({ mode: "auto", revision: 0 });
-
-export function ActivityExpansionProvider({
-  command,
-  children,
-}: {
-  command: ExpansionCommand;
-  children: ReactNode;
-}) {
-  return <ExpansionContext.Provider value={command}>{children}</ExpansionContext.Provider>;
-}
+export type ActivityTimelineItem = ActivityItem | ActivityTurnGroup;
 
 function isActive(state: ActivityItemState): boolean {
   return state === "pending" || state === "running" || state === "waiting";
 }
 
-function isFailure(state: ActivityItemState): boolean {
-  return state === "failed" || state === "interrupted";
+function isDirectProse(item: ActivityItem): boolean {
+  if (item.kind !== "message") return false;
+  if (item.role === "user") return true;
+  return item.role === "assistant" && item.phase !== "commentary";
+}
+
+function groupState(items: ActivityItem[]): ActivityItemState {
+  if (items.some((item) => item.state === "running" || item.state === "pending")) return "running";
+  if (items.some((item) => item.state === "waiting")) return "waiting";
+  if (items.some((item) => item.state === "failed")) return "failed";
+  if (items.some((item) => item.state === "interrupted")) return "interrupted";
+  return "complete";
+}
+
+/**
+ * Keeps conversation prose in the thread while folding reported implementation
+ * activity into one stable disclosure per authoritative provider turn. Items
+ * without a turnId are deliberately not associated with one another.
+ */
+export function buildActivityTimeline(items: ActivityItem[]): ActivityTimelineItem[] {
+  const ordered = [...items].sort((left, right) => left.seq - right.seq || left.id.localeCompare(right.id));
+  const groups = new Map<string, ActivityTurnGroup>();
+  const timeline: Array<{ seq: number; order: number; value: ActivityTimelineItem }> = [];
+
+  ordered.forEach((item, order) => {
+    if (isDirectProse(item)) {
+      timeline.push({ seq: item.seq, order, value: item });
+      return;
+    }
+    const key = item.turnId ? `turn:${item.turnId}` : `item:${item.id}`;
+    const existing = groups.get(key);
+    if (existing) {
+      existing.items.push(item);
+      existing.state = groupState(existing.items);
+      return;
+    }
+    const group: ActivityTurnGroup = {
+      kind: "activity-group",
+      id: `activity:${key}`,
+      turnId: item.turnId,
+      seq: item.seq,
+      state: item.state,
+      items: [item],
+    };
+    groups.set(key, group);
+    timeline.push({ seq: item.seq, order, value: group });
+  });
+
+  for (const group of groups.values()) {
+    group.id = `${group.id}:${isActive(group.state) ? "live" : "settled"}`;
+  }
+
+  return timeline
+    .sort((left, right) => left.seq - right.seq || left.order - right.order)
+    .map((entry) => entry.value);
 }
 
 function stateLabel(state: ActivityItemState): string {
@@ -127,7 +176,15 @@ function toolArguments(item: Extract<ActivityItem, { kind: "tool" }>): Record<st
   return item.arguments === null ? {} : { input: item.arguments };
 }
 
-export function activityToThreadMessage(item: ActivityItem): ThreadMessageLike {
+export function activityToThreadMessage(item: ActivityTimelineItem): ThreadMessageLike {
+  if (item.kind === "activity-group") {
+    return {
+      id: item.id,
+      role: "assistant",
+      status: activityMessageStatus(item.state),
+      content: [{ type: "data", name: ACTIVITY_GROUP_DATA_PART, data: item }],
+    };
+  }
   const common = {
     id: item.id,
     ...(activityDate(item) ? { createdAt: activityDate(item) } : {}),
@@ -185,7 +242,7 @@ export function activityToThreadMessage(item: ActivityItem): ThreadMessageLike {
   };
 }
 
-function ExpandableActivity({
+function ActivityCard({
   item,
   label,
   icon,
@@ -196,30 +253,22 @@ function ExpandableActivity({
   icon: ReactNode;
   children: ReactNode;
 }) {
-  const command = useContext(ExpansionContext);
-  const shouldOpen = command.mode === "expand"
-    || (command.mode === "auto" && (isActive(item.state) || isFailure(item.state)));
-  const [open, setOpen] = useState(shouldOpen);
-  useEffect(() => setOpen(shouldOpen), [command.mode, command.revision, shouldOpen]);
   return (
-    <details
+    <section
       className={cn(
-        "group/activity w-full min-w-0 rounded-lg border bg-card text-card-foreground shadow-sm",
+        "w-full min-w-0 rounded-lg border bg-card text-card-foreground shadow-sm",
         item.state === "failed" && "border-red-500/35",
       )}
-      open={open}
-      onToggle={(event) => setOpen(event.currentTarget.open)}
       data-activity-kind={item.kind}
       data-activity-state={item.state}
     >
-      <summary className="flex min-w-0 cursor-pointer list-none items-center gap-2 px-3 py-2 text-xs marker:content-none [&::-webkit-details-marker]:hidden">
+      <div className="flex min-w-0 items-center gap-2 px-3 py-2 text-xs">
         <span className="shrink-0 text-muted-foreground">{icon}</span>
         <span className="min-w-0 flex-1 truncate font-medium">{label}</span>
         <ActivityState state={item.state} />
-        <span aria-hidden="true" className="text-muted-foreground transition-transform group-open/activity:rotate-90 motion-reduce:transition-none">›</span>
-      </summary>
+      </div>
       <div className="min-w-0 border-t px-3 py-2.5 text-xs leading-5">{children}</div>
-    </details>
+    </section>
   );
 }
 
@@ -236,14 +285,18 @@ function Pre({ children, label }: { children: string; label: string }) {
 function ActivityReasoningPart({ text, status, providerMetadata }: ReasoningMessagePartProps) {
   const item = itemFromMetadata(providerMetadata);
   if (!item || item.kind !== "reasoning") return <p className="whitespace-pre-wrap break-words">{text}</p>;
+  const provenance = item.exposure === "provider-exposed" ? "Provider reasoning" : "Transcript reasoning";
+  const label = item.label
+    ? `${provenance}: ${item.label}`
+    : item.reasoningKind === "summary" ? `${provenance} summary` : provenance;
   return (
-    <ExpandableActivity
+    <ActivityCard
       item={item}
-      label={item.label ?? (item.reasoningKind === "summary" ? "Reasoning summary" : "Reasoning")}
+      label={label}
       icon={<Brain className="size-3.5" />}
     >
       <p className={cn("whitespace-pre-wrap break-words [overflow-wrap:anywhere]", status.type === "running" && "text-foreground")}>{text || "Thinking…"}</p>
-    </ExpandableActivity>
+    </ActivityCard>
   );
 }
 
@@ -252,10 +305,14 @@ function ActivityToolPart(props: ToolCallMessagePartProps) {
   if (!item || item.kind !== "tool") {
     return <Pre label={props.toolName}>{props.result ? jsonForDisplay(props.result as never) : props.argsText}</Pre>;
   }
+  return <ActivityToolCard item={item} />;
+}
+
+function ActivityToolCard({ item }: { item: Extract<ActivityItem, { kind: "tool" }> }) {
   const argumentsText = jsonForDisplay(item.arguments);
   const resultText = jsonForDisplay(item.result);
   return (
-    <ExpandableActivity item={item} label={item.name || "Tool call"} icon={<Wrench className="size-3.5" />}>
+    <ActivityCard item={item} label={item.name || "Tool call"} icon={<Wrench className="size-3.5" />}>
       <div className="grid min-w-0 gap-2.5">
         <div className="flex flex-wrap items-center gap-2 text-[10px] uppercase tracking-wide text-muted-foreground">
           <span>{item.category.replaceAll("-", " ")}</span>
@@ -267,7 +324,7 @@ function ActivityToolPart(props: ToolCallMessagePartProps) {
         <Pre label="Result">{resultText}</Pre>
         <Pre label="Output">{item.output}</Pre>
       </div>
-    </ExpandableActivity>
+    </ActivityCard>
   );
 }
 
@@ -303,9 +360,9 @@ function PlanRow({ item }: { item: Extract<ActivityItem, { kind: "plan" }> }) {
 function LifecycleRow({ item }: { item: ActivityLifecycleItem }) {
   if (item.details) {
     return (
-      <ExpandableActivity item={item} label={item.title} icon={<Radio className="size-3.5" />}>
+      <ActivityCard item={item} label={item.title} icon={<Radio className="size-3.5" />}>
         <p className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{item.details}</p>
-      </ExpandableActivity>
+      </ActivityCard>
     );
   }
   return (
@@ -363,7 +420,7 @@ function UsageRow({ item }: { item: Extract<ActivityItem, { kind: "usage" }> }) 
 
 function FileChangeRow({ item }: { item: ActivityFileChangeItem }) {
   return (
-    <ExpandableActivity item={item} label={item.summary || `${item.changes.length} file changes`} icon={<FileDiff className="size-3.5" />}>
+    <ActivityCard item={item} label={item.summary || `${item.changes.length} file changes`} icon={<FileDiff className="size-3.5" />}>
       <div className="grid min-w-0 gap-3">
         {item.changes.map((change, index) => (
           <div key={`${change.path}:${index}`} className="min-w-0">
@@ -375,19 +432,19 @@ function FileChangeRow({ item }: { item: ActivityFileChangeItem }) {
           </div>
         ))}
       </div>
-    </ExpandableActivity>
+    </ActivityCard>
   );
 }
 
 function SubagentRow({ item }: { item: ActivitySubagentItem }) {
   return (
-    <ExpandableActivity item={item} label={item.name || "Subagent"} icon={<Users className="size-3.5" />}>
+    <ActivityCard item={item} label={item.name || "Subagent"} icon={<Users className="size-3.5" />}>
       <div className="grid min-w-0 gap-2">
         {item.description && <p className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{item.description}</p>}
         <Pre label="Output">{item.output}</Pre>
         {item.childItemIds.length > 0 && <p className="text-muted-foreground">{item.childItemIds.length} child activit{item.childItemIds.length === 1 ? "y" : "ies"}</p>}
       </div>
-    </ExpandableActivity>
+    </ActivityCard>
   );
 }
 
@@ -406,6 +463,70 @@ function AttentionRow({ item }: { item: Extract<ActivityItem, { kind: "attention
         </ul>
       )}
     </section>
+  );
+}
+
+function CommentaryRow({ item }: { item: Extract<ActivityItem, { kind: "message" }> }) {
+  const label = item.role === "assistant"
+    ? "Commentary"
+    : item.role === "system"
+      ? "System update"
+      : "Tool message";
+  return (
+    <section className="w-full min-w-0 rounded-lg border bg-muted/20 px-3 py-2.5 text-xs" data-activity-kind="message">
+      <div className="flex items-center gap-2">
+        <MessageSquareText className="size-3.5 shrink-0 text-muted-foreground" />
+        <span className="min-w-0 flex-1 font-medium">{item.label || label}</span>
+        <ActivityState state={item.state} />
+      </div>
+      <p className="mt-2 whitespace-pre-wrap break-words leading-5 [overflow-wrap:anywhere]">{item.text}</p>
+    </section>
+  );
+}
+
+function ActivityItemRow({ item }: { item: ActivityItem }) {
+  switch (item.kind) {
+    case "message": return <CommentaryRow item={item} />;
+    case "reasoning": return (
+      <ActivityReasoningPart
+        type="reasoning"
+        text={item.text}
+        status={activityPartStatus(item.state)}
+        providerMetadata={metadata(item)}
+      />
+    );
+    case "tool": return <ActivityToolCard item={item} />;
+    case "plan": return <PlanRow item={item} />;
+    case "lifecycle": return <LifecycleRow item={item} />;
+    case "queue": return <QueueRow item={item} />;
+    case "usage": return <UsageRow item={item} />;
+    case "file-change": return <FileChangeRow item={item} />;
+    case "subagent": return <SubagentRow item={item} />;
+    case "attention": return <AttentionRow item={item} />;
+  }
+}
+
+function ActivityTurnDisclosure({ group }: { group: ActivityTurnGroup }) {
+  const live = isActive(group.state);
+  const itemLabel = `${group.items.length} update${group.items.length === 1 ? "" : "s"}`;
+  return (
+    <details
+      className="group/turn w-full min-w-0 rounded-xl border bg-muted/20 shadow-sm"
+      open={live ? true : undefined}
+      data-activity-turn={group.turnId ?? group.id}
+      data-activity-state={group.state}
+    >
+      <summary className="flex min-w-0 cursor-pointer list-none items-center gap-2 px-3 py-2.5 text-xs marker:content-none [&::-webkit-details-marker]:hidden">
+        <Brain className={cn("size-3.5 shrink-0 text-muted-foreground", live && "animate-pulse motion-reduce:animate-none")} />
+        <span className="font-medium">Activity</span>
+        <span className="min-w-0 flex-1 truncate text-muted-foreground">{itemLabel}</span>
+        <ActivityState state={group.state} />
+        <span aria-hidden="true" className="text-muted-foreground transition-transform group-open/turn:rotate-90 motion-reduce:transition-none">›</span>
+      </summary>
+      <div className="grid min-w-0 gap-2 border-t p-2.5">
+        {group.items.map((item) => <ActivityItemRow key={item.id} item={item} />)}
+      </div>
+    </details>
   );
 }
 
@@ -434,6 +555,9 @@ export function ActivityMessageParts() {
           case "tool-call":
             return part.toolUI ?? <ActivityToolPart {...part} />;
           case "data":
+            if (part.name === ACTIVITY_GROUP_DATA_PART) {
+              return <ActivityTurnDisclosure group={part.data as ActivityTurnGroup} />;
+            }
             return part.name === ACTIVITY_DATA_PART
               ? <ActivityDataPart {...part} data={part.data as ActivityItem} />
               : part.dataRendererUI;

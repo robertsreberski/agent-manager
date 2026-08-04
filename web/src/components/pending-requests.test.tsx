@@ -51,7 +51,11 @@ function sessionWithQuestions(): SessionView {
 }
 
 describe("PendingRequests", () => {
-  it("bounds pending forms in their own mobile-scrollable tray", () => {
+  function reviewRequests() {
+    fireEvent.click(screen.getByRole("button", { name: /Needs you/u }));
+  }
+
+  it("keeps attention compact until its responsive sheet is opened", () => {
     render(
       <PendingRequests
         session={sessionWithQuestions()}
@@ -61,13 +65,14 @@ describe("PendingRequests", () => {
       />,
     );
 
-    expect(screen.getByRole("region", { name: "Pending requests" })).toHaveClass(
-      "max-h-[min(34dvh,18rem)]",
-      "shrink-0",
-      "overflow-y-auto",
-      "overscroll-contain",
-    );
-    expect(screen.getByText("1 waiting")).toBeInTheDocument();
+    const bar = screen.getByRole("region", { name: "Pending requests" });
+    expect(bar).toHaveClass("shrink-0");
+    expect(screen.queryByText("Which database?")).not.toBeInTheDocument();
+
+    reviewRequests();
+    const sheet = screen.getByRole("dialog", { name: "Needs you" });
+    expect(sheet).toHaveClass("md:inset-y-0", "md:w-[min(92vw,42rem)]");
+    expect(screen.getByRole("group", { name: /Which database\?/u })).toBeInTheDocument();
   });
 
   it("submits every exact provider question atomically", async () => {
@@ -80,6 +85,8 @@ describe("PendingRequests", () => {
         onRespond={onRespond}
       />,
     );
+
+    reviewRequests();
 
     fireEvent.click(screen.getByRole("button", { name: "SQLite" }));
     fireEvent.click(screen.getByRole("button", { name: "Backups" }));
@@ -115,6 +122,8 @@ describe("PendingRequests", () => {
       />,
     );
 
+    reviewRequests();
+
     fireEvent.click(screen.getByRole("button", { name: "SQLite" }));
     fireEvent.change(screen.getByPlaceholderText("Add context (optional)"), {
       target: { value: "Enable WAL mode" },
@@ -149,6 +158,8 @@ describe("PendingRequests", () => {
         onRespond={onRespond}
       />,
     );
+
+    reviewRequests();
 
     expect(screen.getByText(/cannot be represented safely/i)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /allow once/i })).not.toBeInTheDocument();

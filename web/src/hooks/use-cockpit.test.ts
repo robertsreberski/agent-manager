@@ -7,7 +7,11 @@ import {
   autoAcquireCreatedSession,
   BROWSER_CLIENT_ID_STORAGE_KEY,
   getOrCreateBrowserClientId,
+  mutationsAreReady,
+  sensitiveBoundaryStatus,
 } from "./use-cockpit";
+import { ApiError } from "../lib/api";
+import { BrowserSessionError } from "../lib/auth";
 
 function lease(token: string, seconds = 300): ControlLease {
   return {
@@ -172,5 +176,22 @@ describe("getOrCreateBrowserClientId", () => {
     expect(getOrCreateBrowserClientId(secondStorage, () => "web-second-tab-1234")).toBe(
       "web-second-tab-1234",
     );
+  });
+});
+
+describe("cockpit connectivity guards", () => {
+  it("allows mutations only with an authenticated, open, authoritative snapshot", () => {
+    expect(mutationsAreReady(true, "open", false, "online")).toBe(true);
+    expect(mutationsAreReady(true, "retrying", false, "online")).toBe(false);
+    expect(mutationsAreReady(true, "open", true, "online")).toBe(false);
+    expect(mutationsAreReady(false, "open", false, "online")).toBe(false);
+    expect(mutationsAreReady(true, "open", false, "offline")).toBe(false);
+  });
+
+  it("recognizes API and browser-session privacy boundaries", () => {
+    expect(sensitiveBoundaryStatus(new ApiError("expired", 401))).toBe(401);
+    expect(sensitiveBoundaryStatus(new BrowserSessionError("locked", "locked", 423))).toBe(423);
+    expect(sensitiveBoundaryStatus(new ApiError("conflict", 409))).toBeNull();
+    expect(sensitiveBoundaryStatus(new TypeError("offline"))).toBeNull();
   });
 });

@@ -1,8 +1,9 @@
 import { useState } from "react";
-import { AlertTriangle, Check, CircleHelp, ShieldQuestion, X } from "lucide-react";
+import { AlertTriangle, Check, ChevronRight, CircleHelp, ShieldQuestion, X } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "./ui/alert";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "./ui/sheet";
 import { cn } from "../lib/utils";
 import type { AttentionQuestion, AttentionRequest, RequestResponse, SessionView } from "../types";
 
@@ -228,27 +229,55 @@ export function PendingRequests({
   busy: boolean;
   onRespond: (requestId: string, response: RequestResponse) => Promise<void>;
 }) {
+  const [open, setOpen] = useState(false);
   if (requests.length === 0) return null;
+  const first = requests[0];
+  const summary = requests.length === 1
+    ? first?.title || first?.summary || "This session needs your input."
+    : `${requests.length} requests are waiting.`;
   return (
-    <section
-      className="max-h-[min(34dvh,18rem)] shrink-0 overflow-y-auto overscroll-contain border-b bg-muted/20 [scrollbar-gutter:stable] sm:max-h-[min(42dvh,22rem)] md:max-h-[min(36dvh,28rem)]"
-      aria-label="Pending requests"
-    >
-      <div className="sticky top-0 z-10 flex items-center justify-between gap-3 border-b bg-background/95 px-4 py-2 backdrop-blur md:px-6">
-        <h3 className="text-xs font-semibold">Pending requests</h3>
-        <span className="text-[11px] text-muted-foreground">{requests.length} waiting</span>
-      </div>
-      <div className="grid gap-2 px-3 py-3 sm:px-4 md:px-6">
-        {requests.map((request, index) => (
-          <PendingRequestCard
-            key={request.id ?? `${request.kind}-${index}`}
-            request={request}
-            disabled={!writable || !session.control.capabilities.includes("respond")}
-            busy={busy}
-            onRespond={onRespond}
-          />
-        ))}
-      </div>
-    </section>
+    <>
+      <section className="shrink-0 border-b bg-amber-500/[0.06]" aria-label="Pending requests">
+        <button
+          type="button"
+          className="flex min-h-11 w-full items-center gap-2.5 px-4 py-2 text-left outline-none hover:bg-amber-500/[0.08] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring md:px-6"
+          onClick={() => setOpen(true)}
+          aria-haspopup="dialog"
+        >
+          <AlertTriangle className="size-4 shrink-0 text-amber-700 dark:text-amber-300" />
+          <span className="shrink-0 text-sm font-semibold">Needs you</span>
+          <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{summary}</span>
+          <span className="shrink-0 rounded-full border border-amber-500/30 bg-background px-2 py-0.5 text-[11px] font-medium">
+            {requests.length}
+          </span>
+          <span className="hidden shrink-0 text-xs font-medium sm:inline">Review</span>
+          <ChevronRight className="size-4 shrink-0 text-muted-foreground" />
+        </button>
+      </section>
+      <Sheet open={open} onOpenChange={setOpen}>
+        <SheetContent
+          side="bottom"
+          className="gap-0 overflow-hidden p-0 md:inset-y-0 md:left-auto md:right-0 md:h-full md:max-h-none md:w-[min(92vw,42rem)] md:border-l md:border-t-0"
+        >
+          <SheetHeader className="border-b px-5 py-4">
+            <SheetTitle>Needs you</SheetTitle>
+            <SheetDescription>
+              {requests.length === 1 ? "Review and answer this request." : `Review and answer ${requests.length} waiting requests.`}
+            </SheetDescription>
+          </SheetHeader>
+          <div className="grid min-h-0 flex-1 gap-3 overflow-y-auto overscroll-contain px-4 py-4 [scrollbar-gutter:stable] sm:px-5">
+            {requests.map((request, index) => (
+              <PendingRequestCard
+                key={request.id ?? `${request.kind}-${index}`}
+                request={request}
+                disabled={!writable || !session.control.capabilities.includes("respond")}
+                busy={busy}
+                onRespond={onRespond}
+              />
+            ))}
+          </div>
+        </SheetContent>
+      </Sheet>
+    </>
   );
 }
