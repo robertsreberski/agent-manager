@@ -79,6 +79,7 @@ function managedSession(overrides: Partial<SessionView> = {}): SessionView {
 
 function inertAdapter(
   getSettingsOptions?: ProviderControlAdapter["getSettingsOptions"],
+  getCreateSettingsOptions?: ProviderControlAdapter["getCreateSettingsOptions"],
 ): ProviderControlAdapter {
   return {
     async createSession() {
@@ -88,6 +89,7 @@ function inertAdapter(
       return { status: "succeeded" };
     },
     ...(getSettingsOptions ? { getSettingsOptions } : {}),
+    ...(getCreateSettingsOptions ? { getCreateSettingsOptions } : {}),
   };
 }
 
@@ -171,6 +173,266 @@ test("serves an authenticated Codex catalog with provider-declared model efforts
     }],
   });
   assert.equal(calls, 1);
+});
+
+test("serves a Codex draft catalog without any session", async (t) => {
+  let calls = 0;
+  const codex = inertAdapter(undefined, async () => {
+    calls += 1;
+    return {
+      source: "provider-api",
+      models: [{
+        value: "gpt-codex",
+        label: "Codex",
+        description: "Live provider catalog",
+        isDefault: true,
+        defaultEffort: "high",
+        efforts: ["medium", "high", "xhigh"],
+      }],
+    };
+  });
+  const backend = await createAgentManagerServer({
+    discovery: false,
+    staticDir: false,
+    adapters: { codex },
+    initialSessions: [],
+  });
+  t.after(() => backend.close());
+  await backend.app.ready();
+
+  const unauthenticated = await backend.app.inject({
+    method: "GET",
+    url: "/api/v1/providers/codex/settings-options?hostId=local",
+    headers: { host },
+  });
+  assert.equal(unauthenticated.statusCode, 401);
+
+  const cookie = await authenticatedCookie(backend);
+  const local = await backend.app.inject({
+    method: "GET",
+    url: "/api/v1/providers/codex/settings-options?hostId=local",
+    headers: { host, cookie },
+  });
+  assert.equal(local.statusCode, 200, local.body);
+  assert.deepEqual(local.json(), {
+    available: true,
+    source: "provider-api",
+    models: [{
+      value: "gpt-codex",
+      label: "Codex",
+      description: "Live provider catalog",
+      isDefault: true,
+      defaultEffort: "high",
+      efforts: ["medium", "high", "xhigh"],
+    }],
+  });
+
+  assert.equal(calls, 1);
+  assert.deepEqual(backend.state.list(), []);
+});
+
+test("validates host identity before reporting remote draft settings as unavailable", async (t) => {
+  let calls = 0;
+  const backend = await createAgentManagerServer({
+    discovery: false,
+    staticDir: false,
+    adapters: { codex: inertAdapter(undefined, async () => {
+      calls += 1;
+      return { source: "provider-api", models: [] };
+    }) },
+    initialSessions: [],
+  });
+  t.after(() => backend.close());
+  await backend.app.ready();
+  const cookie = await authenticatedCookie(backend);
+
+  const unknown = await backend.app.inject({
+    method: "GET",
+    url: "/api/v1/providers/codex/settings-options?hostId=unknown-host",
+    headers: { host, cookie },
+  });
+  assert.equal(unknown.statusCode, 404, unknown.body);
+  assert.deepEqual(unknown.json(), {
+    error: { code: "HOST_NOT_FOUND", message: "host is not configured" },
+  });
+
+  backend.database.addHost({
+    id: "build-host",
+    label: "Build host",
+    kind: "ssh",
+    sshTarget: "owner@build-host",
+  });
+  const configured = await backend.app.inject({
+    method: "GET",
+    url: "/api/v1/providers/codex/settings-options?hostId=build-host",
+    headers: { host, cookie },
+  });
+  assert.equal(configured.statusCode, 200, configured.body);
+  assert.deepEqual(configured.json(), {
+    available: false,
+    reason: "remote-host",
+    models: [],
+  });
+  assert.equal(calls, 0, "remote draft discovery must not consult the local provider");
+});
+
+test("does not borrow a manager-owned session for legacy draft catalogs", async (t) => {
+  let selectedSessionId: string | null = null;
+  const claude = inertAdapter(async (session) => {
+    selectedSessionId = session.id;
+    return {
+      source: "provider-api",
+      models: [{ value: "sonnet", label: "Sonnet", description: "Balanced" }],
+    };
+  });
+  const remote = managedSession({
+    id: "build-host:claude:managed-remote",
+    providerThreadId: "managed-remote",
+    providerTreeId: "managed-remote",
+    hostId: "build-host",
+    hostLabel: "Build host",
+  });
+  const foreign = managedSession({
+    id: "local:claude:foreign",
+    providerThreadId: "foreign",
+    providerTreeId: "foreign",
+    control: {
+      plane: "resume-only",
+      authority: "foreign",
+      capabilities: ["set-model"],
+      withheld: [],
+    },
+  });
+  const managed = managedSession();
+  const backend = await createAgentManagerServer({
+    discovery: false,
+    staticDir: false,
+    adapters: { claude },
+    initialSessions: [remote, foreign, managed],
+  });
+  t.after(() => backend.close());
+  await backend.app.ready();
+  const cookie = await authenticatedCookie(backend);
+
+  const response = await backend.app.inject({
+    method: "GET",
+    url: "/api/v1/providers/claude/settings-options?hostId=local",
+    headers: { host, cookie },
+  });
+  assert.equal(response.statusCode, 200, response.body);
+  assert.deepEqual(response.json(), {
+    available: false,
+    reason: "unsupported-provider",
+    models: [],
+  });
+  assert.equal(selectedSessionId, null);
+});
+
+test("distinguishes unavailable providers from unsupported draft catalogs", async (t) => {
+  const backend = await createAgentManagerServer({
+    discovery: false,
+    staticDir: false,
+    adapters: { claude: inertAdapter() },
+    initialSessions: [],
+  });
+  t.after(() => backend.close());
+  await backend.app.ready();
+  const cookie = await authenticatedCookie(backend);
+
+  const unavailable = await backend.app.inject({
+    method: "GET",
+    url: "/api/v1/providers/codex/settings-options?hostId=local",
+    headers: { host, cookie },
+  });
+  assert.equal(unavailable.statusCode, 200, unavailable.body);
+  assert.deepEqual(unavailable.json(), {
+    available: false,
+    reason: "provider-unavailable",
+    models: [],
+  });
+
+  const unsupported = await backend.app.inject({
+    method: "GET",
+    url: "/api/v1/providers/claude/settings-options?hostId=local",
+    headers: { host, cookie },
+  });
+  assert.equal(unsupported.statusCode, 200, unsupported.body);
+  assert.deepEqual(unsupported.json(), {
+    available: false,
+    reason: "unsupported-provider",
+    models: [],
+  });
+});
+
+test("degrades a synchronously failing direct draft catalog", async (t) => {
+  const backend = await createAgentManagerServer({
+    discovery: false,
+    staticDir: false,
+    adapters: {
+      codex: inertAdapter(undefined, () => {
+        throw new Error("provider process is unavailable");
+      }),
+    },
+    initialSessions: [],
+  });
+  t.after(() => backend.close());
+  await backend.app.ready();
+  const cookie = await authenticatedCookie(backend);
+
+  const response = await backend.app.inject({
+    method: "GET",
+    url: "/api/v1/providers/codex/settings-options?hostId=local",
+    headers: { host, cookie },
+  });
+  assert.equal(response.statusCode, 200, response.body);
+  assert.deepEqual(response.json(), {
+    available: false,
+    reason: "provider-unavailable",
+    models: [],
+  });
+});
+
+test("aborts and releases a provider draft lookup at its deadline", async (t) => {
+  let active = false;
+  let cancelled = false;
+  const backend = await createAgentManagerServer({
+    discovery: false,
+    staticDir: false,
+    providerSettingsOptionsTimeoutMs: 10,
+    adapters: {
+      codex: inertAdapter(undefined, async (requestContext) => {
+        active = true;
+        return await new Promise<never>((_resolve, reject) => {
+          const abort = (): void => {
+            cancelled = true;
+            active = false;
+            const reason = requestContext.signal.reason;
+            reject(reason instanceof Error ? reason : new Error("catalog cancelled"));
+          };
+          requestContext.signal.addEventListener("abort", abort, { once: true });
+          if (requestContext.signal.aborted) abort();
+        });
+      }),
+    },
+    initialSessions: [],
+  });
+  t.after(() => backend.close());
+  await backend.app.ready();
+  const cookie = await authenticatedCookie(backend);
+
+  const response = await backend.app.inject({
+    method: "GET",
+    url: "/api/v1/providers/codex/settings-options?hostId=local",
+    headers: { host, cookie },
+  });
+  assert.equal(response.statusCode, 200, response.body);
+  assert.deepEqual(response.json(), {
+    available: false,
+    reason: "provider-unavailable",
+    models: [],
+  });
+  assert.equal(cancelled, true, "the provider receives the deadline abort");
+  assert.equal(active, false, "the provider releases its in-flight lookup");
 });
 
 test("reports remote, foreign, unsupported, and failed catalogs as explicitly unavailable", async (t) => {

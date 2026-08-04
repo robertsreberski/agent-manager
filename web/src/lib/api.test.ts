@@ -434,6 +434,84 @@ describe("CockpitApi", () => {
     );
   });
 
+  it("loads draft model choices directly from the provider on the requested host", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      available: true,
+      source: "provider-api",
+      models: [{
+        value: "gpt-codex",
+        label: "Codex",
+        description: "Balanced",
+        isDefault: true,
+        defaultEffort: "medium",
+        efforts: ["low", "medium", "high"],
+      }],
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    const api = new CockpitApi({ csrfToken: null, actor: "Local" });
+
+    await expect(api.providerSettingsOptions("codex", "build/one")).resolves.toEqual({
+      available: true,
+      source: "provider-api",
+      models: [{
+        value: "gpt-codex",
+        label: "Codex",
+        description: "Balanced",
+        isDefault: true,
+        defaultEffort: "medium",
+        efforts: ["low", "medium", "high"],
+      }],
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/providers/codex/settings-options?hostId=build%2Fone",
+      expect.anything(),
+    );
+  });
+
+  it("accepts the explicit remote-host result and rejects malformed provider catalogs", async () => {
+    const responses = [
+      { available: false, reason: "remote-host", models: [] },
+      { available: false, reason: "remote-host", models: [{ value: "guess", label: "Guess", description: null }] },
+    ];
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(responses.shift()), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    })));
+    const api = new CockpitApi({ csrfToken: null, actor: "Local" });
+
+    await expect(api.providerSettingsOptions("claude", "remote")).resolves.toEqual({
+      available: false,
+      reason: "remote-host",
+      models: [],
+    });
+    await expect(api.providerSettingsOptions("claude", "remote")).rejects.toThrow(
+      "invalid provider settings options response",
+    );
+  });
+
+  it("rejects unavailability reasons returned by the wrong settings-options route", async () => {
+    const responses = [
+      { available: false, reason: "remote-host", models: [] },
+      { available: false, reason: "remote-session", models: [] },
+      { available: false, reason: "not-manager-owned", models: [] },
+    ];
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(responses.shift()), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    })));
+    const api = new CockpitApi({ csrfToken: null, actor: "Local" });
+
+    await expect(api.settingsOptions("remote:codex:thread-1")).rejects.toThrow(
+      "invalid session settings options response",
+    );
+    await expect(api.providerSettingsOptions("codex", "local")).rejects.toThrow(
+      "invalid provider settings options response",
+    );
+    await expect(api.providerSettingsOptions("claude", "local")).rejects.toThrow(
+      "invalid provider settings options response",
+    );
+  });
+
   it("keeps unavailable catalogs explicit and rejects fallback-shaped data", async () => {
     const responses = [
       { available: false, reason: "unsupported-provider", models: [] },

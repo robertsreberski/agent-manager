@@ -63,9 +63,9 @@ import { useSessionActivity } from "./hooks/use-session-activity";
 import { useTodoDetails } from "./hooks/use-todo-details";
 import { hasActiveModalLayer, useModalFocus } from "./hooks/use-modal-focus";
 import { toCockpitSessionView } from "./lib/cockpit-view";
-import type { SessionSettingsOptionsResponse, SetupReadModel, TranscriptSearchMatch } from "./lib/api";
+import type { ProviderSettingsOptionsResponse, SessionSettingsOptionsResponse, SetupReadModel, TranscriptSearchMatch } from "./lib/api";
 import { isTypingTarget } from "./lib/shortcuts";
-import type { ReasoningEffort, SessionView } from "./types";
+import type { HostOption, ReasoningEffort, SessionView } from "./types";
 
 const FILTERS = [
   ["all", "All"],
@@ -105,20 +105,34 @@ function workspaceForColumn(column: BoardColumn): DraftWorkspace | undefined {
   return path ? { hostId: column.hostId, path } : undefined;
 }
 
-function settingsUnavailableMessage(reason: Extract<SessionSettingsOptionsResponse, { available: false }>["reason"]): string {
+export function settingsUnavailableMessage(
+  reason: Extract<SessionSettingsOptionsResponse | ProviderSettingsOptionsResponse, { available: false }>["reason"],
+): string {
   switch (reason) {
     case "remote-session": return "Model choices are unavailable for remote sessions.";
+    case "remote-host": return "Model choices are unavailable when creating a thread on a remote host.";
     case "not-manager-owned": return "Model choices stay in the CLI that owns this session.";
     case "unsupported-provider": return "This provider does not expose a live model catalog.";
     case "provider-unavailable": return "The provider model catalog is temporarily unavailable.";
   }
 }
 
+export function effectiveDraftHostId(
+  draft: Pick<DraftSession, "workspace"> | null,
+  hosts: readonly Pick<HostOption, "id" | "kind">[],
+): string | null {
+  if (!draft) return null;
+  return draft.workspace?.hostId
+    ?? hosts.find((host) => host.kind === "local")?.id
+    ?? hosts[0]?.id
+    ?? "local";
+}
+
 /** Codex effort support is model-specific in the pinned provider catalog. */
 export function codexCatalogEfforts(
   provider: SessionView["provider"],
   model: string | null,
-  response: SessionSettingsOptionsResponse | null,
+  response: SessionSettingsOptionsResponse | ProviderSettingsOptionsResponse | null,
 ): readonly ReasoningEffort[] | undefined {
   if (provider !== "codex" || !response?.available) return undefined;
   const option = model
@@ -370,10 +384,11 @@ export default function App() {
   >(null);
   const [draftSettingsOptions, setDraftSettingsOptions] = useState<{
     provider: DraftSession["provider"];
-    sourceId: string | null;
-    state: "unavailable" | "loading" | "loaded" | "error";
-    response: SessionSettingsOptionsResponse | null;
+    hostId: string;
+    state: "loading" | "loaded" | "error";
+    response: ProviderSettingsOptionsResponse | null;
   } | null>(null);
+  const draftSettingsRequest = useRef(0);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [notificationSettingsOpen, setNotificationSettingsOpen] = useState(false);
   const [notificationPreferences, setNotificationPreferences] = useState<ClientNotificationPreferences>(loadNotificationPreferences);
@@ -434,12 +449,7 @@ export default function App() {
   const dispatchDraft = useCallback((action: DraftAction) => setDraft((current) => current ? draftReducer(current, action) : current), []);
   const remoteHostIds = useMemo(() => new Set(cockpit.hosts.filter((host) => host.kind === "ssh").map((host) => host.id)), [cockpit.hosts]);
   const draftProvider = draft?.provider ?? null;
-  const draftCatalogSource = useMemo(() => draftProvider === null ? null : cockpit.sessions.find((session) => (
-    session.provider === draftProvider
-      && !remoteHostIds.has(session.hostId)
-      && session.control.authority === "manager"
-      && session.control.capabilities.includes("set-model")
-  )) ?? null, [cockpit.sessions, draftProvider, remoteHostIds]);
+  const draftHostId = effectiveDraftHostId(draft, cockpit.hosts);
   const headerHosts = useMemo(() => cockpit.hosts.map((host) => ({
     ...host,
     count: cockpit.sessions.filter((session) => session.hostId === host.id).length,
@@ -479,24 +489,25 @@ export default function App() {
   const selectedCanSetModel = Boolean(selected?.control.capabilities.includes("set-model"));
 
   useEffect(() => {
-    if (draftProvider === null) {
+    const request = ++draftSettingsRequest.current;
+    if (draftProvider === null || draftHostId === null) {
       setDraftSettingsOptions(null);
       return;
     }
-    const sourceId = draftCatalogSource?.id ?? null;
-    if (sourceId === null) {
-      setDraftSettingsOptions({ provider: draftProvider, sourceId: null, state: "unavailable", response: null });
-      return;
-    }
-    let cancelled = false;
-    setDraftSettingsOptions({ provider: draftProvider, sourceId, state: "loading", response: null });
-    void cockpit.loadSettingsOptions(sourceId).then((response) => {
-      if (!cancelled) setDraftSettingsOptions({ provider: draftProvider, sourceId, state: "loaded", response });
+    setDraftSettingsOptions({ provider: draftProvider, hostId: draftHostId, state: "loading", response: null });
+    void cockpit.loadProviderSettingsOptions(draftProvider, draftHostId).then((response) => {
+      if (draftSettingsRequest.current === request) {
+        setDraftSettingsOptions({ provider: draftProvider, hostId: draftHostId, state: "loaded", response });
+      }
     }).catch(() => {
-      if (!cancelled) setDraftSettingsOptions({ provider: draftProvider, sourceId, state: "error", response: null });
+      if (draftSettingsRequest.current === request) {
+        setDraftSettingsOptions({ provider: draftProvider, hostId: draftHostId, state: "error", response: null });
+      }
     });
-    return () => { cancelled = true; };
-  }, [cockpit.loadSettingsOptions, draftCatalogSource?.id, draftProvider]);
+    return () => {
+      if (draftSettingsRequest.current === request) draftSettingsRequest.current += 1;
+    };
+  }, [cockpit.loadProviderSettingsOptions, draftHostId, draftProvider]);
 
   useEffect(() => {
     if (!selected || !selectedCanSetModel) {
@@ -525,10 +536,14 @@ export default function App() {
   }, [selected?.id, selected?.model.value, selected?.provider, settingsOptions]);
   const draftModelCatalog = useMemo(() => {
     if (draftProvider === null) return { models: [], status: null, effortOptions: undefined };
-    if (!draftSettingsOptions || draftSettingsOptions.provider !== draftProvider || draftSettingsOptions.sourceId !== (draftCatalogSource?.id ?? null)) {
-      return { models: [], status: "Finding a live provider model catalog…", effortOptions: undefined };
+    if (draftHostId === null) {
+      return { models: [], status: "Choose a host to load its provider model catalog.", effortOptions: undefined };
     }
-    if (draftSettingsOptions.state === "unavailable") return { models: [], status: `No local manager-owned ${draftProvider} session currently exposes a model catalog.`, effortOptions: undefined };
+    if (!draftSettingsOptions
+      || draftSettingsOptions.provider !== draftProvider
+      || draftSettingsOptions.hostId !== draftHostId) {
+      return { models: [], status: "Loading the provider model catalog…", effortOptions: undefined };
+    }
     if (draftSettingsOptions.state === "loading") return { models: [], status: "Loading the provider model catalog…", effortOptions: undefined };
     if (draftSettingsOptions.state === "error") return { models: [], status: "The provider model catalog could not be loaded.", effortOptions: undefined };
     const response = draftSettingsOptions.response;
@@ -536,7 +551,7 @@ export default function App() {
     return response.available
       ? { models: response.models, status: null, effortOptions: codexCatalogEfforts(draftProvider, draft?.model ?? null, response) }
       : { models: [], status: settingsUnavailableMessage(response.reason), effortOptions: undefined };
-  }, [draft?.model, draftCatalogSource?.id, draftProvider, draftSettingsOptions]);
+  }, [draft?.model, draftHostId, draftProvider, draftSettingsOptions]);
 
   useEffect(() => {
     const query = paletteQuery.trimStart();

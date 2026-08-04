@@ -398,6 +398,78 @@ test("reads the bounded Codex model catalog with per-model effort truth", async 
   await adapter.dispose();
 });
 
+test("reads draft settings through the provider bridge without creating a session", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("model/list", () => ({
+    data: [modelCatalogEntry({
+      model: "gpt-codex",
+      displayName: "Codex",
+      description: "Live provider catalog",
+      isDefault: true,
+      efforts: ["medium", "high", "xhigh"],
+      defaultEffort: "high",
+    })],
+    nextCursor: null,
+  }));
+  const bridge = new CodexProviderBridge({
+    adapter,
+    resolveWorkspace: () => "/workspace",
+  });
+
+  assert.deepEqual(await bridge.getCreateSettingsOptions({
+    actor: { id: "local", kind: "local", displayName: "Local user" },
+    requestId: "draft-settings",
+    signal: new AbortController().signal,
+    workspace: null,
+  }), {
+    source: "provider-api",
+    models: [{
+      value: "gpt-codex",
+      label: "Codex",
+      description: "Live provider catalog",
+      isDefault: true,
+      defaultEffort: "high",
+      efforts: ["medium", "high", "xhigh"],
+    }],
+  });
+  assert.deepEqual(adapter.listThreadStates(), []);
+  assert.equal(methodMessages(transport, "model/list").length, 1);
+  assert.equal(methodMessages(transport, "thread/start").length, 0);
+  assert.equal(methodMessages(transport, "thread/resume").length, 0);
+
+  bridge.dispose();
+  await adapter.dispose();
+});
+
+test("cancels and releases an in-flight draft model/list RPC", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  let finishCatalog!: (value: JsonValue) => void;
+  transport.handlers.set("model/list", () => new Promise<JsonValue>((resolve) => {
+    finishCatalog = resolve;
+  }));
+  const bridge = new CodexProviderBridge({
+    adapter,
+    resolveWorkspace: () => "/workspace",
+  });
+  const controller = new AbortController();
+  const lookup = bridge.getCreateSettingsOptions({
+    actor: { id: "local", kind: "local", displayName: "Local user" },
+    requestId: "cancel-draft-settings",
+    signal: controller.signal,
+    workspace: null,
+  });
+  await eventually(() => assert.equal(methodMessages(transport, "model/list").length, 1));
+  controller.abort(new Error("draft settings cancelled"));
+  // The fake App Server is still holding its response. Rejection here can only
+  // come from the signal removing the client's pending model/list call.
+  await assert.rejects(lookup, /draft settings cancelled/u);
+
+  finishCatalog({ data: [], nextCursor: null });
+  await new Promise((resolve) => setImmediate(resolve));
+  bridge.dispose();
+  await adapter.dispose();
+});
+
 test("fails closed on malformed Codex model effort metadata", async () => {
   const { adapter, transport } = await initializedAdapter();
   transport.handlers.set("model/list", () => ({

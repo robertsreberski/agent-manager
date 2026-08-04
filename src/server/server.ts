@@ -138,6 +138,15 @@ const transcriptSearchQuerySchema = z.object({
 const eventsQuerySchema = z.object({
   clientId: z.string().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/).optional(),
 }).strict();
+const providerSettingsOptionsParamsSchema = z.object({
+  provider: z.enum(["codex", "claude"]),
+}).strict();
+const providerSettingsOptionsQuerySchema = z.object({
+  hostId: z.string().min(1).max(128).refine(
+    (value) => !/[\u0000-\u001f\u007f]/u.test(value),
+    "host ID must not contain control characters",
+  ),
+}).strict();
 const bootstrapSchema = z.object({ secret: z.string().min(32).max(256) }).strict();
 
 const NO_STORE = "no-store";
@@ -244,6 +253,8 @@ export interface AgentManagerServerOptions {
   shutdownTimeoutMs?: number;
   /** Test/embedder seam; production account reads stay under three seconds. */
   sessionFactsTimeoutMs?: number;
+  /** Test/embedder seam; production provider draft reads stay under three seconds. */
+  providerSettingsOptionsTimeoutMs?: number;
   /** Configured owner SSH nodes. Browser input can only select these stable IDs. */
   remoteHosts?: readonly RemoteHostDefinition[];
   sshExecutable?: string;
@@ -322,6 +333,49 @@ function bounded<T>(promise: Promise<T>, timeoutMs: number, label: string): Prom
       },
     );
   });
+}
+
+async function boundedProviderLookup<T>(
+  start: (signal: AbortSignal) => Promise<T>,
+  parentSignal: AbortSignal,
+  timeoutMs: number,
+  label: string,
+): Promise<T> {
+  const controller = new AbortController();
+  const abortFromParent = (): void => controller.abort(parentSignal.reason);
+  if (parentSignal.aborted) abortFromParent();
+  else parentSignal.addEventListener("abort", abortFromParent, { once: true });
+  const timer = setTimeout(() => {
+    controller.abort(new Error(`${label} timed out`));
+  }, timeoutMs);
+  timer.unref();
+
+  try {
+    controller.signal.throwIfAborted();
+    return await new Promise<T>((resolve, reject) => {
+      let settled = false;
+      const finish = (complete: () => void): void => {
+        if (settled) return;
+        settled = true;
+        controller.signal.removeEventListener("abort", abort);
+        complete();
+      };
+      const abort = (): void => finish(() => {
+        const reason = controller.signal.reason;
+        reject(reason instanceof Error ? reason : new Error(`${label} was cancelled`));
+      });
+      controller.signal.addEventListener("abort", abort, { once: true });
+      Promise.resolve()
+        .then(() => start(controller.signal))
+        .then(
+          (value) => finish(() => resolve(value)),
+          (error: unknown) => finish(() => reject(error)),
+        );
+    });
+  } finally {
+    clearTimeout(timer);
+    parentSignal.removeEventListener("abort", abortFromParent);
+  }
 }
 
 function actionRecord(
@@ -1365,6 +1419,42 @@ export async function createAgentManagerServer(
       generation: current.generation,
       todo: stable ? todo : null,
     });
+  });
+
+  app.get("/api/v1/providers/:provider/settings-options", {
+    config: { rateLimit: { max: 60, timeWindow: "1 minute" } },
+  }, async (request) => {
+    const { provider } = providerSettingsOptionsParamsSchema.parse(request.params);
+    const { hostId } = providerSettingsOptionsQuerySchema.parse(request.query);
+    if (hostId !== "local") {
+      const host = database.getHost(hostId);
+      if (!host || host.kind !== "ssh") {
+        throw new ApiError(404, "HOST_NOT_FOUND", "host is not configured");
+      }
+      return { available: false as const, reason: "remote-host" as const, models: [] };
+    }
+
+    const adapter = adapters[provider];
+    if (!adapter) {
+      return { available: false as const, reason: "provider-unavailable" as const, models: [] };
+    }
+    if (!adapter.getCreateSettingsOptions) {
+      return { available: false as const, reason: "unsupported-provider" as const, models: [] };
+    }
+    const getCreateSettingsOptions = adapter.getCreateSettingsOptions.bind(adapter);
+
+    try {
+      const requestContext = context(request);
+      const settingsOptions = sessionSettingsOptionsSchema.parse(await boundedProviderLookup(
+        (signal) => getCreateSettingsOptions({ ...requestContext, signal }),
+        requestContext.signal,
+        Math.max(1, options.providerSettingsOptionsTimeoutMs ?? SETTINGS_OPTIONS_TIMEOUT_MS),
+        "provider draft settings lookup",
+      ));
+      return { available: true as const, ...settingsOptions };
+    } catch {
+      return { available: false as const, reason: "provider-unavailable" as const, models: [] };
+    }
   });
 
   app.get("/api/v1/sessions/:id/settings-options", {

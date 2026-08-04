@@ -225,7 +225,7 @@ export interface ManagedCodexAdapter {
     options?: ResumeCodexThreadOptions,
   ): Promise<CodexThreadState>;
   readThread(threadId: string): Promise<CodexThreadState>;
-  listModels(): Promise<readonly CodexModelOption[]>;
+  listModels(signal?: AbortSignal): Promise<readonly CodexModelOption[]>;
   readAccountFacts(): Promise<AvailableSessionAccountFacts>;
   adoptThread(
     threadId: string,

@@ -167,15 +167,26 @@ const sessionModelOptionsSchema = z.array(sessionModelOptionSchema).max(64).supe
   }
 });
 
+const availableSettingsOptionsResponseSchema = z.object({
+  available: z.literal(true),
+  source: z.literal("provider-api"),
+  models: sessionModelOptionsSchema,
+}).strict();
+
 const sessionSettingsOptionsResponseSchema = z.discriminatedUnion("available", [
-  z.object({
-    available: z.literal(true),
-    source: z.literal("provider-api"),
-    models: sessionModelOptionsSchema,
-  }).strict(),
+  availableSettingsOptionsResponseSchema,
   z.object({
     available: z.literal(false),
     reason: z.enum(["remote-session", "not-manager-owned", "unsupported-provider", "provider-unavailable"]),
+    models: z.array(z.never()).max(0),
+  }).strict(),
+]);
+
+const providerSettingsOptionsResponseSchema = z.discriminatedUnion("available", [
+  availableSettingsOptionsResponseSchema,
+  z.object({
+    available: z.literal(false),
+    reason: z.enum(["remote-host", "unsupported-provider", "provider-unavailable"]),
     models: z.array(z.never()).max(0),
   }).strict(),
 ]);
@@ -185,6 +196,7 @@ export type TranscriptSearchResponse = z.infer<typeof transcriptSearchResponseSc
 export type PlanFileResponse = z.infer<typeof planFileResponseSchema>;
 export type SessionModelOption = z.infer<typeof sessionModelOptionSchema>;
 export type SessionSettingsOptionsResponse = z.infer<typeof sessionSettingsOptionsResponseSchema>;
+export type ProviderSettingsOptionsResponse = z.infer<typeof providerSettingsOptionsResponseSchema>;
 export type { SetupHookOffer, SetupReadModel } from "../../../src/shared/setup.ts";
 export type { SelectedAttentionDetailsResponse } from "../../../src/shared/attention-detail.ts";
 export type { SelectedSessionFactsResponse } from "../../../src/shared/session-facts.ts";
@@ -302,6 +314,20 @@ export class CockpitApi {
       sessionSettingsOptionsResponseSchema,
       await this.request<unknown>(`/api/v1/sessions/${encodeURIComponent(sessionId)}/settings-options`),
       "session settings options",
+    );
+  }
+
+  async providerSettingsOptions(
+    provider: CreateSessionInput["provider"],
+    hostId: string,
+  ): Promise<ProviderSettingsOptionsResponse> {
+    const query = new URLSearchParams({ hostId });
+    return parseResponse(
+      providerSettingsOptionsResponseSchema,
+      await this.request<unknown>(
+        `/api/v1/providers/${encodeURIComponent(provider)}/settings-options?${query.toString()}`,
+      ),
+      "provider settings options",
     );
   }
 

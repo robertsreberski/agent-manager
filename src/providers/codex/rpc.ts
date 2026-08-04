@@ -35,6 +35,8 @@ interface PendingCall {
   resolve: (value: JsonValue) => void;
   reject: (error: Error) => void;
   timeout: ReturnType<typeof setTimeout>;
+  signal: AbortSignal | null;
+  abort: (() => void) | null;
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -81,22 +83,46 @@ export class CodexRpcClient {
   async request(
     method: string,
     params?: JsonObject,
+    signal?: AbortSignal,
   ): Promise<JsonValue> {
     if (this.#closed) {
       throw new Error("Codex RPC connection is closed");
     }
+    signal?.throwIfAborted();
 
     const id = this.#nextId++;
     const key = rpcIdKey(id);
     const result = new Promise<JsonValue>((resolve, reject) => {
       const timeout = setTimeout(() => {
-        this.#pending.delete(key);
-        reject(new Error(`Codex RPC request timed out: ${method}`));
+        this.#takePending(key)?.reject(new Error(`Codex RPC request timed out: ${method}`));
       }, this.requestTimeoutMs);
       timeout.unref?.();
-      this.#pending.set(key, { method, resolve, reject, timeout });
+      const pending: PendingCall = {
+        method,
+        resolve,
+        reject,
+        timeout,
+        signal: signal ?? null,
+        abort: null,
+      };
+      this.#pending.set(key, pending);
+      if (signal) {
+        pending.abort = () => {
+          const aborted = this.#takePending(key);
+          if (!aborted) return;
+          const reason = signal.reason;
+          aborted.reject(
+            reason instanceof Error
+              ? reason
+              : new Error(`Codex RPC request cancelled: ${method}`),
+          );
+        };
+        signal.addEventListener("abort", pending.abort, { once: true });
+        if (signal.aborted) pending.abort();
+      }
     });
 
+    if (!this.#pending.has(key)) return result;
     try {
       await this.transport.send(JSON.stringify({
         jsonrpc: "2.0",
@@ -105,10 +131,8 @@ export class CodexRpcClient {
         ...(params === undefined ? {} : { params }),
       }));
     } catch (error) {
-      const pending = this.#pending.get(key);
+      const pending = this.#takePending(key);
       if (pending) {
-        clearTimeout(pending.timeout);
-        this.#pending.delete(key);
         pending.reject(error instanceof Error ? error : new Error(String(error)));
       }
     }
@@ -205,10 +229,8 @@ export class CodexRpcClient {
 
     if (!isRpcId(message.id)) return;
     const key = rpcIdKey(message.id);
-    const pending = this.#pending.get(key);
+    const pending = this.#takePending(key);
     if (!pending) return;
-    this.#pending.delete(key);
-    clearTimeout(pending.timeout);
 
     if (isObject(message.error)) {
       const code = typeof message.error.code === "number"
@@ -237,12 +259,21 @@ export class CodexRpcClient {
     this.#removeCloseListener = null;
 
     const closeError = error ?? new Error("Codex RPC connection closed");
-    for (const pending of this.#pending.values()) {
-      clearTimeout(pending.timeout);
-      pending.reject(closeError);
+    for (const key of [...this.#pending.keys()]) {
+      this.#takePending(key)?.reject(closeError);
     }
-    this.#pending.clear();
     for (const listener of this.#closeListeners) listener(error);
+  }
+
+  #takePending(key: string): PendingCall | null {
+    const pending = this.#pending.get(key);
+    if (!pending) return null;
+    this.#pending.delete(key);
+    clearTimeout(pending.timeout);
+    if (pending.signal && pending.abort) {
+      pending.signal.removeEventListener("abort", pending.abort);
+    }
+    return pending;
   }
 }
 

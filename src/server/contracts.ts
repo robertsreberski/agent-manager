@@ -353,6 +353,14 @@ export const sessionSettingsOptionsSchema: z.ZodType<SessionSettingsOptions> = z
 export interface ProviderControlAdapter {
   createSession(input: CreateSessionInput, context: RequestContext): Promise<SessionView>;
   /**
+   * Read provider-owned settings for a session draft, before a provider
+   * session exists. Implementations must not create, resume, or adopt a
+   * session as part of this read.
+   */
+  getCreateSettingsOptions?(
+    context: RequestContext,
+  ): Promise<SessionSettingsOptions>;
+  /**
    * Re-adopt only identities previously committed by the manager. Startup
    * recovery is deliberately separate from discovery and never receives an
    * action log: implementations may list/read/resume provider state, but must

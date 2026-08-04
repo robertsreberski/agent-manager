@@ -698,19 +698,21 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     return codexAccountFacts({ usage, rateLimits });
   }
 
-  async listModels(): Promise<readonly CodexModelOption[]> {
+  async listModels(signal?: AbortSignal): Promise<readonly CodexModelOption[]> {
     this.#assertModelCatalogReadable();
+    signal?.throwIfAborted();
     const models: CodexModelOption[] = [];
     const values = new Set<string>();
     const cursors = new Set<string>();
     let cursor: string | null = null;
 
     for (let page = 0; page < MAX_MODEL_LIST_PAGES; page += 1) {
+      signal?.throwIfAborted();
       const result = asJsonObject(await this.rpc.request("model/list", {
         limit: MAX_MODEL_OPTIONS - models.length,
         includeHidden: false,
         ...(cursor === null ? {} : { cursor }),
-      }), "model/list result");
+      }, signal), "model/list result");
       if (!Array.isArray(result.data)) {
         throw new Error("Invalid Codex response: model/list data");
       }

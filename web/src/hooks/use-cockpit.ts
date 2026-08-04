@@ -3,6 +3,7 @@ import {
   ApiError,
   CockpitApi,
   type PlanFileResponse,
+  type ProviderSettingsOptionsResponse,
   type SelectedAttentionDetailsResponse,
   type SelectedSessionFactsResponse,
   type SelectedTodoDetailResponse,
@@ -504,6 +505,13 @@ export function useCockpit() {
     if (!api) throw new Error("The cockpit is offline.");
     return api.settingsOptions(sessionId);
   }, [api]);
+  const loadProviderSettingsOptions = useCallback((
+    provider: SessionView["provider"],
+    hostId: string,
+  ): Promise<ProviderSettingsOptionsResponse> => {
+    if (!api) throw new Error("The cockpit is offline.");
+    return api.providerSettingsOptions(provider, hostId);
+  }, [api]);
   const loadSessionFacts = useCallback((sessionId: string, generation: number): Promise<SelectedSessionFactsResponse> => {
     if (!api) throw new Error("The cockpit is offline.");
     return api.sessionFacts(sessionId, generation);
@@ -524,7 +532,7 @@ export function useCockpit() {
     refresh, retryConnection: recoverBrowserSession, controlConflict: selectedSession ? controlConflicts[selectedSession.id] : undefined,
     takeOverControl, hasBusyAction: Object.values(busy).some(Boolean),
     sendMessage, respond, interrupt, setProfile, setModel, setEffort, removeQueued, lifecycleAction, openEditor,
-    createSession, completeWorkspacePath, loadPreview, loadAttach, loadAttentionDetails, loadTodoDetail, searchTranscript, loadSettingsOptions, loadSessionFacts, loadPlanFile, loadSetup, outbox, offlineReview,
+    createSession, completeWorkspacePath, loadPreview, loadAttach, loadAttentionDetails, loadTodoDetail, searchTranscript, loadSettingsOptions, loadProviderSettingsOptions, loadSessionFacts, loadPlanFile, loadSetup, outbox, offlineReview,
     dismissOfflineReview: (id: string) => setOfflineReview((items) => items.filter((item) => item.id !== id)),
   };
 }

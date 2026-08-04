@@ -28,6 +28,11 @@ permission/sandbox enum in browser state. The orange chip is derived from `full-
 
 ### Live settings
 
+- Draft catalog discovery is a read-only provider-runtime operation and must work before any
+  manager-owned thread exists. It must not borrow an unrelated session as a catalog proxy.
+  Host routing remains explicit: a local Codex draft reads the private App Server's live
+  `model/list`; a remote draft reports unavailable until that remote provider exposes the same
+  bounded read edge.
 - Claude SDK `0.3.220` exposes `setModel`, `applyFlagSettings({ effortLevel })`,
   `supportedModels`, and `setPermissionMode`. Advertise only what the pinned Query currently
   supports and withdraw on provider/transport failure.

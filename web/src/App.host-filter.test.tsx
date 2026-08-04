@@ -5,6 +5,7 @@ import {
   boardScrollBehavior,
   cockpitContentMode,
   codexCatalogEfforts,
+  effectiveDraftHostId,
   handleCockpitEscape,
   handleOpenDrawerMenuEscape,
   Header,
@@ -12,6 +13,7 @@ import {
   CockpitToast,
   NotificationSettings,
   notificationAwaySince,
+  settingsUnavailableMessage,
 } from "./App";
 
 describe("hostSelectionSummary", () => {
@@ -52,6 +54,24 @@ describe("notificationAwaySince", () => {
 });
 
 describe("cockpit presentation contracts", () => {
+  it("loads draft settings for the workspace host, otherwise the local default", () => {
+    const hosts = [
+      { id: "build", kind: "ssh" as const },
+      { id: "local-main", kind: "local" as const },
+    ];
+    expect(effectiveDraftHostId({ workspace: { hostId: "build", path: "/srv/repo" } }, hosts)).toBe("build");
+    expect(effectiveDraftHostId({ workspace: null }, hosts)).toBe("local-main");
+    expect(effectiveDraftHostId({ workspace: null }, [{ id: "build", kind: "ssh" }])).toBe("build");
+    expect(effectiveDraftHostId({ workspace: null }, [])).toBe("local");
+    expect(effectiveDraftHostId(null, hosts)).toBeNull();
+  });
+
+  it("explains that draft model discovery is unavailable on a remote host", () => {
+    expect(settingsUnavailableMessage("remote-host")).toBe(
+      "Model choices are unavailable when creating a thread on a remote host.",
+    );
+  });
+
   it("uses only the selected Codex model's provider-declared efforts", () => {
     const response = {
       available: true,

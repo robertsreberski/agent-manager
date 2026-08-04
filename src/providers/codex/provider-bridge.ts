@@ -883,6 +883,15 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     return this.adapter.readAccountFacts();
   }
 
+  async getCreateSettingsOptions(
+    context: RequestContext,
+  ): Promise<SessionSettingsOptions> {
+    context.signal.throwIfAborted();
+    const models = await this.adapter.listModels(context.signal);
+    context.signal.throwIfAborted();
+    return sessionSettingsOptionsSchema.parse({ source: "provider-api", models });
+  }
+
   async getSettingsOptions(
     session: SessionView,
     context: RequestContext,
@@ -900,14 +909,13 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     if (!before || before.activeTurnId || before.status === "running" || before.writeBlockedReason) {
       throw new Error("Codex settings require a loaded, idle, writable thread");
     }
-    const models = await this.adapter.listModels();
-    context.signal.throwIfAborted();
+    const options = await this.getCreateSettingsOptions(context);
     const current = this.adapter.getThreadState(session.providerThreadId);
     if (!current || current.generation !== before.generation || current.activeTurnId ||
         current.status === "running" || current.writeBlockedReason) {
       throw new Error("Codex thread changed while its model catalog was loading");
     }
-    return sessionSettingsOptionsSchema.parse({ source: "provider-api", models });
+    return options;
   }
 
   toSessionView(state: CodexThreadState): SessionView {
