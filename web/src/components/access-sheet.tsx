@@ -89,7 +89,7 @@ export function AccessSheet({
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent className="overflow-y-auto">
+      <SheetContent className="overflow-y-auto [padding-bottom:max(1.25rem,env(safe-area-inset-bottom))] [padding-right:max(1.25rem,env(safe-area-inset-right))] [padding-top:max(1.25rem,env(safe-area-inset-top))]">
         <SheetHeader>
           <SheetTitle>Session details</SheetTitle>
           <SheetDescription>
