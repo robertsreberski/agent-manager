@@ -1,23 +1,13 @@
 import { useEffect, useState } from "react";
-import { Check, Copy, KeyRound, LoaderCircle, Monitor, TerminalSquare } from "lucide-react";
+import { Check, Copy, LoaderCircle, Monitor, TerminalSquare } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "./ui/alert";
 import { Button } from "./ui/button";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "./ui/sheet";
 import { copyText } from "../lib/utils";
-import type { AttachInstruction, ControlLease, PanePreview, SessionView } from "../types";
+import type { AttachInstruction, PanePreview, SessionView } from "../types";
 
 function displayValue(value: string | null | undefined): string {
   return value || "Not reported";
-}
-
-function leaseExpiry(expiresAt: string): string {
-  const date = new Date(expiresAt);
-  if (Number.isNaN(date.getTime())) return expiresAt;
-  return new Intl.DateTimeFormat(undefined, {
-    hour: "numeric",
-    minute: "2-digit",
-    second: "2-digit",
-  }).format(date);
 }
 
 function Detail({ label, children }: { label: string; children: React.ReactNode }) {
@@ -33,20 +23,12 @@ export function AccessSheet({
   session,
   open,
   onOpenChange,
-  lease,
-  busy,
-  mutationsReady,
-  onRelease,
   loadPreview,
   loadAttach,
 }: {
   session: SessionView;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  lease: ControlLease | null;
-  busy: boolean;
-  mutationsReady: boolean;
-  onRelease: () => Promise<void>;
   loadPreview: (session: SessionView) => Promise<PanePreview>;
   loadAttach: (session: SessionView) => Promise<AttachInstruction>;
 }) {
@@ -93,7 +75,7 @@ export function AccessSheet({
         <SheetHeader>
           <SheetTitle>Session details</SheetTitle>
           <SheetDescription>
-            Identity, access, control, and terminal handoff for this session.
+            Identity, access, and terminal handoff for this session.
           </SheetDescription>
         </SheetHeader>
 
@@ -101,6 +83,7 @@ export function AccessSheet({
           <h3 id="implementation-details-title" className="text-sm font-semibold">Implementation</h3>
           <dl className="grid gap-3 sm:grid-cols-2">
             <Detail label="Provider"><span className="uppercase">{session.provider}</span></Detail>
+            <Detail label="Host">{session.hostLabel ?? "This Mac"}</Detail>
             <Detail label="Session ID"><code className="font-mono text-xs">{session.id}</code></Detail>
             <Detail label="Workspace"><code className="font-mono text-xs">{displayValue(session.cwd)}</code></Detail>
             <Detail label="Owner">{session.ownership === "manager" ? "Agent Manager" : "External"}</Detail>
@@ -114,32 +97,16 @@ export function AccessSheet({
           <dl className="grid gap-3 sm:grid-cols-2">
             <Detail label="Permission">{displayValue(session.effectiveAccess.permissionMode)}</Detail>
             <Detail label="Sandbox">{displayValue(session.effectiveAccess.sandboxMode)}</Detail>
-            <Detail label="Full host">{session.effectiveAccess.fullHostAccess ? "Yes — not sandboxed" : "No"}</Detail>
+            <Detail label="Access mode">{
+              session.effectiveAccess.accessMode === "bypass-permissions"
+                ? "Bypass permissions"
+                : session.effectiveAccess.accessMode === "sandboxed"
+                  ? "Sandboxed"
+                  : "Unknown"
+            }</Detail>
             <Detail label="Mode">{session.mode.value === "planning" ? "Plan" : session.mode.value === "execution" ? "Execute" : "Unknown"}</Detail>
             <Detail label="Mode evidence">{session.mode.confidence} · {session.mode.source}</Detail>
           </dl>
-        </section>
-
-        <section className="grid gap-3 rounded-xl border bg-muted/15 p-4" aria-labelledby="control-details-title">
-          <div className="flex items-center justify-between gap-3">
-            <div className="min-w-0">
-              <h3 id="control-details-title" className="text-sm font-semibold">Browser control</h3>
-              <p className="mt-1 text-xs text-muted-foreground">
-                {lease ? `Writable until ${leaseExpiry(lease.expiresAt)}.` : "This browser is read-only."}
-              </p>
-            </div>
-            {lease && (
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={busy || !mutationsReady}
-                onClick={() => void onRelease().catch(() => undefined)}
-              >
-                <KeyRound /> Release control
-              </Button>
-            )}
-          </div>
-          {!mutationsReady && <p className="text-xs text-amber-700 dark:text-amber-300">Reconnect before changing control.</p>}
         </section>
 
         <div className="border-t pt-4">

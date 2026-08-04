@@ -8,12 +8,14 @@ import {
   Download,
   ExternalLink,
   ListTree,
+  Laptop,
   Menu,
   PanelLeftClose,
   PanelLeftOpen,
   Plus,
   RefreshCw,
   Search,
+  Server,
   Sparkles,
   UserRoundCog,
   Wifi,
@@ -362,18 +364,49 @@ function SessionList({
   onSelect: (id: string) => void;
 }) {
   const activeScope = SCOPE_ITEMS.find((item) => item.value === scope)?.label ?? "All";
+  const hostGroups = sessions.reduce<Array<{ id: string; label: string; items: NavigationSession[] }>>(
+    (groups, item) => {
+      const current = groups.at(-1);
+      const hostId = item.session.hostId ?? "local";
+      if (current?.id === hostId) {
+        current.items.push(item);
+      } else {
+        groups.push({
+          id: hostId,
+          label: item.session.hostLabel ?? "This Mac",
+          items: [item],
+        });
+      }
+      return groups;
+    },
+    [],
+  );
   return (
     <nav className="min-h-0 flex-1 overflow-y-auto p-2" aria-label={`${activeScope} sessions`} role="tree">
       {sessions.length > 0 ? (
-        <div className="space-y-0.5">
-          {sessions.map((item) => (
-            <SessionRow
-              key={item.session.id}
-              item={item}
-              selected={item.session.id === selectedId}
-              onSelect={() => onSelect(item.session.id)}
-            />
-          ))}
+        <div className="space-y-2">
+          {hostGroups.map((group) => {
+            const HostIcon = group.id === "local" ? Laptop : Server;
+            return (
+              <section key={group.id} aria-label={`${group.label} sessions`}>
+                <div className="flex items-center gap-1.5 px-2 pb-1 pt-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  <HostIcon className="size-3" aria-hidden="true" />
+                  <span className="truncate">{group.label}</span>
+                  <span className="ml-auto tabular-nums">{group.items.length}</span>
+                </div>
+                <div className="space-y-0.5" role="group">
+                  {group.items.map((item) => (
+                    <SessionRow
+                      key={item.session.id}
+                      item={item}
+                      selected={item.session.id === selectedId}
+                      onSelect={() => onSelect(item.session.id)}
+                    />
+                  ))}
+                </div>
+              </section>
+            );
+          })}
         </div>
       ) : (
         <div className="m-2 rounded-lg border border-dashed px-4 py-8 text-center text-sm text-muted-foreground">

@@ -59,7 +59,6 @@ function publicLease(lease: StoredLease): ControlLease {
     clientId: lease.clientId,
     acquiredAt: lease.acquiredAt,
     expiresAt: lease.expiresAt,
-    fullHostArmedUntil: lease.fullHostArmedUntil,
   };
 }
 
@@ -83,7 +82,7 @@ export class ControlLeaseBroker {
     principal: LeasePrincipal,
     currentToken?: string | string[],
     ttlMs?: number,
-    armFullHost = false,
+    takeover = false,
   ): ControlLease {
     this.#purge(sessionId);
     const active = this.#leases.get(sessionId);
@@ -105,17 +104,19 @@ export class ControlLeaseBroker {
         return publicLease(active);
       }
       if (!samePrincipal || !tokenMatches(active.token, currentToken)) {
-        throw new LeaseConflictError(active.expiresAt);
+        if (!takeover) throw new LeaseConflictError(active.expiresAt);
+        clearTimeout(active.timer);
+        this.#leases.delete(sessionId);
+      } else {
+        clearTimeout(active.timer);
+        active.expiresAtMs = expiresAtMs;
+        active.expiresAt = new Date(expiresAtMs).toISOString();
+        active.previousToken = active.token;
+        active.previousTokenExpiresAtMs = this.#now() + this.#recoveryWindowMs;
+        active.token = token();
+        active.timer = this.#expiryTimer(sessionId, duration);
+        return publicLease(active);
       }
-      clearTimeout(active.timer);
-      active.expiresAtMs = expiresAtMs;
-      active.expiresAt = new Date(expiresAtMs).toISOString();
-      active.previousToken = active.token;
-      active.previousTokenExpiresAtMs = this.#now() + this.#recoveryWindowMs;
-      active.token = token();
-      if (armFullHost) active.fullHostArmedUntil = new Date(expiresAtMs).toISOString();
-      active.timer = this.#expiryTimer(sessionId, duration);
-      return publicLease(active);
     }
 
     const now = this.#now();
@@ -130,7 +131,6 @@ export class ControlLeaseBroker {
       expiresAtMs,
       previousToken: null,
       previousTokenExpiresAtMs: 0,
-      fullHostArmedUntil: armFullHost ? new Date(expiresAtMs).toISOString() : null,
       timer: this.#expiryTimer(sessionId, duration),
     };
     this.#leases.set(sessionId, lease);
@@ -146,16 +146,6 @@ export class ControlLeaseBroker {
       && tokenMatches(active.token, value)
       && active.actorId === principal.actorId
       && active.authSessionId === principal.authSessionId;
-  }
-
-  isFullHostArmed(sessionId: string, principal: LeasePrincipal): boolean {
-    this.#purge(sessionId);
-    const active = this.#leases.get(sessionId);
-    return !!active
-      && active.actorId === principal.actorId
-      && active.authSessionId === principal.authSessionId
-      && active.fullHostArmedUntil !== null
-      && Date.parse(active.fullHostArmedUntil) > this.#now();
   }
 
   has(sessionId: string): boolean {

@@ -23,10 +23,6 @@ describe("AccessSheet", () => {
         session={session}
         open
         onOpenChange={() => undefined}
-        lease={null}
-        busy={false}
-        mutationsReady
-        onRelease={vi.fn(async () => undefined)}
         loadPreview={vi.fn()}
         loadAttach={loadAttach}
       />,
@@ -40,30 +36,20 @@ describe("AccessSheet", () => {
     expect(screen.queryByText("Attach in terminal")).not.toBeInTheDocument();
   });
 
-  it("shows the writable lease in details and releases it there", async () => {
+  it("shows the durable access mode without exposing lease controls", () => {
     const session = normalizeSession({
       id: "codex:managed",
       provider: "codex",
       cwd: "/tmp/project",
       ownership: "manager",
       control: { plane: "codex-app-server", capabilities: [] },
-      access: { permissionMode: "default", sandboxMode: "workspace-write", fullHostAccess: false },
+      access: { accessMode: "sandboxed", permissionMode: "default", sandboxMode: "workspace-write" },
     });
-    const onRelease = vi.fn(async () => undefined);
     render(
       <AccessSheet
         session={session}
         open
         onOpenChange={() => undefined}
-        lease={{
-          token: "lease",
-          clientId: "browser",
-          expiresAt: "2099-01-01T12:00:00.000Z",
-          fullHostArmedUntil: null,
-        }}
-        busy={false}
-        mutationsReady
-        onRelease={onRelease}
         loadPreview={vi.fn()}
         loadAttach={vi.fn()}
       />,
@@ -71,7 +57,7 @@ describe("AccessSheet", () => {
 
     expect(screen.getByText("/tmp/project")).toBeInTheDocument();
     expect(screen.getByText("codex-app-server")).toBeInTheDocument();
-    screen.getByRole("button", { name: "Release control" }).click();
-    await waitFor(() => expect(onRelease).toHaveBeenCalledOnce());
+    expect(screen.getByText("Sandboxed")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /control/i })).not.toBeInTheDocument();
   });
 });

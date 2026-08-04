@@ -79,11 +79,21 @@ export const createSessionSchema = z.object({
   name: z.string().trim().min(1).max(120).optional(),
   initialMessage: z.string().min(1).max(100_000),
   mode: z.enum(["planning", "execution"]).default("planning"),
-  permissionPreset: z.enum(["standard", "full-host"]).default("standard"),
+  accessMode: z.enum(["sandboxed", "bypass-permissions"]).default("sandboxed"),
   idempotencyKey,
 }).strict();
 
 export type CreateSessionInput = z.infer<typeof createSessionSchema>;
+
+export const directoryCompletionQuerySchema = z.object({
+  path: z.string().max(4_096).default(""),
+  limit: z.coerce.number().int().min(1).max(50).default(30),
+}).strict();
+
+export const resolveWorkspaceSchema = z.object({
+  hostId: z.string().min(1).max(128),
+  path: z.string().trim().min(1).max(4_096),
+}).strict();
 
 export const leaseRequestSchema = z.object({
   clientId: z
@@ -92,7 +102,7 @@ export const leaseRequestSchema = z.object({
     .max(128)
     .regex(/^[A-Za-z0-9._:-]+$/, "must contain only safe identifier characters"),
   ttlSeconds: z.number().int().min(15).max(300).optional(),
-  armFullHost: z.boolean().default(false),
+  takeover: z.boolean().default(false),
 }).strict();
 
 export interface Actor {
@@ -107,7 +117,6 @@ export interface ControlLease {
   clientId: string;
   acquiredAt: string;
   expiresAt: string;
-  fullHostArmedUntil: string | null;
 }
 
 export type ActionStatus =

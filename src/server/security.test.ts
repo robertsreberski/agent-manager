@@ -65,12 +65,10 @@ test("leases are bound to one auth session and rotate on every renewal", () => {
     firstPrincipal,
     first.token,
     undefined,
-    true,
   );
   assert.notEqual(renewed.token, first.token);
   assert.equal(broker.verify("codex:one", first.token, firstPrincipal), false);
   assert.equal(broker.verify("codex:one", renewed.token, firstPrincipal), true);
-  assert.equal(broker.isFullHostArmed("codex:one", firstPrincipal), true);
   assert.equal("actorId" in renewed, false);
 
   const recovered = broker.acquire(
@@ -79,11 +77,9 @@ test("leases are bound to one auth session and rotate on every renewal", () => {
     firstPrincipal,
     first.token,
     undefined,
-    true,
   );
   assert.equal(recovered.token, renewed.token, "a lost rotation response can be recovered once");
   assert.equal(recovered.expiresAt, renewed.expiresAt);
-  assert.equal(recovered.fullHostArmedUntil, renewed.fullHostArmedUntil);
   assert.equal(broker.release("codex:one", first.token, firstPrincipal), false);
   assert.throws(
     () => broker.acquire("codex:one", "other-browser", firstPrincipal, first.token),
@@ -100,20 +96,32 @@ test("leases are bound to one auth session and rotate on every renewal", () => {
     firstPrincipal,
     renewed.token,
     undefined,
-    true,
   );
   assert.notEqual(rotatedAgain.token, renewed.token);
   assert.throws(
     () => broker.acquire("codex:one", "browser", firstPrincipal, first.token),
     LeaseConflictError,
   );
+
+  const takenOver = broker.acquire(
+    "codex:one",
+    "other-browser",
+    secondPrincipal,
+    undefined,
+    undefined,
+    true,
+  );
+  assert.equal(broker.verify("codex:one", rotatedAgain.token, firstPrincipal), false);
+  assert.equal(broker.verify("codex:one", takenOver.token, secondPrincipal), true);
+  assert.equal("actorId" in takenOver, false);
   now += 15_001;
   assert.throws(
     () => broker.acquire("codex:one", "browser", firstPrincipal, renewed.token),
     LeaseConflictError,
   );
 
-  assert.deepEqual(broker.releaseForAuthSession(firstPrincipal.authSessionId), ["codex:one"]);
+  assert.deepEqual(broker.releaseForAuthSession(firstPrincipal.authSessionId), []);
+  assert.deepEqual(broker.releaseForAuthSession(secondPrincipal.authSessionId), ["codex:one"]);
   assert.equal(broker.has("codex:one"), false);
 });
 

@@ -14,6 +14,7 @@ import {
 import type { ListingResult } from "../core/types.ts";
 import {
   addWorkspace,
+  addSshHost,
   assertPanicUnlocked,
   buildControlledServicePath,
   defaultPaths,
@@ -26,6 +27,7 @@ import {
   mutateConfig,
   panicLockPath,
   removeTailscaleRoute,
+  removeSshHost,
   removeWorkspace,
   releasePanicLock,
   renderLaunchAgent,
@@ -51,6 +53,7 @@ import {
 } from "../server/control-socket.ts";
 import type { AttachInstruction } from "../server/contracts.ts";
 import { ManagerDatabase } from "../server/persistence.ts";
+import { installRemoteNode, runNodeBridge } from "../remote/index.ts";
 import {
   attachSpecFromInstruction,
   executeLifecycleAttach,
@@ -91,6 +94,7 @@ interface ServerModule {
     tailscaleAllowedLogins?: readonly string[];
     codexExecutable?: string;
     tmuxExecutable?: string;
+    remoteHosts?: ReadonlyArray<{ id: string; label: string; target: string }>;
   }): Promise<{
     listen(): Promise<string>;
     close(): Promise<void>;
@@ -117,9 +121,14 @@ export interface CliDependencies {
   loadConfig(): AgentManagerConfig;
   mutateConfig<T>(mutator: (config: AgentManagerConfig) => T): T;
   addWorkspace(config: AgentManagerConfig, path: string): AgentManagerConfig["workspaces"][number];
+  addSshHost(config: AgentManagerConfig, input: { name: string; target: string }): AgentManagerConfig["hosts"][number];
   removeWorkspace(config: AgentManagerConfig, id: string): boolean;
+  removeSshHost(config: AgentManagerConfig, id: string): boolean;
   persistWorkspace(workspace: AgentManagerConfig["workspaces"][number]): void;
+  persistHost(host: AgentManagerConfig["hosts"][number]): void;
   removePersistedWorkspace(id: string): boolean;
+  removePersistedHost(id: string): boolean;
+  installRemoteNode(target: string): Promise<{ serviceLabel: string }>;
   inspectTailscale(config: AgentManagerConfig): TailscaleInspection;
   installTailscale(config: AgentManagerConfig): TailscaleInstallResult;
   removeTailscale(config: AgentManagerConfig): { changed: boolean };
@@ -169,23 +178,22 @@ function tailscaleOptions(config: AgentManagerConfig, executables: ServiceExecut
 function syncConfiguredWorkspaces(config: AgentManagerConfig): void {
   const database = new ManagerDatabase(defaultPaths().databaseFile);
   try {
-    const configuredIds = new Set(config.workspaces.map((workspace) => workspace.id));
-    const configuredByPath = new Map(
-      config.workspaces.map((workspace) => [workspace.path, workspace] as const),
-    );
-    for (const stored of database.listWorkspaces()) {
-      const configured = configuredByPath.get(stored.path);
-      if (configured && configured.id !== stored.id) database.removeWorkspace(stored.id);
+    const configuredHostIds = new Set(config.hosts.map((host) => host.id));
+    for (const stored of database.listHosts()) {
+      if (stored.kind === "ssh" && !configuredHostIds.has(stored.id)) {
+        database.removeHost(stored.id);
+      }
+    }
+    for (const host of config.hosts) {
+      database.addHost({ id: host.id, label: host.name, kind: "ssh", sshTarget: host.target });
     }
     for (const workspace of config.workspaces) {
       database.addWorkspace({
         id: workspace.id,
         label: workspace.name,
         path: workspace.path,
+        hostId: workspace.hostId,
       });
-    }
-    for (const workspace of database.listWorkspaces()) {
-      if (!configuredIds.has(workspace.id)) database.removeWorkspace(workspace.id);
     }
   } finally {
     database.close();
@@ -211,6 +219,11 @@ async function defaultStartServer(
     ...options,
     codexExecutable: executables.codex,
     tmuxExecutable: executables.tmux,
+    remoteHosts: config.hosts.map((host) => ({
+      id: host.id,
+      label: host.name,
+      target: host.target,
+    })),
     ...(tailscaleConfigured
       ? {
           tailscaleHosts: [`${tailscaleDnsName}:${config.tailscale.httpsPort}`],
@@ -291,18 +304,23 @@ function defaultDependencies(): CliDependencies {
     loadConfig,
     mutateConfig,
     addWorkspace,
+    addSshHost,
     removeWorkspace,
+    removeSshHost,
     persistWorkspace: (workspace) => {
       const database = new ManagerDatabase(paths.databaseFile);
       try {
         const conflicting = database.listWorkspaces().find((stored) =>
-          stored.path === workspace.path && stored.id !== workspace.id
+          stored.hostId === workspace.hostId
+          && stored.path === workspace.path
+          && stored.id !== workspace.id
         );
         if (conflicting) database.removeWorkspace(conflicting.id);
         database.addWorkspace({
           id: workspace.id,
           label: workspace.name,
           path: workspace.path,
+          hostId: workspace.hostId,
         });
       } finally {
         database.close();
@@ -316,6 +334,23 @@ function defaultDependencies(): CliDependencies {
         database.close();
       }
     },
+    persistHost: (host) => {
+      const database = new ManagerDatabase(paths.databaseFile);
+      try {
+        database.addHost({ id: host.id, label: host.name, kind: "ssh", sshTarget: host.target });
+      } finally {
+        database.close();
+      }
+    },
+    removePersistedHost: (id) => {
+      const database = new ManagerDatabase(paths.databaseFile);
+      try {
+        return database.removeHost(id);
+      } finally {
+        database.close();
+      }
+    },
+    installRemoteNode: (target) => installRemoteNode({ target }),
     inspectTailscale: (config) => {
       const executables = resolveServiceExecutables({ nodeExecutable: process.execPath });
       return inspectTailscaleRoute(undefined, tailscaleOptions(config, executables));
@@ -438,6 +473,9 @@ async function dispatch(argv: readonly string[], deps: CliDependencies): Promise
       }
       return 0;
     }
+    case "node":
+      await runNodeBridge({ controlSocketPath: deps.controlSocketPath });
+      return 0;
     case "attach": {
       const reply = await deps.requestAttach(deps.controlSocketPath, command.sessionId);
       const handoffId = reply.instruction.handoffId;
@@ -554,6 +592,40 @@ async function dispatch(argv: readonly string[], deps: CliDependencies): Promise
       }
       deps.removePersistedWorkspace(command.value!);
       writeLine(deps.stdout, `Removed workspace ${command.value!}.`);
+      return 0;
+    }
+    case "host": {
+      if (command.operation === "list") {
+        const config = deps.loadConfig();
+        if (config.hosts.length === 0) {
+          writeLine(deps.stdout, "No configured SSH hosts.");
+        } else {
+          for (const host of config.hosts) {
+            writeLine(deps.stdout, `${host.id}\t${host.name}\t${host.target}`);
+          }
+        }
+        return 0;
+      }
+      if (command.operation === "add") {
+        const host = deps.mutateConfig((config) => deps.addSshHost(config, {
+          name: command.label,
+          target: command.target,
+        }));
+        deps.persistHost(host);
+        writeLine(deps.stdout, `${host.id}\t${host.name}\t${host.target}`);
+        writeLine(deps.stdout, "Ensure Agent Manager is installed and its service is running on this host.");
+        writeLine(deps.stdout, "A running cockpit will discover this host automatically.");
+        return 0;
+      }
+      if (command.operation === "install") {
+        const installed = await deps.installRemoteNode(command.value!);
+        writeLine(deps.stdout, `Installed and started ${installed.serviceLabel} on ${command.value!}.`);
+        return 0;
+      }
+      const removed = deps.mutateConfig((config) => deps.removeSshHost(config, command.value!));
+      if (!removed) throw new Error(`Unknown SSH host id: ${command.value!}`);
+      deps.removePersistedHost(command.value!);
+      writeLine(deps.stdout, `Removed SSH host ${command.value!}.`);
       return 0;
     }
     case "tailscale": {

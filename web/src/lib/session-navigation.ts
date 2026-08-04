@@ -107,7 +107,7 @@ function parentCandidate(
 }
 
 function searchableValues(session: SessionView): Array<string | null> {
-  return [session.name, session.cwd, session.id, session.provider];
+  return [session.name, session.cwd, session.id, session.provider, session.hostLabel ?? null];
 }
 
 function sessionMatchesQuery(session: SessionView, needle: string): boolean {
@@ -204,5 +204,12 @@ export function navigationSessions(
     }
   };
   for (const root of roots) append(root, 0);
-  return result;
+  return result.sort((left, right) => {
+    const leftHostId = left.session.hostId ?? "local";
+    const rightHostId = right.session.hostId ?? "local";
+    if (leftHostId === rightHostId) return 0;
+    if (leftHostId === "local") return -1;
+    if (rightHostId === "local") return 1;
+    return (left.session.hostLabel ?? leftHostId).localeCompare(right.session.hostLabel ?? rightHostId);
+  });
 }

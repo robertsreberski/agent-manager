@@ -39,7 +39,7 @@ function sessionWithQuestions(): SessionView {
         },
       ],
     }],
-    effectiveAccess: { permissionMode: "default", sandboxMode: "workspace-write", fullHostAccess: false },
+    effectiveAccess: { accessMode: "sandboxed", permissionMode: "default", sandboxMode: "workspace-write" },
     terminal: null,
     control: { plane: "claude-sdk", capabilities: ["respond"], managerOwned: true, writableLease: true },
     generation: 1,
@@ -61,7 +61,6 @@ describe("PendingRequests", () => {
       <PendingRequests
         session={sessionWithQuestions()}
         exactRequestIds={new Set(["request-1"])}
-        writable
         busy={false}
         onJumpToRequest={onJumpToRequest}
         onRespond={vi.fn(async () => undefined)}
@@ -83,7 +82,6 @@ describe("PendingRequests", () => {
     render(
       <QuestionRequestForm
         request={sessionWithQuestions().attention[0]!}
-        writable
         mutationsReady
         canRespond
         busy={false}
@@ -119,7 +117,6 @@ describe("PendingRequests", () => {
     render(
       <QuestionRequestForm
         request={withContext.attention[0]!}
-        writable
         mutationsReady
         canRespond
         busy={false}
@@ -140,19 +137,16 @@ describe("PendingRequests", () => {
     }));
   });
 
-  it("preserves a local draft while taking the writable lease", async () => {
+  it("keeps the answer form directly writable while control is acquired in the background", async () => {
     const request = sessionWithQuestions().attention[0]!;
     request.questions = [request.questions![0]!];
-    const onTakeControl = vi.fn();
     const onRespond = vi.fn(async () => undefined);
-    const rendered = render(
+    render(
       <QuestionRequestForm
         request={request}
-        writable={false}
         mutationsReady
         canRespond
         busy={false}
-        onTakeControl={onTakeControl}
         onRespond={onRespond}
       />,
     );
@@ -160,21 +154,6 @@ describe("PendingRequests", () => {
     const sqlite = screen.getByRole("radio", { name: "SQLite" });
     fireEvent.click(sqlite);
     expect(sqlite).toBeChecked();
-    fireEvent.click(screen.getByRole("button", { name: "Take control to answer" }));
-    expect(onTakeControl).toHaveBeenCalledTimes(1);
-
-    rendered.rerender(
-      <QuestionRequestForm
-        request={request}
-        writable
-        mutationsReady
-        canRespond
-        busy={false}
-        onTakeControl={onTakeControl}
-        onRespond={onRespond}
-      />,
-    );
-    expect(screen.getByRole("radio", { name: "SQLite" })).toBeChecked();
     fireEvent.click(screen.getByRole("button", { name: "Send answer" }));
     await waitFor(() => expect(onRespond).toHaveBeenCalledWith("request-1", {
       kind: "answer",
@@ -199,7 +178,6 @@ describe("PendingRequests", () => {
     render(
       <QuestionRequestForm
         request={request}
-        writable
         mutationsReady
         canRespond
         busy={false}
@@ -240,7 +218,6 @@ describe("PendingRequests", () => {
       <PendingRequests
         session={elicitation}
         exactRequestIds={new Set(["elicitation-1"])}
-        writable
         busy={false}
         onRespond={onRespond}
       />,
@@ -259,7 +236,6 @@ describe("PendingRequests", () => {
     render(
       <PendingRequests
         session={sessionWithQuestions()}
-        writable
         busy={false}
         onRespond={onRespond}
       />,
@@ -291,7 +267,6 @@ describe("PendingRequests", () => {
       <PendingRequests
         session={approval}
         exactRequestIds={new Set(["approval-1"])}
-        writable
         busy={false}
         onRespond={onRespond}
       />,
@@ -311,7 +286,6 @@ describe("PendingRequests", () => {
     render(
       <QuestionRequestForm
         request={sessionWithQuestions().attention[0]!}
-        writable
         mutationsReady={false}
         canRespond
         busy={false}

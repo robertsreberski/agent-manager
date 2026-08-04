@@ -62,11 +62,18 @@ export function AttentionBadge({ count }: { count: number }) {
   );
 }
 
-export function FullAccessBadge() {
+export function AccessBadge({ accessMode }: { accessMode: SessionView["effectiveAccess"]["accessMode"] }) {
+  if (accessMode === "bypass-permissions") {
+    return (
+      <Badge variant="danger">
+        <ShieldAlert className="size-3" aria-hidden="true" />
+        Bypass permissions
+      </Badge>
+    );
+  }
   return (
-    <Badge variant="danger">
-      <ShieldAlert className="size-3" aria-hidden="true" />
-      Full host
+    <Badge variant={accessMode === "sandboxed" ? "secondary" : "outline"}>
+      {accessMode === "sandboxed" ? "Sandboxed" : "Access unknown"}
     </Badge>
   );
 }

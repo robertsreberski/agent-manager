@@ -275,11 +275,23 @@ export function normalizeSession(raw: unknown): SessionView {
   const rawMode = modeInput.value ?? input.mode;
   const permissionMode = text(accessInput.permissionMode) ?? text(input.permissionMode);
   const sandboxMode = text(accessInput.sandboxMode) ?? text(input.sandboxMode);
-  const inferredFullAccess =
-    permissionMode === "bypassPermissions" ||
-    permissionMode === "danger-full-access" ||
-    sandboxMode === "danger-full-access" ||
-    boolean(accessInput.fullHostAccess);
+  const normalizedPermission = permissionMode?.toLowerCase() ?? "";
+  const dangerFullAccess = sandboxMode?.toLowerCase().includes("danger-full-access") ?? false;
+  const inferredBypass =
+    normalizedPermission.includes("bypass") ||
+    normalizedPermission.includes("dangerously") ||
+    boolean(accessInput.fullHostAccess) ||
+    (dangerFullAccess && normalizedPermission === "never");
+  const reportedAccessMode = text(accessInput.accessMode);
+  const accessMode = reportedAccessMode === "sandboxed" || reportedAccessMode === "bypass-permissions"
+    ? reportedAccessMode
+    : inferredBypass
+      ? "bypass-permissions"
+      : dangerFullAccess
+        ? "unknown"
+      : permissionMode || sandboxMode
+        ? "sandboxed"
+        : "unknown";
 
   const queueInput = Array.isArray(input.queue) ? input.queue : [];
   const rawMessages = Array.isArray(input.messages)
@@ -292,6 +304,8 @@ export function normalizeSession(raw: unknown): SessionView {
   return {
     id: sessionId,
     provider,
+    hostId: text(input.hostId) ?? "local",
+    hostLabel: text(input.hostLabel) ?? "This Mac",
     name: text(input.name) ?? text(input.title),
     cwd: text(input.cwd),
     parentSessionId: text(input.parentSessionId),
@@ -307,9 +321,9 @@ export function normalizeSession(raw: unknown): SessionView {
     activity: normalizedActivity,
     attention: normalizeAttention(input.attention, input.waitingReason),
     effectiveAccess: {
+      accessMode,
       permissionMode,
       sandboxMode,
-      fullHostAccess: inferredFullAccess,
     },
     terminal:
       Object.keys(terminalInput).length > 0

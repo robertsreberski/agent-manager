@@ -21,7 +21,7 @@ function session(overrides: Partial<SessionView> & Pick<SessionView, "id">): Ses
     mode: { value: "execution", providerValue: null, source: "test", confidence: "exact" },
     activity: "idle",
     attention: [],
-    effectiveAccess: { permissionMode: null, sandboxMode: null, fullHostAccess: false },
+    effectiveAccess: { accessMode: "unknown", permissionMode: null, sandboxMode: null },
     terminal: null,
     control: { plane: "test", capabilities: [], managerOwned: false, writableLease: false },
     generation: 1,

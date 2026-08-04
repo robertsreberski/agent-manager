@@ -15,7 +15,7 @@ describe("LaunchDialog", () => {
       <LaunchDialog
         open
         onOpenChange={() => undefined}
-        workspaces={[{ id: "workspace-1", label: "Workspace" }]}
+        workspaces={[{ id: "workspace-1", label: "Workspace", path: "/tmp/workspace", hostId: "local" }]}
         creating={false}
         onCreate={onCreate}
       />,
@@ -38,7 +38,7 @@ describe("LaunchDialog", () => {
       <LaunchDialog
         open
         onOpenChange={() => undefined}
-        workspaces={[{ id: "workspace-1", label: "Workspace" }]}
+        workspaces={[{ id: "workspace-1", label: "Workspace", path: "/tmp/workspace", hostId: "local" }]}
         creating={false}
         onCreate={onCreate}
       />,
@@ -62,7 +62,7 @@ describe("LaunchDialog", () => {
       <LaunchDialog
         open
         onOpenChange={() => undefined}
-        workspaces={[{ id: "workspace-1", label: "Workspace" }]}
+        workspaces={[{ id: "workspace-1", label: "Workspace", path: "/tmp/workspace", hostId: "local" }]}
         creating={false}
         onCreate={onCreate}
       />,
@@ -87,7 +87,7 @@ describe("LaunchDialog", () => {
       <LaunchDialog
         open
         onOpenChange={() => undefined}
-        workspaces={[{ id: "workspace-1", label: "Workspace" }]}
+        workspaces={[{ id: "workspace-1", label: "Workspace", path: "/tmp/workspace", hostId: "local" }]}
         creating={false}
         onCreate={onCreate}
       />,
@@ -97,18 +97,52 @@ describe("LaunchDialog", () => {
     const advanced = screen.getByText("Advanced options").closest("details");
     expect(advanced).not.toHaveAttribute("open");
     fireEvent.click(screen.getByText("Advanced options"));
-    fireEvent.click(screen.getByRole("button", { name: "Full host" }));
+    fireEvent.click(screen.getByRole("button", { name: "Bypass permissions" }));
     fireEvent.change(screen.getByPlaceholderText("Describe the outcome you want…"), {
       target: { value: "Inspect the host" },
     });
 
-    expect(screen.getByRole("button", { name: "Launch session" })).toBeDisabled();
-    fireEvent.click(screen.getByLabelText("I understand this session is not sandboxed."));
+    expect(screen.getByRole("button", { name: "Launch session" })).toBeEnabled();
+    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Launch session" }));
 
     await waitFor(() => expect(onCreate).toHaveBeenCalledWith(expect.objectContaining({
-      permissionPreset: "full-host",
+      accessMode: "bypass-permissions",
       initialMessage: "Inspect the host",
+    })));
+  });
+
+  it("completes paths on the selected SSH host and submits that host-path pair", async () => {
+    const onCreate = vi.fn(async () => ({}));
+    const onCompletePath = vi.fn(async () => ["/Users/remote/project"]);
+    render(
+      <LaunchDialog
+        open
+        onOpenChange={() => undefined}
+        hosts={[
+          { id: "local", label: "This Mac", kind: "local", status: "online" },
+          { id: "host-studio", label: "Studio Mac", kind: "ssh", status: "online", sshTarget: "remote" },
+        ]}
+        workspaces={[]}
+        creating={false}
+        onCompletePath={onCompletePath}
+        onCreate={onCreate}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("Host"), { target: { value: "host-studio" } });
+    fireEvent.change(screen.getByLabelText("Workspace path"), { target: { value: "/Users/rem" } });
+    await waitFor(() => expect(onCompletePath).toHaveBeenCalledWith("host-studio", "/Users/rem"));
+    fireEvent.change(screen.getByLabelText("Workspace path"), { target: { value: "/Users/remote/project" } });
+    fireEvent.change(screen.getByPlaceholderText("Describe the outcome you want…"), {
+      target: { value: "Work remotely" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Launch session" }));
+
+    await waitFor(() => expect(onCreate).toHaveBeenCalledWith(expect.objectContaining({
+      hostId: "host-studio",
+      workspacePath: "/Users/remote/project",
+      initialMessage: "Work remotely",
     })));
   });
 });

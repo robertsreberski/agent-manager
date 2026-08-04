@@ -110,9 +110,9 @@ function session(overrides: Partial<SessionRecord> = {}): SessionRecord {
     activity: "completed",
     attention: [],
     effectiveAccess: {
+      accessMode: "unknown",
       permissionMode: null,
       sandboxMode: null,
-      fullHostAccess: false,
     },
     terminal: null,
     control: {
@@ -224,10 +224,19 @@ test("tracks Codex mode, access, and unresolved requests independently", () => {
   assert.equal(waiting.status, "waiting");
   assert.equal(waiting.mode.value, "planning");
   assert.equal(waiting.mode.providerValue, "plan");
-  assert.equal(waiting.effectiveAccess.fullHostAccess, true);
+  assert.equal(waiting.effectiveAccess.accessMode, "bypass-permissions");
   assert.deepEqual(waiting.attention.map((item) => [item.id, item.kind]), [
     ["question-1", "question"],
   ]);
+
+  const hybrid = analyzeCodexObjects([{
+    type: "turn_context",
+    payload: {
+      approval_policy: "on-request",
+      sandbox_policy: { type: "danger-full-access" },
+    },
+  }], "live");
+  assert.equal(hybrid.effectiveAccess.accessMode, "unknown");
 
   const resolved = analyzeCodexObjects([
     ...objects,
@@ -269,7 +278,7 @@ test("tracks unmatched Claude questions and exact mode changes", () => {
     },
   ]);
   assert.equal(resolved.mode.value, "execution");
-  assert.equal(resolved.effectiveAccess.fullHostAccess, true);
+  assert.equal(resolved.effectiveAccess.accessMode, "bypass-permissions");
   assert.deepEqual(resolved.attention, []);
 
   const interrupted = parseTranscriptMetadata([
@@ -296,15 +305,15 @@ test("merges evidence field by field without erasing an exact mode", () => {
     statusSource: "transcript",
     mode: normalizeProviderMode("plan", "transcript"),
     effectiveAccess: {
+      accessMode: "bypass-permissions",
       permissionMode: "bypassPermissions",
       sandboxMode: null,
-      fullHostAccess: true,
     },
   });
   const merged = mergeSessionRecords(providerRecord, transcriptRecord);
   assert.equal(merged.status, "running");
   assert.equal(merged.mode.value, "planning");
-  assert.equal(merged.effectiveAccess.fullHostAccess, true);
+  assert.equal(merged.effectiveAccess.accessMode, "bypass-permissions");
   assert.equal(merged.lifecycle, "live");
 });
 

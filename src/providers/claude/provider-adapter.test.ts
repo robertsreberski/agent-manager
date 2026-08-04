@@ -118,7 +118,7 @@ test("bridges manager-owned Claude state and normalized backend actions", async 
       workspaceId: "workspace",
       initialMessage: "Plan this",
       mode: "planning",
-      permissionPreset: "standard",
+      accessMode: "sandboxed",
       idempotencyKey: "create-managed-claude",
     },
     context(),
@@ -128,7 +128,7 @@ test("bridges manager-owned Claude state and normalized backend actions", async 
   assert.equal(created.mode.value, "planning");
   assert.equal(created.control.plane, "claude-sdk");
   assert.ok(created.control.capabilities.includes("steer"));
-  assert.equal(created.effectiveAccess.fullHostAccess, false);
+  assert.equal(created.effectiveAccess.accessMode, "sandboxed");
 
   const query = runtime.queries[0];
   assert.ok(query);
@@ -266,7 +266,7 @@ test("publishes buffered SDK messages and callback attention as activity", async
       workspaceId: "workspace",
       initialMessage: "Begin",
       mode: "execution",
-      permissionPreset: "standard",
+      accessMode: "sandboxed",
       idempotencyKey: "activity-managed-claude",
     },
     context(),
@@ -309,7 +309,7 @@ test("publishes buffered SDK messages and callback attention as activity", async
   adapter.dispose();
 });
 
-test("keeps full-host access visible in plan mode before switching to bypass", async () => {
+test("keeps bypass-permissions visible in plan mode before switching to execution", async () => {
   const runtime = new BridgeRuntime();
   const adapter = new ClaudeProviderControlAdapter({
     runtime,
@@ -321,13 +321,13 @@ test("keeps full-host access visible in plan mode before switching to bypass", a
       workspaceId: "workspace",
       initialMessage: "Plan",
       mode: "planning",
-      permissionPreset: "full-host",
-      idempotencyKey: "create-full-host-claude",
+      accessMode: "bypass-permissions",
+      idempotencyKey: "create-bypass-claude",
     },
     context(),
   );
   assert.equal(view.mode.providerValue, "plan");
-  assert.equal(view.effectiveAccess.fullHostAccess, true);
+  assert.equal(view.effectiveAccess.accessMode, "bypass-permissions");
   assert.equal(
     runtime.queries[0]?.params.options.allowDangerouslySkipPermissions,
     true,
@@ -336,7 +336,7 @@ test("keeps full-host access visible in plan mode before switching to bypass", a
     type: "set-mode",
     mode: "execution",
     expectedGeneration: view.generation,
-    idempotencyKey: "set-full-host-mode",
+    idempotencyKey: "set-bypass-mode",
   }, context());
   assert.deepEqual(result, {
     status: "succeeded",
@@ -359,7 +359,7 @@ test("publishes exact multi-question and approval attention details", async () =
       workspaceId: "workspace",
       initialMessage: "Ask me",
       mode: "planning",
-      permissionPreset: "standard",
+      accessMode: "sandboxed",
       idempotencyKey: "create-attention-claude",
     },
     context(),
@@ -543,7 +543,7 @@ test("returns the provider handoff id with native Claude attach instructions", a
       workspaceId: "workspace",
       initialMessage: "Prepare",
       mode: "planning",
-      permissionPreset: "standard",
+      accessMode: "sandboxed",
       idempotencyKey: "create-handoff-claude",
     },
     context(),
@@ -588,7 +588,7 @@ test("withdraws writable controls after stream close while preserving native res
       workspaceId: "workspace",
       initialMessage: "Prepare for terminal close",
       mode: "execution",
-      permissionPreset: "standard",
+      accessMode: "sandboxed",
       idempotencyKey: "create-terminal-claude",
     },
     context(),
@@ -653,7 +653,7 @@ test("withdraws writable controls after terminal provider failure", async () => 
       workspaceId: "workspace",
       initialMessage: "Fail safely",
       mode: "execution",
-      permissionPreset: "standard",
+      accessMode: "sandboxed",
       idempotencyKey: "create-failed-claude",
     },
     context(),

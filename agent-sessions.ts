@@ -227,13 +227,20 @@ function accessFromValues(
 ): EffectiveAccess {
   const permission = permissionMode?.toLowerCase() ?? "";
   const sandbox = sandboxMode?.toLowerCase() ?? "";
+  const bypassPermissions =
+    permission.includes("bypass") ||
+    permission.includes("dangerously") ||
+    (sandbox.includes("danger-full-access") && (permission === "never" || permission.includes("bypass")));
   return {
+    accessMode: bypassPermissions
+      ? "bypass-permissions"
+      : sandbox.includes("danger-full-access")
+        ? "unknown"
+      : permissionMode || sandboxMode
+        ? "sandboxed"
+        : "unknown",
     permissionMode,
     sandboxMode,
-    fullHostAccess:
-      permission.includes("bypass") ||
-      permission.includes("dangerously") ||
-      (sandbox.includes("danger-full-access") && (permission === "never" || permission.includes("bypass"))),
   };
 }
 
@@ -266,10 +273,19 @@ function accessFromCommand(command: string): EffectiveAccess {
 }
 
 function mergeAccess(first: EffectiveAccess, second: EffectiveAccess): EffectiveAccess {
+  const permissionMode = first.permissionMode ?? second.permissionMode;
+  const sandboxMode = first.sandboxMode ?? second.sandboxMode;
+  const dangerFullAccess = sandboxMode?.toLowerCase().includes("danger-full-access") ?? false;
   return {
-    permissionMode: first.permissionMode ?? second.permissionMode,
-    sandboxMode: first.sandboxMode ?? second.sandboxMode,
-    fullHostAccess: first.fullHostAccess || second.fullHostAccess,
+    accessMode: first.accessMode === "bypass-permissions" || second.accessMode === "bypass-permissions"
+      ? "bypass-permissions"
+      : dangerFullAccess
+        ? "unknown"
+      : first.accessMode === "sandboxed" || second.accessMode === "sandboxed"
+        ? "sandboxed"
+        : "unknown",
+    permissionMode,
+    sandboxMode,
   };
 }
 

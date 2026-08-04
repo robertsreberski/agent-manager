@@ -10,7 +10,20 @@ export interface WorkspaceRecord {
   id: string;
   label: string;
   path: string;
+  hostId: string;
+  hostLabel: string;
+  hostKind: "local" | "ssh";
+  remoteWorkspaceId: string | null;
   createdAt: string;
+}
+
+export interface HostRecord {
+  id: string;
+  label: string;
+  kind: "local" | "ssh";
+  sshTarget: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface ManagedSessionMetadata {
@@ -141,13 +154,27 @@ export class ManagerDatabase {
 
   #migrate(): void {
     this.#database.exec(`
-      PRAGMA foreign_keys = ON;
       PRAGMA secure_delete = ON;
+      CREATE TABLE IF NOT EXISTS hosts (
+        id TEXT PRIMARY KEY,
+        label TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('local', 'ssh')),
+        ssh_target TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK ((kind = 'local' AND ssh_target IS NULL) OR (kind = 'ssh' AND ssh_target IS NOT NULL)),
+        UNIQUE (ssh_target)
+      ) STRICT;
+      INSERT OR IGNORE INTO hosts (id, label, kind, ssh_target, created_at, updated_at)
+        VALUES ('local', 'This Mac', 'local', NULL, datetime('now'), datetime('now'));
       CREATE TABLE IF NOT EXISTS workspaces (
         id TEXT PRIMARY KEY,
         label TEXT NOT NULL,
-        path TEXT NOT NULL UNIQUE,
-        created_at TEXT NOT NULL
+        path TEXT NOT NULL,
+        host_id TEXT NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
+        remote_workspace_id TEXT,
+        created_at TEXT NOT NULL,
+        UNIQUE (host_id, path)
       ) STRICT;
       CREATE TABLE IF NOT EXISTS managed_sessions (
         id TEXT PRIMARY KEY,
@@ -240,53 +267,159 @@ export class ManagerDatabase {
         COMMIT;
       `);
     }
+    const workspaceColumns = this.#database.prepare("PRAGMA table_info(workspaces)").all() as unknown as Array<{ name: string }>;
+    if (!workspaceColumns.some((column) => column.name === "host_id")) {
+      this.#database.exec(`
+        PRAGMA foreign_keys = OFF;
+        BEGIN IMMEDIATE;
+        ALTER TABLE managed_sessions RENAME TO managed_sessions_v2;
+        ALTER TABLE workspaces RENAME TO workspaces_v2;
+        CREATE TABLE workspaces (
+          id TEXT PRIMARY KEY,
+          label TEXT NOT NULL,
+          path TEXT NOT NULL,
+          host_id TEXT NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
+          remote_workspace_id TEXT,
+          created_at TEXT NOT NULL,
+          UNIQUE (host_id, path)
+        ) STRICT;
+        INSERT INTO workspaces (id, label, path, host_id, remote_workspace_id, created_at)
+          SELECT id, label, path, 'local', NULL, created_at FROM workspaces_v2;
+        CREATE TABLE managed_sessions (
+          id TEXT PRIMARY KEY,
+          provider TEXT NOT NULL CHECK (provider IN ('codex', 'claude')),
+          provider_session_id TEXT NOT NULL,
+          workspace_id TEXT REFERENCES workspaces(id) ON DELETE SET NULL,
+          metadata_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE (provider, provider_session_id)
+        ) STRICT;
+        INSERT INTO managed_sessions
+          SELECT id, provider, provider_session_id, workspace_id, metadata_json, created_at, updated_at
+          FROM managed_sessions_v2;
+        DROP TABLE managed_sessions_v2;
+        DROP TABLE workspaces_v2;
+        COMMIT;
+        PRAGMA foreign_keys = ON;
+      `);
+    } else {
+      this.#database.exec("PRAGMA foreign_keys = ON;");
+    }
+    this.#database.exec("PRAGMA user_version = 3;");
   }
 
-  addWorkspace(input: { id?: string; label: string; path: string; createdAt?: string }): WorkspaceRecord {
+  addHost(input: {
+    id: string;
+    label: string;
+    kind: "local" | "ssh";
+    sshTarget?: string | null;
+    createdAt?: string;
+  }): HostRecord {
+    const at = input.createdAt ?? new Date().toISOString();
+    this.#database.prepare(`
+      INSERT INTO hosts (id, label, kind, ssh_target, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        label = excluded.label,
+        kind = excluded.kind,
+        ssh_target = excluded.ssh_target,
+        updated_at = excluded.updated_at
+    `).run(input.id, input.label, input.kind, input.sshTarget ?? null, at, at);
+    return this.getHost(input.id)!;
+  }
+
+  listHosts(): HostRecord[] {
+    const rows = this.#database.prepare(`
+      SELECT id, label, kind, ssh_target, created_at, updated_at
+      FROM hosts ORDER BY kind, label, id
+    `).all() as unknown as Record<string, unknown>[];
+    return rows.map((row) => ({
+      id: asString(row.id),
+      label: asString(row.label),
+      kind: asString(row.kind) as HostRecord["kind"],
+      sshTarget: row.ssh_target === null ? null : asString(row.ssh_target),
+      createdAt: asString(row.created_at),
+      updatedAt: asString(row.updated_at),
+    }));
+  }
+
+  getHost(id: string): HostRecord | null {
+    return this.listHosts().find((host) => host.id === id) ?? null;
+  }
+
+  removeHost(id: string): boolean {
+    if (id === "local") return false;
+    const result = this.#database.prepare("DELETE FROM hosts WHERE id = ? AND kind = 'ssh'").run(id);
+    return Number(result.changes) > 0;
+  }
+
+  addWorkspace(input: {
+    id?: string;
+    label: string;
+    path: string;
+    hostId?: string;
+    remoteWorkspaceId?: string | null;
+    createdAt?: string;
+  }): WorkspaceRecord {
+    const hostId = input.hostId ?? "local";
+    const host = this.getHost(hostId);
+    if (!host) throw new Error(`Unknown workspace host: ${hostId}`);
     const record: WorkspaceRecord = {
       id: input.id ?? randomUUID(),
       label: input.label,
       path: input.path,
+      hostId,
+      hostLabel: host.label,
+      hostKind: host.kind,
+      remoteWorkspaceId: input.remoteWorkspaceId ?? null,
       createdAt: input.createdAt ?? new Date().toISOString(),
     };
     this.#database.prepare(`
-      INSERT INTO workspaces (id, label, path, created_at)
-      VALUES (?, ?, ?, ?)
-      ON CONFLICT(path) DO UPDATE SET label = excluded.label
-    `).run(record.id, record.label, record.path, record.createdAt);
-    const stored = this.#database.prepare(
-      "SELECT id, label, path, created_at FROM workspaces WHERE path = ?",
-    ).get(record.path) as Record<string, unknown> | undefined;
-    return stored ? {
-      id: asString(stored.id),
-      label: asString(stored.label),
-      path: asString(stored.path),
-      createdAt: asString(stored.created_at),
-    } : record;
+      INSERT INTO workspaces (id, label, path, host_id, remote_workspace_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(host_id, path) DO UPDATE SET
+        label = excluded.label,
+        remote_workspace_id = COALESCE(excluded.remote_workspace_id, workspaces.remote_workspace_id)
+    `).run(record.id, record.label, record.path, record.hostId, record.remoteWorkspaceId, record.createdAt);
+    return this.#workspaceByHostPath(record.hostId, record.path) ?? record;
   }
 
   listWorkspaces(): WorkspaceRecord[] {
-    const rows = this.#database.prepare(
-      "SELECT id, label, path, created_at FROM workspaces ORDER BY label, path",
-    ).all() as unknown as Record<string, unknown>[];
-    return rows.map((row) => ({
-      id: asString(row.id),
-      label: asString(row.label),
-      path: asString(row.path),
-      createdAt: asString(row.created_at),
-    }));
+    const rows = this.#database.prepare(`${this.#workspaceSelect()} ORDER BY h.kind, h.label, w.label, w.path`)
+      .all() as unknown as Record<string, unknown>[];
+    return rows.map((row) => this.#workspaceRecord(row));
   }
 
   getWorkspace(id: string): WorkspaceRecord | null {
-    const row = this.#database.prepare(
-      "SELECT id, label, path, created_at FROM workspaces WHERE id = ?",
-    ).get(id) as Record<string, unknown> | undefined;
-    return row ? {
+    const row = this.#database.prepare(`${this.#workspaceSelect()} WHERE w.id = ?`)
+      .get(id) as Record<string, unknown> | undefined;
+    return row ? this.#workspaceRecord(row) : null;
+  }
+
+  #workspaceByHostPath(hostId: string, path: string): WorkspaceRecord | null {
+    const row = this.#database.prepare(`${this.#workspaceSelect()} WHERE w.host_id = ? AND w.path = ?`)
+      .get(hostId, path) as Record<string, unknown> | undefined;
+    return row ? this.#workspaceRecord(row) : null;
+  }
+
+  #workspaceSelect(): string {
+    return `SELECT w.id, w.label, w.path, w.host_id, w.remote_workspace_id, w.created_at,
+                   h.label AS host_label, h.kind AS host_kind
+            FROM workspaces w JOIN hosts h ON h.id = w.host_id`;
+  }
+
+  #workspaceRecord(row: Record<string, unknown>): WorkspaceRecord {
+    return {
       id: asString(row.id),
       label: asString(row.label),
       path: asString(row.path),
+      hostId: asString(row.host_id),
+      hostLabel: asString(row.host_label),
+      hostKind: asString(row.host_kind) as WorkspaceRecord["hostKind"],
+      remoteWorkspaceId: row.remote_workspace_id === null ? null : asString(row.remote_workspace_id),
       createdAt: asString(row.created_at),
-    } : null;
+    };
   }
 
   removeWorkspace(id: string): boolean {
@@ -329,14 +462,6 @@ export class ManagerDatabase {
       createdAt: asString(row.created_at),
       updatedAt: asString(row.updated_at),
     }));
-  }
-
-  managedSessionRequiresFullHostArm(id: string): boolean {
-    const row = this.#database.prepare(
-      "SELECT metadata_json FROM managed_sessions WHERE id = ?",
-    ).get(id) as { metadata_json?: unknown } | undefined;
-    const metadata = safeJsonParse<Record<string, unknown>>(row?.metadata_json, {});
-    return metadata.permissionPreset === "full-host";
   }
 
   beginCreateSessionIntent(input: {

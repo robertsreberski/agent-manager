@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { get as httpGet } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -102,9 +102,9 @@ function session(overrides: Partial<SessionView> = {}): SessionView {
     activity: "idle",
     attention: [],
     effectiveAccess: {
+      accessMode: "sandboxed",
       permissionMode: "default",
       sandboxMode: "workspace-write",
-      fullHostAccess: false,
     },
     terminal: {
       attachAvailable: true,
@@ -945,7 +945,7 @@ test("session creation reserves a durable idempotency intent before provider dis
     workspaceId: "workspace-one",
     initialMessage: "Private initial task",
     mode: "planning" as const,
-    permissionPreset: "standard" as const,
+    accessMode: "sandboxed" as const,
     idempotencyKey: "create-idempotency-one",
   };
   const first = await backend.app.inject({
@@ -977,7 +977,272 @@ test("session creation reserves a durable idempotency intent before provider dis
   assert.equal(calls, 1);
 });
 
-test("requires explicit full-host arming on the exclusive control lease", async (t) => {
+test("validates, completes, and remembers arbitrary local workspace paths", async (t) => {
+  const workspaceDirectory = mkdtempSync(join(tmpdir(), "agent-manager-custom-workspace-"));
+  t.after(() => rmSync(workspaceDirectory, { recursive: true, force: true }));
+  const backend = await createAgentManagerServer({ discovery: false, staticDir: false });
+  t.after(() => backend.close());
+  await backend.app.ready();
+  const headers = await authenticatedHeaders(backend);
+
+  const hosts = await backend.app.inject({ method: "GET", url: "/api/v1/hosts", headers });
+  assert.equal(hosts.statusCode, 200, hosts.body);
+  const localHost = hosts.json<{ hosts: Array<{ id: string; status: string }> }>().hosts[0];
+  assert.equal(localHost?.id, "local");
+  assert.equal(localHost?.status, "online");
+
+  const partial = workspaceDirectory.slice(0, -1);
+  const completions = await backend.app.inject({
+    method: "GET",
+    url: `/api/v1/hosts/local/directories?path=${encodeURIComponent(partial)}`,
+    headers,
+  });
+  assert.equal(completions.statusCode, 200, completions.body);
+  assert.ok(completions.json<{ paths: string[] }>().paths.includes(workspaceDirectory));
+
+  const resolved = await backend.app.inject({
+    method: "POST",
+    url: "/api/v1/workspaces/resolve",
+    headers,
+    payload: { hostId: "local", path: workspaceDirectory },
+  });
+  assert.equal(resolved.statusCode, 200, resolved.body);
+  const workspace = resolved.json<{ workspace: { id: string; hostId: string; path: string } }>().workspace;
+  assert.equal(workspace.hostId, "local");
+  assert.equal(workspace.path, realpathSync(workspaceDirectory));
+
+  const repeated = await backend.app.inject({
+    method: "POST",
+    url: "/api/v1/workspaces/resolve",
+    headers,
+    payload: { hostId: "local", path: workspaceDirectory },
+  });
+  assert.equal(repeated.json<{ workspace: { id: string } }>().workspace.id, workspace.id);
+  assert.equal(backend.database.listWorkspaces().length, 1);
+});
+
+test("proxies remote sessions through SSH and reserves takeover for a real writer conflict", async (t) => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "agent-manager-ssh-bridge-"));
+  const fakeSsh = join(fixtureRoot, "fake-ssh.cjs");
+  const remoteSession = session({
+    id: "codex:remote-thread",
+    sessionId: "remote-thread",
+    name: "Remote session",
+    cwd: "/srv/project",
+  });
+  const remoteCreatedSession = session({
+    id: "codex:remote-created",
+    sessionId: "remote-created",
+    name: "Created remotely",
+    cwd: "/srv/project",
+  });
+  writeFileSync(fakeSsh, `#!/usr/bin/env node
+const readline = require("node:readline");
+if (process.argv.at(-1) !== "/bin/zsh -lc 'exec agent-manager node bridge'") process.exit(64);
+const remoteSession = ${JSON.stringify(remoteSession)};
+const remoteCreatedSession = ${JSON.stringify(remoteCreatedSession)};
+let owner = "other-controller";
+let leaseToken = null;
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+send({ type: "ready", protocol: 1 });
+const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+lines.on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.method === "GET" && request.path === "/api/v1/sessions") {
+    send({ id: request.id, status: 200, body: { sessions: [remoteSession], diagnostics: [] } });
+    return;
+  }
+  if (request.method === "GET" && request.path.startsWith("/api/v1/hosts/local/directories?")) {
+    send({ id: request.id, status: 200, body: { hostId: "local", paths: ["/srv/project", "/srv/project-two"] } });
+    return;
+  }
+  if (request.method === "POST" && request.path === "/api/v1/workspaces/resolve") {
+    send({ id: request.id, status: 200, body: { workspace: { id: "remote-workspace", label: "project", path: "/srv/project" } } });
+    return;
+  }
+  if (request.method === "POST" && request.path === "/api/v1/sessions") {
+    const valid = request.body?.workspaceId === "remote-workspace";
+    send({ id: request.id, status: valid ? 201 : 400, body: valid ? { session: remoteCreatedSession } : { error: { code: "WORKSPACE_UNKNOWN", message: "unknown workspace" } } });
+    return;
+  }
+  if (request.method === "GET" && request.path.endsWith("/attach")) {
+    send({ id: request.id, status: 200, body: { instruction: { kind: "manager-cli", argv: ["agent-manager", "attach", remoteSession.id], cwd: remoteSession.cwd, warning: null } } });
+    return;
+  }
+  if (request.method === "POST" && request.path.endsWith("/control-lease")) {
+    if (owner !== null && owner !== "controller" && request.body?.takeover !== true) {
+      send({ id: request.id, status: 409, body: { error: { code: "LEASE_CONFLICT", message: "another writer is active", details: { expiresAt: "2099-01-01T00:00:00.000Z" } } } });
+      return;
+    }
+    owner = "controller";
+    leaseToken = "remote-lease-token";
+    remoteSession.control.writableLease = true;
+    send({ id: request.id, status: 200, body: { lease: { token: leaseToken, expiresAt: "2099-01-01T00:00:00.000Z" } } });
+    return;
+  }
+  if (request.method === "DELETE" && request.path.endsWith("/control-lease")) {
+    if (request.controlLease === leaseToken) {
+      owner = null;
+      leaseToken = null;
+      remoteSession.control.writableLease = false;
+    }
+    send({ id: request.id, status: 204, body: null });
+    return;
+  }
+  if (request.method === "POST" && request.path.endsWith("/actions")) {
+    const status = owner === "controller" && request.controlLease === leaseToken ? 200 : 409;
+    const body = status === 200
+      ? { action: { status: "succeeded" } }
+      : { error: { code: "LEASE_INVALID", message: "remote lease missing" } };
+    send({ id: request.id, status, body });
+    return;
+  }
+  send({ id: request.id, status: 404, body: { error: { code: "NOT_FOUND", message: "not found" } } });
+});
+`, { mode: 0o700 });
+  chmodSync(fakeSsh, 0o700);
+
+  const backend = await createAgentManagerServer({
+    discovery: false,
+    staticDir: false,
+    sshExecutable: fakeSsh,
+    remotePollIntervalMs: 60_000,
+  });
+  backend.database.addHost({
+    id: "build-host",
+    label: "Build Host",
+    kind: "ssh",
+    sshTarget: "dev@build-host",
+  });
+  t.after(async () => {
+    await backend.close();
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  });
+  await backend.app.ready();
+  const headers = await authenticatedHeaders(backend);
+  const hosts = await backend.app.inject({ method: "GET", url: "/api/v1/hosts", headers });
+  assert.equal(hosts.statusCode, 200, hosts.body);
+  assert.ok(hosts.json<{ hosts: Array<{ id: string }> }>().hosts.some((candidate) => candidate.id === "build-host"));
+
+  let selected = backend.state.list().find((candidate) => candidate.hostId === "build-host");
+  for (let attempt = 0; !selected && attempt < 50; attempt += 1) {
+    await delay(20);
+    selected = backend.state.list().find((candidate) => candidate.hostId === "build-host");
+  }
+  assert.ok(selected);
+  assert.equal(selected.hostLabel, "Build Host");
+  const routeId = encodeURIComponent(selected.id);
+
+  const completions = await backend.app.inject({
+    method: "GET",
+    url: `/api/v1/hosts/build-host/directories?path=${encodeURIComponent("/srv/pro")}`,
+    headers,
+  });
+  assert.equal(completions.statusCode, 200, completions.body);
+  assert.deepEqual(completions.json<{ paths: string[] }>().paths, ["/srv/project", "/srv/project-two"]);
+
+  const resolved = await backend.app.inject({
+    method: "POST",
+    url: "/api/v1/workspaces/resolve",
+    headers,
+    payload: { hostId: "build-host", path: "/srv/project" },
+  });
+  assert.equal(resolved.statusCode, 200, resolved.body);
+  const workspace = resolved.json<{ workspace: { id: string; hostId: string; remoteWorkspaceId: string } }>().workspace;
+  assert.equal(workspace.hostId, "build-host");
+  assert.equal(workspace.remoteWorkspaceId, "remote-workspace");
+
+  const created = await backend.app.inject({
+    method: "POST",
+    url: "/api/v1/sessions",
+    headers,
+    payload: {
+      provider: "codex",
+      workspaceId: workspace.id,
+      initialMessage: "Start on the build host",
+      mode: "execution",
+      accessMode: "sandboxed",
+      idempotencyKey: "remote-create-0001",
+    },
+  });
+  assert.equal(created.statusCode, 201, created.body);
+  assert.equal(created.json<{ session: { hostId: string; cwd: string } }>().session.hostId, "build-host");
+  assert.equal(created.json<{ session: { cwd: string } }>().session.cwd, "/srv/project");
+
+  const attach = await backend.app.inject({
+    method: "GET",
+    url: `/api/v1/sessions/${routeId}/attach`,
+    headers,
+  });
+  assert.equal(attach.statusCode, 200, attach.body);
+  const attachInstruction = attach.json<{ instruction: { kind: string; argv: string[] } }>().instruction;
+  assert.equal(attachInstruction.kind, "ssh");
+  assert.deepEqual(attachInstruction.argv.slice(0, 3), ["ssh", "-t", "dev@build-host"]);
+  assert.match(attachInstruction.argv[3] ?? "", /\/bin\/zsh -lc/);
+  assert.match(attachInstruction.argv[3] ?? "", /codex:remote-thread/);
+
+  const conflict = await backend.app.inject({
+    method: "POST",
+    url: `/api/v1/sessions/${routeId}/control-lease`,
+    headers,
+    payload: { clientId: "browser-client", takeover: false },
+  });
+  assert.equal(conflict.statusCode, 409, conflict.body);
+  assert.equal(conflict.json<{ error: { code: string } }>().error.code, "LEASE_CONFLICT");
+  assert.equal(backend.state.get(selected.id)?.control.writableLease, false);
+
+  const takeover = await backend.app.inject({
+    method: "POST",
+    url: `/api/v1/sessions/${routeId}/control-lease`,
+    headers,
+    payload: { clientId: "browser-client", takeover: true },
+  });
+  assert.equal(takeover.statusCode, 200, takeover.body);
+  const lease = takeover.json<{ lease: { token: string } }>().lease;
+  const action = await backend.app.inject({
+    method: "POST",
+    url: `/api/v1/sessions/${routeId}/actions`,
+    headers: { ...headers, "x-control-lease": lease.token },
+    payload: {
+      type: "send",
+      delivery: "queue",
+      text: "Continue remotely",
+      expectedGeneration: selected.generation,
+      idempotencyKey: "remote-action-0001",
+    },
+  });
+  assert.equal(action.statusCode, 200, action.body);
+  assert.equal(action.json<{ action: { status: string } }>().action.status, "succeeded");
+
+  const released = await backend.app.inject({
+    method: "DELETE",
+    url: `/api/v1/sessions/${routeId}/control-lease`,
+    headers: {
+      host,
+      origin,
+      cookie: headers.cookie,
+      "x-csrf-token": headers["x-csrf-token"],
+      "x-control-lease": lease.token,
+    },
+  });
+  assert.equal(released.statusCode, 204, released.body);
+  await delay(30);
+  const reacquired = await backend.app.inject({
+    method: "POST",
+    url: `/api/v1/sessions/${routeId}/control-lease`,
+    headers,
+    payload: { clientId: "second-browser", takeover: false },
+  });
+  assert.equal(reacquired.statusCode, 200, reacquired.body);
+
+  assert.equal(backend.database.removeHost("build-host"), true);
+  const afterRemoval = await backend.app.inject({ method: "GET", url: "/api/v1/hosts", headers });
+  assert.equal(afterRemoval.statusCode, 200, afterRemoval.body);
+  assert.equal(afterRemoval.json<{ hosts: Array<{ id: string }> }>().hosts.some((candidate) => candidate.id === "build-host"), false);
+  assert.equal(backend.state.get(selected.id), null);
+});
+
+test("keeps bypass-permissions access independent from automatic writer leases", async (t) => {
   let calls = 0;
   const backend = await createAgentManagerServer({
     discovery: false,
@@ -990,9 +1255,9 @@ test("requires explicit full-host arming on the exclusive control lease", async 
     },
     initialSessions: [session({
       effectiveAccess: {
+        accessMode: "bypass-permissions",
         permissionMode: "never",
         sandboxMode: "danger-full-access",
-        fullHostAccess: true,
       },
     })],
   });
@@ -1003,7 +1268,7 @@ test("requires explicit full-host arming on the exclusive control lease", async 
     method: "POST",
     url: "/api/v1/sessions/codex:thread-1/control-lease",
     headers,
-    payload: { clientId: "browser-client", armFullHost: false },
+    payload: { clientId: "browser-client" },
   });
   const lease = leaseResponse.json<{ lease: { token: string } }>().lease;
   const response = await backend.app.inject({
@@ -1013,29 +1278,29 @@ test("requires explicit full-host arming on the exclusive control lease", async 
     payload: {
       type: "interrupt",
       expectedGeneration: backend.state.get("codex:thread-1")!.generation,
-      idempotencyKey: "idem-key-armed",
+      idempotencyKey: "idem-key-bypass",
     },
   });
-  assert.equal(response.statusCode, 428, response.body);
-  assert.equal(calls, 0);
+  assert.equal(response.statusCode, 200, response.body);
+  assert.equal(calls, 1);
 
-  const missingCurrentToken = await backend.app.inject({
+  const conflict = await backend.app.inject({
     method: "POST",
     url: "/api/v1/sessions/codex:thread-1/control-lease",
     headers,
-    payload: { clientId: "browser-client", armFullHost: true },
+    payload: { clientId: "other-browser" },
   });
-  assert.equal(missingCurrentToken.statusCode, 409, missingCurrentToken.body);
+  assert.equal(conflict.statusCode, 409, conflict.body);
 
-  const armedResponse = await backend.app.inject({
+  const takeoverResponse = await backend.app.inject({
     method: "POST",
     url: "/api/v1/sessions/codex:thread-1/control-lease",
-    headers: { ...headers, "x-control-lease": lease.token },
-    payload: { clientId: "browser-client", armFullHost: true },
+    headers,
+    payload: { clientId: "other-browser", takeover: true },
   });
-  assert.equal(armedResponse.statusCode, 200, armedResponse.body);
-  const armed = armedResponse.json<{ lease: { token: string } }>().lease;
-  assert.notEqual(armed.token, lease.token);
+  assert.equal(takeoverResponse.statusCode, 200, takeoverResponse.body);
+  const takeover = takeoverResponse.json<{ lease: { token: string } }>().lease;
+  assert.notEqual(takeover.token, lease.token);
 
   const oldToken = await backend.app.inject({
     method: "POST",
@@ -1049,18 +1314,18 @@ test("requires explicit full-host arming on the exclusive control lease", async 
   });
   assert.equal(oldToken.statusCode, 409, oldToken.body);
 
-  const armedAction = await backend.app.inject({
+  const takeoverAction = await backend.app.inject({
     method: "POST",
     url: "/api/v1/sessions/codex:thread-1/actions",
-    headers: { ...headers, "x-control-lease": armed.token },
+    headers: { ...headers, "x-control-lease": takeover.token },
     payload: {
       type: "interrupt",
       expectedGeneration: backend.state.get("codex:thread-1")!.generation,
-      idempotencyKey: "idem-key-armed-success",
+      idempotencyKey: "idem-key-takeover-success",
     },
   });
-  assert.equal(armedAction.statusCode, 200, armedAction.body);
-  assert.equal(calls, 1);
+  assert.equal(takeoverAction.statusCode, 200, takeoverAction.body);
+  assert.equal(calls, 2);
 });
 
 test("serves newly published static assets and the production SPA fallback without weakening Host checks", async (t) => {

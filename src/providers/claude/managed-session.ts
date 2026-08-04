@@ -276,7 +276,7 @@ export class ClaudeManagedSession {
     this.#assertManagerControl();
     if (mode === "bypassPermissions" && !this.#config.allowDangerouslySkipPermissions) {
       throw new Error(
-        "bypassPermissions was not armed when this session was created",
+        "bypassPermissions was not selected when this session was created",
       );
     }
     const { query } = this.#requireLiveConsumer();

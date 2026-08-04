@@ -48,9 +48,9 @@ function externalSession(): SessionView {
     activity: "running",
     attention: [],
     effectiveAccess: {
+      accessMode: "unknown",
       permissionMode: null,
       sandboxMode: null,
-      fullHostAccess: false,
     },
     terminal: null,
     control: {

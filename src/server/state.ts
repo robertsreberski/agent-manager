@@ -177,6 +177,12 @@ export class SessionStateStore {
     return stored;
   }
 
+  remove(id: string): boolean {
+    if (!this.#sessions.delete(id)) return false;
+    this.#publish("session.remove", { id });
+    return true;
+  }
+
   setWritableLease(id: string, writableLease: boolean): SessionView | null {
     const current = this.#sessions.get(id);
     if (!current || current.control.writableLease === writableLease) return current ? clone(current) : null;

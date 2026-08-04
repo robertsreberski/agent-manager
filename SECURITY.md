@@ -14,9 +14,10 @@ session or owner control socket as access to the underlying agents.
   memory and can be reissued only through the owner-only Unix socket.
 - Browser mutations require both the session cookie and a CSRF token. Session
   controls additionally require a short, single-writer lease bound to the auth
-  session, actor, browser client ID, and rotating token. The shipped UI requests
-  five minutes; other tabs and browsers remain read-only until release or
-  expiry. Sessions with full-host access require an explicitly armed lease.
+  session, actor, browser client ID, and rotating token. The shipped UI acquires
+  a 60-second lease only when an action is sent and renews it automatically as needed.
+  Lease state is not presented as an access switch. A competing browser gets an
+  explicit conflict and may deliberately take over subsequent writes.
 - Tailscale access is opt-in. The server accepts only the exact configured
   device host and login identity relayed by a loopback Tailscale Serve proxy.
   The design assumes the local macOS account and its processes are trusted;
@@ -25,6 +26,11 @@ session or owner control socket as access to the underlying agents.
 - The owner Unix socket and state directory are mode `0600`/`0700`. It exposes
   a closed command set for bootstrap, panic lock, and native attach lifecycle;
   it is not a shell or generic RPC bridge.
+- SSH hosts are selected only by configured stable IDs. Targets are validated,
+  OpenSSH runs without a local shell, and a persistent JSON-lines bridge
+  exchanges a remote owner-socket bootstrap entirely inside the SSH login. The
+  remote HTTP service remains loopback-only; its cookie and CSRF token are never
+  returned to the browser or stored by the controller.
 
 ## Provider and terminal safety
 

@@ -80,9 +80,9 @@ export interface SessionAttention {
 }
 
 export interface EffectiveAccess {
+  accessMode: "sandboxed" | "bypass-permissions" | "unknown";
   permissionMode: string | null;
   sandboxMode: string | null;
-  fullHostAccess: boolean;
 }
 
 /**
@@ -170,6 +170,9 @@ export interface ChildSummary {
 export interface SessionRecord {
   provider: Provider;
   sessionId: string;
+  /** Host identity is omitted only by legacy/local discovery records. */
+  hostId?: string;
+  hostLabel?: string;
   parentSessionId: string | null;
   rootSessionId: string;
   depth: number;
@@ -289,9 +292,9 @@ export function unknownMode(): SessionMode {
 
 export function unknownAccess(): EffectiveAccess {
   return {
+    accessMode: "unknown",
     permissionMode: null,
     sandboxMode: null,
-    fullHostAccess: false,
   };
 }
 

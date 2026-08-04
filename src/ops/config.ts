@@ -25,10 +25,17 @@ export interface WorkspaceConfig {
   id: string;
   name: string;
   path: string;
+  hostId: string;
+}
+
+export interface SshHostConfig {
+  id: string;
+  name: string;
+  target: string;
 }
 
 export interface AgentManagerConfig {
-  version: 1;
+  version: 2;
   backend: {
     host: "127.0.0.1";
     port: number;
@@ -38,6 +45,7 @@ export interface AgentManagerConfig {
     allowedLogin: string | null;
     dnsName: string | null;
   };
+  hosts: SshHostConfig[];
   workspaces: WorkspaceConfig[];
 }
 
@@ -142,9 +150,10 @@ export function defaultPaths(homeDirectory = homedir(), uid = process.getuid?.()
 
 export function defaultConfig(): AgentManagerConfig {
   return {
-    version: 1,
+    version: 2,
     backend: { host: "127.0.0.1", port: 43_127 },
     tailscale: { httpsPort: 9_443, allowedLogin: null, dnsName: null },
+    hosts: [],
     workspaces: [],
   };
 }
@@ -177,10 +186,30 @@ function isSafeDnsName(value: unknown): value is string {
   );
 }
 
+export function isSafeSshTarget(value: unknown): value is string {
+  return isSafeIdentityText(value, 320)
+    && !value.startsWith("-")
+    && /^(?:[A-Za-z0-9._-]+@)?(?:[A-Za-z0-9._-]+|\[[0-9A-Fa-f:]+\])$/u.test(value);
+}
+
 function validateConfig(value: unknown): AgentManagerConfig {
   if (!value || typeof value !== "object") throw new Error("Agent Manager config must be an object");
-  const config = value as Partial<AgentManagerConfig>;
-  if (config.version !== 1) throw new Error("Unsupported Agent Manager config version");
+  const input = value as Record<string, unknown>;
+  if (input.version !== 1 && input.version !== 2) {
+    throw new Error("Unsupported Agent Manager config version");
+  }
+  const legacy = input.version === 1;
+  const config = {
+    ...input,
+    version: 2,
+    hosts: legacy ? [] : input.hosts,
+    workspaces: Array.isArray(input.workspaces)
+      ? input.workspaces.map((workspace) => ({
+          ...(workspace as Record<string, unknown>),
+          hostId: legacy ? "local" : (workspace as Record<string, unknown>).hostId,
+        }))
+      : input.workspaces,
+  } as unknown as Partial<AgentManagerConfig>;
   if (config.backend?.host !== "127.0.0.1") throw new Error("Backend host must be 127.0.0.1");
   if (
     !Number.isInteger(config.backend.port)
@@ -201,9 +230,29 @@ function validateConfig(value: unknown): AgentManagerConfig {
     (allowedLogin !== null && !isSafeIdentityText(allowedLogin, 320))
     || (dnsName !== null && !isSafeDnsName(dnsName))
   ) throw new Error("Tailscale identity is invalid");
+  if (!Array.isArray(config.hosts)) throw new Error("Hosts must be an array");
+  const hostIds = new Set<string>(["local"]);
+  const hostTargets = new Set<string>();
+  for (const host of config.hosts) {
+    if (
+      !isSafeIdentityText(host.id, 128)
+      || !isSafeIdentityText(host.name, 120)
+      || !isSafeSshTarget(host.target)
+      || host.id === "local"
+      || hostIds.has(host.id)
+      || hostTargets.has(host.target)
+    ) throw new Error("SSH host entry is invalid or duplicated");
+    hostIds.add(host.id);
+    hostTargets.add(host.target);
+  }
   if (!Array.isArray(config.workspaces)) throw new Error("Workspaces must be an array");
   for (const workspace of config.workspaces) {
-    if (!workspace.id || !workspace.name || !workspace.path) {
+    if (
+      !isSafeIdentityText(workspace.id, 128)
+      || !isSafeIdentityText(workspace.name, 120)
+      || !isSafeIdentityText(workspace.path, 4_096)
+      || !hostIds.has(workspace.hostId)
+    ) {
       throw new Error("Workspace entry is incomplete");
     }
   }
@@ -643,19 +692,57 @@ export function mutateConfig<T>(
   }, paths, options);
 }
 
-function workspaceId(path: string): string {
-  return `ws_${createHash("sha256").update(path).digest("hex").slice(0, 16)}`;
+function workspaceId(path: string, hostId: string): string {
+  return `ws_${createHash("sha256").update(`${hostId}\0${path}`).digest("hex").slice(0, 16)}`;
 }
 
-export function addWorkspace(config: AgentManagerConfig, requestedPath: string): WorkspaceConfig {
+export function addWorkspace(
+  config: AgentManagerConfig,
+  requestedPath: string,
+  hostId = "local",
+): WorkspaceConfig {
+  if (hostId !== "local") {
+    throw new Error("Remote workspaces are validated and remembered by their Agent Manager node");
+  }
   const path = realpathSync(requestedPath);
   if (!statSync(path).isDirectory()) throw new Error("Workspace path must be a directory");
-  const existing = config.workspaces.find((workspace) => workspace.path === path);
+  const existing = config.workspaces.find((workspace) =>
+    workspace.hostId === hostId && workspace.path === path
+  );
   if (existing) return existing;
-  const workspace = { id: workspaceId(path), name: basename(path), path };
+  const workspace = { id: workspaceId(path, hostId), name: basename(path), path, hostId };
   config.workspaces.push(workspace);
   config.workspaces.sort((left, right) => left.name.localeCompare(right.name));
   return workspace;
+}
+
+function sshHostId(target: string): string {
+  return `host_${createHash("sha256").update(target).digest("hex").slice(0, 16)}`;
+}
+
+export function addSshHost(
+  config: AgentManagerConfig,
+  input: { name: string; target: string },
+): SshHostConfig {
+  const name = input.name.trim();
+  const target = input.target.trim();
+  if (!isSafeIdentityText(name, 120) || !isSafeSshTarget(target)) {
+    throw new Error("SSH host name or target is invalid");
+  }
+  const existing = config.hosts.find((host) => host.target === target);
+  if (existing) return existing;
+  const host = { id: sshHostId(target), name, target };
+  config.hosts.push(host);
+  config.hosts.sort((left, right) => left.name.localeCompare(right.name));
+  return host;
+}
+
+export function removeSshHost(config: AgentManagerConfig, id: string): boolean {
+  const index = config.hosts.findIndex((host) => host.id === id);
+  if (index < 0) return false;
+  config.hosts.splice(index, 1);
+  config.workspaces = config.workspaces.filter((workspace) => workspace.hostId !== id);
+  return true;
 }
 
 export function removeWorkspace(config: AgentManagerConfig, id: string): boolean {

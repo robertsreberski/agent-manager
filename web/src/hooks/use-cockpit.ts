@@ -19,6 +19,8 @@ import type {
   ControlLease,
   CreateSessionInput,
   Diagnostic,
+  HostOption,
+  LaunchSessionInput,
   PanePreview,
   SessionView,
   SessionsSnapshot,
@@ -137,43 +139,47 @@ function replaceNavigationUrl(search: string): void {
   );
 }
 
-export async function acquireLeaseInStages(
+function apiErrorCode(error: unknown): string | null {
+  if (!(error instanceof ApiError) || !error.body || typeof error.body !== "object") return null;
+  const envelope = error.body as Record<string, unknown>;
+  const nested = envelope.error && typeof envelope.error === "object"
+    ? envelope.error as Record<string, unknown>
+    : envelope;
+  return typeof nested.code === "string" ? nested.code : null;
+}
+
+function leaseConflictExpiry(error: unknown): string | null | undefined {
+  if (apiErrorCode(error) !== "LEASE_CONFLICT") return undefined;
+  const body = error instanceof ApiError && error.body && typeof error.body === "object"
+    ? error.body as Record<string, unknown>
+    : {};
+  const nested = body.error && typeof body.error === "object"
+    ? body.error as Record<string, unknown>
+    : body;
+  const details = nested.details && typeof nested.details === "object"
+    ? nested.details as Record<string, unknown>
+    : {};
+  return typeof details.expiresAt === "string" ? details.expiresAt : null;
+}
+
+export async function acquireAutomaticLease(
   api: Pick<CockpitApi, "acquireLease">,
   session: SessionView,
   clientId: string,
   current: ControlLease | undefined,
-  retain: (lease: ControlLease) => void,
+  takeover = false,
 ): Promise<ControlLease> {
-  let seed = current && new Date(current.expiresAt).getTime() > Date.now()
-    ? current
+  if (
+    !takeover
+    && current
+    && new Date(current.expiresAt).getTime() > Date.now() + 5_000
+  ) {
+    return current;
+  }
+  const currentToken = current && new Date(current.expiresAt).getTime() > Date.now()
+    ? current.token
     : undefined;
-  if (!seed) {
-    seed = await api.acquireLease(session.id, clientId, false, undefined, 30);
-    // Keep the short token even if the rotating 300-second renewal response is
-    // lost. The broker can recover that immediate previous token briefly.
-    retain(seed);
-  }
-  return api.acquireLease(
-    session.id,
-    clientId,
-    session.effectiveAccess.fullHostAccess,
-    seed.token,
-    300,
-  );
-}
-
-export async function autoAcquireCreatedSession(
-  input: Pick<CreateSessionInput, "permissionPreset">,
-  session: SessionView,
-  acquire: (session: SessionView) => Promise<unknown>,
-): Promise<boolean> {
-  // Full-host access always remains behind the explicit Arm control dialog,
-  // even if a provider response disagrees with the requested preset.
-  if (input.permissionPreset !== "standard" || session.effectiveAccess.fullHostAccess) {
-    return false;
-  }
-  await acquire(session);
-  return true;
+  return api.acquireLease(session.id, clientId, currentToken, 60, takeover);
 }
 
 export function useCockpit() {
@@ -184,6 +190,7 @@ export function useCockpit() {
   const [hasSuccessfulSnapshot, setHasSuccessfulSnapshot] = useState(false);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [workspaces, setWorkspaces] = useState<WorkspaceOption[]>([]);
+  const [hosts, setHosts] = useState<HostOption[]>([]);
   const [scope, setScopeState] = useState<SessionScope>(() => (
     sessionScopeFromSearch(window.location.search)
   ));
@@ -191,6 +198,7 @@ export function useCockpit() {
     return new URLSearchParams(window.location.search).get("session");
   });
   const [leases, setLeases] = useState<Record<string, ControlLease>>({});
+  const [controlConflicts, setControlConflicts] = useState<Record<string, string | null>>({});
   const [busy, setBusy] = useState<Record<string, boolean>>({});
   const [notice, setNotice] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -198,6 +206,8 @@ export function useCockpit() {
   const apiRef = useRef(api);
   apiRef.current = api;
   const snapshotRef = useRef<SessionsSnapshot>(EMPTY_SNAPSHOT);
+  const leasesRef = useRef<Record<string, ControlLease>>({});
+  const leaseOperationsRef = useRef(new Map<string, Promise<ControlLease>>());
   const stateGuardRef = useRef(new SessionStateGuard());
   const recoveryRef = useRef<Promise<boolean> | null>(null);
 
@@ -222,7 +232,11 @@ export function useCockpit() {
     commitSnapshot(EMPTY_SNAPSHOT);
     stateGuardRef.current = new SessionStateGuard();
     setWorkspaces([]);
+    setHosts([]);
     setLeases({});
+    leasesRef.current = {};
+    leaseOperationsRef.current.clear();
+    setControlConflicts({});
     setBusy({});
     setNotice(null);
     setActionError(null);
@@ -338,8 +352,9 @@ export function useCockpit() {
     void Promise.all([
       api.sessions(),
       api.workspaces().catch(() => [] as WorkspaceOption[]),
+      api.hosts().catch(() => [] as HostOption[]),
     ])
-      .then(([nextSnapshot, nextWorkspaces]) => {
+      .then(([nextSnapshot, nextWorkspaces, nextHosts]) => {
         if (cancelled) return;
         commitSnapshot(stateGuardRef.current.applyRestSnapshot(
           snapshotRef.current,
@@ -348,6 +363,7 @@ export function useCockpit() {
         ));
         setHasSuccessfulSnapshot(true);
         setWorkspaces(nextWorkspaces);
+        setHosts(nextHosts);
         setAvailability("online");
         setAuthError(null);
       })
@@ -427,6 +443,23 @@ export function useCockpit() {
   }, [api, commitSnapshot, handleFailure, markDisconnected, refresh]);
 
   useEffect(() => {
+    if (!api) return;
+    let cancelled = false;
+    const refreshTargets = (): void => {
+      void Promise.all([api.hosts(), api.workspaces()]).then(([nextHosts, nextWorkspaces]) => {
+        if (cancelled) return;
+        setHosts(nextHosts);
+        setWorkspaces(nextWorkspaces);
+      }).catch(() => undefined);
+    };
+    const timer = window.setInterval(refreshTargets, 5_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [api]);
+
+  useEffect(() => {
     if (!auth || (connection !== "retrying" && connection !== "offline")) return;
     const timer = window.setTimeout(() => {
       if (document.visibilityState === "visible" && navigator.onLine !== false) {
@@ -492,7 +525,10 @@ export function useCockpit() {
       const now = Date.now();
       setLeases((current) => {
         const active = Object.entries(current).filter(([, lease]) => new Date(lease.expiresAt).getTime() > now);
-        return active.length === Object.keys(current).length ? current : Object.fromEntries(active);
+        if (active.length === Object.keys(current).length) return current;
+        const next = Object.fromEntries(active);
+        leasesRef.current = next;
+        return next;
       });
     }, 1_000);
     return () => window.clearInterval(timer);
@@ -520,60 +556,89 @@ export function useCockpit() {
     }
   }, [handleFailure]);
 
-  const acquireLease = useCallback(async (session: SessionView) => {
-    if (!api || !mutationsReady) throw new Error("Reconnect to control this session.");
-    const lease = await withBusy(`lease:${session.id}`, async () => {
-      return acquireLeaseInStages(
-        api,
-        session,
-        BROWSER_CLIENT_ID,
-        leases[session.id],
-        (retained) => setLeases((value) => ({ ...value, [session.id]: retained })),
-      );
-    });
-    setLeases((current) => ({ ...current, [session.id]: lease }));
-    setNotice(session.effectiveAccess.fullHostAccess ? "Full-host controls armed for five minutes." : "Control acquired for five minutes.");
-    return lease;
-  }, [api, leases, mutationsReady, withBusy]);
-
-  const releaseLease = useCallback(async (session: SessionView) => {
-    if (!api || !mutationsReady) throw new Error("Reconnect before releasing control.");
-    const lease = leases[session.id];
-    if (!lease) return;
-    await withBusy(`lease:${session.id}`, () => api.releaseLease(session.id, lease.token));
-    setLeases((current) => {
+  const rememberLease = useCallback((sessionId: string, lease: ControlLease) => {
+    leasesRef.current = { ...leasesRef.current, [sessionId]: lease };
+    setLeases(leasesRef.current);
+    setControlConflicts((current) => {
+      if (!(sessionId in current)) return current;
       const next = { ...current };
-      delete next[session.id];
+      delete next[sessionId];
       return next;
     });
-    setNotice("Control released.");
-  }, [api, leases, mutationsReady, withBusy]);
+  }, []);
 
-  const validLease = useCallback((session: SessionView): ControlLease | null => {
-    const lease = leases[session.id];
-    if (!lease || new Date(lease.expiresAt).getTime() <= Date.now()) return null;
-    if (
-      session.effectiveAccess.fullHostAccess
-      && (!lease.fullHostArmedUntil || new Date(lease.fullHostArmedUntil).getTime() <= Date.now())
-    ) {
-      return null;
-    }
-    return lease;
-  }, [leases]);
+  const forgetLease = useCallback((sessionId: string) => {
+    if (!(sessionId in leasesRef.current)) return;
+    const next = { ...leasesRef.current };
+    delete next[sessionId];
+    leasesRef.current = next;
+    setLeases(next);
+  }, []);
+
+  const ensureLease = useCallback(async (
+    session: SessionView,
+    takeover = false,
+  ): Promise<ControlLease> => {
+    if (!api || !mutationsReady) throw new Error("Reconnect before sending an action.");
+    const pending = leaseOperationsRef.current.get(session.id);
+    if (pending && !takeover) return pending;
+
+    const operation = withBusy(`lease:${session.id}`, () => acquireAutomaticLease(
+      api,
+      session,
+      BROWSER_CLIENT_ID,
+      leasesRef.current[session.id],
+      takeover,
+    )).then((lease) => {
+      rememberLease(session.id, lease);
+      return lease;
+    }).catch((error: unknown) => {
+      const expiresAt = leaseConflictExpiry(error);
+      if (expiresAt !== undefined) {
+        setControlConflicts((current) => ({
+          ...current,
+          [session.id]: expiresAt,
+        }));
+        setActionError("This session is active in another browser.");
+      }
+      throw error;
+    }).finally(() => {
+      if (leaseOperationsRef.current.get(session.id) === operation) {
+        leaseOperationsRef.current.delete(session.id);
+      }
+    });
+    leaseOperationsRef.current.set(session.id, operation);
+    return operation;
+  }, [api, mutationsReady, rememberLease, withBusy]);
 
   const perform = useCallback(async (
     session: SessionView,
     action: Parameters<CockpitApi["action"]>[1],
   ) => {
     if (!api || !mutationsReady) throw new Error("Reconnect before sending an action.");
-    const lease = validLease(session);
-    if (!lease) {
-      const message = "Take control of this session before sending an action.";
-      setActionError(message);
-      throw new Error(message);
-    }
-    await withBusy(`action:${session.id}`, () => api.action(session.id, action, lease.token));
-  }, [api, mutationsReady, validLease, withBusy]);
+    await withBusy(`action:${session.id}`, async () => {
+      let lease = await ensureLease(session);
+      try {
+        await api.action(session.id, action, lease.token);
+      } catch (error) {
+        const expiresAt = leaseConflictExpiry(error);
+        if (expiresAt !== undefined) {
+          setControlConflicts((current) => ({ ...current, [session.id]: expiresAt }));
+          setActionError("This session is active elsewhere.");
+          throw error;
+        }
+        if (apiErrorCode(error) !== "LEASE_INVALID") throw error;
+        forgetLease(session.id);
+        lease = await ensureLease(session);
+        await api.action(session.id, action, lease.token);
+      }
+    });
+  }, [api, ensureLease, forgetLease, mutationsReady, withBusy]);
+
+  const takeOverControl = useCallback(async (session: SessionView) => {
+    await ensureLease(session, true);
+    setNotice("This browser is now active for the session.");
+  }, [ensureLease]);
 
   const sendMessage = useCallback(async (session: SessionView, text: string, delivery: "queue" | "steer") => {
     const trimmed = text.trim();
@@ -620,23 +685,35 @@ export function useCockpit() {
     setNotice(`Mode change to ${mode} requested.`);
   }, [perform]);
 
-  const createSession = useCallback(async (input: CreateSessionInput) => {
+  const createSession = useCallback(async (input: LaunchSessionInput) => {
     if (!api || !mutationsReady) throw new Error("Reconnect before creating a session.");
-    const session = await withBusy("create", () => api.createSession(input));
+    const session = await withBusy("create", async () => {
+      const workspace = await api.resolveWorkspace(input.hostId, input.workspacePath);
+      setWorkspaces((current) => [
+        workspace,
+        ...current.filter((entry) => entry.id !== workspace.id),
+      ]);
+      const request: CreateSessionInput = {
+        provider: input.provider,
+        workspaceId: workspace.id,
+        ...(input.name ? { name: input.name } : {}),
+        initialMessage: input.initialMessage,
+        mode: input.mode,
+        accessMode: input.accessMode,
+        idempotencyKey: input.idempotencyKey,
+      };
+      return api.createSession(request);
+    });
     commitSnapshot(stateGuardRef.current.applyLocalSession(snapshotRef.current, session));
     setScopeAndSelectedId("managed", session.id);
-    let acquired = false;
-    try {
-      acquired = await autoAcquireCreatedSession(input, session, acquireLease);
-    } catch {
-      // Creation already succeeded. Keep that result and surface the lease
-      // error rather than causing the launch dialog to retry creation.
-    }
-    setNotice(acquired
-      ? "Managed session created with control ready for five minutes."
-      : "Managed session created.");
+    setNotice("Managed session created.");
     return session;
-  }, [acquireLease, api, commitSnapshot, mutationsReady, setScopeAndSelectedId, withBusy]);
+  }, [api, commitSnapshot, mutationsReady, setScopeAndSelectedId, withBusy]);
+
+  const completeWorkspacePath = useCallback(async (hostId: string, path: string) => {
+    if (!api) return [];
+    return api.completeDirectories(hostId, path);
+  }, [api]);
 
   const releaseAllLeases = useCallback(async (): Promise<void> => {
     if (Object.values(busy).some(Boolean)) {
@@ -649,8 +726,9 @@ export function useCockpit() {
     // server boundary even when this tab has no local lease record, so a stale
     // background tab cannot remain writable across a PWA code takeover.
     await withBusy("lease:all", () => api.releaseBrowserLeases());
+    leasesRef.current = {};
     setLeases({});
-    setNotice("Browser control released.");
+    setControlConflicts({});
   }, [api, busy, mutationsReady, withBusy]);
 
   const loadPreview = useCallback(async (session: SessionView): Promise<PanePreview> => {
@@ -687,9 +765,8 @@ export function useCockpit() {
     setScope,
     connection,
     mutationsReady,
+    hosts,
     workspaces,
-    leases,
-    validLease,
     busy,
     notice,
     clearNotice: () => setNotice(null),
@@ -697,16 +774,16 @@ export function useCockpit() {
     clearActionError: () => setActionError(null),
     refresh,
     retryConnection: recoverBrowserSession,
-    acquireLease,
-    releaseLease,
+    controlConflict: selectedSession ? controlConflicts[selectedSession.id] ?? undefined : undefined,
+    takeOverControl,
     releaseAllLeases,
-    hasActiveLeases: Object.values(leases).some((lease) => new Date(lease.expiresAt).getTime() > Date.now()),
     hasBusyAction: Object.values(busy).some(Boolean),
     sendMessage,
     respond,
     interrupt,
     setMode,
     createSession,
+    completeWorkspacePath,
     loadPreview,
     loadAttach,
   };

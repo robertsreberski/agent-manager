@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { AlertTriangle, Check, ChevronRight, CircleHelp, KeyRound, ShieldQuestion, X } from "lucide-react";
+import { AlertTriangle, Check, ChevronRight, CircleHelp, ShieldQuestion, X } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "./ui/alert";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
@@ -37,19 +37,15 @@ export function isCanonicalInlineQuestion(
 
 export function QuestionRequestForm({
   request,
-  writable,
   mutationsReady,
   canRespond,
   busy,
-  onTakeControl,
   onRespond,
 }: {
   request: AttentionRequest;
-  writable: boolean;
   mutationsReady: boolean;
   canRespond: boolean;
   busy: boolean;
-  onTakeControl?: () => void;
   onRespond: (requestId: string, response: RequestResponse) => Promise<void>;
 }) {
   const [answers, setAnswers] = useState<Record<string, string>>({});
@@ -74,7 +70,7 @@ export function QuestionRequestForm({
     return selectedOptions.length > 0;
   });
   const draftDisabled = !mutationsReady || !canRespond || busy || submitting;
-  const canSubmit = writable && mutationsReady && canRespond && !busy && !submitting;
+  const canSubmit = mutationsReady && canRespond && !busy && !submitting;
 
   function selectNamedOption(question: AttentionQuestion, value: string) {
     setSelected((current) => {
@@ -230,10 +226,6 @@ export function QuestionRequestForm({
           <Button type="button" disabled>Reconnect to answer</Button>
         ) : !canRespond ? (
           <p className="text-xs text-muted-foreground">Continue in the provider’s native interface to answer.</p>
-        ) : !writable ? (
-          <Button type="button" disabled={busy} onClick={onTakeControl}>
-            <KeyRound /> {busy ? "Taking control…" : "Take control to answer"}
-          </Button>
         ) : (
           <Button
             type="button"
@@ -331,7 +323,7 @@ function PendingRequestCard({
           )}
           {exactCurrent && disabled && providerRespondable && (
             <p className="mt-3 text-xs text-muted-foreground">
-              {mutationsReady ? "Take control to answer this request." : "Reconnect to answer this request."}
+              {mutationsReady ? "This request cannot be answered from the cockpit." : "Reconnect to answer this request."}
             </p>
           )}
         </div>
@@ -344,7 +336,6 @@ export function PendingRequests({
   session,
   requests = session.attention,
   exactRequestIds = new Set<string>(),
-  writable,
   mutationsReady = true,
   busy,
   onJumpToRequest,
@@ -353,7 +344,6 @@ export function PendingRequests({
   session: SessionView;
   requests?: AttentionRequest[];
   exactRequestIds?: ReadonlySet<string>;
-  writable: boolean;
   mutationsReady?: boolean;
   busy: boolean;
   onJumpToRequest?: (requestId: string) => void;
@@ -435,7 +425,7 @@ export function PendingRequests({
                 key={request.id ?? `${request.kind}-${index}`}
                 request={request}
                 exactCurrent={Boolean(request.id && exactRequestIds.has(request.id))}
-                disabled={!mutationsReady || !writable || !session.control.capabilities.includes("respond")}
+                disabled={!mutationsReady || !session.control.capabilities.includes("respond")}
                 mutationsReady={mutationsReady}
                 busy={busy}
                 onRespond={onRespond}

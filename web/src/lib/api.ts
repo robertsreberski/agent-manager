@@ -4,6 +4,7 @@ import type {
   AuthSession,
   ControlLease,
   CreateSessionInput,
+  HostOption,
   PanePreview,
   SessionAction,
   SessionView,
@@ -94,17 +95,70 @@ export class CockpitApi {
         id,
         label: typeof value.label === "string" ? value.label : path ?? id,
         ...(path ? { path } : {}),
+        hostId: typeof value.hostId === "string" ? value.hostId : "local",
+        hostLabel: typeof value.hostLabel === "string" ? value.hostLabel : "This Mac",
+        hostKind: value.hostKind === "ssh" ? "ssh" as const : "local" as const,
         temporary: value.temporary === true,
       }];
     });
   }
 
+  async hosts(): Promise<HostOption[]> {
+    const result = await this.request<unknown>("/api/v1/hosts");
+    const items = result && typeof result === "object" && Array.isArray((result as { hosts?: unknown }).hosts)
+      ? (result as { hosts: unknown[] }).hosts
+      : [];
+    return items.flatMap((raw): HostOption[] => {
+      if (!raw || typeof raw !== "object") return [];
+      const value = raw as Record<string, unknown>;
+      if (typeof value.id !== "string" || typeof value.label !== "string") return [];
+      const status = value.status === "online" || value.status === "offline" || value.status === "connecting"
+        ? value.status
+        : "unknown";
+      return [{
+        id: value.id,
+        label: value.label,
+        kind: value.kind === "ssh" ? "ssh" : "local",
+        ...(typeof value.sshTarget === "string" ? { sshTarget: value.sshTarget } : {}),
+        status,
+        ...(typeof value.statusMessage === "string" ? { statusMessage: value.statusMessage } : {}),
+      }];
+    });
+  }
+
+  async completeDirectories(hostId: string, path: string): Promise<string[]> {
+    const result = await this.request<Record<string, unknown>>(
+      `/api/v1/hosts/${encodeURIComponent(hostId)}/directories?path=${encodeURIComponent(path)}&limit=30`,
+    );
+    return Array.isArray(result.paths)
+      ? result.paths.filter((value): value is string => typeof value === "string")
+      : [];
+  }
+
+  async resolveWorkspace(hostId: string, path: string): Promise<WorkspaceOption> {
+    const result = await this.request<Record<string, unknown>>("/api/v1/workspaces/resolve", {
+      method: "POST",
+      body: JSON.stringify({ hostId, path }),
+    });
+    const value = result.workspace && typeof result.workspace === "object"
+      ? result.workspace as Record<string, unknown>
+      : result;
+    if (typeof value.id !== "string" || typeof value.path !== "string") {
+      throw new ApiError("The host did not return a valid workspace.", 502, result);
+    }
+    return {
+      id: value.id,
+      label: typeof value.label === "string" ? value.label : value.path,
+      path: value.path,
+      hostId: typeof value.hostId === "string" ? value.hostId : hostId,
+      hostLabel: typeof value.hostLabel === "string" ? value.hostLabel : hostId,
+      hostKind: value.hostKind === "ssh" ? "ssh" : "local",
+    };
+  }
+
   async createSession(input: CreateSessionInput): Promise<SessionView> {
     const result = await this.request<unknown>("/api/v1/sessions", {
       method: "POST",
-      ...(input.permissionPreset === "full-host"
-        ? { headers: { "x-confirm-full-host": "true" } }
-        : {}),
       body: JSON.stringify(input),
     });
     const payload = result && typeof result === "object" && "session" in result
@@ -173,16 +227,16 @@ export class CockpitApi {
   async acquireLease(
     id: string,
     clientId: string,
-    armFullHost: boolean,
     currentToken?: string,
-    ttlSeconds = 300,
+    ttlSeconds = 60,
+    takeover = false,
   ): Promise<ControlLease> {
     const value = await this.request<Record<string, unknown>>(
       `/api/v1/sessions/${encodeURIComponent(id)}/control-lease`,
       {
         method: "POST",
         ...(currentToken ? { headers: { "x-control-lease": currentToken } } : {}),
-        body: JSON.stringify({ clientId, ttlSeconds, armFullHost }),
+        body: JSON.stringify({ clientId, ttlSeconds, takeover }),
       },
     );
     const rawLease = value.lease && typeof value.lease === "object"
@@ -199,9 +253,6 @@ export class CockpitApi {
       token: responseToken,
       clientId: typeof rawLease.clientId === "string" ? rawLease.clientId : clientId,
       expiresAt,
-      fullHostArmedUntil: typeof rawLease.fullHostArmedUntil === "string"
-        ? rawLease.fullHostArmedUntil
-        : null,
     };
   }
 

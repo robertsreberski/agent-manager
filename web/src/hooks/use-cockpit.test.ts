@@ -3,8 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { normalizeSession } from "../lib/normalize";
 import type { ControlLease } from "../types";
 import {
-  acquireLeaseInStages,
-  autoAcquireCreatedSession,
+  acquireAutomaticLease,
   BROWSER_CLIENT_ID_STORAGE_KEY,
   getOrCreateBrowserClientId,
   mutationsAreReady,
@@ -18,99 +17,59 @@ function lease(token: string, seconds = 300): ControlLease {
     token,
     clientId: "browser",
     expiresAt: new Date(Date.now() + seconds * 1_000).toISOString(),
-    fullHostArmedUntil: null,
   };
 }
 
-function session(fullHostAccess: boolean) {
+function session(accessMode: "sandboxed" | "bypass-permissions" = "sandboxed") {
   return normalizeSession({
-    id: fullHostAccess ? "codex:full" : "codex:standard",
+    id: accessMode === "bypass-permissions" ? "codex:bypass" : "codex:sandboxed",
     provider: "codex",
-    effectiveAccess: { fullHostAccess },
+    effectiveAccess: { accessMode },
   });
 }
 
-describe("acquireLeaseInStages", () => {
-  it.each([
-    [false, false],
-    [true, true],
-  ] as const)(
-    "retains a 30-second seed before the 300-second renew/arm (fullHost=%s)",
-    async (fullHost, finalArm) => {
-      const seed = lease("seed", 30);
-      const final = lease("rotated", 300);
-      const acquireLease = vi.fn()
-        .mockResolvedValueOnce(seed)
-        .mockResolvedValueOnce(final);
-      const retained: ControlLease[] = [];
+describe("acquireAutomaticLease", () => {
+  it.each(["sandboxed", "bypass-permissions"] as const)(
+    "acquires the same short background lease for %s sessions",
+    async (accessMode) => {
+      const acquired = lease("ready", 60);
+      const acquireLease = vi.fn().mockResolvedValue(acquired);
+      const target = session(accessMode);
 
-      await expect(acquireLeaseInStages(
+      await expect(acquireAutomaticLease(
         { acquireLease },
-        session(fullHost),
+        target,
         "browser",
         undefined,
-        (value) => retained.push(value),
-      )).resolves.toBe(final);
+      )).resolves.toBe(acquired);
 
-      expect(acquireLease.mock.calls).toEqual([
-        [fullHost ? "codex:full" : "codex:standard", "browser", false, undefined, 30],
-        [fullHost ? "codex:full" : "codex:standard", "browser", finalArm, "seed", 300],
-      ]);
-      expect(retained).toEqual([seed]);
+      expect(acquireLease).toHaveBeenCalledWith(target.id, "browser", undefined, 60, false);
     },
   );
 
-  it("retries the rotating step with the retained seed after an ambiguous failure", async () => {
-    const seed = lease("seed", 30);
-    const acquireLease = vi.fn().mockResolvedValue(lease("recovered"));
-
-    await acquireLeaseInStages(
+  it("reuses a fresh lease without surfacing renewal UI", async () => {
+    const current = lease("current", 60);
+    const acquireLease = vi.fn();
+    await expect(acquireAutomaticLease(
       { acquireLease },
-      session(false),
+      session(),
       "browser",
-      seed,
-      () => undefined,
-    );
+      current,
+    )).resolves.toBe(current);
+    expect(acquireLease).not.toHaveBeenCalled();
+  });
 
-    expect(acquireLease).toHaveBeenCalledOnce();
+  it("uses an explicit takeover only after the user resolves a browser conflict", async () => {
+    const current = lease("current", 1);
+    const acquireLease = vi.fn().mockResolvedValue(lease("taken-over"));
+    await acquireAutomaticLease({ acquireLease }, session(), "browser", current, true);
     expect(acquireLease).toHaveBeenCalledWith(
-      "codex:standard",
+      "codex:sandboxed",
       "browser",
-      false,
-      "seed",
-      300,
+      "current",
+      60,
+      true,
     );
-  });
-});
-
-describe("autoAcquireCreatedSession", () => {
-  it("acquires control immediately for a standard managed session", async () => {
-    const acquire = vi.fn().mockResolvedValue(lease("ready"));
-    const created = session(false);
-
-    await expect(autoAcquireCreatedSession(
-      { permissionPreset: "standard" },
-      created,
-      acquire,
-    )).resolves.toBe(true);
-
-    expect(acquire).toHaveBeenCalledOnce();
-    expect(acquire).toHaveBeenCalledWith(created);
-  });
-
-  it.each([
-    ["full-host" as const, false],
-    ["standard" as const, true],
-  ])("requires explicit control when preset=%s", async (permissionPreset, fullHost) => {
-    const acquire = vi.fn();
-
-    await expect(autoAcquireCreatedSession(
-      { permissionPreset },
-      session(fullHost),
-      acquire,
-    )).resolves.toBe(false);
-
-    expect(acquire).not.toHaveBeenCalled();
   });
 });
 

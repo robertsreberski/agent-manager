@@ -100,7 +100,6 @@ export default function App() {
   const [launchOpen, setLaunchOpen] = useState(launchRequested);
   const [privacyCovered, setPrivacyCovered] = useState(document.visibilityState === "hidden");
   const [installHelpOpen, setInstallHelpOpen] = useState(false);
-  const [updateConfirmOpen, setUpdateConfirmOpen] = useState(false);
   const [updating, setUpdating] = useState(false);
   const [pwaError, setPwaError] = useState<string | null>(null);
   const attentionCount = useMemo(
@@ -132,12 +131,11 @@ export default function App() {
     setUpdating(true);
     setPwaError(null);
     try {
-      // Always release at the shared browser-session boundary. Another tab can
-      // own a lease that this tab has never observed.
+      // Browser writer coordination is internal. Release it before replacing
+      // the app shell without exposing a separate control ceremony.
       await cockpit.releaseAllLeases();
       const applied = await pwa.applyUpdate();
       if (!applied) throw new Error("The update is no longer ready. It will be offered again when available.");
-      setUpdateConfirmOpen(false);
     } catch (error) {
       setPwaError(error instanceof Error ? error.message : "Agent Manager could not apply the update.");
     } finally {
@@ -149,10 +147,6 @@ export default function App() {
     setPwaError(null);
     if (cockpit.hasBusyAction) {
       setPwaError("Finish the current action before updating Agent Manager.");
-      return;
-    }
-    if (cockpit.hasActiveLeases) {
-      setUpdateConfirmOpen(true);
       return;
     }
     void applyUpdate();
@@ -204,7 +198,6 @@ export default function App() {
   if (!cockpit.ready) return <LoadingScreen />;
 
   const selected = cockpit.selectedSession;
-  const lease = selected ? cockpit.validLease(selected) : null;
   const selectedBusy = selected
     ? Boolean(cockpit.busy[`action:${selected.id}`] || cockpit.busy[`lease:${selected.id}`])
     : false;
@@ -283,6 +276,16 @@ export default function App() {
           <div className="absolute right-[max(1rem,env(safe-area-inset-right))] top-[calc(4rem+env(safe-area-inset-top))] z-50 flex w-[min(calc(100%-2rem),36rem)] items-start gap-2 rounded-lg border border-red-500/30 bg-background px-3 py-2.5 text-sm shadow-lg min-[901px]:bottom-[max(1rem,env(safe-area-inset-bottom))] min-[901px]:top-auto">
             <AlertCircle className="mt-0.5 size-4 shrink-0 text-red-600" />
             <span className="flex-1">{cockpit.actionError || pwaError}</span>
+            {cockpit.actionError && selected && cockpit.controlConflict !== undefined && (
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={selectedBusy}
+                onClick={() => void cockpit.takeOverControl(selected).catch(() => undefined)}
+              >
+                Use here instead
+              </Button>
+            )}
             <Button
               size="icon"
               variant="ghost"
@@ -311,11 +314,8 @@ export default function App() {
             <SessionThread
               key={selected.id}
               session={selected}
-              lease={lease}
               busy={selectedBusy}
               mutationsReady={cockpit.mutationsReady}
-              onAcquire={() => cockpit.acquireLease(selected).then(() => undefined)}
-              onRelease={() => cockpit.releaseLease(selected)}
               onSend={(text, delivery) => cockpit.sendMessage(selected, text, delivery)}
               onRespond={(requestId, response) => cockpit.respond(selected, requestId, response)}
               onInterrupt={() => cockpit.interrupt(selected)}
@@ -345,8 +345,10 @@ export default function App() {
       <LaunchDialog
         open={launchOpen}
         onOpenChange={setLaunchOpen}
+        hosts={cockpit.hosts}
         workspaces={cockpit.workspaces}
         creating={Boolean(cockpit.busy.create)}
+        onCompletePath={cockpit.completeWorkspacePath}
         onCreate={cockpit.createSession}
       />
 
@@ -367,24 +369,6 @@ export default function App() {
           </div>
           <DialogFooter>
             <Button onClick={() => setInstallHelpOpen(false)}>Done</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={updateConfirmOpen} onOpenChange={setUpdateConfirmOpen}>
-        <DialogContent className="max-w-md">
-          <DialogHeader>
-            <DialogTitle className="text-base">Release control and update?</DialogTitle>
-            <DialogDescription className="leading-6">
-              Agent sessions keep running. Agent Manager will release control held by every tab in this browser session, install the update, and reload those tabs.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setUpdateConfirmOpen(false)} disabled={updating}>Cancel</Button>
-            <Button onClick={() => void applyUpdate()} disabled={updating || cockpit.hasBusyAction}>
-              {updating ? <LoaderCircle className="animate-spin" /> : <RefreshCw />}
-              Release and update
-            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

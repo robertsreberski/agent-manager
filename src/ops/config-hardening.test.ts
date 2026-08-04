@@ -58,7 +58,7 @@ test("mutateConfig serializes interprocess reload-mutate-save transactions", asy
     mutateConfig((config) => {
       const holdUntil = Date.now() + 150;
       while (Date.now() < holdUntil) {}
-      config.workspaces.push({ id, name: id, path: "/tmp/" + id });
+      config.workspaces.push({ id, name: id, path: "/tmp/" + id, hostId: "local" });
     }, paths, { timeoutMs: 3000, pollIntervalMs: 5 });
   `;
 
@@ -96,7 +96,7 @@ test("a stale loaded config cannot restore a revoked Tailscale identity", (t) =>
     config.tailscale.dnsName = null;
   }, paths);
 
-  stale.workspaces.push({ id: "stale", name: "stale", path: "/tmp/stale" });
+  stale.workspaces.push({ id: "stale", name: "stale", path: "/tmp/stale", hostId: "local" });
   assert.throws(() => saveConfig(stale, paths), ConfigConflictError);
   assert.deepEqual(loadConfig(paths).tailscale, {
     httpsPort: 9_443,
@@ -115,7 +115,7 @@ test("mutateConfig CAS rejects a non-cooperating write during the transaction", 
     competing.tailscale.allowedLogin = "new-owner@example.com";
     competing.tailscale.dnsName = "new.example.ts.net";
     writeFileSync(paths.configFile, `${JSON.stringify(competing, null, 2)}\n`, { mode: 0o600 });
-    config.workspaces.push({ id: "stale", name: "stale", path: "/tmp/stale" });
+    config.workspaces.push({ id: "stale", name: "stale", path: "/tmp/stale", hostId: "local" });
   }, paths), ConfigConflictError);
 
   const finalConfig = loadConfig(paths);
@@ -148,6 +148,22 @@ test("config validation rejects partial or unsafe identity and invalid ports", (
   tailscalePort.tailscale.httpsPort = 0;
   assert.throws(() => saveConfig(tailscalePort, paths), /HTTPS port is invalid/);
   assert.throws(() => lstatSync(paths.configFile), { code: "ENOENT" });
+});
+
+test("loads version 1 config as host-aware version 2 without losing workspaces", (t) => {
+  const paths = temporaryPaths(t);
+  mkdirSync(paths.dataDirectory, { recursive: true, mode: 0o700 });
+  writeFileSync(paths.configFile, `${JSON.stringify({
+    version: 1,
+    backend: { host: "127.0.0.1", port: 43_127 },
+    tailscale: { httpsPort: 9_443, allowedLogin: null, dnsName: null },
+    workspaces: [{ id: "legacy", name: "Legacy", path: "/tmp/legacy" }],
+  })}\n`, { mode: 0o600 });
+
+  const migrated = loadConfig(paths);
+  assert.equal(migrated.version, 2);
+  assert.deepEqual(migrated.hosts, []);
+  assert.equal(migrated.workspaces[0]?.hostId, "local");
 });
 
 test("withConfigLock times out on a live lock and reclaims an old malformed lock", (t) => {
@@ -215,7 +231,7 @@ test("multiple stale reclaimers cannot remove a newly acquired live claim", asyn
       try {
         const holdUntil = Date.now() + 75;
         while (Date.now() < holdUntil) {}
-        config.workspaces.push({ id, name: id, path: "/tmp/" + id });
+        config.workspaces.push({ id, name: id, path: "/tmp/" + id, hostId: "local" });
       } finally {
         closeSync(descriptor);
         unlinkSync(marker);

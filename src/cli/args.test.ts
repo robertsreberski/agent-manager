@@ -17,10 +17,23 @@ test("parses safe cockpit commands", () => {
     port: 43_127,
   });
   assert.deepEqual(parseCliCommand(["panic-unlock"]), { name: "panic-unlock" });
+  assert.deepEqual(parseCliCommand(["host", "add", "Studio Mac", "robert@studio.local"]), {
+    name: "host",
+    operation: "add",
+    label: "Studio Mac",
+    target: "robert@studio.local",
+  });
+  assert.deepEqual(parseCliCommand(["host", "install", "robert@studio.local"]), {
+    name: "host",
+    operation: "install",
+    value: "robert@studio.local",
+  });
+  assert.deepEqual(parseCliCommand(["node", "bridge"]), { name: "node", operation: "bridge" });
 });
 
 test("refuses broad listeners and malformed mutations", () => {
   assert.throws(() => parseCliCommand(["serve", "--host", "0.0.0.0"]), /127\.0\.0\.1/);
   assert.throws(() => parseCliCommand(["attach", "one", "two"]), /Usage/);
   assert.throws(() => parseCliCommand(["tailscale", "reset"]), /install\|status\|off/);
+  assert.throws(() => parseCliCommand(["host", "add", "missing-target"]), /Usage/);
 });

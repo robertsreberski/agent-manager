@@ -704,7 +704,7 @@ test("Codex MCP elicitation fails closed across SessionView and action dispatch"
     workspaceId: "workspace",
     initialMessage: "Start",
     mode: "planning",
-    permissionPreset: "standard",
+    accessMode: "sandboxed",
     idempotencyKey: "create-elicit-session",
   }, context);
   transport.request(request.id, request.method, request.params);
@@ -871,7 +871,7 @@ test("ProviderControlAdapter bridge creates normalized sessions and streams chan
     name: "Cockpit builder",
     initialMessage: "Build it",
     mode: "planning",
-    permissionPreset: "standard",
+    accessMode: "sandboxed",
     idempotencyKey: "create-cockpit-builder",
   }, {
     actor: { id: "local", kind: "local", displayName: "Local user" },
@@ -884,7 +884,7 @@ test("ProviderControlAdapter bridge creates normalized sessions and streams chan
   assert.equal(view.control.plane, "codex-app-server");
   assert.ok(view.control.capabilities.includes("steer"));
   assert.equal(view.mode.value, "planning");
-  assert.equal(view.effectiveAccess.fullHostAccess, false);
+  assert.equal(view.effectiveAccess.accessMode, "sandboxed");
   assert.equal(view.runId, "turn-bridge");
 
   transport.notify("turn/completed", {
@@ -934,7 +934,7 @@ test("ProviderControlAdapter surfaces an addressable recovery handle after mode 
     workspaceId: "workspace",
     initialMessage: "This must not be sent before mode is confirmed",
     mode: "planning",
-    permissionPreset: "standard",
+    accessMode: "sandboxed",
     idempotencyKey: "mode-recovery",
   }, context);
 
@@ -1017,7 +1017,7 @@ test("ProviderControlAdapter retains buffered live activity when turn acknowledg
     workspaceId: "workspace",
     initialMessage: "Run exactly once",
     mode: "execution",
-    permissionPreset: "standard",
+    accessMode: "sandboxed",
     idempotencyKey: "uncertain-ack",
   }, context);
 
@@ -1088,7 +1088,7 @@ test("ProviderControlAdapter buffers first-turn activity until the manager sessi
     workspaceId: "workspace",
     initialMessage: "Start immediately",
     mode: "execution",
-    permissionPreset: "standard",
+    accessMode: "sandboxed",
     idempotencyKey: "first-activity-race",
   }, {
     actor: { id: "local", kind: "local", displayName: "Local user" },
@@ -1147,7 +1147,7 @@ test("Codex SessionView publishes exact questions and bounded approval details",
     workspaceId: "workspace",
     initialMessage: "Start",
     mode: "planning",
-    permissionPreset: "standard",
+    accessMode: "sandboxed",
     idempotencyKey: "create-details-session",
   }, context);
 
@@ -1260,7 +1260,7 @@ test("transport death atomically fails managed sessions and in-flight controls",
     workspaceId: "workspace",
     initialMessage: "bootstrap",
     mode: "execution",
-    permissionPreset: "standard",
+    accessMode: "sandboxed",
     idempotencyKey: "runtime-death-session",
   }, {
     actor: { id: "local", kind: "local", displayName: "Local user" },

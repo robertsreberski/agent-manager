@@ -81,7 +81,7 @@ describe("CockpitApi", () => {
     await expect(api.sessions()).rejects.toThrow("Session state changed.");
   });
 
-  it("presents the current rotating token when arming full-host access", async () => {
+  it("presents the current rotating token when explicitly taking over control", async () => {
     let captured: { body: unknown; leaseToken: string | null } | null = null;
     vi.stubGlobal("fetch", vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       const headers = init?.headers as Headers;
@@ -94,29 +94,30 @@ describe("CockpitApi", () => {
           token: "rotated-lease-token",
           clientId: "browser-client",
           expiresAt: "2026-08-03T10:05:00.000Z",
-          fullHostArmedUntil: "2026-08-03T10:05:00.000Z",
         },
       }), { status: 200, headers: { "content-type": "application/json" } });
     }));
     const api = new CockpitApi({ csrfToken: "csrf", actor: "Local" });
 
-    await expect(api.acquireLease("full-host", "browser-client", true, "current-token")).resolves.toEqual(
+    await expect(api.acquireLease("session-one", "browser-client", "current-token", 60, true)).resolves.toEqual(
       expect.objectContaining({
         token: "rotated-lease-token",
-        fullHostArmedUntil: "2026-08-03T10:05:00.000Z",
       }),
     );
 
     expect(captured).toEqual({
-      body: { clientId: "browser-client", ttlSeconds: 300, armFullHost: true },
+      body: { clientId: "browser-client", ttlSeconds: 60, takeover: true },
       leaseToken: "current-token",
     });
   });
 
-  it("carries the explicit confirmation when launching a full-host session", async () => {
-    let capturedHeaders: Headers | undefined;
+  it("launches bypass-permissions sessions without a legacy confirmation header", async () => {
+    let captured: { headers: Headers; body: unknown } | undefined;
     vi.stubGlobal("fetch", vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
-      capturedHeaders = init?.headers as Headers;
+      captured = {
+        headers: init?.headers as Headers,
+        body: JSON.parse(String(init?.body ?? "{}")),
+      };
       return new Response(JSON.stringify({
         session: { id: "codex:new", provider: "codex", ownership: "manager" },
       }), { status: 201, headers: { "content-type": "application/json" } });
@@ -128,11 +129,53 @@ describe("CockpitApi", () => {
       workspaceId: "workspace-1",
       initialMessage: "Start",
       mode: "execution",
-      permissionPreset: "full-host",
+      accessMode: "bypass-permissions",
       idempotencyKey: "create-session-1",
     });
 
-    expect(capturedHeaders?.get("x-confirm-full-host")).toBe("true");
-    expect(capturedHeaders?.get("x-csrf-token")).toBe("csrf");
+    expect(captured?.headers.has("x-confirm-full-host")).toBe(false);
+    expect(captured?.headers.get("x-csrf-token")).toBe("csrf");
+    expect(captured?.body).toEqual(expect.objectContaining({ accessMode: "bypass-permissions" }));
+  });
+
+  it("resolves a host-specific workspace and requests path completion on that host", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/directories?")) {
+        return new Response(JSON.stringify({ paths: ["/srv/project"] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({
+        workspace: {
+          id: "workspace-remote",
+          label: "project",
+          path: "/srv/project",
+          hostId: "host-studio",
+          hostLabel: "Studio Mac",
+          hostKind: "ssh",
+        },
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const api = new CockpitApi({ csrfToken: "csrf", actor: "Local" });
+
+    await expect(api.completeDirectories("host-studio", "/srv/pro")).resolves.toEqual(["/srv/project"]);
+    await expect(api.resolveWorkspace("host-studio", "/srv/project")).resolves.toEqual({
+      id: "workspace-remote",
+      label: "project",
+      path: "/srv/project",
+      hostId: "host-studio",
+      hostLabel: "Studio Mac",
+      hostKind: "ssh",
+    });
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "/api/v1/hosts/host-studio/directories?path=%2Fsrv%2Fpro&limit=30",
+    );
+    expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body))).toEqual({
+      hostId: "host-studio",
+      path: "/srv/project",
+    });
   });
 });

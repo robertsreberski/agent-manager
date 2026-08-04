@@ -326,12 +326,12 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
 
     const runtime = await this.#getRuntime();
     const executionMode: Exclude<ClaudePermissionMode, "plan"> =
-      input.permissionPreset === "full-host" ? "bypassPermissions" : "default";
+      input.accessMode === "bypass-permissions" ? "bypassPermissions" : "default";
     const session = await ClaudeManagedSession.start(runtime, {
       cwd,
       mode: input.mode === "planning" ? "plan" : executionMode,
       initialMessage: input.initialMessage,
-      allowDangerouslySkipPermissions: input.permissionPreset === "full-host",
+      allowDangerouslySkipPermissions: input.accessMode === "bypass-permissions",
     });
     if (context.signal.aborted) {
       session.dispose();
@@ -598,12 +598,11 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
         details: attentionDetails(request),
       })),
       effectiveAccess: {
+        accessMode: entry.executionMode === "bypassPermissions"
+          ? "bypass-permissions"
+          : "sandboxed",
         permissionMode: snapshot.mode,
         sandboxMode: null,
-        // The session retains its execution preset while temporarily in plan
-        // mode. Keep the high-risk badge/arming requirement visible before a
-        // set-mode action can restore bypassPermissions.
-        fullHostAccess: entry.executionMode === "bypassPermissions",
       },
       terminal: null,
       control: {

@@ -297,7 +297,7 @@ test("workspace, Tailscale, service, doctor, and panic commands use injected ope
   assert.equal(await runCli(["workspace", "add", "/tmp/project"], {
     ...common,
     addWorkspace(target) {
-      const workspace = { id: "ws_1", name: "project", path: "/tmp/project" };
+      const workspace = { id: "ws_1", name: "project", path: "/tmp/project", hostId: "local" };
       target.workspaces.push(workspace);
       return workspace;
     },
@@ -355,6 +355,49 @@ test("workspace, Tailscale, service, doctor, and panic commands use injected ope
   assert.match(stdout.read(), /workstation\.example\.ts\.net:9443/);
   assert.match(stdout.read(), /<plist\/>/);
   assert.match(stdout.read(), /control plane locked/);
+});
+
+test("SSH host commands persist configuration, install the node, and remove live discovery data", async () => {
+  const stdout = output();
+  const config = defaultConfig();
+  const persisted: string[] = [];
+  const removed: string[] = [];
+  const installed: string[] = [];
+  const common: Partial<CliDependencies> = {
+    stdout: stdout.writer,
+    loadConfig: () => config,
+    mutateConfig: (mutator) => mutator(config),
+    addSshHost(target, input) {
+      const host = { id: "host_build", name: input.name, target: input.target };
+      target.hosts.push(host);
+      return host;
+    },
+    removeSshHost(target, id) {
+      const index = target.hosts.findIndex((host) => host.id === id);
+      if (index < 0) return false;
+      target.hosts.splice(index, 1);
+      return true;
+    },
+    persistHost: (host) => { persisted.push(host.id); },
+    removePersistedHost: (id) => {
+      removed.push(id);
+      return true;
+    },
+    installRemoteNode: async (target) => {
+      installed.push(target);
+      return { serviceLabel: "local.agent-manager.cockpit" };
+    },
+  };
+
+  assert.equal(await runCli(["host", "add", "Build Mac", "dev@build-mac"], common), 0);
+  assert.deepEqual(persisted, ["host_build"]);
+  assert.equal(await runCli(["host", "list"], common), 0);
+  assert.equal(await runCli(["host", "install", "dev@build-mac"], common), 0);
+  assert.deepEqual(installed, ["dev@build-mac"]);
+  assert.equal(await runCli(["host", "remove", "host_build"], common), 0);
+  assert.deepEqual(removed, ["host_build"]);
+  assert.match(stdout.read(), /running cockpit will discover this host automatically/);
+  assert.match(stdout.read(), /Installed and started local\.agent-manager\.cockpit/);
 });
 
 test("panic-lock reports the durable lock when live cleanup is incomplete", async () => {

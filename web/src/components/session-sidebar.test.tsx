@@ -15,7 +15,7 @@ function session(overrides: Partial<SessionView> & Pick<SessionView, "id">): Ses
     mode: { value: "execution", providerValue: null, source: "test", confidence: "exact" },
     activity: "idle",
     attention: [],
-    effectiveAccess: { permissionMode: null, sandboxMode: null, fullHostAccess: false },
+    effectiveAccess: { accessMode: "unknown", permissionMode: null, sandboxMode: null },
     terminal: null,
     control: { plane: "test", capabilities: [], managerOwned: false, writableLease: false },
     generation: 1,
@@ -134,5 +134,22 @@ describe("SessionSidebar", () => {
       />,
     );
     expect(screen.queryByRole("button", { name: "Install Agent Manager" })).not.toBeInTheDocument();
+  });
+
+  it("keeps one session list grouped by local and SSH host", () => {
+    renderSidebar({
+      scope: "all",
+      sessions: [
+        session({ id: "remote:one", name: "Remote task", hostId: "host-studio", hostLabel: "Studio Mac" }),
+        session({ id: "codex:root", name: "Local task", hostId: "local", hostLabel: "This Mac" }),
+      ],
+    });
+
+    const tree = screen.getByRole("tree", { name: "All sessions" });
+    const groups = within(tree).getAllByRole("region");
+    expect(groups[0]).toHaveAccessibleName("This Mac sessions");
+    expect(groups[0]).toHaveTextContent("Local task");
+    expect(groups[1]).toHaveAccessibleName("Studio Mac sessions");
+    expect(groups[1]).toHaveTextContent("Remote task");
   });
 });

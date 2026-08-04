@@ -54,11 +54,9 @@ export type ActivityTimelineItem = ActivityItem | ActivityTurnGroup;
 
 export interface ActivityAttentionControls {
   exactRequestIds: ReadonlySet<string>;
-  writable: boolean;
   mutationsReady: boolean;
   canRespond: boolean;
   busy: boolean;
-  onTakeControl: () => void;
   onRespond: (requestId: string, response: RequestResponse) => Promise<void>;
 }
 
@@ -70,6 +68,14 @@ function isDirectProse(item: ActivityItem): boolean {
   if (item.kind !== "message") return false;
   if (item.role === "user") return true;
   return item.role === "assistant" && item.phase !== "commentary";
+}
+
+function isInitialUserMessage(item: ActivityItem): boolean {
+  return item.kind === "message" && item.role === "user";
+}
+
+function isFinalAssistantMessage(item: ActivityItem): boolean {
+  return item.kind === "message" && item.role === "assistant" && item.phase === "final";
 }
 
 function groupState(items: ActivityItem[]): ActivityItemState {
@@ -90,47 +96,101 @@ function groupState(items: ActivityItem[]): ActivityItemState {
   return "complete";
 }
 
+function turnTimeline(turnId: string, items: ActivityItem[]): ActivityTimelineItem[] {
+  const ordered = [...items].sort((left, right) => left.seq - right.seq || left.id.localeCompare(right.id));
+
+  // Provider notification order is not conversational order. Codex, for
+  // example, reports turn/started before the userMessage item and reports
+  // terminal usage after the final answer. Keep the initiating user message
+  // first and the explicit final answer last, while leaving any later user
+  // messages in place so steering naturally splits the activity disclosure.
+  const initialUser = ordered.find(isInitialUserMessage);
+  const finals = ordered.filter(isFinalAssistantMessage);
+  const finalIds = new Set(finals.map((item) => item.id));
+  const semantic = [
+    ...(initialUser ? [initialUser] : []),
+    ...ordered.filter((item) => item.id !== initialUser?.id && !finalIds.has(item.id)),
+    ...finals,
+  ];
+
+  const timeline: ActivityTimelineItem[] = [];
+  let segment: ActivityItem[] = [];
+  const flush = () => {
+    if (segment.length === 0) return;
+    const first = segment[0]!;
+    timeline.push({
+      kind: "activity-group",
+      id: `activity:turn:${turnId}:segment:${encodeURIComponent(first.id)}`,
+      turnId,
+      seq: first.seq,
+      state: groupState(segment),
+      items: segment,
+    });
+    segment = [];
+  };
+
+  for (const item of semantic) {
+    if (isDirectProse(item)) {
+      flush();
+      timeline.push(item);
+    } else {
+      segment.push(item);
+    }
+  }
+  flush();
+  return timeline;
+}
+
 /**
- * Keeps conversation prose in the thread while folding reported implementation
- * activity into one stable disclosure per authoritative provider turn. Items
- * without a turnId are deliberately not associated with one another.
+ * Keeps prose and activity in conversational order. Items in one authoritative
+ * provider turn stay together, but direct messages split activity into stable
+ * segments. Items without a turnId are deliberately not associated.
  */
 export function buildActivityTimeline(items: ActivityItem[]): ActivityTimelineItem[] {
   const ordered = [...items].sort((left, right) => left.seq - right.seq || left.id.localeCompare(right.id));
-  const groups = new Map<string, ActivityTurnGroup>();
-  const timeline: Array<{ seq: number; order: number; value: ActivityTimelineItem }> = [];
+  const turns = new Map<string, { seq: number; order: number; items: ActivityItem[] }>();
+  const entries: Array<{
+    seq: number;
+    order: number;
+    values: ActivityTimelineItem[];
+  }> = [];
 
   ordered.forEach((item, order) => {
-    if (isDirectProse(item)) {
-      timeline.push({ seq: item.seq, order, value: item });
+    if (!item.turnId) {
+      entries.push({
+        seq: item.seq,
+        order,
+        values: isDirectProse(item)
+          ? [item]
+          : [{
+              kind: "activity-group",
+              id: `activity:item:${encodeURIComponent(item.id)}`,
+              turnId: null,
+              seq: item.seq,
+              state: item.state,
+              items: [item],
+            }],
+      });
       return;
     }
-    const key = item.turnId ? `turn:${item.turnId}` : `item:${item.id}`;
-    const existing = groups.get(key);
+    const existing = turns.get(item.turnId);
     if (existing) {
       existing.items.push(item);
-      existing.state = groupState(existing.items);
       return;
     }
-    const group: ActivityTurnGroup = {
-      kind: "activity-group",
-      id: `activity:${key}`,
-      turnId: item.turnId,
-      seq: item.seq,
-      state: item.state,
-      items: [item],
-    };
-    groups.set(key, group);
-    timeline.push({ seq: item.seq, order, value: group });
+    const turn = { seq: item.seq, order, items: [item] };
+    turns.set(item.turnId, turn);
+    entries.push({ seq: item.seq, order, values: turn.items });
   });
 
-  for (const group of groups.values()) {
-    group.id = `${group.id}:${isActive(group.state) ? "live" : "settled"}`;
+  for (const [turnId, turn] of turns) {
+    const entry = entries.find((candidate) => candidate.values === turn.items);
+    if (entry) entry.values = turnTimeline(turnId, turn.items);
   }
 
-  return timeline
+  return entries
     .sort((left, right) => left.seq - right.seq || left.order - right.order)
-    .map((entry) => entry.value);
+    .flatMap((entry) => entry.values);
 }
 
 function stateLabel(state: ActivityItemState): string {
@@ -553,11 +613,9 @@ function AttentionRow({
       {interactive ? (
         <QuestionRequestForm
           request={questionRequest(item)}
-          writable={controls.writable}
           mutationsReady={controls.mutationsReady}
           canRespond={controls.canRespond}
           busy={controls.busy}
-          onTakeControl={controls.onTakeControl}
           onRespond={controls.onRespond}
         />
       ) : item.questions.length > 0 && (

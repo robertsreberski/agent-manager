@@ -31,7 +31,7 @@ import {
 
 interface ManagedMetadata {
   name: string | null;
-  permissionPreset: "standard" | "full-host";
+  accessMode: "sandboxed" | "bypass-permissions";
   createdAt: string;
   creationIssue: CodexManagedCreationIssue | null;
 }
@@ -460,7 +460,7 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     const cwd = await this.#resolveWorkspace(input.workspaceId, context);
     if (!cwd) throw new Error(`Unknown or unauthorized workspace ${input.workspaceId}`);
     context.signal.throwIfAborted();
-    const fullHost = input.permissionPreset === "full-host";
+    const bypassPermissions = input.accessMode === "bypass-permissions";
     let state: CodexThreadState;
     let creationIssue: CodexManagedCreationIssue | null = null;
     try {
@@ -468,8 +468,8 @@ export class CodexProviderBridge implements ProviderControlAdapter {
         cwd,
         mode: input.mode,
         initialMessage: input.initialMessage,
-        approvalPolicy: fullHost ? "never" : "on-request",
-        sandbox: fullHost ? "danger-full-access" : "workspace-write",
+        approvalPolicy: bypassPermissions ? "never" : "on-request",
+        sandbox: bypassPermissions ? "danger-full-access" : "workspace-write",
       });
     } catch (error) {
       if (!(error instanceof CodexManagedCreationError)) throw error;
@@ -481,7 +481,7 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     }
     this.#metadata.set(state.threadId, {
       name: input.name ?? null,
-      permissionPreset: input.permissionPreset,
+      accessMode: input.accessMode,
       createdAt: this.#now().toISOString(),
       creationIssue,
     });
@@ -577,11 +577,11 @@ export class CodexProviderBridge implements ProviderControlAdapter {
   toSessionView(state: CodexThreadState): SessionView {
     const metadata = this.#metadata.get(state.threadId) ?? {
       name: null,
-      permissionPreset: "standard" as const,
+      accessMode: "sandboxed" as const,
       createdAt: this.#now().toISOString(),
       creationIssue: null,
     };
-    const fullHost = metadata.permissionPreset === "full-host";
+    const bypassPermissions = metadata.accessMode === "bypass-permissions";
     const updatedAt = this.#now().toISOString();
     const recoveryAttention: SessionView["attention"] = metadata.creationIssue
       ? [{
@@ -658,9 +658,9 @@ export class CodexProviderBridge implements ProviderControlAdapter {
       activity: normalizedStatus,
       attention: [...recoveryAttention, ...pendingAttention],
       effectiveAccess: {
-        permissionMode: fullHost ? "never" : "on-request",
-        sandboxMode: fullHost ? "danger-full-access" : "workspace-write",
-        fullHostAccess: fullHost,
+        accessMode: metadata.accessMode,
+        permissionMode: bypassPermissions ? "never" : "on-request",
+        sandboxMode: bypassPermissions ? "danger-full-access" : "workspace-write",
       },
       terminal: null,
       control: {

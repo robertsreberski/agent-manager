@@ -18,11 +18,9 @@ import {
   Bot,
   CircleStop,
   Clock3,
-  KeyRound,
   LoaderCircle,
   PanelRightOpen,
   Send,
-  ShieldAlert,
   SlidersHorizontal,
   Sparkles,
   WifiOff,
@@ -37,10 +35,9 @@ import {
   type ActivityTimelineItem,
 } from "./session-activity";
 import {
-  FullAccessBadge,
+  AccessBadge,
   ModeBadge,
 } from "./session-badges";
-import { Alert, AlertDescription, AlertTitle } from "./ui/alert";
 import { Badge, type BadgeProps } from "./ui/badge";
 import { Button, buttonVariants } from "./ui/button";
 import {
@@ -56,7 +53,6 @@ import type {
   ActivityItem,
   AttentionRequest,
   AttachInstruction,
-  ControlLease,
   ConversationMessage,
   PanePreview,
   RequestResponse,
@@ -321,22 +317,16 @@ function AgentComposer({
   running,
   canQueue,
   canSteer,
-  writable,
   mutationsReady,
-  busy,
   queueCount,
-  onTakeControl,
 }: {
   running: boolean;
   canQueue: boolean;
   canSteer: boolean;
-  writable: boolean;
   mutationsReady: boolean;
-  busy: boolean;
   queueCount: number;
-  onTakeControl: () => void;
 }) {
-  const disabled = !mutationsReady || !writable || (!canQueue && !canSteer);
+  const disabled = !mutationsReady || (!canQueue && !canSteer);
   return (
     <div className="border-t bg-background/95 px-3 pt-3 [padding-bottom:max(0.75rem,env(safe-area-inset-bottom))] backdrop-blur sm:px-4 md:px-6">
       <ComposerPrimitive.Root className="mx-auto grid w-full max-w-3xl gap-2 rounded-xl border bg-background p-2 shadow-sm focus-within:ring-2 focus-within:ring-ring/30">
@@ -372,9 +362,7 @@ function AgentComposer({
           placeholder={
             !mutationsReady
               ? "Reconnect to continue"
-              : !writable
-                ? "Take control to send a message"
-                : running && canSteer
+              : running && canSteer
                   ? "Steer the running turn…"
                   : canQueue
                     ? "Message this session…"
@@ -387,9 +375,7 @@ function AgentComposer({
             {queueCount > 0 ? `${queueCount} queued · ` : ""}
             {!mutationsReady
               ? "Read-only while reconnecting"
-              : !writable
-                ? "Take control to send"
-                : running && canQueue && canSteer
+              : running && canQueue && canSteer
                   ? "Enter queues · Shift+Enter adds a line · Ctrl/⌘+Shift+Enter steers"
                   : running && canQueue
                     ? "Enter queues · Shift+Enter adds a line"
@@ -400,15 +386,10 @@ function AgentComposer({
                         : "Ctrl/⌘+Shift+Enter steers · Shift+Enter adds a line"}
           </p>
           <div className="flex items-center justify-end gap-2">
-            {mutationsReady && !writable && (
-              <Button type="button" disabled={busy} onClick={onTakeControl}>
-                <KeyRound /> Take control
-              </Button>
-            )}
-            {mutationsReady && writable && running && canSteer && (
+            {mutationsReady && running && canSteer && (
               <SteerButton enabled primary />
             )}
-            {mutationsReady && writable && canQueue && (
+            {mutationsReady && canQueue && (
               <ComposerPrimitive.Send
                 className={buttonVariants({ variant: running && canSteer ? "outline" : "default" })}
               >
@@ -416,7 +397,7 @@ function AgentComposer({
                 {running ? "Queue" : "Send"}
               </ComposerPrimitive.Send>
             )}
-            {mutationsReady && writable && !running && !canQueue && canSteer && (
+            {mutationsReady && !running && !canQueue && canSteer && (
               <SteerButton enabled primary />
             )}
           </div>
@@ -463,81 +444,24 @@ function ConfirmInterrupt({
   );
 }
 
-function ConfirmLease({
-  session,
-  open,
-  onOpenChange,
-  busy,
-  mutationsReady,
-  onConfirm,
-}: {
-  session: SessionView;
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  busy: boolean;
-  mutationsReady: boolean;
-  onConfirm: () => Promise<void>;
-}) {
-  const fullHost = session.effectiveAccess.fullHostAccess;
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>{fullHost ? "Arm full-host controls?" : "Take control of this session?"}</DialogTitle>
-          <DialogDescription>
-            {fullHost
-              ? "For five minutes, actions from this browser can direct an agent with unrestricted host access. Review every request carefully."
-              : "This browser receives the only writable lease for five minutes. Other cockpit browsers stay read-only."}
-          </DialogDescription>
-        </DialogHeader>
-        {fullHost && (
-          <Alert className="border-red-500/40 bg-red-500/5">
-            <ShieldAlert className="mb-2 size-4 text-red-600" />
-            <AlertTitle>Not sandboxed</AlertTitle>
-            <AlertDescription>This session may read, edit, or execute outside its workspace.</AlertDescription>
-          </Alert>
-        )}
-        <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button>
-          <Button
-            variant={fullHost ? "destructive" : "default"}
-            disabled={busy || !mutationsReady}
-            onClick={() => void onConfirm().then(() => onOpenChange(false)).catch(() => undefined)}
-          >
-            <KeyRound /> {busy ? "Acquiring…" : fullHost ? "Arm for five minutes" : "Take control"}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
 function SessionHeader({
   session,
-  lease,
   busy,
   attentionCount,
   mutationsReady,
   onAccess,
-  onRequestControl,
   onSetMode,
   onInterrupt,
 }: {
   session: SessionView;
-  lease: ControlLease | null;
   busy: boolean;
   attentionCount: number;
   mutationsReady: boolean;
   onAccess: () => void;
-  onRequestControl: () => void;
   onSetMode: (mode: "planning" | "execution") => Promise<void>;
   onInterrupt: () => Promise<void>;
 }) {
   const [interruptDialog, setInterruptDialog] = useState(false);
-  const writable = lease !== null;
-  const hasControl = session.control.capabilities.some((capability) =>
-    capability === "queue" || capability === "steer" || capability === "interrupt" || capability === "respond" || capability === "set-mode",
-  );
   const status: { label: string; variant: BadgeProps["variant"] } = attentionCount > 0 || session.activity === "waiting"
     ? { label: "Needs you", variant: "warning" }
     : session.activity === "running"
@@ -569,11 +493,11 @@ function SessionHeader({
               <ModeBadge mode={session.mode.value} />
             </span>
           )}
-          {session.effectiveAccess.fullHostAccess && <FullAccessBadge />}
+          <AccessBadge accessMode={session.effectiveAccess.accessMode} />
         </div>
 
         <div className="flex shrink-0 items-center gap-1.5">
-          {session.control.capabilities.includes("set-mode") && writable && session.mode.value !== "unknown" && (
+          {session.control.capabilities.includes("set-mode") && session.mode.value !== "unknown" && (
             <Button
               variant="outline"
               size="sm"
@@ -589,20 +513,10 @@ function SessionHeader({
             <Button
               variant="outline"
               size="sm"
-              disabled={!writable || busy || !mutationsReady}
+              disabled={busy || !mutationsReady}
               onClick={() => setInterruptDialog(true)}
             >
               <CircleStop /> <span>Stop</span>
-            </Button>
-          )}
-          {hasControl && !writable && mutationsReady && (
-            <Button
-              variant={session.effectiveAccess.fullHostAccess ? "destructive" : "default"}
-              size="sm"
-              disabled={busy}
-              onClick={onRequestControl}
-            >
-              <KeyRound /> <span>Take control</span>
             </Button>
           )}
           <Button variant="ghost" size="icon" className="size-8" onClick={onAccess} aria-label="Session details">
@@ -623,11 +537,8 @@ function SessionHeader({
 
 export function SessionThread({
   session,
-  lease,
   busy,
   mutationsReady = true,
-  onAcquire,
-  onRelease,
   onSend,
   onRespond,
   onInterrupt,
@@ -636,11 +547,8 @@ export function SessionThread({
   loadAttach,
 }: {
   session: SessionView;
-  lease: ControlLease | null;
   busy: boolean;
   mutationsReady?: boolean;
-  onAcquire: () => Promise<void>;
-  onRelease: () => Promise<void>;
   onSend: (text: string, delivery: "queue" | "steer") => Promise<void>;
   onRespond: (requestId: string, response: RequestResponse) => Promise<void>;
   onInterrupt: () => Promise<void>;
@@ -649,7 +557,6 @@ export function SessionThread({
   loadAttach: (session: SessionView) => Promise<AttachInstruction>;
 }) {
   const [accessOpen, setAccessOpen] = useState(false);
-  const [leaseDialog, setLeaseDialog] = useState(false);
   const [unseenUpdates, setUnseenUpdates] = useState(0);
   const viewportRef = useRef<HTMLDivElement>(null);
   const followingRef = useRef(true);
@@ -657,7 +564,6 @@ export function SessionThread({
     source: "transcript",
     revision: 0,
   });
-  const writable = lease !== null;
   const transcript = session.transcript ?? NOT_LOADED_TRANSCRIPT;
   const activity = useSessionActivity(session.id);
   const hasLiveActivity = activity.hasSnapshot;
@@ -680,7 +586,7 @@ export function SessionThread({
   const queueAdapter = useMemo(() => ({
     items: session.queue,
     enqueue: (message: AppendMessage, options: { steer: boolean }) => {
-      if (!writable || !mutationsReady) return;
+      if (!mutationsReady) return;
       const text = messageText(message);
       const delivery = options.steer ? "steer" : "queue";
       const supported = options.steer ? canSteer : canQueue;
@@ -689,17 +595,17 @@ export function SessionThread({
     steer: () => undefined,
     remove: () => undefined,
     clear: () => undefined,
-  }), [canQueue, canSteer, mutationsReady, onSend, session.queue, writable]);
+  }), [canQueue, canSteer, mutationsReady, onSend, session.queue]);
   const runtime = useExternalStoreRuntime<TimelineMessage>({
     messages: timelineMessages,
     convertMessage: convertTimelineMessage,
     // Item-level statuses carry live state. Keeping the thread itself false
     // prevents assistant-ui from inventing an empty running message.
     isRunning: false,
-    isDisabled: !mutationsReady || !writable || (!canQueue && !canSteer),
+    isDisabled: !mutationsReady || (!canQueue && !canSteer),
     onNew: async (message) => {
       const text = messageText(message);
-      if (text && canQueue && writable && mutationsReady) await onSend(text, "queue");
+      if (text && canQueue && mutationsReady) await onSend(text, "queue");
     },
     queue: canQueue || canSteer ? queueAdapter : undefined,
   });
@@ -746,11 +652,9 @@ export function SessionThread({
 
   const attentionControls: ActivityAttentionControls = {
     exactRequestIds,
-    writable,
     mutationsReady,
     canRespond: session.control.capabilities.includes("respond"),
     busy,
-    onTakeControl: () => setLeaseDialog(true),
     onRespond,
   };
 
@@ -758,12 +662,10 @@ export function SessionThread({
     <div className="flex h-dvh min-w-0 flex-1 flex-col bg-background">
       <SessionHeader
         session={session}
-        lease={lease}
         busy={busy}
         attentionCount={pendingRequests.length}
         mutationsReady={mutationsReady}
         onAccess={() => setAccessOpen(true)}
-        onRequestControl={() => setLeaseDialog(true)}
         onSetMode={onSetMode}
         onInterrupt={onInterrupt}
       />
@@ -771,7 +673,6 @@ export function SessionThread({
         session={session}
         requests={pendingRequests}
         exactRequestIds={exactRequestIds}
-        writable={writable}
         mutationsReady={mutationsReady}
         busy={busy}
         onJumpToRequest={jumpToAttentionRequest}
@@ -826,11 +727,8 @@ export function SessionThread({
               running={session.activity === "running"}
               canQueue={canQueue}
               canSteer={canSteer}
-              writable={writable}
               mutationsReady={mutationsReady}
-              busy={busy}
               queueCount={session.queue.length}
-              onTakeControl={() => setLeaseDialog(true)}
             />
           )}
         </ThreadPrimitive.Root>
@@ -840,20 +738,8 @@ export function SessionThread({
         session={session}
         open={accessOpen}
         onOpenChange={setAccessOpen}
-        lease={lease}
-        busy={busy}
-        mutationsReady={mutationsReady}
-        onRelease={onRelease}
         loadPreview={loadPreview}
         loadAttach={loadAttach}
-      />
-      <ConfirmLease
-        session={session}
-        open={leaseDialog}
-        onOpenChange={setLeaseDialog}
-        busy={busy}
-        mutationsReady={mutationsReady}
-        onConfirm={onAcquire}
       />
     </div>
   );

@@ -31,7 +31,7 @@ function transcriptBearingSession() {
     mode: { value: "unknown" as const, providerValue: null, source: "inferred" as const, confidence: "heuristic" as const },
     activity: "idle" as const,
     attention: [],
-    effectiveAccess: { permissionMode: null, sandboxMode: null, fullHostAccess: false },
+    effectiveAccess: { accessMode: "unknown" as const, permissionMode: null, sandboxMode: null },
     terminal: null,
     control: { plane: "observe-only" as const, capabilities: [], managerOwned: false, writableLease: false },
     generation: 0,

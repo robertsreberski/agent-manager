@@ -92,9 +92,6 @@ back to an unverified protocol.
 pnpm install
 pnpm check
 
-# Allow managed sessions to start in this workspace.
-pnpm exec tsx src/cli/index.ts workspace add "$PWD"
-
 # Terminal 1: loopback-only service and UI.
 pnpm exec tsx src/cli/index.ts serve
 
@@ -129,11 +126,36 @@ agent-manager open [--no-browser]
 agent-manager attach <session-id>
 agent-manager doctor [--json]
 agent-manager workspace list|add <path>|remove <id>
+agent-manager host list|add <name> <ssh-target>|install <ssh-target>|remove <id>
 agent-manager tailscale install|status|off
 agent-manager service print|install
+agent-manager node bridge
 agent-manager panic-lock
 agent-manager panic-unlock
 ```
+
+The launch dialog accepts any absolute directory on the selected host. Agent
+Manager validates it on that host and remembers successful paths for later
+completion, so pre-registering local workspaces is optional. `workspace add`
+remains useful for seeding a frequently used local path from scripts.
+
+For a macOS SSH host, build the current package, install its loopback-only node,
+then register the stable SSH target:
+
+```sh
+pnpm build
+agent-manager host install user@remote-mac
+agent-manager host add "Remote Mac" user@remote-mac
+```
+
+The installer packages the current build, installs it for the remote user, and
+loads its per-user launchd service. The controller reaches it through a
+persistent BatchMode SSH bridge; no remote HTTP port is exposed. Sessions from
+all hosts remain in one list, grouped by host, and copied native attach commands
+wrap remote handoff through `ssh -t`. The remote Mac needs Node 24 and the
+provider/runtime tools that Agent Manager normally validates (`codex`, `claude`,
+`tmux`, and `tailscale`) on its login-shell path. A running cockpit discovers
+host additions and removals automatically.
 
 `attach` is the verbose/native escape hatch:
 
@@ -255,16 +277,12 @@ Scans never overlap; failures retain the last snapshot and mark it stale.
 ## Safety and current limits
 
 - There is no writable browser terminal and no tmux `send-keys` fallback.
-- Browser control is single-writer, generation-checked, idempotency-keyed, and
-  separately armed for full-host sessions.
-- The writer lease is per session and bound to the authenticated actor, browser
-  session, client ID, and rotating token. The UI uses a five-minute lease;
-  another tab/browser stays read-only until explicit release or expiry. Closing
-  or reloading the controlling tab without releasing may therefore delay a new
-  controller until expiry.
-- A standard session launched in the browser automatically acquires its
-  five-minute writer lease for that browser. Full-host creation and arming
-  remain separate explicit confirmations.
+- Browser control is single-writer, generation-checked, and idempotency-keyed.
+  Short writer leases are acquired automatically when an action is sent and
+  stay hidden unless another browser is actively writing. A conflicting
+  browser can explicitly move subsequent control to itself.
+- Sandboxed versus bypass-permissions access is a durable, visible session
+  property. It does not require a separate browser arming or expiry step.
 - Session creation is also idempotency-keyed. An interrupted creation is marked
   `unknown` and is never blindly replayed against a provider.
 - A manager process owns its live SDK/App Server transports. Provider session

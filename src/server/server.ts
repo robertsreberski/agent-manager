@@ -23,11 +23,18 @@ import {
   DiscoveryReconciler,
   type DiscoveryReconcilerOptions,
 } from "../discovery/index.ts";
+import {
+  RemoteHostManager,
+  RemoteNodeError,
+  type RemoteHostDefinition,
+} from "../remote/index.ts";
 import { AuthManager, type AuthManagerOptions, type AuthSession } from "./auth.ts";
 import {
   createSessionSchema,
+  directoryCompletionQuerySchema,
   leaseRequestSchema,
   requiredCapability,
+  resolveWorkspaceSchema,
   sessionActionSchema,
   type ActionRecord,
   type AttachInstruction,
@@ -57,6 +64,11 @@ import {
 import { SessionStateStore } from "./state.ts";
 import type { SessionTranscriptReader, TranscriptReadResult } from "./transcript.ts";
 import { SelectedTranscriptActivityObserver } from "./activity-observer.ts";
+import {
+  localDirectoryCompletions,
+  resolveLocalWorkspacePath,
+  workspaceLabel,
+} from "./workspaces.ts";
 
 const previewQuerySchema = z.object({
   lines: z.coerce.number().int().min(1).max(200).default(200),
@@ -159,6 +171,10 @@ export interface AgentManagerServerOptions {
   maxSseClients?: number;
   maxSseClientsPerAuthSession?: number;
   shutdownTimeoutMs?: number;
+  /** Configured owner SSH nodes. Browser input can only select these stable IDs. */
+  remoteHosts?: readonly RemoteHostDefinition[];
+  sshExecutable?: string;
+  remotePollIntervalMs?: number;
 }
 
 export interface AgentManagerBackend {
@@ -270,6 +286,18 @@ export async function createAgentManagerServer(
   });
   const activityHub = options.activityHub ?? new ActivityHub();
   const database = options.database ?? new ManagerDatabase(options.databasePath);
+  for (const remoteHost of options.remoteHosts ?? []) {
+    database.addHost({
+      id: remoteHost.id,
+      label: remoteHost.label,
+      kind: "ssh",
+      sshTarget: remoteHost.target,
+    });
+  }
+  const remoteHosts = new RemoteHostManager(options.remoteHosts ?? [], {
+    ...(options.sshExecutable ? { sshExecutable: options.sshExecutable } : {}),
+    ...(options.remotePollIntervalMs ? { pollIntervalMs: options.remotePollIntervalMs } : {}),
+  });
   const adapters = options.adapters ?? {};
   const previewAdapter = options.previewAdapter ?? new TmuxPanePreviewAdapter(
     options.tmuxExecutable === undefined ? {} : { executable: options.tmuxExecutable },
@@ -291,7 +319,13 @@ export async function createAgentManagerServer(
   const requestSessions = new WeakMap<FastifyRequest, AuthSession>();
   const idempotency = new IdempotencyStore();
   const leases = new ControlLeaseBroker({
-    onChange: (sessionId, leased) => void state.setWritableLease(sessionId, leased),
+    onChange: (sessionId, leased) => {
+      const session = state.get(sessionId);
+      state.setWritableLease(sessionId, leased);
+      if (!leased && session?.hostId && session.hostId !== "local") {
+        void remoteHosts.releaseControl(sessionId).catch(() => undefined);
+      }
+    },
   });
   let controlSocket: NetServer | null = null;
   let databaseClosed = false;
@@ -329,6 +363,19 @@ export async function createAgentManagerServer(
     reclaimedView: SessionView | null;
   }
   const nativeHandoffs = new Map<string, NativeHandoff>();
+  const remoteSessionIds = new Map<string, Set<string>>();
+  const syncRemoteHostDefinitions = (): void => {
+    const stored = database.listHosts().filter((host) => host.kind === "ssh" && host.sshTarget);
+    const storedIds = new Set(stored.map((host) => host.id));
+    for (const host of stored) {
+      remoteHosts.upsertHost({ id: host.id, label: host.label, target: host.sshTarget! });
+    }
+    for (const remoteState of remoteHosts.states()) {
+      if (storedIds.has(remoteState.id)) continue;
+      for (const sessionId of remoteHosts.removeHost(remoteState.id)) state.remove(sessionId);
+      remoteSessionIds.delete(remoteState.id);
+    }
+  };
   const transcriptActivity = new SelectedTranscriptActivityObserver({
     hub: activityHub,
     ...(transcriptReader ? { reader: transcriptReader } : {}),
@@ -336,7 +383,11 @@ export async function createAgentManagerServer(
     eligible: (session) => !session.control.managerOwned || nativeHandoffs.has(session.id),
   });
   const shouldObserveTranscript = (session: SessionView): boolean =>
-    !session.control.managerOwned || nativeHandoffs.has(session.id);
+    session.hostId === undefined || session.hostId === "local"
+      ? !session.control.managerOwned || nativeHandoffs.has(session.id)
+      : false;
+  const isRemoteSession = (session: SessionView): boolean =>
+    typeof session.hostId === "string" && session.hostId !== "local";
   const localOwnerActor = {
     id: "owner-control-socket",
     kind: "local" as const,
@@ -352,13 +403,15 @@ export async function createAgentManagerServer(
     sessions: readonly (SessionRecord | SessionView)[],
     diagnostics: readonly Diagnostic[],
   ): void => {
-    const managed = state.list().filter((session) => session.control.managerOwned);
-    const managedIds = new Set(managed.map((session) => session.id));
+    const retained = state.list().filter((session) =>
+      session.control.managerOwned || isRemoteSession(session)
+    );
+    const retainedIds = new Set(retained.map((session) => session.id));
     const external = sessions.filter((session) => {
       const id = "id" in session ? session.id : `${session.provider}:${session.sessionId}`;
-      return !managedIds.has(id);
+      return !retainedIds.has(id);
     });
-    state.replace([...external, ...managed], diagnostics);
+    state.replace([...external, ...retained], diagnostics);
   };
 
   if (options.initialSessions || options.initialDiagnostics) {
@@ -367,6 +420,18 @@ export async function createAgentManagerServer(
   }
   database.markInterruptedDispatchesUnknown();
   database.recoverCreateSessionIntents();
+
+  remoteHosts.start({
+    onSessions: (hostId, sessions) => {
+      const nextIds = new Set(sessions.map((session) => session.id));
+      for (const previousId of remoteSessionIds.get(hostId) ?? []) {
+        if (!nextIds.has(previousId)) state.remove(previousId);
+      }
+      remoteSessionIds.set(hostId, nextIds);
+      for (const session of sessions) state.upsert(session);
+    },
+    onDiagnostic: (diagnostic) => state.addDiagnostic(diagnostic),
+  });
 
   await app.register(rateLimit, {
     global: false,
@@ -470,6 +535,11 @@ export async function createAgentManagerServer(
       void reply.status(409).send(errorBody("IDEMPOTENCY_CONFLICT", error.message));
       return;
     }
+    if (error instanceof RemoteNodeError) {
+      const status = error.status >= 400 && error.status < 500 ? error.status : 502;
+      void reply.status(status).send(errorBody(error.code, error.message));
+      return;
+    }
     const status = typeof error === "object"
       && error !== null
       && "statusCode" in error
@@ -534,8 +604,12 @@ export async function createAgentManagerServer(
   app.get("/api/v1/sessions/:id", {
     config: { rateLimit: { max: 60, timeWindow: "1 minute" } },
   }, async (request) => {
-    const session = state.get(routeSessionId(request));
+    const id = routeSessionId(request);
+    const session = state.get(id);
     if (!session) throw new ApiError(404, "SESSION_NOT_FOUND", "session was not found");
+    if (isRemoteSession(session)) {
+      return { session: await remoteHosts.session(id) };
+    }
     let detail: TranscriptReadResult;
     try {
       detail = transcriptReader?.read(session) ?? {
@@ -570,7 +644,13 @@ export async function createAgentManagerServer(
     const session = state.get(id);
     if (!session) throw new ApiError(404, "SESSION_NOT_FOUND", "session was not found");
     activityHub.ensureSession(id, session.provider);
-    if (shouldObserveTranscript(session)) transcriptActivity.seedOnce(session);
+    if (isRemoteSession(session)) {
+      const release = remoteHosts.acquireActivity(id, activityHub, session.provider);
+      const timer = setTimeout(release, 1_500);
+      timer.unref();
+    } else if (shouldObserveTranscript(session)) {
+      transcriptActivity.seedOnce(session);
+    }
     const { before, limit } = activityHistoryQuerySchema.parse(request.query);
     const snapshot = activityHub.snapshot(id);
     if (!snapshot) {
@@ -613,13 +693,85 @@ export async function createAgentManagerServer(
     };
   });
 
+  app.get("/api/v1/hosts", async () => {
+    syncRemoteHostDefinitions();
+    const remoteStates = new Map(remoteHosts.states().map((host) => [host.id, host]));
+    return {
+      hosts: database.listHosts().map((host) => {
+        const remote = remoteStates.get(host.id);
+        return {
+          id: host.id,
+          label: host.label,
+          kind: host.kind,
+          ...(host.sshTarget ? { sshTarget: host.sshTarget } : {}),
+          status: host.kind === "local" ? "online" : remote?.status ?? "unknown",
+          ...(remote?.statusMessage ? { statusMessage: remote.statusMessage } : {}),
+        };
+      }),
+    };
+  });
+
+  app.get("/api/v1/hosts/:id/directories", {
+    config: { rateLimit: { max: 60, timeWindow: "1 minute" } },
+  }, async (request) => {
+    syncRemoteHostDefinitions();
+    const hostId = (request.params as { id?: string }).id ?? "";
+    const host = database.getHost(hostId);
+    if (!host) throw new ApiError(404, "HOST_NOT_FOUND", "host is not configured");
+    const query = directoryCompletionQuerySchema.parse(request.query);
+    const paths = host.kind === "local"
+      ? localDirectoryCompletions(query.path, query.limit)
+      : await remoteHosts.completePath(host.id, query.path, query.limit);
+    return { hostId, paths };
+  });
+
   app.get("/api/v1/workspaces", async () => ({ workspaces: database.listWorkspaces() }));
+
+  app.post("/api/v1/workspaces/resolve", {
+    config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
+  }, async (request) => {
+    syncRemoteHostDefinitions();
+    const input = resolveWorkspaceSchema.parse(request.body);
+    const host = database.getHost(input.hostId);
+    if (!host) throw new ApiError(404, "HOST_NOT_FOUND", "host is not configured");
+    try {
+      if (host.kind === "local") {
+        const path = resolveLocalWorkspacePath(input.path);
+        return {
+          workspace: database.addWorkspace({
+            hostId: host.id,
+            label: workspaceLabel(path),
+            path,
+          }),
+        };
+      }
+      const resolved = await remoteHosts.resolveWorkspace(host.id, input.path);
+      return {
+        workspace: database.addWorkspace({
+          hostId: host.id,
+          label: resolved.label,
+          path: resolved.path,
+          remoteWorkspaceId: resolved.remoteWorkspaceId,
+        }),
+      };
+    } catch (error) {
+      if (error instanceof RemoteNodeError) throw error;
+      throw new ApiError(400, "WORKSPACE_INVALID", "workspace path is not an accessible directory");
+    }
+  });
 
   app.get("/api/v1/sessions/:id/preview", {
     config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
   }, async (request) => {
     const session = state.get(routeSessionId(request));
     if (!session) throw new ApiError(404, "SESSION_NOT_FOUND", "session was not found");
+    if (isRemoteSession(session)) {
+      const limits = previewQuerySchema.parse(request.query);
+      return remoteHosts.preview(
+        session.id,
+        `?lines=${String(limits.lines)}&bytes=${String(limits.bytes)}`,
+      );
+    }
     if (!session.terminal || !session.control.capabilities.includes("preview")) {
       throw new ApiError(409, "PREVIEW_UNAVAILABLE", "this session has no safe pane preview");
     }
@@ -645,6 +797,7 @@ export async function createAgentManagerServer(
   app.get("/api/v1/sessions/:id/attach", async (request) => {
     const session = state.get(routeSessionId(request));
     if (!session) throw new ApiError(404, "SESSION_NOT_FOUND", "session was not found");
+    if (isRemoteSession(session)) return remoteHosts.attach(session.id);
     let instruction: AttachInstruction | null = null;
     if (session.control.managerOwned && session.control.capabilities.includes("attach")) {
       // The browser may only advertise the owner-socket wrapper. Returning a
@@ -790,9 +943,11 @@ export async function createAgentManagerServer(
     if (sseClients.size >= maxSseClients || actorStreams >= maxSseClientsPerAuthSession) {
       throw new ApiError(429, "SSE_LIMIT_REACHED", "too many live event streams");
     }
-    const releaseTranscript = shouldObserveTranscript(session)
-      ? transcriptActivity.acquire(session)
-      : () => undefined;
+    const releaseTranscript = isRemoteSession(session)
+      ? remoteHosts.acquireActivity(id, activityHub, session.provider)
+      : shouldObserveTranscript(session)
+        ? transcriptActivity.acquire(session)
+        : () => undefined;
 
     reply
       .header("Content-Type", "text/event-stream; charset=utf-8")
@@ -884,12 +1039,11 @@ export async function createAgentManagerServer(
     config: { rateLimit: { max: 20, timeWindow: "1 minute" } },
   }, async (request, reply) => {
     const input = createSessionSchema.parse(request.body);
-    if (input.permissionPreset === "full-host" && request.headers["x-confirm-full-host"] !== "true") {
-      throw new ApiError(428, "FULL_HOST_CONFIRMATION_REQUIRED", "full-host session creation requires explicit confirmation");
-    }
     const workspace = database.getWorkspace(input.workspaceId);
     if (!workspace) throw new ApiError(400, "WORKSPACE_UNKNOWN", "workspace is not configured");
-    const adapter = providerAdapter(adapters, input.provider);
+    const adapter = workspace.hostKind === "local"
+      ? providerAdapter(adapters, input.provider)
+      : null;
     const authSession = requireSession(request);
     const begun = database.beginCreateSessionIntent({
       actorId: authSession.actor.id,
@@ -930,8 +1084,9 @@ export async function createAgentManagerServer(
         details: {
           provider: input.provider,
           workspaceId: input.workspaceId,
+          hostId: workspace.hostId,
           mode: input.mode,
-          permissionPreset: input.permissionPreset,
+          accessMode: input.accessMode,
         },
       });
       database.markCreateSessionDispatching(authSession.actor.id, input.idempotencyKey);
@@ -942,10 +1097,12 @@ export async function createAgentManagerServer(
 
     let created: SessionView;
     try {
-      created = await adapter.createSession(
-        input,
-        context(request, workspace, begun.intent.managerRequestId),
-      );
+      created = workspace.hostKind === "ssh"
+        ? await remoteHosts.createSession(workspace.hostId, input, workspace)
+        : await adapter!.createSession(
+            input,
+            context(request, workspace, begun.intent.managerRequestId),
+          );
     } catch {
       database.markCreateSessionUnknown(authSession.actor.id, input.idempotencyKey);
       try {
@@ -996,13 +1153,14 @@ export async function createAgentManagerServer(
         session: {
           id: created.id,
           provider: created.provider,
-          providerSessionId: created.sessionId,
+          providerSessionId: workspace.hostKind === "ssh" ? created.id : created.sessionId,
           workspaceId: workspace.id,
           metadata: {
             managerRequestId: begun.intent.managerRequestId,
             name: input.name ?? null,
             mode: input.mode,
-            permissionPreset: input.permissionPreset,
+            accessMode: input.accessMode,
+            hostId: workspace.hostId,
           },
           createdAt: created.startedAt ?? now,
           updatedAt: now,
@@ -1062,8 +1220,8 @@ export async function createAgentManagerServer(
     const body = leaseRequestSchema.parse(request.body);
     const authSession = requireSession(request);
     const renewal = leases.has(session.id);
-    const operation = body.armFullHost
-      ? "lease.arm"
+    const operation = body.takeover
+      ? "lease.takeover"
       : renewal
       ? "lease.renew"
       : "lease.acquire";
@@ -1076,31 +1234,12 @@ export async function createAgentManagerServer(
         outcome: "requested",
         details: {
           renewal,
-          armFullHost: body.armFullHost,
+          takeover: body.takeover,
           ttlSeconds: body.ttlSeconds ?? 60,
         },
       });
     } catch {
       throw new ApiError(500, "LEASE_AUDIT_FAILED", "lease operation could not be recorded safely");
-    }
-    if (body.armFullHost && !renewal) {
-      try {
-        database.auditOperation({
-          actor: authSession.actor,
-          operation,
-          targetId: session.id,
-          phase: "outcome",
-          outcome: "current-token-required",
-          details: { armFullHost: true },
-        });
-      } catch {
-        // The durable attempt already records the rejected operation.
-      }
-      throw new ApiError(
-        428,
-        "LEASE_TOKEN_REQUIRED",
-        "acquire an unarmed lease, then present its current token to arm full-host control",
-      );
     }
     const lease = leases.acquire(
       session.id,
@@ -1108,8 +1247,16 @@ export async function createAgentManagerServer(
       principal(authSession),
       request.headers["x-control-lease"],
       body.ttlSeconds === undefined ? undefined : body.ttlSeconds * 1_000,
-      body.armFullHost,
+      body.takeover,
     );
+    if (isRemoteSession(session)) {
+      try {
+        await remoteHosts.acquireControl(session.id, body.takeover);
+      } catch (error) {
+        leases.forceRelease(session.id);
+        throw error;
+      }
+    }
     try {
       database.auditOperation({
         actor: authSession.actor,
@@ -1117,7 +1264,7 @@ export async function createAgentManagerServer(
         targetId: session.id,
         phase: "outcome",
         outcome: "succeeded",
-        details: { renewal, armFullHost: body.armFullHost },
+        details: { renewal, takeover: body.takeover },
       });
     } catch {
       leases.forceRelease(session.id);
@@ -1285,19 +1432,25 @@ export async function createAgentManagerServer(
           throw new ApiError(409, "LEASE_INVALID", "writable control lease is missing or invalid");
         }
         if (
-          (session.effectiveAccess.fullHostAccess || database.managedSessionRequiresFullHostArm(id))
-          && !leases.isFullHostArmed(id, principal(authSession))
-        ) {
-          throw new ApiError(428, "FULL_HOST_NOT_ARMED", "full-host control requires an explicitly armed lease");
-        }
-        if (
           action.type === "respond"
           && !session.attention.some((attention) => attention.id === action.requestId)
         ) {
           throw new ApiError(409, "REQUEST_STALE", "pending request is no longer active");
         }
+        if (isRemoteSession(session)) {
+          // Validate the remote node's auth-bound lease before persisting the
+          // local action intent. An SSH reconnect can replace the bridge auth
+          // session; a conflict here is safe to retry after explicit takeover.
+          await remoteHosts.acquireControl(session.id, false, true);
+        }
 
-        const adapter = providerAdapter(adapters, session.provider);
+        const dispatchAction = () => isRemoteSession(session)
+          ? remoteHosts.performAction(session.id, action)
+          : providerAdapter(adapters, session.provider).performAction(
+              session,
+              action,
+              context(request),
+            );
         const actionId = randomUUID();
         const createdAt = new Date().toISOString();
         let record = actionRecord(actionId, id, action, "pending", createdAt);
@@ -1331,7 +1484,7 @@ export async function createAgentManagerServer(
 
           let acknowledged = false;
           try {
-            const result = await adapter.performAction(session, action, context(request));
+            const result = await dispatchAction();
             acknowledged = result.status !== "unknown";
             record = actionRecord(actionId, id, action, result.status, createdAt, {
               ...(result.status === "queued" ? {} : { completedAt: new Date().toISOString() }),
@@ -1434,7 +1587,7 @@ export async function createAgentManagerServer(
 
         let acknowledged = false;
         try {
-          const result = await adapter.performAction(session, action, context(request));
+          const result = await dispatchAction();
           acknowledged = result.status !== "unknown";
           record = actionRecord(actionId, id, action, result.status, createdAt, {
             ...(result.status === "queued" ? {} : { completedAt: new Date().toISOString() }),
@@ -1603,6 +1756,7 @@ export async function createAgentManagerServer(
         }
       }
       transcriptActivity.dispose();
+      remoteHosts.dispose();
       if (options.onShutdown) {
         tasks.push(bounded(Promise.resolve(options.onShutdown()), shutdownTimeoutMs, "runtime shutdown"));
       }

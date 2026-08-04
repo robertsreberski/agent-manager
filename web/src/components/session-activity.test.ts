@@ -76,3 +76,91 @@ describe("activity turn state", () => {
     expect(groupedState([failedTool, running])).toBe("running");
   });
 });
+
+describe("activity timeline ordering", () => {
+  function message(
+    id: string,
+    seq: number,
+    role: "user" | "assistant",
+    phase: "commentary" | "final" | null,
+  ): ActivityItem {
+    return {
+      ...base(id, seq, "complete"),
+      kind: "message",
+      role,
+      phase,
+      text: id,
+      label: null,
+    };
+  }
+
+  function lifecycle(
+    id: string,
+    seq: number,
+    event: "turn-started" | "turn-completed",
+  ): ActivityItem {
+    return {
+      ...base(id, seq, event === "turn-started" ? "running" : "complete"),
+      kind: "lifecycle",
+      event,
+      level: "info",
+      title: id,
+      details: null,
+    };
+  }
+
+  it("renders a Codex turn as user, activity, then final despite provider arrival order", () => {
+    const timeline = buildActivityTimeline([
+      lifecycle("turn-started", 1, "turn-started"),
+      message("prompt", 2, "user", null),
+      {
+        ...base("tool", 3, "complete"),
+        kind: "tool",
+        toolCallId: "tool-1",
+        name: "read",
+        category: "command",
+        arguments: null,
+        result: null,
+        output: "done",
+      },
+      message("answer", 4, "assistant", "final"),
+      lifecycle("turn-completed", 5, "turn-completed"),
+    ]);
+
+    expect(timeline.map((item) => item.kind === "activity-group" ? "activity" : item.id))
+      .toEqual(["prompt", "activity", "answer"]);
+    const activity = timeline[1];
+    expect(activity?.kind === "activity-group" ? activity.items.map((item) => item.id) : [])
+      .toEqual(["turn-started", "tool", "turn-completed"]);
+  });
+
+  it("splits activity around a later steering message without moving it to the turn start", () => {
+    const timeline = buildActivityTimeline([
+      lifecycle("turn-started", 1, "turn-started"),
+      message("prompt", 2, "user", null),
+      {
+        ...base("tool-before", 3, "complete"),
+        kind: "plan",
+        text: "before",
+        steps: [],
+      },
+      message("steer", 4, "user", null),
+      {
+        ...base("tool-after", 5, "complete"),
+        kind: "plan",
+        text: "after",
+        steps: [],
+      },
+      message("answer", 6, "assistant", "final"),
+    ]);
+
+    expect(timeline.map((item) => item.kind === "activity-group" ? item.items.map((child) => child.id) : item.id))
+      .toEqual([
+        "prompt",
+        ["turn-started", "tool-before"],
+        "steer",
+        ["tool-after"],
+        "answer",
+      ]);
+  });
+});

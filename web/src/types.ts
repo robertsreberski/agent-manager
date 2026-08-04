@@ -69,9 +69,9 @@ export interface AttentionQuestion {
 }
 
 export interface EffectiveAccess {
+  accessMode: "sandboxed" | "bypass-permissions" | "unknown";
   permissionMode: string | null;
   sandboxMode: string | null;
-  fullHostAccess: boolean;
 }
 
 export interface TerminalTarget {
@@ -118,6 +118,8 @@ export interface QueueEntry {
 export interface SessionView {
   id: string;
   provider: Provider;
+  hostId?: string;
+  hostLabel?: string;
   name: string | null;
   cwd: string | null;
   parentSessionId: string | null;
@@ -161,7 +163,6 @@ export interface ControlLease {
   token: string;
   clientId: string;
   expiresAt: string;
-  fullHostArmedUntil: string | null;
 }
 
 export interface AttachInstruction {
@@ -216,7 +217,24 @@ export interface WorkspaceOption {
   id: string;
   label: string;
   path?: string;
+  hostId?: string;
+  hostLabel?: string;
+  hostKind?: "local" | "ssh";
   temporary?: boolean;
+}
+
+export interface HostOption {
+  id: string;
+  label: string;
+  kind: "local" | "ssh";
+  sshTarget?: string;
+  status: "online" | "offline" | "connecting" | "unknown";
+  statusMessage?: string;
+}
+
+export interface WorkspaceDraft {
+  hostId: string;
+  path: string;
 }
 
 export interface CreateSessionInput {
@@ -225,8 +243,13 @@ export interface CreateSessionInput {
   name?: string;
   initialMessage: string;
   mode: "planning" | "execution";
-  permissionPreset: "standard" | "full-host";
+  accessMode: "sandboxed" | "bypass-permissions";
   idempotencyKey: string;
+}
+
+export interface LaunchSessionInput extends Omit<CreateSessionInput, "workspaceId"> {
+  hostId: string;
+  workspacePath: string;
 }
 
 export type RequestResponse =

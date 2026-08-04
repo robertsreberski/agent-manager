@@ -57,9 +57,9 @@ describe("normalizeSession", () => {
         },
       ],
       effectiveAccess: {
+        accessMode: "sandboxed",
         permissionMode: "default",
         sandboxMode: "workspace-write",
-        fullHostAccess: false,
       },
       control: {
         plane: "codex-app-server",
@@ -76,14 +76,24 @@ describe("normalizeSession", () => {
     expect(session.runId).toBe("turn-7");
   });
 
-  it("detects full host access from raw provider permission modes", () => {
+  it("detects bypass-permissions access from raw provider permission modes", () => {
     const session = normalizeSession({
       id: "full-access",
       provider: "claude",
       permissionMode: "bypassPermissions",
       sandboxMode: null,
     });
-    expect(session.effectiveAccess.fullHostAccess).toBe(true);
+    expect(session.effectiveAccess.accessMode).toBe("bypass-permissions");
+  });
+
+  it("does not call an approval-gated danger-full-access session sandboxed or bypassed", () => {
+    const session = normalizeSession({
+      id: "hybrid-access",
+      provider: "codex",
+      permissionMode: "on-request",
+      sandboxMode: "danger-full-access",
+    });
+    expect(session.effectiveAccess.accessMode).toBe("unknown");
   });
 
   it("preserves exact structured multi-question details", () => {

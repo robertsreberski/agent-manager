@@ -5,8 +5,11 @@ export type CliCommand =
   | { name: "attach"; sessionId: string }
   | { name: "doctor"; json: boolean }
   | { name: "workspace"; operation: "list" | "add" | "remove"; value?: string }
+  | { name: "host"; operation: "list" | "remove" | "install"; value?: string }
+  | { name: "host"; operation: "add"; label: string; target: string }
   | { name: "tailscale"; operation: "install" | "status" | "off" }
   | { name: "service"; operation: "print" | "install" }
+  | { name: "node"; operation: "bridge" }
   | { name: "panic-lock" }
   | { name: "panic-unlock" }
   | { name: "help" };
@@ -76,6 +79,22 @@ export function parseCliCommand(argv: readonly string[]): CliCommand {
       }
       throw new Error("Usage: agent-manager workspace list|add <path>|remove <id>");
     }
+    case "host": {
+      const operation = rest[0];
+      if (operation === "list" && rest.length === 1) return { name: "host", operation };
+      if ((operation === "remove" || operation === "install") && rest.length === 2) {
+        return { name: "host", operation, value: required(rest[1], "Host id required") };
+      }
+      if (operation === "add" && rest.length === 3) {
+        return {
+          name: "host",
+          operation,
+          label: required(rest[1], "Host label required"),
+          target: required(rest[2], "SSH target required"),
+        };
+      }
+      throw new Error("Usage: agent-manager host list|add <name> <ssh-target>|install <ssh-target>|remove <id>");
+    }
     case "tailscale": {
       const operation = rest[0];
       if ((operation === "install" || operation === "status" || operation === "off") && rest.length === 1) {
@@ -90,6 +109,9 @@ export function parseCliCommand(argv: readonly string[]): CliCommand {
       }
       throw new Error("Usage: agent-manager service print|install");
     }
+    case "node":
+      if (rest.length === 1 && rest[0] === "bridge") return { name: "node", operation: "bridge" };
+      throw new Error("Usage: agent-manager node bridge");
     case "panic-lock":
       if (rest.length > 0) throw new Error("Usage: agent-manager panic-lock");
       return { name: "panic-lock" };
@@ -112,8 +134,10 @@ Usage:
   agent-manager attach <session-id>
   agent-manager doctor [--json]
   agent-manager workspace list|add <path>|remove <id>
+  agent-manager host list|add <name> <ssh-target>|install <ssh-target>|remove <id>
   agent-manager tailscale install|status|off
   agent-manager service print|install
+  agent-manager node bridge
   agent-manager panic-lock
   agent-manager panic-unlock
 

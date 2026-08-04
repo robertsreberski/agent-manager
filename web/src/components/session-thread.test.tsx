@@ -31,10 +31,7 @@ function renderThread(session: SessionView) {
   return render(
     <SessionThread
       session={session}
-      lease={null}
       busy={false}
-      onAcquire={vi.fn()}
-      onRelease={vi.fn()}
       onSend={vi.fn()}
       onRespond={vi.fn()}
       onInterrupt={vi.fn()}
@@ -45,23 +42,13 @@ function renderThread(session: SessionView) {
   );
 }
 
-const WRITABLE_LEASE = {
-  token: "lease-token",
-  clientId: "web-test",
-  expiresAt: "2099-01-01T00:00:00.000Z",
-  fullHostArmedUntil: null,
-};
-
 function renderWritableThread(session: SessionView, onSend = vi.fn(async () => undefined)) {
   return {
     onSend,
     ...render(
       <SessionThread
         session={session}
-        lease={WRITABLE_LEASE}
         busy={false}
-        onAcquire={vi.fn()}
-        onRelease={vi.fn()}
         onSend={onSend}
         onRespond={vi.fn()}
         onInterrupt={vi.fn()}
@@ -419,10 +406,7 @@ describe("SessionThread live activity", () => {
     rendered.rerender(
       <SessionThread
         session={session}
-        lease={null}
         busy={false}
-        onAcquire={vi.fn()}
-        onRelease={vi.fn()}
         onSend={vi.fn()}
         onRespond={vi.fn()}
         onInterrupt={vi.fn()}
@@ -472,10 +456,7 @@ describe("SessionThread live activity", () => {
     rendered.rerender(
       <SessionThread
         session={session}
-        lease={null}
         busy={false}
-        onAcquire={vi.fn()}
-        onRelease={vi.fn()}
         onSend={vi.fn()}
         onRespond={vi.fn()}
         onInterrupt={vi.fn()}
@@ -497,7 +478,7 @@ describe("SessionThread live activity", () => {
       transcript: { state: "available", source: "provider-api", messageCount: 0 },
     }));
 
-    const input = screen.getByPlaceholderText("Take control to send a message");
+    const input = screen.getByPlaceholderText("Message this session…");
     expect(input.parentElement?.parentElement?.className).toContain("safe-area-inset-bottom");
   });
 
@@ -549,10 +530,7 @@ describe("SessionThread live activity", () => {
     render(
       <SessionThread
         session={session}
-        lease={WRITABLE_LEASE}
         busy={false}
-        onAcquire={vi.fn()}
-        onRelease={vi.fn()}
         onSend={vi.fn()}
         onRespond={onRespond}
         onInterrupt={vi.fn()}
@@ -648,10 +626,7 @@ describe("SessionThread live activity", () => {
     render(
       <SessionThread
         session={session}
-        lease={WRITABLE_LEASE}
         busy={false}
-        onAcquire={vi.fn()}
-        onRelease={vi.fn()}
         onSend={vi.fn()}
         onRespond={onRespond}
         onInterrupt={vi.fn()}
@@ -710,10 +685,7 @@ describe("SessionThread live activity", () => {
     render(
       <SessionThread
         session={session}
-        lease={WRITABLE_LEASE}
         busy={false}
-        onAcquire={vi.fn()}
-        onRelease={vi.fn()}
         onSend={vi.fn()}
         onRespond={onRespond}
         onInterrupt={vi.fn()}
@@ -768,10 +740,7 @@ describe("SessionThread live activity", () => {
     render(
       <SessionThread
         session={session}
-        lease={WRITABLE_LEASE}
         busy={false}
-        onAcquire={vi.fn()}
-        onRelease={vi.fn()}
         onSend={vi.fn()}
         onRespond={onRespond}
         onInterrupt={vi.fn()}
@@ -920,11 +889,8 @@ describe("SessionThread asymmetric composer capabilities", () => {
           control: { capabilities: ["queue", "steer", "interrupt"] },
           transcript: { state: "available", source: "provider-api", messageCount: 0 },
         })}
-        lease={WRITABLE_LEASE}
         busy={false}
         mutationsReady={false}
-        onAcquire={vi.fn()}
-        onRelease={vi.fn()}
         onSend={onSend}
         onRespond={vi.fn()}
         onInterrupt={vi.fn()}
