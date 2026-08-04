@@ -2,6 +2,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError, CockpitApi } from "../lib/api";
 import { BrowserSessionError, establishBrowserSession } from "../lib/auth";
 import { connectCockpitEvents, type CockpitEvent } from "../lib/sse";
+import {
+  reconcileSelectedSessionId,
+  searchWithSelectedSession,
+  searchWithSessionScope,
+  sessionMatchesScope,
+  sessionScopeFromSearch,
+  type SessionScope,
+} from "../lib/session-navigation";
 import { SessionStateGuard } from "../lib/session-state";
 import { idempotencyKey } from "../lib/utils";
 import type {
@@ -51,6 +59,22 @@ export function sensitiveBoundaryStatus(error: unknown): 401 | 423 | null {
     return error.status;
   }
   return null;
+}
+
+export function leasesAfterReleaseResults(
+  current: Record<string, ControlLease>,
+  sessionIds: readonly string[],
+  results: readonly PromiseSettledResult<unknown>[],
+): Record<string, ControlLease> {
+  const releasedIds = new Set(
+    results.flatMap((result, index) => result.status === "fulfilled" && sessionIds[index]
+      ? [sessionIds[index]]
+      : []),
+  );
+  if (releasedIds.size === 0) return current;
+  return Object.fromEntries(
+    Object.entries(current).filter(([sessionId]) => !releasedIds.has(sessionId)),
+  );
 }
 
 function staleSnapshot(value: SessionsSnapshot): SessionsSnapshot {
@@ -121,6 +145,14 @@ function sortSessions(sessions: SessionView[]): SessionView[] {
   });
 }
 
+function replaceNavigationUrl(search: string): void {
+  window.history.replaceState(
+    window.history.state,
+    "",
+    `${window.location.pathname}${search}${window.location.hash}`,
+  );
+}
+
 export async function acquireLeaseInStages(
   api: Pick<CockpitApi, "acquireLease">,
   session: SessionView,
@@ -165,8 +197,12 @@ export function useCockpit() {
   const [authError, setAuthError] = useState<string | null>(null);
   const [availability, setAvailability] = useState<CockpitAvailability>("connecting");
   const [snapshot, setSnapshot] = useState(EMPTY_SNAPSHOT);
+  const [hasSuccessfulSnapshot, setHasSuccessfulSnapshot] = useState(false);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [workspaces, setWorkspaces] = useState<WorkspaceOption[]>([]);
+  const [scope, setScopeState] = useState<SessionScope>(() => (
+    sessionScopeFromSearch(window.location.search)
+  ));
   const [selectedId, setSelectedIdState] = useState<string | null>(() => {
     return new URLSearchParams(window.location.search).get("session");
   });
@@ -188,10 +224,14 @@ export function useCockpit() {
 
   const setSelectedId = useCallback((id: string | null) => {
     setSelectedIdState(id);
-    const url = new URL(window.location.href);
-    if (id) url.searchParams.set("session", id);
-    else url.searchParams.delete("session");
-    window.history.replaceState(null, "", `${url.pathname}${url.search}`);
+    replaceNavigationUrl(searchWithSelectedSession(window.location.search, id));
+  }, []);
+
+  const setScopeAndSelectedId = useCallback((nextScope: SessionScope, id: string | null) => {
+    setScopeState(nextScope);
+    setSelectedIdState(id);
+    const scopedSearch = searchWithSessionScope(window.location.search, nextScope);
+    replaceNavigationUrl(searchWithSelectedSession(scopedSearch, id));
   }, []);
 
   const clearSensitiveState = useCallback(() => {
@@ -202,6 +242,7 @@ export function useCockpit() {
     setBusy({});
     setNotice(null);
     setActionError(null);
+    setHasSuccessfulSnapshot(false);
     setSelectedId(null);
   }, [commitSnapshot, setSelectedId]);
 
@@ -264,6 +305,7 @@ export function useCockpit() {
     try {
       const next = await apiRef.current.sessions();
       commitSnapshot(stateGuardRef.current.applyRestSnapshot(snapshotRef.current, next, request));
+      setHasSuccessfulSnapshot(true);
     } catch (error) {
       handleFailure(error);
       throw error;
@@ -273,6 +315,16 @@ export function useCockpit() {
   useEffect(() => {
     void recoverBrowserSession();
   }, [recoverBrowserSession]);
+
+  useEffect(() => {
+    const syncNavigation = () => {
+      const params = new URLSearchParams(window.location.search);
+      setScopeState(sessionScopeFromSearch(window.location.search));
+      setSelectedIdState(params.get("session"));
+    };
+    window.addEventListener("popstate", syncNavigation);
+    return () => window.removeEventListener("popstate", syncNavigation);
+  }, []);
 
   useEffect(() => {
     const onOffline = () => {
@@ -310,6 +362,7 @@ export function useCockpit() {
           nextSnapshot,
           sessionsRequest,
         ));
+        setHasSuccessfulSnapshot(true);
         setWorkspaces(nextWorkspaces);
         setAvailability("online");
         setAuthError(null);
@@ -328,6 +381,8 @@ export function useCockpit() {
       let nextSnapshot = applied.snapshot;
       switch (event.type) {
         case "snapshot":
+          setHasSuccessfulSnapshot(true);
+          break;
         case "session.upsert":
         case "session.remove":
           break;
@@ -397,15 +452,39 @@ export function useCockpit() {
     return () => window.clearTimeout(timer);
   }, [auth, connection, recoverBrowserSession]);
 
-  const selectedGeneration = selectedId
-    ? snapshot.sessions.find((session) => session.id === selectedId)?.generation ?? null
+  const sessions = useMemo(() => sortSessions(snapshot.sessions), [snapshot.sessions]);
+  const reconciledSelectedId = reconcileSelectedSessionId({
+    sessions,
+    scope,
+    selectedId,
+    hasSuccessfulSnapshot,
+  });
+
+  const setScope = useCallback((nextScope: SessionScope) => {
+    const nextSelectedId = reconcileSelectedSessionId({
+      sessions,
+      scope: nextScope,
+      selectedId,
+      hasSuccessfulSnapshot,
+    });
+    setScopeAndSelectedId(nextScope, nextSelectedId);
+  }, [hasSuccessfulSnapshot, selectedId, sessions, setScopeAndSelectedId]);
+
+  useEffect(() => {
+    if (reconciledSelectedId !== selectedId) {
+      setSelectedId(reconciledSelectedId);
+    }
+  }, [reconciledSelectedId, selectedId, setSelectedId]);
+
+  const selectedGeneration = reconciledSelectedId
+    ? snapshot.sessions.find((session) => session.id === reconciledSelectedId)?.generation ?? null
     : null;
 
   useEffect(() => {
-    if (!api || !selectedId) return;
+    if (!api || !reconciledSelectedId) return;
     let cancelled = false;
     const request = stateGuardRef.current.beginRequest();
-    void api.session(selectedId)
+    void api.session(reconciledSelectedId)
       .then((session) => {
         if (!cancelled) {
           commitSnapshot(stateGuardRef.current.applyRestSession(
@@ -421,7 +500,7 @@ export function useCockpit() {
     return () => {
       cancelled = true;
     };
-  }, [api, commitSnapshot, handleFailure, selectedGeneration, selectedId]);
+  }, [api, commitSnapshot, handleFailure, reconciledSelectedId, selectedGeneration]);
 
   useEffect(() => {
     if (Object.keys(leases).length === 0) return;
@@ -435,19 +514,9 @@ export function useCockpit() {
     return () => window.clearInterval(timer);
   }, [leases]);
 
-  const sessions = useMemo(() => sortSessions(snapshot.sessions), [snapshot.sessions]);
-
-  useEffect(() => {
-    if (sessions.length === 0) {
-      if (selectedId !== null) setSelectedId(null);
-      return;
-    }
-    if (!selectedId || !sessions.some((session) => session.id === selectedId)) {
-      setSelectedId(sessions[0]!.id);
-    }
-  }, [selectedId, sessions, setSelectedId]);
-
-  const selectedSession = sessions.find((session) => session.id === selectedId) ?? null;
+  const selectedSession = sessions.find((session) => (
+    session.id === reconciledSelectedId && sessionMatchesScope(session, scope)
+  )) ?? null;
   const mutationsReady = mutationsAreReady(auth !== null, connection, snapshot.stale, availability);
 
   const withBusy = useCallback(async <T,>(key: string, operation: () => Promise<T>): Promise<T> => {
@@ -571,7 +640,7 @@ export function useCockpit() {
     if (!api || !mutationsReady) throw new Error("Reconnect before creating a session.");
     const session = await withBusy("create", () => api.createSession(input));
     commitSnapshot(stateGuardRef.current.applyLocalSession(snapshotRef.current, session));
-    setSelectedId(session.id);
+    setScopeAndSelectedId("managed", session.id);
     let acquired = false;
     try {
       acquired = await autoAcquireCreatedSession(input, session, acquireLease);
@@ -583,7 +652,7 @@ export function useCockpit() {
       ? "Managed session created with control ready for five minutes."
       : "Managed session created.");
     return session;
-  }, [acquireLease, api, commitSnapshot, mutationsReady, setSelectedId, withBusy]);
+  }, [acquireLease, api, commitSnapshot, mutationsReady, setScopeAndSelectedId, withBusy]);
 
   const releaseAllLeases = useCallback(async (): Promise<void> => {
     if (Object.values(busy).some(Boolean)) {
@@ -599,6 +668,8 @@ export function useCockpit() {
     const results = await Promise.allSettled(active.map(([sessionId, lease]) => (
       api.releaseLease(sessionId, lease.token)
     )));
+    const activeSessionIds = active.map(([sessionId]) => sessionId);
+    setLeases((current) => leasesAfterReleaseResults(current, activeSessionIds, results));
     const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
     if (failure) {
       handleFailure(failure.reason);
@@ -635,8 +706,10 @@ export function useCockpit() {
     snapshot,
     sessions,
     selectedSession,
-    selectedId,
+    selectedId: reconciledSelectedId,
     setSelectedId,
+    scope,
+    setScope,
     connection,
     mutationsReady,
     workspaces,

@@ -39,6 +39,14 @@ export function searchWithSessionScope(search: string, scope: SessionScope): str
   return next ? `?${next}` : "";
 }
 
+export function searchWithSelectedSession(search: string, selectedId: string | null): string {
+  const params = new URLSearchParams(search);
+  if (selectedId) params.set("session", selectedId);
+  else params.delete("session");
+  const next = params.toString();
+  return next ? `?${next}` : "";
+}
+
 export function sessionMatchesScope(session: SessionView, scope: SessionScope): boolean {
   switch (scope) {
     case "needs-you":
@@ -55,6 +63,28 @@ export function sessionMatchesScope(session: SessionView, scope: SessionScope): 
     case "claude":
       return session.provider === scope;
   }
+}
+
+export function reconcileSelectedSessionId({
+  sessions,
+  scope,
+  selectedId,
+  hasSuccessfulSnapshot,
+}: {
+  sessions: readonly SessionView[];
+  scope: SessionScope;
+  selectedId: string | null;
+  hasSuccessfulSnapshot: boolean;
+}): string | null {
+  // The initial empty client state is not evidence that a deep-linked session
+  // disappeared. Wait for an authoritative snapshot before replacing it.
+  if (!hasSuccessfulSnapshot) return selectedId;
+
+  const scopedSessions = sessions.filter((session) => sessionMatchesScope(session, scope));
+  if (selectedId && scopedSessions.some((session) => session.id === selectedId)) {
+    return selectedId;
+  }
+  return scopedSessions[0]?.id ?? null;
 }
 
 export function countSessionScopes(sessions: readonly SessionView[]): SessionScopeCounts {

@@ -7,6 +7,7 @@ import {
   autoAcquireCreatedSession,
   BROWSER_CLIENT_ID_STORAGE_KEY,
   getOrCreateBrowserClientId,
+  leasesAfterReleaseResults,
   mutationsAreReady,
   sensitiveBoundaryStatus,
 } from "./use-cockpit";
@@ -193,5 +194,26 @@ describe("cockpit connectivity guards", () => {
     expect(sensitiveBoundaryStatus(new BrowserSessionError("locked", "locked", 423))).toBe(423);
     expect(sensitiveBoundaryStatus(new ApiError("conflict", 409))).toBeNull();
     expect(sensitiveBoundaryStatus(new TypeError("offline"))).toBeNull();
+  });
+
+  it("removes only leases the server successfully released during an update", () => {
+    const current = {
+      "codex:released": lease("released"),
+      "codex:failed": lease("failed"),
+      "codex:untouched": lease("untouched"),
+    };
+    const next = leasesAfterReleaseResults(
+      current,
+      ["codex:released", "codex:failed"],
+      [
+        { status: "fulfilled", value: undefined },
+        { status: "rejected", reason: new Error("network") },
+      ],
+    );
+
+    expect(next).toEqual({
+      "codex:failed": current["codex:failed"],
+      "codex:untouched": current["codex:untouched"],
+    });
   });
 });

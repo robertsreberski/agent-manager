@@ -38,9 +38,11 @@ function renderSidebar(overrides: Partial<React.ComponentProps<typeof SessionSid
     <SessionSidebar
       sessions={sessions}
       selectedId="codex:root"
+      scope="managed"
       connection="open"
       actor="Robert"
       onSelect={vi.fn()}
+      onScopeChange={vi.fn()}
       onLaunch={vi.fn()}
       onRefresh={vi.fn()}
       {...overrides}
@@ -53,19 +55,35 @@ describe("SessionSidebar", () => {
     window.history.replaceState(null, "", "/?session=codex%3Aroot&scope=managed");
   });
 
-  it("hydrates scope from the URL, exposes counts, and preserves the session query", () => {
-    renderSidebar();
+  it("renders the controlled scope, exposes counts, and reports scope changes", () => {
+    const onScopeChange = vi.fn();
+    renderSidebar({ onScopeChange });
 
     expect(screen.getByRole("button", { name: "Managed, 1 session" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByRole("button", { name: "Claude, 1 session" })).toHaveAttribute("aria-pressed", "false");
 
     fireEvent.click(screen.getByRole("button", { name: "Claude, 1 session" }));
-    expect(window.location.search).toBe("?session=codex%3Aroot&scope=claude");
+    expect(onScopeChange).toHaveBeenCalledOnce();
+    expect(onScopeChange).toHaveBeenCalledWith("claude");
+    expect(window.location.search).toBe("?session=codex%3Aroot&scope=managed");
+  });
+
+  it("does not change the active session or scope when the query changes", () => {
+    const onSelect = vi.fn();
+    const onScopeChange = vi.fn();
+    renderSidebar({ scope: "all", onSelect, onScopeChange });
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Search sessions" }), {
+      target: { value: "claude" },
+    });
+
+    expect(screen.getByRole("treeitem")).toHaveTextContent("Claude notes");
+    expect(onSelect).not.toHaveBeenCalled();
+    expect(onScopeChange).not.toHaveBeenCalled();
   });
 
   it("keeps matching ancestors and renders compact hierarchy rows", () => {
-    renderSidebar();
-    fireEvent.click(screen.getByRole("button", { name: "All, 3 sessions" }));
+    renderSidebar({ scope: "all" });
     fireEvent.change(screen.getByRole("textbox", { name: "Search sessions" }), { target: { value: "deploy" } });
 
     const tree = screen.getByRole("tree", { name: "All sessions" });
@@ -75,8 +93,11 @@ describe("SessionSidebar", () => {
     expect(rows[0]).toHaveAttribute("data-ancestor-only", "true");
     expect(rows[1]).toHaveTextContent("Deploy reports");
     expect(rows[1]).toHaveAttribute("aria-level", "2");
-    expect(rows[1]).toHaveClass("h-[52px]");
+    expect(rows[1]).toHaveClass("h-[52px]", "ps-5");
     expect(rows[1]).toHaveAttribute("data-compact-control");
+    expect(rows[1]).not.toHaveAttribute("style");
+    expect(rows[1]!.querySelector(".w-px")).toHaveClass("start-[5px]");
+    expect(rows[1]!.querySelector(".w-px")).not.toHaveAttribute("style");
   });
 
   it("keeps launch visible but safely disabled when mutations are unavailable", () => {
@@ -84,6 +105,10 @@ describe("SessionSidebar", () => {
 
     expect(screen.getByRole("button", { name: "New session unavailable while the manager is reconnecting" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Expand scope navigation" })).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByRole("button", { name: "Open navigation" }).parentElement).toHaveClass(
+      "left-[max(0.75rem,env(safe-area-inset-left))]",
+      "top-[max(0.75rem,env(safe-area-inset-top))]",
+    );
   });
 
   it("exposes the browser-owned install action only when it is available", () => {
@@ -97,9 +122,11 @@ describe("SessionSidebar", () => {
       <SessionSidebar
         sessions={sessions}
         selectedId="codex:root"
+        scope="managed"
         connection="open"
         actor="Robert"
         onSelect={vi.fn()}
+        onScopeChange={vi.fn()}
         onLaunch={vi.fn()}
         onRefresh={vi.fn()}
         installAvailable={false}

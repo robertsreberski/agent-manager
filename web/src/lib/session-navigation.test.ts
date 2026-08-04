@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   countSessionScopes,
   navigationSessions,
+  reconcileSelectedSessionId,
+  searchWithSelectedSession,
   searchWithSessionScope,
   sessionScopeFromSearch,
 } from "./session-navigation";
@@ -38,6 +40,12 @@ describe("session navigation scopes", () => {
     expect(sessionScopeFromSearch("?scope=attention")).toBe("needs-you");
     expect(searchWithSessionScope("?session=codex%3Aone", "claude")).toBe("?session=codex%3Aone&scope=claude");
     expect(searchWithSessionScope("?session=codex%3Aone&scope=claude", "all")).toBe("?session=codex%3Aone");
+    expect(searchWithSelectedSession("?scope=managed&launch=1", "codex:two")).toBe(
+      "?scope=managed&launch=1&session=codex%3Atwo",
+    );
+    expect(searchWithSelectedSession("?session=codex%3Aone&scope=managed&launch=1", null)).toBe(
+      "?scope=managed&launch=1",
+    );
   });
 
   it("counts every independent scope", () => {
@@ -60,6 +68,46 @@ describe("session navigation scopes", () => {
       codex: 1,
       claude: 2,
     });
+  });
+});
+
+describe("reconcileSelectedSessionId", () => {
+  const managed = session({ id: "codex:managed", ownership: "manager" });
+  const firstClaude = session({ id: "claude:first", provider: "claude" });
+  const secondClaude = session({ id: "claude:second", provider: "claude" });
+
+  it("preserves an unresolved deep link until the first successful snapshot", () => {
+    expect(reconcileSelectedSessionId({
+      sessions: [],
+      scope: "claude",
+      selectedId: "claude:deep-link",
+      hasSuccessfulSnapshot: false,
+    })).toBe("claude:deep-link");
+  });
+
+  it("keeps an in-scope selection and otherwise chooses the first scoped session", () => {
+    const sessions = [managed, firstClaude, secondClaude];
+    expect(reconcileSelectedSessionId({
+      sessions,
+      scope: "claude",
+      selectedId: "claude:second",
+      hasSuccessfulSnapshot: true,
+    })).toBe("claude:second");
+    expect(reconcileSelectedSessionId({
+      sessions,
+      scope: "claude",
+      selectedId: "codex:managed",
+      hasSuccessfulSnapshot: true,
+    })).toBe("claude:first");
+  });
+
+  it("returns null after hydration when the active scope is empty", () => {
+    expect(reconcileSelectedSessionId({
+      sessions: [managed],
+      scope: "needs-you",
+      selectedId: "codex:managed",
+      hasSuccessfulSnapshot: true,
+    })).toBeNull();
   });
 });
 

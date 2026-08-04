@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import * as TooltipPrimitive from "@radix-ui/react-tooltip";
 import {
   Activity,
@@ -26,8 +26,6 @@ import { Sheet, SheetContent, SheetTitle, SheetTrigger } from "./ui/sheet";
 import {
   countSessionScopes,
   navigationSessions,
-  searchWithSessionScope,
-  sessionScopeFromSearch,
   type NavigationSession,
   type SessionScope,
   type SessionScopeCounts,
@@ -52,9 +50,11 @@ const SCOPE_ITEMS: Array<{
 export interface SessionSidebarProps {
   sessions: SessionView[];
   selectedId: string | null;
+  scope: SessionScope;
   connection: ConnectionState;
   actor: string | null;
   onSelect: (id: string) => void;
+  onScopeChange: (scope: SessionScope) => void;
   onLaunch: () => void;
   onRefresh: () => void;
   canLaunch?: boolean;
@@ -256,6 +256,24 @@ function activityMeta(session: SessionView): { label: string; dot: string } {
   }
 }
 
+const ROW_INDENT = [
+  "ps-2",
+  "ps-5",
+  "ps-8",
+  "ps-11",
+  "ps-14",
+  "ps-[4.25rem]",
+] as const;
+
+const HIERARCHY_GUIDE_INSET = [
+  "",
+  "start-[5px]",
+  "start-[17px]",
+  "start-[29px]",
+  "start-[41px]",
+  "start-[53px]",
+] as const;
+
 function SessionRow({
   item,
   selected,
@@ -285,13 +303,15 @@ function SessionRow({
         "hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-ring",
         selected && "border-sidebar-border bg-sidebar-accent shadow-sm",
         item.ancestorOnly && "text-muted-foreground",
+        ROW_INDENT[depth],
       )}
-      style={{ paddingInlineStart: `${8 + depth * 12}px` }}
     >
       {depth > 0 && (
         <span
-          className="absolute bottom-1.5 top-1.5 w-px bg-sidebar-border"
-          style={{ insetInlineStart: `${5 + (depth - 1) * 12}px` }}
+          className={cn(
+            "absolute bottom-1.5 top-1.5 w-px bg-sidebar-border",
+            HIERARCHY_GUIDE_INSET[depth],
+          )}
           aria-hidden="true"
         />
       )}
@@ -433,7 +453,10 @@ function NewSessionButton({ canLaunch, onLaunch }: { canLaunch: boolean; onLaunc
   );
 }
 
-type NavigationPaneProps = Omit<SessionSidebarProps, "sessions" | "canLaunch"> & {
+type NavigationPaneProps = Omit<
+  SessionSidebarProps,
+  "sessions" | "scope" | "onScopeChange" | "canLaunch"
+> & {
   sessions: NavigationSession[];
   scope: SessionScope;
   query: string;
@@ -533,8 +556,8 @@ function MobileSidebarContents({
   onQueryChange: (query: string) => void;
 }) {
   return (
-    <div className="flex h-full min-h-0 flex-col bg-sidebar text-sidebar-foreground">
-      <header className="shrink-0 border-b border-sidebar-border px-3 pb-3 pt-3 pr-14">
+    <div className="safe-area-inline flex h-full min-h-0 flex-col bg-sidebar text-sidebar-foreground">
+      <header className="shrink-0 border-b border-sidebar-border px-3 pb-3 [padding-top:max(0.75rem,env(safe-area-inset-top))] pr-14">
         <div className="mb-3 flex h-9 items-center gap-2.5">
           <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground shadow-sm">
             <Activity className="size-4" aria-hidden="true" />
@@ -560,12 +583,13 @@ function MobileSidebarContents({
   );
 }
 
-function currentScope(): SessionScope {
-  return typeof window === "undefined" ? "all" : sessionScopeFromSearch(window.location.search);
-}
-
-export function SessionSidebar({ canLaunch = true, installAvailable = false, ...props }: SessionSidebarProps) {
-  const [scope, setScopeState] = useState<SessionScope>(currentScope);
+export function SessionSidebar({
+  canLaunch = true,
+  installAvailable = false,
+  scope,
+  onScopeChange,
+  ...props
+}: SessionSidebarProps) {
   const [query, setQuery] = useState("");
   const [railExpanded, setRailExpanded] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -574,22 +598,6 @@ export function SessionSidebar({ canLaunch = true, installAvailable = false, ...
     () => navigationSessions(props.sessions, scope, query),
     [props.sessions, query, scope],
   );
-
-  useEffect(() => {
-    const syncScope = () => setScopeState(currentScope());
-    window.addEventListener("popstate", syncScope);
-    return () => window.removeEventListener("popstate", syncScope);
-  }, []);
-
-  const setScope = useCallback((next: SessionScope) => {
-    setScopeState(next);
-    const search = searchWithSessionScope(window.location.search, next);
-    window.history.replaceState(
-      window.history.state,
-      "",
-      `${window.location.pathname}${search}${window.location.hash}`,
-    );
-  }, []);
 
   const selectAndClose = (id: string) => {
     props.onSelect(id);
@@ -608,7 +616,7 @@ export function SessionSidebar({ canLaunch = true, installAvailable = false, ...
           scope={scope}
           counts={counts}
           expanded={railExpanded}
-          onScopeChange={setScope}
+          onScopeChange={onScopeChange}
           onExpandedChange={setRailExpanded}
         />
         <DesktopSessionPane
@@ -622,7 +630,7 @@ export function SessionSidebar({ canLaunch = true, installAvailable = false, ...
         />
       </aside>
 
-      <div className="fixed left-3 top-3 z-40 min-[901px]:hidden">
+      <div className="fixed left-[max(0.75rem,env(safe-area-inset-left))] top-[max(0.75rem,env(safe-area-inset-top))] z-40 min-[901px]:hidden">
         <Sheet open={mobileOpen} onOpenChange={setMobileOpen}>
           <SheetTrigger asChild>
             <Button size="icon" variant="outline" aria-label="Open navigation">
@@ -639,7 +647,7 @@ export function SessionSidebar({ canLaunch = true, installAvailable = false, ...
               query={query}
               canLaunch={canLaunch}
               installAvailable={installAvailable}
-              onScopeChange={setScope}
+              onScopeChange={onScopeChange}
               onQueryChange={setQuery}
               onSelect={selectAndClose}
               onLaunch={launchAndClose}

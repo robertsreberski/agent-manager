@@ -213,9 +213,11 @@ export default function App() {
       <SessionSidebar
         sessions={cockpit.sessions}
         selectedId={cockpit.selectedId}
+        scope={cockpit.scope}
         connection={cockpit.connection}
         actor={cockpit.actor}
         onSelect={cockpit.setSelectedId}
+        onScopeChange={cockpit.setScope}
         onLaunch={() => setLaunchOpen(true)}
         onRefresh={() => void cockpit.refresh().catch(() => undefined)}
         canLaunch={cockpit.mutationsReady}
