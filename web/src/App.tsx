@@ -280,7 +280,7 @@ export default function App() {
         )}
 
         {(cockpit.actionError || pwaError) && (
-          <div className="absolute bottom-[max(1rem,env(safe-area-inset-bottom))] right-[max(1rem,env(safe-area-inset-right))] z-50 flex w-[min(calc(100%-2rem),36rem)] items-start gap-2 rounded-lg border border-red-500/30 bg-background px-3 py-2.5 text-sm shadow-lg">
+          <div className="absolute right-[max(1rem,env(safe-area-inset-right))] top-[calc(4rem+env(safe-area-inset-top))] z-50 flex w-[min(calc(100%-2rem),36rem)] items-start gap-2 rounded-lg border border-red-500/30 bg-background px-3 py-2.5 text-sm shadow-lg min-[901px]:bottom-[max(1rem,env(safe-area-inset-bottom))] min-[901px]:top-auto">
             <AlertCircle className="mt-0.5 size-4 shrink-0 text-red-600" />
             <span className="flex-1">{cockpit.actionError || pwaError}</span>
             <Button
@@ -298,7 +298,7 @@ export default function App() {
           </div>
         )}
         {cockpit.notice && !cockpit.actionError && !pwaError && (
-          <div className="absolute bottom-[max(1rem,env(safe-area-inset-bottom))] right-[max(1rem,env(safe-area-inset-right))] z-50 flex w-fit max-w-[calc(100%-2rem)] items-center gap-2 rounded-lg border bg-background px-3 py-2 text-xs shadow-lg">
+          <div className="absolute right-[max(1rem,env(safe-area-inset-right))] top-[calc(4rem+env(safe-area-inset-top))] z-50 flex w-fit max-w-[calc(100%-2rem)] items-center gap-2 rounded-lg border bg-background px-3 py-2 text-xs shadow-lg min-[901px]:bottom-[max(1rem,env(safe-area-inset-bottom))] min-[901px]:top-auto">
             <span>{cockpit.notice}</span>
             <Button size="icon" variant="ghost" className="size-5" onClick={cockpit.clearNotice} aria-label="Dismiss notice">
               <X />
