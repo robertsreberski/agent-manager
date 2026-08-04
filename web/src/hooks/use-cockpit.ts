@@ -61,22 +61,6 @@ export function sensitiveBoundaryStatus(error: unknown): 401 | 423 | null {
   return null;
 }
 
-export function leasesAfterReleaseResults(
-  current: Record<string, ControlLease>,
-  sessionIds: readonly string[],
-  results: readonly PromiseSettledResult<unknown>[],
-): Record<string, ControlLease> {
-  const releasedIds = new Set(
-    results.flatMap((result, index) => result.status === "fulfilled" && sessionIds[index]
-      ? [sessionIds[index]]
-      : []),
-  );
-  if (releasedIds.size === 0) return current;
-  return Object.fromEntries(
-    Object.entries(current).filter(([sessionId]) => !releasedIds.has(sessionId)),
-  );
-}
-
 function staleSnapshot(value: SessionsSnapshot): SessionsSnapshot {
   return value.stale ? value : { ...value, stale: true };
 }
@@ -658,25 +642,16 @@ export function useCockpit() {
     if (Object.values(busy).some(Boolean)) {
       throw new Error("Wait for the current action before updating.");
     }
-    const active = Object.entries(leases).filter(([, lease]) => (
-      new Date(lease.expiresAt).getTime() > Date.now()
-    ));
-    if (active.length === 0) return;
     if (!api || !mutationsReady) {
       throw new Error("Reconnect before releasing control for an update.");
     }
-    const results = await Promise.allSettled(active.map(([sessionId, lease]) => (
-      api.releaseLease(sessionId, lease.token)
-    )));
-    const activeSessionIds = active.map(([sessionId]) => sessionId);
-    setLeases((current) => leasesAfterReleaseResults(current, activeSessionIds, results));
-    const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
-    if (failure) {
-      handleFailure(failure.reason);
-      throw failure.reason;
-    }
+    // The auth session is shared by this browser's tabs. Release at the
+    // server boundary even when this tab has no local lease record, so a stale
+    // background tab cannot remain writable across a PWA code takeover.
+    await withBusy("lease:all", () => api.releaseBrowserLeases());
     setLeases({});
-  }, [api, busy, handleFailure, leases, mutationsReady]);
+    setNotice("Browser control released.");
+  }, [api, busy, mutationsReady, withBusy]);
 
   const loadPreview = useCallback(async (session: SessionView): Promise<PanePreview> => {
     if (!api) throw new Error("The cockpit is not connected.");

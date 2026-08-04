@@ -171,8 +171,8 @@ Agent Manager is installable as a PWA over its private HTTPS Tailscale URL.
 Supported browsers expose an **Install Agent Manager** action in the session
 footer; on iPhone and iPad the cockpit shows the Safari Share → Add to Home
 Screen instructions. Updates are prompt-based. Applying one releases this
-browser's active writer leases before reloading, while the agent processes keep
-running.
+browser session's active writer leases across every open tab, then every
+controlled tab reloads onto the new shell. The agent processes keep running.
 
 Only the versioned public app shell is precached. API, authentication, SSE,
 action, health, source-map, and session data responses are never placed in a

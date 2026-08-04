@@ -132,7 +132,9 @@ export default function App() {
     setUpdating(true);
     setPwaError(null);
     try {
-      if (cockpit.hasActiveLeases) await cockpit.releaseAllLeases();
+      // Always release at the shared browser-session boundary. Another tab can
+      // own a lease that this tab has never observed.
+      await cockpit.releaseAllLeases();
       const applied = await pwa.applyUpdate();
       if (!applied) throw new Error("The update is no longer ready. It will be offered again when available.");
       setUpdateConfirmOpen(false);
@@ -237,7 +239,7 @@ export default function App() {
         {pwa.updateReady && (
           <div className="z-30 flex min-h-9 flex-wrap items-center justify-center gap-x-3 gap-y-1 border-b border-primary/20 bg-primary/[0.06] px-3 py-1.5 text-xs">
             <span className="font-medium">Agent Manager update ready.</span>
-            <span className="text-muted-foreground">Agents keep running; this cockpit will reload.</span>
+            <span className="text-muted-foreground">Agents keep running; open cockpit tabs will reload.</span>
             <span className="flex items-center gap-1.5">
               <Button
                 size="sm"
@@ -374,7 +376,7 @@ export default function App() {
           <DialogHeader>
             <DialogTitle className="text-base">Release control and update?</DialogTitle>
             <DialogDescription className="leading-6">
-              Agent sessions keep running. Agent Manager will release this browser’s active control leases, install the update, and reload the cockpit.
+              Agent sessions keep running. Agent Manager will release control held by every tab in this browser session, install the update, and reload those tabs.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
