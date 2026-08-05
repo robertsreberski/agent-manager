@@ -125,7 +125,7 @@ export function ToolCall({ part }: { part: ToolPart }) {
       <button type="button" data-compact-control className="flex min-h-8 w-full min-w-0 items-center gap-[9px] py-1.5 text-left" aria-expanded={open} onClick={() => { lockScroll(); setOpen((value) => !value); }}>
         {part.status.type === "running" ? <LoaderCircle size={15} strokeWidth={1.75} className="shrink-0 text-[var(--text-muted)] motion-safe:animate-spin" /> : part.isError ? <Circle size={12} className="shrink-0 text-[var(--danger)]" /> : <Check size={15} strokeWidth={1.75} className="shrink-0 text-[var(--text-muted)]" />}
         <strong className="min-w-0 truncate font-mono text-code-sm font-medium text-[var(--text)]" data-tool-name>{part.toolName}</strong>
-        {detail !== null && <span className="min-w-0 flex-1 truncate font-mono text-code-sm text-[var(--text-faint)]" data-tool-detail>{detail}</span>}
+        {detail !== null && <span className="min-w-0 flex-1 truncate font-mono text-code-sm text-[var(--text-muted)]" data-tool-detail>{detail}</span>}
         {duration && <span className="shrink-0 font-mono text-code-xs text-[var(--text-faint)]">{duration}</span>}
         <ChevronDown size={12} className={`shrink-0 text-[var(--text-faint)] ${open ? "rotate-180" : ""}`} />
       </button>
@@ -206,7 +206,7 @@ function SubagentStep({ item, renderData }: { item: ActivityItem; renderData?: (
   if (item.kind === "message") {
     return (
       <div className={`py-1 text-meta-sm ${CONTAINED}`} data-subagent-message-role={item.role}>
-        {item.role !== "assistant" && <span className="mb-1 block font-mono text-eyebrow uppercase text-[var(--text-faint)]">{item.role}</span>}
+        {item.role !== "assistant" && <span className="mb-1 block font-mono text-eyebrow uppercase text-[var(--text-muted)]">{item.role}</span>}
         <p className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{item.text}</p>
       </div>
     );

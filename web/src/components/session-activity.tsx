@@ -577,7 +577,7 @@ function Attention({ item, controls }: { item: ActivityAttentionItem; controls: 
     <section className="my-2 border-l-2 border-dashed border-[var(--accent)] bg-[var(--surface-raised)] p-3" data-attention-confidence={item.confidence}>
       <p className="flex items-start gap-2 text-meta"><CircleAlert size={15} className="mt-0.5 text-[var(--accent)]" /><strong>{item.title ?? item.attentionKind.replaceAll("-", " ")}</strong></p>
       {item.summary && <p className="mt-1 text-meta-sm text-[var(--text-muted)]">{item.summary}</p>}
-      <p className="mt-2 text-code-sm text-[var(--text-faint)]">{item.resolved ? "Resolved in the harness." : "Open the native harness to respond; this request is not safely representable here."}</p>
+      <p className="mt-2 text-code-sm text-[var(--text-muted)]">{item.resolved ? "Resolved in the harness." : "Open the native harness to respond; this request is not safely representable here."}</p>
     </section>
   );
 }
@@ -604,7 +604,7 @@ function Usage({ item }: { item: Extract<ActivityItem, { kind: "usage" }> }) {
     item.costUsd === null ? null : `$${item.costUsd.toFixed(4)}`,
   ].filter((value): value is string => value !== null);
   if (facts.length === 0) return null;
-  return <p className="my-2 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-code-xs text-[var(--text-faint)]"><Gauge size={13} className="shrink-0" />{facts.map((fact) => <span key={fact}>{fact}</span>)}</p>;
+  return <p className="my-2 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-code-xs text-[var(--text-muted)]"><Gauge size={13} className="shrink-0" />{facts.map((fact) => <span key={fact}>{fact}</span>)}</p>;
 }
 
 function Plan({ item, controls }: { item: Extract<ActivityItem, { kind: "plan" }>; controls: ActivityPlanControls }) {

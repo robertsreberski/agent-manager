@@ -10,7 +10,7 @@ export interface QueuedMessageView {
 export function QueuedMessageCount({ count }: { count: number }) {
   if (count === 0) return null;
   return (
-    <p className="text-center font-mono text-code-xs text-[var(--text-faint)]" aria-label={`${count} queued ${count === 1 ? "message" : "messages"}`}>
+    <p className="text-center font-mono text-code-xs text-[var(--text-muted)]" aria-label={`${count} queued ${count === 1 ? "message" : "messages"}`}>
       {count} queued · shown in the thread
     </p>
   );
@@ -28,7 +28,7 @@ export function QueuedMessages({
   if (messages.length === 0) return null;
   return (
     <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-3" aria-label={`${messages.length} queued ${messages.length === 1 ? "message" : "messages"}`}>
-      <div className="flex items-center gap-2.5 font-mono text-eyebrow uppercase text-[var(--text-faint)]">
+      <div className="flex items-center gap-2.5 font-mono text-eyebrow uppercase text-[var(--text-muted)]">
         <span className="h-px flex-1 bg-[var(--border-hairline)]" />
         <span className="inline-flex shrink-0 items-center gap-1.5"><Clock size={11} strokeWidth={1.75} />Queued · sends when this turn ends</span>
         <span className="h-px flex-1 bg-[var(--border-hairline)]" />

@@ -24,7 +24,7 @@ export function ShortcutSheet({ open, onClose }: { open: boolean; onClose: () =>
           <DialogTitle className="sr-only">Keyboard shortcuts</DialogTitle>
           <p className="flex items-baseline gap-2.5 pr-8">
             <span aria-hidden="true" className="text-title-md text-[var(--text)]">Keys</span>
-            <span className="font-mono text-code-sm text-[var(--text-faint)]">? closes this</span>
+            <span className="font-mono text-code-sm text-[var(--text-muted)]">? closes this</span>
           </p>
         </DialogHeader>
         <div className="grid grid-cols-1 gap-x-[34px] gap-y-0 sm:grid-cols-2">
@@ -37,7 +37,7 @@ export function ShortcutSheet({ open, onClose }: { open: boolean; onClose: () =>
                     <div className="flex items-center gap-[11px] py-1.5">
                       <dt className="flex min-w-[62px] shrink-0 gap-[3px]">
                         {keyCaps(keys).map((cap, index) => cap === "/"
-                          ? <span key={`${cap}:${index}`} className="text-[var(--text-faint)]">/</span>
+                          ? <span key={`${cap}:${index}`} className="text-[var(--text-muted)]">/</span>
                           : <kbd key={`${cap}:${index}`} className="inline-flex h-[19px] min-w-[19px] items-center justify-center bg-[var(--surface-selected)] px-[5px] font-mono text-code-xs text-[var(--text-secondary)]">{cap}</kbd>)}
                       </dt>
                       <dd className="m-0 min-w-0 flex-1 text-meta-sm text-[var(--text-secondary)]">{label}</dd>

@@ -27,7 +27,7 @@ export function TurnMarker({ facts }: { facts: TurnFacts }) {
   const hasDiff = facts.additions !== null || facts.removals !== null;
   if (!ended && facts.duration === null && facts.subagents === null && !hasDiff && facts.tokens === null && facts.costUsd === null) return null;
   return (
-    <div className="mt-[18px] flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 border-t border-[var(--border-hairline)] pt-[11px] font-mono text-code-xs text-[var(--text-faint)]">
+    <div className="mt-[18px] flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 border-t border-[var(--border-hairline)] pt-[11px] font-mono text-code-xs text-[var(--text-muted)]">
       {ended && <span>{ended}</span>}
       {facts.duration && <span>{facts.duration}</span>}
       {facts.subagents !== null && (

@@ -61,10 +61,10 @@ export function TodoList({
           <li
             key={step.id}
             data-todo-churn={step.status === "removed" ? "removed" : step.addedAfterStart ? "added" : undefined}
-            className={`grid grid-cols-[15px_minmax(0,1fr)] items-start gap-[11px] py-[7px] text-[13.5px] leading-5 ${step.status === "removed" ? "text-[var(--text-faint)]" : ""}`}
+            className={`grid grid-cols-[15px_minmax(0,1fr)] items-start gap-[11px] py-[7px] text-[13.5px] leading-5 ${step.status === "removed" ? "text-[var(--text-muted)]" : ""}`}
           >
             {step.status === "completed" ? <Check size={15} strokeWidth={1.75} className="mt-[3px] text-[var(--text-faint)]" /> : step.status === "in-progress" ? <LoaderCircle size={15} strokeWidth={1.75} className="mt-[3px] motion-safe:animate-spin text-[var(--accent)]" /> : step.status === "removed" ? <Minus size={15} strokeWidth={1.75} className="mt-[3px] text-[var(--removed)]" /> : step.addedAfterStart ? <Plus size={15} strokeWidth={1.75} className="mt-[3px] text-[var(--added)]" /> : <span className="mt-[3px] grid size-[15px] place-items-center"><span className="size-[9px] rounded-full border border-[var(--border-loud)]" /></span>}
-            <span className={`min-w-0 [overflow-wrap:anywhere] [text-wrap:pretty] ${step.status === "completed" ? "text-[var(--text-secondary)] line-through decoration-[var(--text-faint)]" : step.status === "in-progress" ? "font-semibold text-[var(--text)]" : step.status === "removed" ? "text-[var(--text-faint)]" : "text-[var(--text-secondary)]"}`}>
+            <span className={`min-w-0 [overflow-wrap:anywhere] [text-wrap:pretty] ${step.status === "completed" ? "text-[var(--text-secondary)] line-through decoration-[var(--text-faint)]" : step.status === "in-progress" ? "font-semibold text-[var(--text)]" : step.status === "removed" ? "text-[var(--text-muted)]" : "text-[var(--text-secondary)]"}`}>
               {step.text}
               {step.detail && step.status === "in-progress" && <span className="mt-0.5 block font-mono text-code-sm leading-[17px] font-normal text-[var(--text-muted)]">{step.detail}</span>}
               {step.removedReason && step.status === "removed" && <span className="mt-0.5 block font-mono text-code-sm leading-[17px]">{step.removedReason}</span>}
@@ -74,7 +74,7 @@ export function TodoList({
       </ol>
       {(list.added > 0 || list.removed > 0) && <>
         <Separator className="bg-[var(--border-hairline)]" />
-        <footer className="px-3.5 py-2 font-mono text-code-sm text-[var(--text-faint)]">+{list.added} −{list.removed} since it started</footer>
+        <footer className="px-3.5 py-2 font-mono text-code-sm text-[var(--text-muted)]">+{list.added} −{list.removed} since it started</footer>
       </>}
       {stalled && (
         <div className="m-3 border-l-2 border-[var(--warning)] bg-[var(--warning-field)] p-3">

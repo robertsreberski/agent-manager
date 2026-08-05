@@ -234,7 +234,7 @@ export function SessionComposer(props: SessionComposerProps) {
                 >
                   <span className="font-medium">{option.label}</span>
                   <span className="font-mono text-code-xs text-[var(--text-muted)]">{option.value}</span>
-                  {option.description && <span className="text-code-xs text-[var(--text-faint)]">{option.description}</span>}
+                  {option.description && <span className="text-code-xs text-[var(--text-muted)]">{option.description}</span>}
                 </DropdownMenuRadioItem>
               ))}
             </DropdownMenuRadioGroup>
@@ -296,7 +296,7 @@ export function SessionComposer(props: SessionComposerProps) {
           <span className="hidden shrink-0 items-center gap-1 bg-[var(--access-field)] px-2 py-1 text-code-xs whitespace-nowrap text-[var(--access)] lg:flex"><Shield size={11} />Full access</span>
         )}
         <span className="min-w-0 flex-1" />
-        <span className="hidden shrink-0 font-mono text-code-sm whitespace-nowrap text-[var(--text-faint)] md:inline">{isRunning ? "queues while running" : "↵ sends"}</span>
+        <span className="hidden shrink-0 font-mono text-code-sm whitespace-nowrap text-[var(--text-muted)] md:inline">{isRunning ? "queues while running" : "↵ sends"}</span>
         {/* Both are withheld capabilities, not decoration: they stay visible, disabled, and say why. */}
         <Button variant="ghost" size="icon" disabled aria-label="Attach files unavailable" title="Attachments are not supported by this harness" className={`hidden size-8 text-[var(--text-faint)] sm:inline-flex ${KEEPS_ITS_TOOLTIP}`}><Paperclip size={16} strokeWidth={1.75} /></Button>
         <Button variant="ghost" size="icon" disabled aria-label="Dictation unavailable" title="Dictation is not configured" className={`hidden size-8 text-[var(--text-faint)] sm:inline-flex ${KEEPS_ITS_TOOLTIP}`}><Mic size={16} strokeWidth={1.75} /></Button>

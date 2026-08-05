@@ -81,13 +81,13 @@ export function PlanDocumentView({
 
         <main className="min-h-0 flex-1 overflow-y-auto px-4 py-5 sm:px-8 sm:py-7">
           {state.kind === "loading" && <div className="grid min-h-full place-content-center gap-2 text-center text-meta-sm text-[var(--text-muted)]"><LoaderCircle className="mx-auto motion-safe:animate-spin" size={18} /><p>Loading provider-named plan file…</p></div>}
-          {state.kind === "unavailable" && <section className="mx-auto grid min-h-full max-w-lg place-content-center text-center" aria-label="Plan file unavailable"><h3 className="text-title-sm">Plan file unavailable</h3><p className="mt-2 text-meta-sm leading-5 text-[var(--text-muted)]">{state.message}</p><p className="mt-3 font-mono text-code-xs text-[var(--text-faint)]">No inline fallback is substituted for this filesystem read.</p></section>}
+          {state.kind === "unavailable" && <section className="mx-auto grid min-h-full max-w-lg place-content-center text-center" aria-label="Plan file unavailable"><h3 className="text-title-sm">Plan file unavailable</h3><p className="mt-2 text-meta-sm leading-5 text-[var(--text-muted)]">{state.message}</p><p className="mt-3 font-mono text-code-xs text-[var(--text-muted)]">No inline fallback is substituted for this filesystem read.</p></section>}
           {state.kind === "loaded" && <div className="mx-auto max-w-3xl"><PlanMarkdown markdown={state.file.markdown} />{state.file.truncated && <p className="mt-4 border-l-2 border-[var(--warning)] bg-[var(--warning-field)] p-3 text-meta-sm text-[var(--warning)]">This file exceeded the safe read limit. Only its retained prefix is shown.</p>}</div>}
         </main>
 
         <Separator className="shrink-0" />
         <footer className="safe-area-bottom flex min-h-14 shrink-0 flex-wrap items-center gap-3 px-3 py-2 sm:px-5">
-          <span className="font-mono text-code-xs text-[var(--text-faint)]">Current provider artifact · no preserved revision history reported</span>
+          <span className="font-mono text-code-xs text-[var(--text-muted)]">Current provider artifact · no preserved revision history reported</span>
           <span className="min-w-0 flex-1" />
           {/* R3: executing the plan is the operator's own action, so it is the lime one. */}
           {onExecute && plan.approvedAt === null && <Button variant="primary" size="touch" disabled={disabled || state.kind !== "loaded" || state.file.truncated} onClick={() => void onExecute(plan)}><Bolt size={13} />{executeLabel}</Button>}

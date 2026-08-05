@@ -118,3 +118,59 @@ describe("lime accent semantics", () => {
     expect(user).not.toContain("var(--accent)");
   });
 });
+
+/*
+  `--text-faint` is deliberately below WCAG AA. That is only defensible while it
+  carries incidental metadata — a timestamp, a key hint, a count — that always
+  appears beside the same fact in a stronger tier. The numeric test above cannot
+  see whether that holds; an audit found roughly thirty-five places where faint
+  was in fact the only rendering of a fact an operator had to read, and this is
+  the guard that keeps them promoted.
+*/
+describe("faint is never the sole source of a fact", () => {
+  const soleSourceFacts = [
+    // Turn end time, duration, tokens and cost exist nowhere else.
+    ["web/src/components/thread/TurnMarker.tsx", "border-[var(--border-hairline)] pt-[11px]"],
+    // The only statement of what a collapsed tool call touched.
+    ["web/src/components/thread/GroupedActivityParts.tsx", "data-tool-detail"],
+    // Diff line numbers, hunk position, and the unpressed state of a real control.
+    ["web/src/components/diffs/DiffViewer.tsx", 'data-diff-gutter="old"'],
+    ["web/src/components/diffs/DiffViewer.tsx", "{hunk.header}"],
+    ["web/src/components/diffs/DiffViewer.tsx", "counts unavailable"],
+    ["web/src/components/diffs/DiffReview.tsx", "counts unavailable"],
+    // What Enter will do, and the queue's semantics.
+    ["web/src/components/composer/SessionComposer.tsx", "queues while running"],
+    ["web/src/components/composer/QueuedMessages.tsx", "sends when this turn ends"],
+    // The keyboard affordance for answering a blocking request.
+    ["web/src/components/requests/ApprovalRequest.tsx", "{shortcutHint}"],
+    ["web/src/components/requests/QuestionRequest.tsx", "{pickHint}"],
+    // The file an operator has to inspect, and why a harness is unavailable.
+    ["web/src/components/system/SystemStates.tsx", "{hook.settingsPath}"],
+    // "No inline fallback is substituted" is the only explanation on that panel.
+    ["web/src/components/plans/PlanDocumentView.tsx", "No inline fallback is substituted"],
+    ["web/src/components/plans/PlanDocumentView.tsx", "no preserved revision history reported"],
+    // Where to act on a request the cockpit cannot represent.
+    ["web/src/components/session-activity.tsx", "Open the native harness to respond"],
+    // The browser notification permission state.
+    ["web/src/App.tsx", "permission: {permission}"],
+    // On a phone this subtitle replaces the desktop badge row entirely.
+    ["web/src/components/board/ThreadDrawer.tsx", "fact.label).join"],
+    // The only disambiguator between two same-named sessions.
+    ["web/src/components/palette/CommandPalette.tsx", "{entry.detail}"],
+  ] as const;
+
+  it("renders each audited sole-source fact in a tier that clears AA", () => {
+    for (const [file, marker] of soleSourceFacts) {
+      const lines = readFileSync(resolve(process.cwd(), file), "utf8").split("\n");
+      const at = lines.findIndex((line) => line.includes(marker));
+      expect(at, `${file} · ${marker}`).toBeGreaterThanOrEqual(0);
+      // JSX here is dense: a wider window would sweep in the neighbouring
+      // timestamps and chevrons that are still legitimately faint. Only the
+      // marker's own line counts, extended back one line when the class list
+      // sits above the text it styles.
+      const own = lines[at]!;
+      const element = own.includes("className") ? own : `${lines[at - 1] ?? ""}\n${own}`;
+      expect(element, `${file} · ${marker}`).not.toContain("var(--text-faint)");
+    }
+  });
+});

@@ -89,7 +89,7 @@ export function CommandPalette({
                           : <Icon size={15} strokeWidth={1.75} />}
                       </span>
                       <span className="min-w-0 flex-1 truncate">{entry.label}</span>
-                      {entry.detail && <span className="shrink-0 truncate font-mono text-code-xs text-[var(--text-faint)]">{entry.detail}</span>}
+                      {entry.detail && <span className="shrink-0 truncate font-mono text-code-xs text-[var(--text-muted)]">{entry.detail}</span>}
                       {entry.progress && <span className="shrink-0 font-mono text-code-xs text-[var(--text-faint)]" data-palette-todo-progress>{entry.progress.completed} of {entry.progress.total}</span>}
                     </CommandItem>
                   );

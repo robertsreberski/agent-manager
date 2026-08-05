@@ -136,7 +136,7 @@ export function ApprovalRequest({
           </div>
         )}
         <div className="flex min-w-0 items-center gap-3">
-          <span className="hidden min-w-0 flex-1 truncate font-mono text-code-sm text-[var(--text-faint)] sm:inline">{shortcutHint}</span>
+          <span className="hidden min-w-0 flex-1 truncate font-mono text-code-sm text-[var(--text-muted)] sm:inline">{shortcutHint}</span>
           <div className="approval-request__actions flex w-full flex-col-reverse gap-2 sm:w-auto sm:flex-row sm:justify-end">
             <Button variant={tier === "workspace" ? "ghost" : "secondary"} size="sm" data-compact-control disabled={disabled || busy} className={`min-h-12 sm:min-h-[29px] ${tier === "workspace" ? "px-3 sm:px-1" : "border-[var(--border-strong)] px-4"}`} onClick={() => explaining ? void decide({ decision: "deny", reason: reason.trim() || null }) : tier === "outside" ? setExplaining(true) : void decide({ decision: "deny", reason: null })}>{tier === "outside" ? explaining ? "Deny with reason" : "Deny and explain" : "Deny"}</Button>
             {!phone && tier === "workspace" && request.canPersist && <Button variant="secondary" size="sm" data-compact-control disabled={disabled || busy} className="min-h-12 border-[var(--border-strong)] px-3 sm:min-h-[29px]" onClick={() => void decide({ decision: "allow", persist: true })}>Always allow this class</Button>}

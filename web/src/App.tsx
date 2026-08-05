@@ -245,9 +245,9 @@ export function NotificationSettings({ preferences, onChange, onClose }: { prefe
             ["stalled", "A todo stalled", "An observed todo has not moved for nine minutes", ListTodo],
             ["quiet", "Quiet delivery", "Questions still light the board, they just do not ring", BellOff],
             ["includeSessionName", "Include session name", "Off by default for lock-screen privacy", Tag],
-          ] as const).map(([key, label, detail, Icon]) => <label key={key} className="flex min-h-11 cursor-pointer items-center gap-3 border-b border-[var(--rule)] py-[11px]"><Icon size={15} strokeWidth={1.75} aria-hidden="true" className="shrink-0 text-[var(--text-muted)]" /><Checkbox checked={preferences[key]} onCheckedChange={() => toggle(key)} /><span className="min-w-0 flex-1"><span className="block text-[13.5px] leading-[1.4]">{label}</span><span className="block font-mono text-code-sm text-[var(--text-faint)]">{detail}</span></span><span aria-hidden="true" className={`shrink-0 px-2.5 py-[5px] text-meta-sm leading-none ${preferences[key] ? "bg-[var(--menu)] text-[var(--text)]" : "bg-transparent text-[var(--text-faint)]"}`}>{preferences[key] ? "Always" : "Never"}</span></label>)}
+          ] as const).map(([key, label, detail, Icon]) => <label key={key} className="flex min-h-11 cursor-pointer items-center gap-3 border-b border-[var(--rule)] py-[11px]"><Icon size={15} strokeWidth={1.75} aria-hidden="true" className="shrink-0 text-[var(--text-muted)]" /><Checkbox checked={preferences[key]} onCheckedChange={() => toggle(key)} /><span className="min-w-0 flex-1"><span className="block text-[13.5px] leading-[1.4]">{label}</span><span className="block font-mono text-code-sm text-[var(--text-muted)]">{detail}</span></span><span aria-hidden="true" className={`shrink-0 px-2.5 py-[5px] text-meta-sm leading-none ${preferences[key] ? "bg-[var(--menu)] text-[var(--text)]" : "bg-transparent text-[var(--text-muted)]"}`}>{preferences[key] ? "Always" : "Never"}</span></label>)}
         </div>
-        <div className="flex items-center justify-between gap-3"><span className="font-mono text-code-xs text-[var(--text-faint)]">permission: {permission}</span>{permission === "default" && <Button variant="primary" data-compact-control onClick={() => void Notification.requestPermission()}>Allow notifications</Button>}</div>
+        <div className="flex items-center justify-between gap-3"><span className="font-mono text-code-xs text-[var(--text-muted)]">permission: {permission}</span>{permission === "default" && <Button variant="primary" data-compact-control onClick={() => void Notification.requestPermission()}>Allow notifications</Button>}</div>
       </DialogContent>
     </Dialog>
   );
@@ -398,10 +398,10 @@ export function Header({
               const HostIcon = host.kind === "ssh" ? Server : Laptop;
               return <button key={host.id} type="button" data-compact-control="height" aria-pressed={selected} aria-label={`${host.label}, ${host.count} ${host.count === 1 ? "session" : "sessions"}`} title={`${host.label} · ${host.status}`} className={`flex shrink-0 items-center gap-1.5 border-0 bg-transparent p-0 ${tone}`} onClick={() => onToggleHost(host.id)}><HostIcon size={13} strokeWidth={1.75} aria-hidden="true" /><span>{host.label}</span><span className={host.kind === "ssh" ? "text-[var(--remote-dim)]" : "text-[var(--text-faint)]"}>{host.count}</span></button>;
             })}
-            {hosts.length === 0 && <span className="text-[var(--text-faint)]">No hosts</span>}
+            {hosts.length === 0 && <span className="text-[var(--text-muted)]">No hosts</span>}
           </nav>
           <span className="flex-1" />
-          <span className="hidden shrink-0 font-mono text-[11.5px] leading-none text-[var(--text-faint)] min-[1180px]:inline">click a card · shift-click to select · ? for keys</span>
+          <span className="hidden shrink-0 font-mono text-[11.5px] leading-none text-[var(--text-muted)] min-[1180px]:inline">click a card · shift-click to select · ? for keys</span>
         </div>
       </div>
     </header>

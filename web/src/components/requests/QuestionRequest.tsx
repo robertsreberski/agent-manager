@@ -174,7 +174,7 @@ export function QuestionRequest({ request, elapsed, disabled = false, onSubmit }
                 <Button key={item.id} variant="ghost" size="sm" data-compact-control className="h-auto min-h-10 w-full justify-start gap-2.5 px-0 py-2.5 text-left" onClick={() => setActive(index)}>
                   <span className="w-[15px] shrink-0 text-center font-mono text-code-sm font-medium text-[var(--text-faint)]">{index + 1}</span>
                   <span className="min-w-0 flex-1 truncate text-[13.5px] leading-[19px] text-[var(--text-muted)]">{item.prompt}</span>
-                  <span className="shrink-0 font-mono text-code-xs text-[var(--text-faint)]">{item.multiple ? "pick many" : item.options.length ? "pick one" : "free text"}</span>
+                  <span className="shrink-0 font-mono text-code-xs text-[var(--text-muted)]">{item.multiple ? "pick many" : item.options.length ? "pick one" : "free text"}</span>
                 </Button>
               );
             }
@@ -251,7 +251,7 @@ export function QuestionRequest({ request, elapsed, disabled = false, onSubmit }
               </fieldset>
             );
           })}
-          {!phone && pickHint && <span className="pt-1 font-mono text-code-sm text-[var(--text-faint)]">{pickHint}</span>}
+          {!phone && pickHint && <span className="pt-1 font-mono text-code-sm text-[var(--text-muted)]">{pickHint}</span>}
           {phone && request.questions.length > 1 && (
             <footer className="question-request__phone-footer" data-phone-sticky-footer aria-label="Question submission">
               <span className="min-w-0 flex-1 font-mono text-meta-sm leading-[1.4] text-[var(--text-muted)]">{remainingCount === 0 ? "All questions answered" : `${remainingCount} ${remainingCount === 1 ? "question" : "questions"} left`}</span>

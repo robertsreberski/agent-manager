@@ -88,7 +88,7 @@ export function ThreadDrawer({ open, title, facts = [], todo = null, onClose, ch
             {facts.length > 0 && (
               <>
                 {/* Phone (9a-2) states the same facts as one mono subtitle; the drawer (4a) chips them. */}
-                <p className="truncate font-mono text-code-xs text-[var(--text-faint)] min-[901px]:hidden">
+                <p className="truncate font-mono text-code-xs text-[var(--text-muted)] min-[901px]:hidden">
                   {facts.map((fact) => fact.label).join(" · ")}
                 </p>
                 <div className="hidden min-w-0 shrink-0 gap-1.5 min-[901px]:flex">

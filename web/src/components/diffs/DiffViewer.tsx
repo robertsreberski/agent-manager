@@ -54,9 +54,9 @@ function Line({ line }: { line: ParsedDiffLine }) {
   const marker = line.kind === "add" ? "text-[var(--added)]" : line.kind === "remove" ? "text-[var(--removed)]" : "text-[var(--text-faint)]";
   return (
     <div className={`grid min-w-0 max-w-full grid-cols-[30px_13px_minmax(0,1fr)] text-code-sm min-[901px]:grid-cols-[38px_38px_16px_minmax(0,1fr)] min-[901px]:text-code min-[901px]:leading-[21px] ${tone}`} data-diff-line={line.kind}>
-      <span data-diff-gutter="old" className="hidden select-none pr-3 text-right font-mono text-[var(--text-faint)] min-[901px]:block">{line.oldLine ?? ""}</span>
-      <span data-diff-gutter="phone" className="select-none pr-1 text-right font-mono text-[var(--text-faint)] min-[901px]:hidden">{line.newLine ?? line.oldLine ?? ""}</span>
-      <span data-diff-gutter="new" className="hidden select-none pr-3 text-right font-mono text-[var(--text-faint)] min-[901px]:block">{line.newLine ?? ""}</span>
+      <span data-diff-gutter="old" className="hidden select-none pr-3 text-right font-mono text-[var(--text-muted)] min-[901px]:block">{line.oldLine ?? ""}</span>
+      <span data-diff-gutter="phone" className="select-none pr-1 text-right font-mono text-[var(--text-muted)] min-[901px]:hidden">{line.newLine ?? line.oldLine ?? ""}</span>
+      <span data-diff-gutter="new" className="hidden select-none pr-3 text-right font-mono text-[var(--text-muted)] min-[901px]:block">{line.newLine ?? ""}</span>
       <span data-diff-marker={line.kind} className={`select-none text-center font-mono min-[901px]:text-left ${marker}`}>{sign}</span>
       <code className="min-w-0 whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{line.text}</code>
     </div>
@@ -68,7 +68,7 @@ function ParsedDiff({ result, view }: { result: Extract<DiffParseResult, { kind:
     <div className="overflow-hidden font-mono">
       {result.hunks.map((hunk, index) => (
         <section key={`${hunk.header}:${index}`}>
-          <div className="max-w-full bg-[var(--surface-raised-active)] px-3 py-1 font-mono text-code-sm whitespace-pre-wrap break-words text-[var(--text-faint)] [overflow-wrap:anywhere]">{hunk.header}</div>
+          <div className="max-w-full bg-[var(--surface-raised-active)] px-3 py-1 font-mono text-code-sm whitespace-pre-wrap break-words text-[var(--text-muted)] [overflow-wrap:anywhere]">{hunk.header}</div>
           {view === "unified" ? hunk.lines.map((line, lineIndex) => <Line key={lineIndex} line={line} />) : (
             <><div data-phone-unified-diff className="min-[901px]:hidden">{hunk.lines.map((line, lineIndex) => <Line key={lineIndex} line={line} />)}</div><div data-desktop-split-diff className="hidden grid-cols-2 divide-x divide-[var(--rule)] min-[901px]:grid">
               {splitRows(hunk).map((row, rowIndex) => (
@@ -140,7 +140,7 @@ export function DiffViewer({
               <span className="min-w-0 truncate font-mono text-code leading-[1.4] text-[var(--text)]">{change.previousPath && change.operation === "rename" ? `${change.previousPath} → ` : ""}{change.path}</span>
             </Button>
           </CollapsibleTrigger>
-          {counts ? <span className="inline-flex shrink-0 gap-[7px] font-mono text-code-xs"><span className="text-[var(--added)]">+{counts.additions}</span><span className="text-[var(--removed)]">−{counts.removals}</span></span> : <span className="shrink-0 font-mono text-eyebrow tracking-normal text-[var(--text-faint)]" aria-label="Diff counts unavailable">counts unavailable</span>}
+          {counts ? <span className="inline-flex shrink-0 gap-[7px] font-mono text-code-xs"><span className="text-[var(--added)]">+{counts.additions}</span><span className="text-[var(--removed)]">−{counts.removals}</span></span> : <span className="shrink-0 font-mono text-eyebrow tracking-normal text-[var(--text-muted)]" aria-label="Diff counts unavailable">counts unavailable</span>}
           {read && <Check size={13} className="shrink-0 text-[var(--text-muted)]" aria-label="Read" />}
           <Button variant="ghost" size="icon" data-compact-control className="size-[22px] shrink-0 text-[var(--text-faint)]" aria-label={`Copy diff for ${change.path}`} onClick={() => void navigator.clipboard?.writeText(change.diff)}><Copy size={12} /></Button>
         </header>
@@ -148,7 +148,7 @@ export function DiffViewer({
           <Separator />
           <div className="flex items-center gap-2 px-2.5 py-1.5">
             <div className="hidden gap-px border border-[var(--border-frame)] min-[901px]:flex" role="group" aria-label="Diff layout">
-              {(["unified", "split"] as const).map((option) => <Button key={option} variant="ghost" size="sm" data-compact-control aria-pressed={view === option} className="h-7 min-h-7 px-[9px] py-[3px] font-mono text-code-sm font-normal text-[var(--text-faint)] hover:bg-transparent aria-pressed:bg-[var(--border-frame)] aria-pressed:text-[var(--text)]" onClick={() => selectView(option)}>{option}</Button>)}
+              {(["unified", "split"] as const).map((option) => <Button key={option} variant="ghost" size="sm" data-compact-control aria-pressed={view === option} className="h-7 min-h-7 px-[9px] py-[3px] font-mono text-code-sm font-normal text-[var(--text-muted)] hover:bg-transparent aria-pressed:bg-[var(--border-frame)] aria-pressed:text-[var(--text)]" onClick={() => selectView(option)}>{option}</Button>)}
             </div>
             <span className="flex-1" />
             {onOpenEditor && change.operation !== "delete" && <Button variant="ghost" size="sm" data-compact-control className="h-7 min-h-7 gap-1 px-2 text-code-xs font-normal text-[var(--accent-quiet)]" onClick={() => onOpenEditor()}><ExternalLink size={12} />Open in editor</Button>}

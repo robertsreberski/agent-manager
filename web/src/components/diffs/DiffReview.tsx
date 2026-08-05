@@ -43,7 +43,7 @@ function useCoalescedCounts(changes: readonly FileChangeView[]): DiffCounts[] {
 }
 
 function CountPair({ counts }: { counts: DiffCounts }) {
-  if (!counts) return <span className="shrink-0 font-mono text-eyebrow tracking-normal text-[var(--text-faint)]">counts unavailable</span>;
+  if (!counts) return <span className="shrink-0 font-mono text-eyebrow tracking-normal text-[var(--text-muted)]">counts unavailable</span>;
   return (
     <span className="flex shrink-0 gap-1.5 font-mono text-code-xs">
       <span className="text-[var(--added)]">+{counts.add}</span>

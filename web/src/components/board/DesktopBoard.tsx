@@ -85,7 +85,7 @@ export function DesktopBoard({
                       </span>
                     )}
                     {directory !== null && (
-                      <span className="truncate font-mono text-eyebrow leading-none tracking-normal text-[var(--text-faint)]" title={group.key}>{directory}</span>
+                      <span className="truncate font-mono text-eyebrow leading-none tracking-normal text-[var(--text-muted)]" title={group.key}>{directory}</span>
                     )}
                   </div>
                 )}
@@ -110,7 +110,7 @@ export function DesktopBoard({
             variant="ghost"
             size="touch"
             data-compact-control
-            className="mb-5 mt-0.5 w-full gap-[7px] border border-dashed border-[var(--border-frame)] text-meta-sm leading-none text-[var(--text-faint)] hover:border-[var(--text-muted)] hover:bg-transparent hover:text-[var(--text)]"
+            className="mb-5 mt-0.5 w-full gap-[7px] border border-dashed border-[var(--border-frame)] text-meta-sm leading-none text-[var(--text-muted)] hover:border-[var(--text-muted)] hover:bg-transparent hover:text-[var(--text)]"
             onClick={() => onNewThread?.(column)}
           >
             <Plus size={13} strokeWidth={1.75} />New thread here
