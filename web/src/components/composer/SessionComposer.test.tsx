@@ -28,14 +28,16 @@ describe("SessionComposer", () => {
     expect(screen.getByRole("button", { name: /execute/i })).toBeDisabled();
   });
 
-  it("keeps provider identity and effort neutral instead of reusing wants-you lime", () => {
-    renderComposer();
-    const providerMark = document.querySelector<HTMLElement>("[data-provider-mark]");
-    expect(providerMark).toHaveClass("bg-[var(--surface-selected-active)]", "text-[var(--text-muted)]");
-    expect(providerMark).not.toHaveClass("bg-[var(--accent)]", "text-[var(--accent-ink)]");
-    for (const bar of document.querySelectorAll<HTMLElement>("[data-effort-bar]")) {
-      expect(bar.className).not.toContain("var(--accent)");
-    }
+  it("fills the harness tile and the reached effort bars lime, as frames 5a and 9a-2 show", () => {
+    renderComposer({ effort: "medium" });
+    expect(document.querySelector<HTMLElement>("[data-provider-mark]"))
+      .toHaveClass("bg-[var(--accent)]", "text-[var(--accent-ink)]");
+
+    // Only the bars the effort actually reaches. An unreached bar staying lime
+    // would make every effort level look like the highest one.
+    const bars = [...document.querySelectorAll<HTMLElement>("[data-effort-bar]")];
+    expect(bars.map((bar) => bar.getAttribute("data-effort-bar"))).toEqual(["active", "active", "inactive"]);
+    expect(bars.filter((bar) => bar.className.includes("var(--accent)"))).toHaveLength(2);
   });
 
   it("shows only model choices returned by the live provider catalog", async () => {

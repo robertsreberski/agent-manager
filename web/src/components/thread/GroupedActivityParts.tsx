@@ -62,7 +62,8 @@ export function ToolGroupShell({ status, count, duration, defaultOpen = false, c
         {duration && <span className="shrink-0 text-meta-sm tabular-nums text-[var(--text-faint)]">{duration}</span>}
         {forced && <span className="shrink-0 font-mono text-code-xs text-[var(--text-faint)]">active</span>}
       </button>
-      {open && <div className={`ml-[22px] gap-0.5 ${STACK}`} data-tool-group-body>{children}</div>}
+      {/* Frame 11b indents the group body 24px. */}
+      {open && <div className={`ml-6 gap-0.5 ${STACK}`} data-tool-group-body>{children}</div>}
     </section>
   );
 }
@@ -124,7 +125,14 @@ export function ToolCall({ part }: { part: ToolPart }) {
     <section ref={rowRef} className={CONTAINED} data-tool-status={part.status.type}>
       <button type="button" data-compact-control className="flex min-h-8 w-full min-w-0 items-center gap-[9px] py-1.5 text-left" aria-expanded={open} onClick={() => { lockScroll(); setOpen((value) => !value); }}>
         {part.status.type === "running" ? <LoaderCircle size={15} strokeWidth={1.75} className="shrink-0 text-[var(--text-muted)] motion-safe:animate-spin" /> : part.isError ? <Circle size={12} className="shrink-0 text-[var(--danger)]" /> : <Check size={15} strokeWidth={1.75} className="shrink-0 text-[var(--text-muted)]" />}
-        <strong className="min-w-0 truncate font-mono text-code-sm font-medium text-[var(--text)]" data-tool-name>{part.toolName}</strong>
+        {/*
+          Frame 11b gives the tool name `flex-shrink: 0` so it is never the
+          thing that gets clipped. It keeps a max-width all the same: Codex
+          names a `commandExecution` with the whole shell command, and an
+          unbounded shrink-0 on one of those is what produced a 2551px row
+          inside a 390px viewport. The detail beside it yields first.
+        */}
+        <strong className="min-w-0 max-w-[60%] shrink-0 truncate font-mono text-code-sm font-medium text-[var(--text)]" data-tool-name>{part.toolName}</strong>
         {detail !== null && <span className="min-w-0 flex-1 truncate font-mono text-code-sm text-[var(--text-muted)]" data-tool-detail>{detail}</span>}
         {duration && <span className="shrink-0 font-mono text-code-xs text-[var(--text-faint)]">{duration}</span>}
         <ChevronDown size={12} className={`shrink-0 text-[var(--text-faint)] ${open ? "rotate-180" : ""}`} />

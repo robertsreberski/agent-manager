@@ -4,6 +4,13 @@ import type { ReasoningEffort } from "@shared/session";
 import type { CockpitProvider, ExecutionProfile } from "../../lib/cockpit-view";
 import { isTypingTarget } from "../../lib/shortcuts";
 import {
+  applyCompletion,
+  completionTrigger,
+  composerPlaceholder,
+  matchCommands,
+  type CompletionTrigger,
+} from "./mentions";
+import {
   Button,
   DropdownMenu,
   DropdownMenuContent,
@@ -65,6 +72,12 @@ export interface SessionComposerProps {
   onEffortChange?: (effort: NonNullable<SessionComposerProps["effort"]>) => void;
   onProfileChange?: (profile: ExecutionProfile) => void;
   onResetSettings?: () => void;
+  /**
+   * Workspace-relative paths matching a query, for `@mention`. Absent where the
+   * session has no readable workspace — a remote one, say — and the composer
+   * then drops that half of frame 5a's placeholder rather than promising it.
+   */
+  onSearchFiles?: (query: string) => Promise<readonly string[]>;
 }
 
 const PROFILE_LABEL: Record<ExecutionProfile, string> = {
@@ -92,6 +105,7 @@ export function SessionComposer(props: SessionComposerProps) {
     profileOptions = ["ask-first", "plan", "execute", "full-access"],
     settingsIdleOnly = false, draft = false, busy = false,
     onProviderChange, onModelChange, onEffortChange, onProfileChange, onResetSettings,
+    onSearchFiles,
   } = props;
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // The only state the composer still keeps for its menus: which one is open.
@@ -125,6 +139,51 @@ export function SessionComposer(props: SessionComposerProps) {
     element.style.height = "0px";
     element.style.height = `${Math.min(120, Math.max(52, element.scrollHeight))}px`;
   }, [value]);
+
+  /*
+    Frame 5a's placeholder promises `@mention files, run /commands`. Both are
+    real here, and the placeholder only names the half that this session can
+    actually do: a workspace the cockpit cannot read offers no files, and a
+    provider whose command set is unknown offers no commands.
+  */
+  const [trigger, setTrigger] = useState<CompletionTrigger | null>(null);
+  const [files, setFiles] = useState<readonly string[]>([]);
+  const [highlighted, setHighlighted] = useState(0);
+  const commands = trigger?.kind === "command" ? matchCommands(provider, trigger.query) : [];
+  const suggestions: readonly string[] = trigger?.kind === "file"
+    ? files
+    : commands.map((command) => command.name);
+  useEffect(() => {
+    setHighlighted(0);
+    if (trigger?.kind !== "file" || !onSearchFiles) { setFiles([]); return; }
+    let cancelled = false;
+    const query = trigger.query;
+    // The operator keeps typing while a walk is in flight; a stale answer must
+    // never replace the one for what is on screen now.
+    const timer = setTimeout(() => {
+      void onSearchFiles(query)
+        .then((paths) => { if (!cancelled) setFiles(paths); })
+        .catch(() => { if (!cancelled) setFiles([]); });
+    }, 120);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [onSearchFiles, trigger?.kind, trigger?.query]);
+
+  function syncTrigger(element: HTMLTextAreaElement) {
+    setTrigger(completionTrigger(element.value, element.selectionStart ?? element.value.length));
+  }
+
+  function choose(choice: string) {
+    const element = textareaRef.current;
+    if (!element || !trigger) return;
+    const caret = element.selectionStart ?? element.value.length;
+    const next = applyCompletion(value, caret, trigger, choice);
+    onChange(next.value);
+    setTrigger(null);
+    requestAnimationFrame(() => {
+      element.focus();
+      element.setSelectionRange(next.caret, next.caret);
+    });
+  }
   useEffect(() => {
     function shortcut(event: KeyboardEvent) {
       if ((event.metaKey || event.ctrlKey) && !event.shiftKey && event.key.toLowerCase() === "l") {
@@ -158,6 +217,27 @@ export function SessionComposer(props: SessionComposerProps) {
   }
 
   function keyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
+    // While the picker is open it owns the arrows, Enter, Tab and Escape. It
+    // must not reach the delivery path below: Enter there would send the
+    // half-typed `@src/` rather than complete it.
+    if (trigger && suggestions.length > 0) {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const step = event.key === "ArrowDown" ? 1 : -1;
+        setHighlighted((current) => (current + step + suggestions.length) % suggestions.length);
+        return;
+      }
+      if (event.key === "Enter" || event.key === "Tab") {
+        event.preventDefault();
+        choose(suggestions[highlighted]!);
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setTrigger(null);
+        return;
+      }
+    }
     if (event.key === "Enter" && (!event.shiftKey || event.metaKey)) {
       const delivery = event.metaKey && event.shiftKey ? "steer" : "queue";
       const supported = delivery === "steer" ? canSteer : canQueue;
@@ -180,15 +260,51 @@ export function SessionComposer(props: SessionComposerProps) {
       {withheldReasons.length > 0 && (
         <p className="mb-2 text-code-sm text-[var(--text-muted)]" role="status" data-withheld-reasons>{withheldReasons.join(" · ")}</p>
       )}
+      {trigger && suggestions.length > 0 && (
+        <ul
+          className="mb-2 max-h-52 min-w-0 overflow-y-auto overscroll-contain border border-[var(--border)] bg-[var(--menu)]"
+          role="listbox"
+          aria-label={trigger.kind === "file" ? "Workspace files" : "Provider commands"}
+          data-composer-completions={trigger.kind}
+        >
+          {suggestions.map((suggestion, index) => (
+            <li key={suggestion}>
+              <button
+                type="button"
+                role="option"
+                aria-selected={index === highlighted}
+                data-compact-control="height"
+                className={`flex min-h-9 w-full min-w-0 items-baseline gap-2 px-2.5 py-1.5 text-left font-mono text-code-sm ${index === highlighted ? "bg-[var(--surface-selected)] text-[var(--text)]" : "text-[var(--text-secondary)]"}`}
+                onMouseEnter={() => setHighlighted(index)}
+                // Blur would close the picker before the click landed.
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => choose(suggestion)}
+              >
+                <span className="min-w-0 flex-1 truncate">{trigger.kind === "file" ? suggestion : `/${suggestion}`}</span>
+                {trigger.kind === "command" && (
+                  <span className="shrink-0 font-sans text-meta-sm text-[var(--text-muted)]">
+                    {commands[index]?.description}
+                  </span>
+                )}
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
       <textarea
         ref={textareaRef}
         value={value}
-        onChange={(event) => onChange(event.target.value)}
+        onChange={(event) => { onChange(event.target.value); syncTrigger(event.target); }}
         onKeyDown={keyDown}
+        onKeyUp={(event) => syncTrigger(event.currentTarget)}
+        onClick={(event) => syncTrigger(event.currentTarget)}
+        onBlur={() => setTrigger(null)}
         disabled={Boolean(readOnlyReason) || busy}
         className="block min-h-[52px] max-h-[120px] w-full resize-none overflow-y-auto border-0 bg-transparent px-0.5 pt-0 pb-2.5 text-body text-[var(--text)] outline-none placeholder:text-[var(--text-faint)]"
         aria-label="Message"
-        placeholder={readOnlyReason ? "This session is read-only" : isRunning ? "Queue a message…" : "Message the agent…"}
+        aria-autocomplete="list"
+        aria-expanded={Boolean(trigger && suggestions.length > 0)}
+        placeholder={readOnlyReason ? "This session is read-only" : isRunning ? "Queue a message…" : composerPlaceholder(provider, Boolean(onSearchFiles))}
       />
       <div className="flex min-w-0 items-center gap-2.5 sm:gap-3.5">
         <DropdownMenu open={openMenu === "runtime"} onOpenChange={(next) => setOpenMenu(next ? "runtime" : null)}>
@@ -200,10 +316,8 @@ export function SessionComposer(props: SessionComposerProps) {
               className={`h-auto min-h-8 min-w-0 justify-start rounded-full px-1.5 text-left text-meta data-[state=open]:bg-[var(--surface-selected)] sm:px-2 ${KEEPS_ITS_TOOLTIP}`}
               title={runtimeDisabled ? runtimeDisabledReason : undefined}
             >
-              {/* Frame 5a fills this tile lime. Spec 12 R3 reserves lime for wants-you and
-                  the operator's own primary action, so the tile keeps the frame's glyph and
-                  a neutral fill — see the "provider identity and effort neutral" test. */}
-              <span className="grid size-[17px] shrink-0 place-items-center bg-[var(--surface-selected-active)] text-[var(--text-muted)]" data-provider-mark>
+              {/* Frames 5a, 9a-2 and 9b fill this tile lime, with the CodeXml glyph. */}
+              <span className="grid size-[17px] shrink-0 place-items-center bg-[var(--accent)] text-[var(--accent-ink)]" data-provider-mark>
                 <CodeXml size={11} strokeWidth={2} />
               </span>
               <span className="shrink-0 font-medium capitalize">{provider}</span>
@@ -265,7 +379,8 @@ export function SessionComposer(props: SessionComposerProps) {
           </DropdownMenuContent>
         </DropdownMenu>
         <span className="flex shrink-0 items-end gap-0.5" role="img" aria-label={`${effort ?? "unknown"} effort`}>
-          {[1, 2, 3].map((bar) => <span key={bar} data-effort-bar={bar <= effortBars(effort) ? "active" : "inactive"} className={`w-[3px] ${bar <= effortBars(effort) ? "h-[11px] bg-[var(--text-muted)]" : "h-[7px] bg-[var(--border-strong)]"}`} />)}
+          {/* Frames 5a and 9a-2 fill the reached bars lime. */}
+          {[1, 2, 3].map((bar) => <span key={bar} data-effort-bar={bar <= effortBars(effort) ? "active" : "inactive"} className={`w-[3px] ${bar <= effortBars(effort) ? "h-[11px] bg-[var(--accent)]" : "h-[7px] bg-[var(--border-strong)]"}`} />)}
         </span>
         <span className="h-3.5 w-px shrink-0 bg-[var(--border)]" />
         <DropdownMenu open={openMenu === "profile"} onOpenChange={(next) => setOpenMenu(next ? "profile" : null)}>

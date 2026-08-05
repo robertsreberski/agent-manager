@@ -254,10 +254,14 @@ describe("Header", () => {
     expect(newThread).toHaveClass("h-8", "rounded-full");
     expect(newThread).toHaveTextContent("New thread");
     for (const control of [search, help, newThread, wantsYou, local, remote]) expect(control).toHaveAttribute("data-compact-control");
+    // The scope tabs and host chips take a height-only touch floor: a 44px
+    // square on each would push this overflow-x-auto row into sideways
+    // scrolling on every phone.
+    for (const control of [wantsYou, local, remote]) expect(control).toHaveAttribute("data-compact-control", "height");
     expect(screen.getByRole("status")).toHaveTextContent("Connection open · 2 diagnostics");
+    // Frame 7a lights a live connection lime; anything else stays a warning.
     const connectionIndicator = primary.querySelector<HTMLElement>("[data-connection-indicator='open']");
-    expect(connectionIndicator).toHaveClass("bg-[var(--text-muted)]");
-    expect(connectionIndicator).not.toHaveClass("bg-[var(--accent)]");
+    expect(connectionIndicator).toHaveClass("bg-[var(--accent)]");
 
     fireEvent.click(within(filters).getByRole("button", { name: "Working, 1 session" }));
     fireEvent.click(remote);

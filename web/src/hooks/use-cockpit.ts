@@ -501,6 +501,10 @@ export function useCockpit() {
     if (!api) throw new Error("The cockpit is offline.");
     return api.searchTranscript(sessionId, query, limit);
   }, [api]);
+  const loadWorkspaceFiles = useCallback((sessionId: string, query: string, limit = 20): Promise<readonly string[]> => {
+    if (!api) throw new Error("The cockpit is offline.");
+    return api.workspaceFiles(sessionId, query, limit);
+  }, [api]);
   const loadSettingsOptions = useCallback((sessionId: string): Promise<SessionSettingsOptionsResponse> => {
     if (!api) throw new Error("The cockpit is offline.");
     return api.settingsOptions(sessionId);
@@ -532,7 +536,7 @@ export function useCockpit() {
     refresh, retryConnection: recoverBrowserSession, controlConflict: selectedSession ? controlConflicts[selectedSession.id] : undefined,
     takeOverControl, hasBusyAction: Object.values(busy).some(Boolean),
     sendMessage, respond, interrupt, setProfile, setModel, setEffort, removeQueued, lifecycleAction, openEditor,
-    createSession, completeWorkspacePath, loadPreview, loadAttach, loadAttentionDetails, loadTodoDetail, searchTranscript, loadSettingsOptions, loadProviderSettingsOptions, loadSessionFacts, loadPlanFile, loadSetup, outbox, offlineReview,
+    createSession, completeWorkspacePath, loadPreview, loadAttach, loadAttentionDetails, loadTodoDetail, searchTranscript, loadWorkspaceFiles, loadSettingsOptions, loadProviderSettingsOptions, loadSessionFacts, loadPlanFile, loadSetup, outbox, offlineReview,
     dismissOfflineReview: (id: string) => setOfflineReview((items) => items.filter((item) => item.id !== id)),
   };
 }

@@ -16,7 +16,10 @@ function classesOf(element: Element | null): string[] {
 }
 
 describe("tool call containment", () => {
-  it("truncates a shell-command tool name instead of forcing the row wide", () => {
+  it("holds a shell-command tool name to a bound instead of forcing the row wide", () => {
+    // Frame 11b asks for `flex-shrink: 0` so the name is never what gets
+    // clipped. Unbounded, a Codex `commandExecution` — whose name is the whole
+    // command — produced a 2551px row inside a 390px viewport.
     const { container } = render(<ToolCall part={{
       toolName: CODEX_TOOL_NAME,
       args: CODEX_ARGS,
@@ -27,8 +30,7 @@ describe("tool call containment", () => {
 
     const name = container.querySelector("[data-tool-name]");
     expect(name?.textContent).toBe(CODEX_TOOL_NAME);
-    expect(classesOf(name)).toEqual(expect.arrayContaining(["min-w-0", "truncate"]));
-    expect(classesOf(name)).not.toContain("shrink-0");
+    expect(classesOf(name)).toEqual(expect.arrayContaining(["min-w-0", "truncate", "shrink-0", "max-w-[60%]"]));
 
     const row = container.querySelector("[data-tool-status]");
     expect(classesOf(row)).toEqual(expect.arrayContaining(["min-w-0", "max-w-full", "overflow-hidden"]));

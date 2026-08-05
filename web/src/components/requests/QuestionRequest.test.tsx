@@ -272,23 +272,56 @@ describe("ApprovalRequest", () => {
     expect(onDecision).toHaveBeenCalledWith("a", { decision: "allow", persist: false });
   });
 
-  it("allows command-enter only for one unambiguous inside-workspace request", () => {
+  it("allows on Enter, as frame 8a prints, for one unambiguous inside-workspace request", () => {
     const onDecision = vi.fn();
     const inside = { id: "inside", label: "Write file", command: "touch src/a.ts", reason: null, workspaceRoot: "/work/app", paths: ["/work/app/src/a.ts"], writes: ["/work/app/src/a.ts"], network: false, deleteCount: 0, remoteHost: null, sessionsOnHost: null, canPersist: true } as const;
     const { unmount } = render(<ApprovalRequest request={inside} onDecision={onDecision} />);
+    expect(screen.getByText("↵ allow", { exact: false })).toBeInTheDocument();
     fireEvent.keyDown(window, { key: "Enter" });
-    expect(onDecision).not.toHaveBeenCalled();
-    fireEvent.keyDown(window, { key: "Enter", metaKey: true });
     expect(onDecision).toHaveBeenCalledWith("inside", { decision: "allow", persist: false });
     expect(screen.getByText("no network")).toBeInTheDocument();
     // Frame 8a emphasises the value inside the fact, so the row is two elements.
     expect(screen.getByText("deletes", { exact: false })).toHaveTextContent("deletes 0 files");
     unmount();
 
+    // ⌘↵ keeps working for anyone who learned it during the ⌘↵-only period.
+    const legacy = vi.fn();
+    const legacyRender = render(<ApprovalRequest request={{ ...inside, id: "legacy" }} onDecision={legacy} />);
+    fireEvent.keyDown(window, { key: "Enter", metaKey: true });
+    expect(legacy).toHaveBeenCalledWith("legacy", { decision: "allow", persist: false });
+    legacyRender.unmount();
+
+    // Two on screen is ambiguous, and a bare Enter must not pick one.
     const ambiguous = vi.fn();
     render(<><ApprovalRequest request={{ ...inside, id: "one" }} onDecision={ambiguous} /><ApprovalRequest request={{ ...inside, id: "two" }} onDecision={ambiguous} /></>);
+    fireEvent.keyDown(window, { key: "Enter" });
     fireEvent.keyDown(window, { key: "Enter", ctrlKey: true });
     expect(ambiguous).not.toHaveBeenCalled();
+  });
+
+  it("never binds Enter on a command that leaves the workspace or the machine", () => {
+    // The bare-Enter binding is only safe because it is tier-1 only. A command
+    // that leaves the worktree needs a deliberate click, always.
+    const onDecision = vi.fn();
+    render(<ApprovalRequest request={{ id: "outside", label: "Delete", command: "rm -rf /tmp/x", reason: null, workspaceRoot: "/work/app", paths: ["/tmp/x"], writes: [], network: null, deleteCount: null, remoteHost: null, sessionsOnHost: null, canPersist: false }} onDecision={onDecision} />);
+
+    fireEvent.keyDown(window, { key: "Enter" });
+    fireEvent.keyDown(window, { key: "Enter", metaKey: true });
+
+    expect(onDecision).not.toHaveBeenCalled();
+  });
+
+  it("names a delete target only when the provider's own payload supports it", () => {
+    // Frame 9a-3's headline. Spec 07 R7 forbids inventing a count and permits
+    // naming a path the tool input gave, so the headline appears for one and
+    // stays silent for the other.
+    const named = render(<ApprovalRequest request={{ id: "a", label: "Delete", command: "rm -rf ~/.cache", reason: null, workspaceRoot: "/work/app", paths: ["/work/app/.cache"], writes: [], network: null, deleteCount: 1, remoteHost: null, sessionsOnHost: null, canPersist: false }} onDecision={vi.fn()} />);
+    expect(document.querySelector("[data-approval-headline]"))
+      .toHaveTextContent("Allow this command to delete /work/app/.cache?");
+    named.unmount();
+
+    render(<ApprovalRequest request={{ id: "b", label: "Delete", command: "rm -rf build", reason: null, workspaceRoot: "/work/app", paths: ["/work/app/build"], writes: [], network: null, deleteCount: null, remoteHost: null, sessionsOnHost: null, canPersist: false }} onDecision={vi.fn()} />);
+    expect(document.querySelector("[data-approval-headline]")).toBeNull();
   });
 
   it("persists only from the provider-backed always-allow button", () => {

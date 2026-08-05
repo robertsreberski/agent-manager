@@ -373,7 +373,8 @@ export function Header({
     <header className="safe-area-top z-30 shrink-0 bg-[var(--app)]">
       <div className="safe-area-inline">
         <div className="flex h-[46px] items-center gap-3 px-4 min-[901px]:gap-3.5 min-[901px]:px-6" data-header-primary>
-          <span className={`size-[9px] shrink-0 rounded-full ${connection === "open" ? "bg-[var(--text-muted)]" : "bg-[var(--warning)]"}`} data-connection-indicator={connection} aria-hidden="true" title={connectionLabel} />
+          {/* Frame 7a: a live connection is lime. */}
+          <span className={`size-[9px] shrink-0 rounded-full ${connection === "open" ? "bg-[var(--accent)]" : "bg-[var(--warning)]"}`} data-connection-indicator={connection} aria-hidden="true" title={connectionLabel} />
           <h1 className="truncate font-mono text-[11px] font-medium uppercase leading-none tracking-[0.14em] text-[var(--text-muted)]">Agent Manager</h1>
           <span className="sr-only" role="status">Connection {connectionLabel}</span>
           <span className="flex-1" />
@@ -987,6 +988,7 @@ export default function App() {
             modelOptionsStatus={selectedModelCatalog.status}
             onOpenSetup={openSetup}
             {...(selectedHookState ? { hookState: selectedHookState } : {})}
+            {...(selectedRemote ? {} : { onSearchFiles: (query: string) => cockpit.loadWorkspaceFiles(selected.id, query) })}
             {...(selectedModelCatalog.effortOptions !== undefined ? { effortOptions: selectedModelCatalog.effortOptions } : {})}
             {...(restoredDraft?.sessionId === selected.id ? { restoredDraft: { key: restoredDraft.key, text: restoredDraft.text } } : {})}
           /> : undefined}

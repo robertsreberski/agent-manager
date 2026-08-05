@@ -60,6 +60,25 @@ export interface ApprovalRequestView {
 
 export type ApprovalTier = "workspace" | "outside" | "remote";
 
+/**
+ * The headline frame 9a-3 asks for — "Allow this command to delete your cache
+ * directory?" — built only from what the provider actually sent.
+ *
+ * Spec 07 R7 is explicit that no payload contains "deletes 412 files" and that
+ * the cockpit must not glob the filesystem to invent one. It is equally
+ * explicit that a path the tool input *named* may be shown. So the headline
+ * appears when the provider supplied a delete count or named the paths, and
+ * otherwise there is none — the generic tier sentence stands rather than a
+ * sentence the payload cannot support.
+ */
+export function approvalDeleteHeadline(request: ApprovalRequestView): string | null {
+  if (request.deleteCount === null) return null;
+  if (request.deleteCount === 0) return null;
+  const named = request.paths?.length === 1 ? request.paths[0] : null;
+  if (named) return `Allow this command to delete ${named}?`;
+  return `Allow this command to delete ${request.deleteCount} ${request.deleteCount === 1 ? "file" : "files"}?`;
+}
+
 function isInside(root: string, path: string): boolean {
   const normalizedRoot = root.replace(/\/+$/u, "");
   return path === normalizedRoot || path.startsWith(`${normalizedRoot}/`);

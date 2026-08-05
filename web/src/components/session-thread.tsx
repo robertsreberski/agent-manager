@@ -311,6 +311,7 @@ export function SessionThreadComposer({
   restoredDraft,
   onOpenSetup,
   hookState,
+  onSearchFiles,
 }: {
   session: SessionView;
   activity: SessionActivityView;
@@ -328,6 +329,8 @@ export function SessionThreadComposer({
   onOpenSetup?: () => void;
   /** This provider's hook state, once the setup facts have been read. */
   hookState?: SetupHookOffer["state"];
+  /** Absent where the workspace is not readable from here, e.g. a remote host. */
+  onSearchFiles?: (query: string) => Promise<readonly string[]>;
 }) {
   const [text, setText] = useState("");
   useEffect(() => {
@@ -382,6 +385,7 @@ export function SessionThreadComposer({
         {...(canSetModel ? { onModelChange: (model: string) => void onSetModel(model) } : {})}
         {...(canSetEffort ? { onEffortChange: (effort: ReasoningEffort) => void onSetEffort(effort) } : {})}
         {...(canSetProfile ? { onProfileChange: (profile: ExecutionProfile) => void onSetProfile(profile) } : {})}
+        {...(onSearchFiles ? { onSearchFiles } : {})}
       />
       {/*
         Read-only is honest — an ordinary CLI session exposes no queue or steer

@@ -12,7 +12,7 @@ import {
   Sheet,
   SheetContent,
 } from "../ui";
-import { approvalTier, type ApprovalRequestView } from "./model";
+import { approvalDeleteHeadline, approvalTier, type ApprovalRequestView } from "./model";
 
 export type ApprovalDecision =
   | { decision: "allow"; persist: boolean }
@@ -29,6 +29,7 @@ export function ApprovalRequest({
 }) {
   const phone = usePhoneViewport();
   const tier = approvalTier(request);
+  const deleteHeadline = approvalDeleteHeadline(request);
   const [open, setOpen] = useState(true);
   const [explaining, setExplaining] = useState(false);
   const [persist, setPersist] = useState(false);
@@ -36,8 +37,17 @@ export function ApprovalRequest({
   const [busy, setBusy] = useState(false);
   useEffect(() => {
     if (!open || disabled || tier !== "workspace") return;
+    /*
+      Frame 8a prints `⏎ allow`, so Enter is what the tier-1 shortcut is. The
+      guards that made ⌘↵ safe all still hold and are what keep a bare Enter
+      from becoming an accidental approval: it binds only on the routine tier —
+      never on a command that leaves the workspace or the machine — only while
+      exactly one such request is on screen and ready, and never while the
+      operator is typing. ⌘↵ keeps working for anyone who learned it.
+    */
     function keydown(event: KeyboardEvent) {
-      if (!isCommandEnter(event) || isTypingTarget(event.target)) return;
+      const enter = event.key === "Enter" && !event.shiftKey && !event.altKey && !event.ctrlKey;
+      if (!(enter || isCommandEnter(event)) || isTypingTarget(event.target)) return;
       const candidates = document.querySelectorAll(`[data-approval-tier="workspace"][data-shortcut-ready="true"]`);
       if (candidates.length !== 1 || candidates[0]?.getAttribute("data-request-id") !== request.id) return;
       event.preventDefault();
@@ -80,7 +90,7 @@ export function ApprovalRequest({
       ? { variant: "secondary" as const, ink: "border-[var(--remote-dim)] bg-[var(--remote-pill-field)] [color:var(--remote)]" }
       : { variant: "primary" as const, ink: "" };
   const shortcutHint = tier === "workspace"
-    ? [request.workspaceRoot ? `in ${request.workspaceRoot}` : null, "⌘↵ allow"].filter(Boolean).join(" · ")
+    ? [request.workspaceRoot ? `in ${request.workspaceRoot}` : null, "↵ allow"].filter(Boolean).join(" · ")
     : tier === "remote"
       ? `no shortcut — ${request.remoteHost ?? "this host"} needs a click`
       : "no shortcut — this one needs a click";
@@ -109,6 +119,12 @@ export function ApprovalRequest({
         </Button>
       </CollapsibleTrigger>
       <CollapsibleContent className={`grid min-w-0 grid-cols-[minmax(0,1fr)] gap-[11px] pt-[11px] ${tier === "workspace" ? "pl-6" : ""}`}>
+        {/*
+          Frame 9a-3's headline, present only when the provider's own payload
+          supports it. Spec 07 R7 forbids inventing a count; it permits naming a
+          path the tool input gave.
+        */}
+        {deleteHeadline && <p className="text-body-sm font-semibold text-[var(--text)]" data-approval-headline>{deleteHeadline}</p>}
         {request.command && <pre className={`min-w-0 max-w-full overflow-x-hidden p-[11px_13px] font-mono text-code leading-5 whitespace-pre-wrap break-words [overflow-wrap:anywhere] ${tier === "workspace" ? "bg-[var(--surface-raised-hover)]" : "bg-[var(--app)]"}`}>{request.command}</pre>}
         {request.reason && <p className="text-meta-sm leading-5 text-[var(--text-muted)]">{request.reason}</p>}
         <div className="flex min-w-0 flex-col gap-1.5 font-mono text-code-sm leading-[1.5] text-[var(--text-muted)] sm:flex-row sm:flex-wrap sm:gap-x-[18px]">

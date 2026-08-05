@@ -131,6 +131,11 @@ const transcriptSearchResponseSchema = z.object({
   truncated: z.boolean(),
 }).strict();
 
+const workspaceFileResponseSchema = z.object({
+  sessionId: z.string().min(1),
+  paths: z.array(z.string().min(1)).max(50),
+}).strict();
+
 const planFileResponseSchema = z.object({
   sessionId: z.string().min(1),
   itemId: z.string().min(1),
@@ -280,6 +285,19 @@ export class CockpitApi {
       invalidResponse("selected todo identity", value, new Error("session id mismatch"));
     }
     return response;
+  }
+
+  /** Workspace-relative file paths for the composer's `@mention`. */
+  async workspaceFiles(id: string, q: string, limit = 20): Promise<readonly string[]> {
+    const params = new URLSearchParams({ q, limit: String(limit) });
+    const value = await this.request<unknown>(
+      `/api/v1/sessions/${encodeURIComponent(id)}/files?${params.toString()}`,
+    );
+    const result = parseResponse(workspaceFileResponseSchema, value, "workspace files");
+    if (result.sessionId !== id) {
+      invalidResponse("workspace file identity", value, new Error("session id mismatch"));
+    }
+    return result.paths;
   }
 
   async searchTranscript(id: string, q: string, limit = 20): Promise<TranscriptSearchResponse> {

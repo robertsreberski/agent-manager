@@ -191,13 +191,8 @@ export function SessionCapabilityPanel({
         const state = offered.has(capability) ? "offered" : withheld.has(capability) ? "withheld" : "unknown";
         const Glyph = state === "offered" ? Check : state === "withheld" ? CircleX : CircleHelp;
         return <li key={capability} className="flex items-center gap-[11px]">
-          {/*
-            Frame 9b ticks these lime. Spec 12 R3 reserves lime for wants-you
-            and the operator's own actions, and `theme-contrast.test.ts` guards
-            it, so the tick stays neutral-bright and only the unknown mark is
-            coloured.
-          */}
-          <Glyph size={14} strokeWidth={1.75} className={`shrink-0 ${state === "offered" ? "text-[var(--text)]" : state === "withheld" ? "text-[var(--text-muted)]" : "text-[var(--warning)]"}`} aria-label={state === "offered" ? "Available" : state === "withheld" ? "Unavailable" : "Unknown"} />
+          {/* Frame 9b ticks an offered capability lime. */}
+          <Glyph size={14} strokeWidth={1.75} className={`shrink-0 ${state === "offered" ? "text-[var(--accent)]" : state === "withheld" ? "text-[var(--text-muted)]" : "text-[var(--warning)]"}`} aria-label={state === "offered" ? "Available" : state === "withheld" ? "Unavailable" : "Unknown"} />
           <span className={`min-w-0 flex-1 text-[13.5px] leading-[1.5] ${state === "withheld" ? "text-[var(--text-secondary)]" : ""}`}>{CAPABILITY_SENTENCE[capability]}{withheld.get(capability) && <span className="block text-code-sm text-[var(--text-muted)]">{withheld.get(capability)}</span>}</span>
         </li>;
       })}</ul><div className="mt-3 flex flex-wrap items-center gap-2.5">{/* R4: the profile is merely a fact, so it is the neutral chip. */}<Badge tone="neutral" className="font-sans"><span className="sr-only">Execution profile · </span>{formatProfile(session.profile)}</Badge>{offered.has("set-profile") && <span className="font-mono text-code-sm leading-[1.4] text-[var(--text-muted)]">changeable mid-session</span>}</div></FactSection>
@@ -329,7 +324,8 @@ export function HostSetupStep({ hosts, onContinue, standalone = false }: { hosts
         missing harness reads as a limit on that host rather than a failure.
       */}
       <div className="grid gap-4">{remote.map((host) => <article key={host.id} className="flex items-start gap-3.5 bg-[var(--surface-raised-hover)] px-[18px] py-4"><Server size={17} strokeWidth={1.75} className="mt-0.5 shrink-0 text-[var(--remote)]" /><div className="min-w-0 flex-1"><h2 className="text-body-sm font-semibold">{host.label}</h2><p className="mt-1 font-mono text-code-sm leading-[1.5] text-[var(--text-muted)]">{host.statusMessage ?? host.status}</p><div className="mt-3 grid gap-[9px]">{(["codex", "claude"] as const).map((provider) => { const available = host.harnesses[provider]; const missing = available.state === "missing"; return <p key={provider} className={`flex items-center gap-2.5 font-mono text-meta-sm leading-[1.5] ${missing ? "text-[var(--text-muted)]" : "text-[var(--text-secondary)]"}`}>{/* Frame 13c ticks a present harness green; spec 12 R4 reserves green for added lines, so the tick stays neutral. */}
-                    {missing ? <X size={14} strokeWidth={1.75} className="shrink-0 text-[var(--text-muted)]" aria-hidden="true" /> : <Check size={14} strokeWidth={1.75} className={`shrink-0 ${available.state === "present" ? "text-[var(--text)]" : "text-[var(--text-muted)]"}`} aria-hidden="true" />}<span className="min-w-0">{harnessLabel(host, provider)}{available.reason && <span className="text-[var(--text-muted)]"> — {available.reason}</span>}</span></p>; })}</div></div></article>)}{remote.length === 0 && <p className="text-meta-sm text-[var(--text-muted)]">No remote hosts are configured. Add one later with <code className="font-mono">agent-manager host add</code>.</p>}</div>
+                    {/* Frame 13c: a harness that is actually present reads green. */}
+                    {missing ? <X size={14} strokeWidth={1.75} className="shrink-0 text-[var(--text-muted)]" aria-hidden="true" /> : <Check size={14} strokeWidth={1.75} className={`shrink-0 ${available.state === "present" ? "text-[var(--added)]" : "text-[var(--text-muted)]"}`} aria-hidden="true" />}<span className="min-w-0">{harnessLabel(host, provider)}{available.reason && <span className="text-[var(--text-muted)]"> — {available.reason}</span>}</span></p>; })}</div></div></article>)}{remote.length === 0 && <p className="text-meta-sm text-[var(--text-muted)]">No remote hosts are configured. Add one later with <code className="font-mono">agent-manager host add</code>.</p>}</div>
       {/* R3: leaving setup for the new thread is the operator's own action. */}
       {onContinue && !standalone && <div className="flex justify-end"><Button variant="primary" size="touch" onClick={onContinue}>Continue to new thread</Button></div>}
     </section>

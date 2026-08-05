@@ -119,6 +119,7 @@ import {
 } from "./setup-workspaces.ts";
 import {
   localDirectoryCompletions,
+  workspaceFileCompletions,
   resolveWorkspaceForHost,
   workspaceResolutionResponse,
 } from "./workspaces.ts";
@@ -134,6 +135,18 @@ const transcriptSearchQuerySchema = z.object({
     .max(200)
     .refine((value) => !value.includes("\0"), "query contains an invalid character"),
   limit: z.coerce.number().int().min(1).max(50).default(20),
+}).strict();
+const workspaceFileQuerySchema = z.object({
+  q: z.string()
+    .trim()
+    .max(200)
+    .refine((value) => !/[\u0000-\u001f\u007f]/u.test(value), "query contains an invalid character")
+    .optional(),
+  limit: z.coerce.number().int().min(1).max(50).default(20),
+}).strict();
+const workspaceFileResponseSchema = z.object({
+  sessionId: z.string().min(1),
+  paths: z.array(z.string().min(1)).max(50),
 }).strict();
 const eventsQuerySchema = z.object({
   clientId: z.string().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/).optional(),
@@ -1717,6 +1730,31 @@ export async function createAgentManagerServer(
       ? localDirectoryCompletions(query.path, query.limit)
       : await remoteHosts.completePath(host.id, query.path, query.limit);
     return { hostId, paths };
+  });
+
+  /*
+    The composer's `@mention` needs the names of files in the session's own
+    worktree. Nothing here reads a file's contents, the paths returned are
+    workspace-relative, and the walk is bounded and does not follow symlinks —
+    a link out of the worktree would otherwise turn this into a directory
+    listing of the whole machine.
+  */
+  app.get("/api/v1/sessions/:id/files", {
+    config: { rateLimit: { max: 60, timeWindow: "1 minute" } },
+  }, async (request) => {
+    requireSession(request);
+    const session = state.get(routeSessionId(request));
+    if (!session) throw new ApiError(404, "SESSION_NOT_FOUND", "session was not found");
+    if (isRemoteSession(session)) {
+      throw new ApiError(409, "FILE_SEARCH_UNAVAILABLE", "remote workspace file search is not available");
+    }
+    const root = session.workspaceIdentity?.worktreePath ?? session.cwd;
+    if (!root) throw new ApiError(409, "FILE_SEARCH_UNAVAILABLE", "this session has no resolved workspace");
+    const query = workspaceFileQuerySchema.parse(request.query);
+    return workspaceFileResponseSchema.parse({
+      sessionId: session.id,
+      paths: workspaceFileCompletions(root, query.q ?? "", query.limit),
+    });
   });
 
   app.get("/api/v1/workspaces", async () => workspaceListResponseSchema.parse({

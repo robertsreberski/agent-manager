@@ -80,14 +80,23 @@ describe("subdued cockpit text", () => {
   });
 });
 
+/*
+  The accent's scope was widened deliberately (issue #4). The frames fill the
+  composer's harness tile and effort bars lime, tick an offered capability lime,
+  and light the connection dot lime; the implementation had held all of them
+  neutral on the reading that the accent "must mean exactly one thing".
+
+  What still may not happen is the accent standing in for *state that the board
+  is scanned for*. A lime session card, assistant bubble or plan artifact would
+  make "this session wants you" and "this session exists" the same glance, and
+  the board's only job is that distinction.
+*/
 describe("lime accent semantics", () => {
-  it("does not decorate provider identity, effort, assistant identity, or plan state", () => {
+  it("does not decorate assistant identity or plan state", () => {
     const decorationFiles = [
-      "web/src/components/composer/SessionComposer.tsx",
       "web/src/components/session-thread.tsx",
       "web/src/components/plans/PlanArtifact.tsx",
       "web/src/components/plans/PlanDocumentView.tsx",
-      "web/src/components/system/SystemStates.tsx",
     ];
     for (const file of decorationFiles) {
       const source = readFileSync(resolve(process.cwd(), file), "utf8");
@@ -99,12 +108,17 @@ describe("lime accent semantics", () => {
     }
   });
 
-  it("keeps generic connection and privacy identity neutral", () => {
-    const app = readFileSync(resolve(process.cwd(), "web/src/App.tsx"), "utf8");
-    const indicator = app.match(/<span(?=[^>]*data-connection-indicator)[^>]*\/>/u)?.[0];
-    expect(indicator).toBeDefined();
-    expect(indicator).not.toContain("var(--accent)");
+  it("keeps the board's own wants-you signal unambiguous", () => {
+    // A card tinted for any reason other than wanting the operator would cost
+    // the board the one distinction it exists to make.
+    const card = readFileSync(resolve(process.cwd(), "web/src/components/board/SessionCard.tsx"), "utf8");
+    const accentUses = card.match(/var\(--accent[^)]*\)/gu) ?? [];
+    for (const use of accentUses) {
+      expect(card, use).toMatch(/wants-you|attention/u);
+    }
+  });
 
+  it("keeps privacy identity neutral", () => {
     const privacyMark = styles.match(/\.app-privacy-cover__mark\s*\{[^}]+\}/u)?.[0];
     expect(privacyMark).toBeDefined();
     expect(privacyMark).not.toContain("var(--accent)");
