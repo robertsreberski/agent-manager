@@ -259,7 +259,7 @@ export function parseActivityItem(value: unknown, label = "activity item"): Acti
       specific.push("event", "level", "title", "details");
       break;
     case "usage":
-      specific.push("scope", "inputTokens", "outputTokens", "cachedInputTokens", "reasoningTokens", "totalTokens", "costUsd");
+      specific.push("scope", "inputTokens", "outputTokens", "cachedInputTokens", "reasoningTokens", "totalTokens", "costUsd", "contextWindow");
       break;
   }
   exactKeys(item, [...COMMON_KEYS, ...specific], label);
@@ -357,6 +357,7 @@ export function parseActivityItem(value: unknown, label = "activity item"): Acti
       finiteOrNull(item.reasoningTokens, `${label}.reasoningTokens`);
       finiteOrNull(item.totalTokens, `${label}.totalTokens`);
       finiteOrNull(item.costUsd, `${label}.costUsd`);
+      finiteOrNull(item.contextWindow, `${label}.contextWindow`);
       break;
   }
   return structuredClone(item) as unknown as ActivityItem;

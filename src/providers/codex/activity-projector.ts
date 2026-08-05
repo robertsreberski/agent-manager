@@ -1029,6 +1029,9 @@ export function projectCodexNotification(
         reasoningTokens: finiteNumber(value.reasoningOutputTokens),
         totalTokens: finiteNumber(value.totalTokens),
         costUsd: null,
+        // Codex states the window on every usage notification. Dropping it left
+        // the token counts without a denominator.
+        contextWindow: finiteNumber(usage?.modelContextWindow),
       });
       return {
         threadId,

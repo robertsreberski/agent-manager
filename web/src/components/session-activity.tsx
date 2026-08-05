@@ -10,6 +10,7 @@ import { DiffViewer, diffIdentityKey, fileChangeIsUpserting, relativeEditorPath,
 import { PlanArtifact, TodoList, type PlanArtifactView, type TodoListView } from "./plans";
 import { ApprovalRequest, QuestionRequest, type ExactQuestionRequest } from "./requests";
 import { QueuedMessages } from "./composer";
+import { ContextDisplay } from "./assistant-ui/context-display";
 import { buildSubagentHierarchy, TurnMarker, type SubagentFrameData, type TurnFacts } from "./thread";
 import { jsonForDisplay } from "../lib/session-activity";
 import type {
@@ -720,7 +721,18 @@ function Usage({ item }: { item: Extract<ActivityItem, { kind: "usage" }> }) {
     item.costUsd === null ? null : `$${item.costUsd.toFixed(4)}`,
   ].filter((value): value is string => value !== null);
   if (facts.length === 0) return null;
-  return <p className="my-2 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-code-xs text-[var(--text-muted)]"><Gauge size={13} className="shrink-0" />{facts.map((fact) => <span key={fact}>{fact}</span>)}</p>;
+  return (
+    <p className="my-2 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-code-xs text-[var(--text-muted)]">
+      <Gauge size={13} className="shrink-0" />
+      {facts.map((fact) => <span key={fact}>{fact}</span>)}
+      {/*
+        How full the window is, where the provider stated a window. Without one
+        there is no denominator, and the component renders nothing rather than
+        let the cockpit guess at the number it is missing.
+      */}
+      <ContextDisplay.Bar usage={item} modelContextWindow={item.contextWindow} />
+    </p>
+  );
 }
 
 function Plan({ item, controls }: { item: Extract<ActivityItem, { kind: "plan" }>; controls: ActivityPlanControls }) {

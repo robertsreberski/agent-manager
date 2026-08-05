@@ -41,7 +41,7 @@ function invertedTurn(): ActivityItem[] {
       ...common, id: "usage-1", seq: 3,
       kind: "usage", scope: "turn",
       inputTokens: 24_354, outputTokens: 72, cachedInputTokens: null,
-      reasoningTokens: 57, totalTokens: 24_426, costUsd: null,
+      reasoningTokens: 57, totalTokens: 24_426, costUsd: null, contextWindow: null,
     },
     {
       ...common, id: "lifecycle-start", seq: 4,

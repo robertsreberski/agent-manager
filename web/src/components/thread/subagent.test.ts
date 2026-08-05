@@ -49,7 +49,7 @@ function fixture(): ActivityItem[] {
     {
       ...common("usage", 5, "sub"), kind: "usage", scope: "turn",
       inputTokens: 900, outputTokens: 500, cachedInputTokens: null,
-      reasoningTokens: null, totalTokens: 1_400, costUsd: 0.04,
+      reasoningTokens: null, totalTokens: 1_400, costUsd: 0.04, contextWindow: null,
     },
     {
       ...common("nested", 6, "read"), kind: "subagent", taskId: "nested",

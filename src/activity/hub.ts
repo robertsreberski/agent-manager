@@ -783,7 +783,7 @@ export class ActivityHub {
         return { ...common, kind: "lifecycle", event: draft.event, level: draft.level ?? old?.level ?? "info", title: text(draft.title), details: draft.details === undefined ? old?.details ?? null : draft.details === null ? null : text(draft.details), truncated };
       }
       case "usage":
-        return { ...common, kind: "usage", scope: draft.scope, inputTokens: finite(draft.inputTokens), outputTokens: finite(draft.outputTokens), cachedInputTokens: finite(draft.cachedInputTokens), reasoningTokens: finite(draft.reasoningTokens), totalTokens: finite(draft.totalTokens), costUsd: finite(draft.costUsd), truncated };
+        return { ...common, kind: "usage", scope: draft.scope, inputTokens: finite(draft.inputTokens), outputTokens: finite(draft.outputTokens), cachedInputTokens: finite(draft.cachedInputTokens), reasoningTokens: finite(draft.reasoningTokens), totalTokens: finite(draft.totalTokens), costUsd: finite(draft.costUsd), contextWindow: finite(draft.contextWindow), truncated };
     }
   }
 

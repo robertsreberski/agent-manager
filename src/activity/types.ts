@@ -230,6 +230,15 @@ export interface ActivityUsageItem extends ActivityItemBase {
   reasoningTokens: number | null;
   totalTokens: number | null;
   costUsd: number | null;
+  /**
+   * The model's context window, where the provider stated one.
+   *
+   * Both providers put it on the wire and both projectors used to drop it —
+   * Codex on every `thread/tokenUsage/updated`, Claude on the result message's
+   * per-model usage. Without it a token count has no denominator, and a
+   * percentage would be the cockpit guessing at the one number it lacked.
+   */
+  contextWindow: number | null;
 }
 
 export type ActivityItem =
@@ -343,6 +352,7 @@ export type ActivityItemDraft =
       reasoningTokens?: number | null;
       totalTokens?: number | null;
       costUsd?: number | null;
+      contextWindow?: number | null;
     });
 
 export type ActivityAppendChannel =

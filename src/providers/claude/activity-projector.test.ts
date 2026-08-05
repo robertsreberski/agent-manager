@@ -1046,3 +1046,56 @@ test("a notification without a key still gets a row of its own", () => {
   assert.equal(mutations.length, 1);
   assert.equal(mutations[0]?.kind === "lifecycle" ? mutations[0].level : null, "warning");
 });
+
+/*
+  Both providers put the model's context window on the wire and both projectors
+  dropped it, so a token count had no denominator and any "% of context used"
+  would have been the cockpit guessing at the one number it lacked.
+*/
+test("carries the context window the result message reported", () => {
+  const projector = new ClaudeActivityProjector();
+  const usage = upserts(projector.projectMessage(sdk({
+    ...baseMessage("result", "result-1"),
+    subtype: "success",
+    usage: { input_tokens: 120, output_tokens: 40 },
+    total_cost_usd: 0.01,
+    permission_denials: [],
+    modelUsage: { "claude-sonnet": { contextWindow: 200_000, inputTokens: 120, outputTokens: 40 } },
+  }))).filter((item) => item.kind === "usage");
+
+  assert.equal(usage.length, 1);
+  assert.equal(usage[0]?.kind === "usage" ? usage[0].contextWindow : null, 200_000);
+});
+
+test("states no window when the turn's models disagree about one", () => {
+  // `modelUsage` is keyed by model and a turn can touch more than one. A single
+  // denominator is only a fact when they agree.
+  const projector = new ClaudeActivityProjector();
+  const usage = upserts(projector.projectMessage(sdk({
+    ...baseMessage("result", "result-1"),
+    subtype: "success",
+    usage: { input_tokens: 120, output_tokens: 40 },
+    total_cost_usd: 0.01,
+    permission_denials: [],
+    modelUsage: {
+      "claude-sonnet": { contextWindow: 200_000 },
+      "claude-haiku": { contextWindow: 100_000 },
+    },
+  }))).filter((item) => item.kind === "usage");
+
+  assert.equal(usage[0]?.kind === "usage" ? usage[0].contextWindow : "missing", null);
+});
+
+test("states no window when the provider reported none", () => {
+  const projector = new ClaudeActivityProjector();
+  const usage = upserts(projector.projectMessage(sdk({
+    ...baseMessage("result", "result-1"),
+    subtype: "success",
+    usage: { input_tokens: 120, output_tokens: 40 },
+    total_cost_usd: 0.01,
+    permission_denials: [],
+    modelUsage: {},
+  }))).filter((item) => item.kind === "usage");
+
+  assert.equal(usage[0]?.kind === "usage" ? usage[0].contextWindow : "missing", null);
+});

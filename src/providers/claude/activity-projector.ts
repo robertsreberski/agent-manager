@@ -227,6 +227,24 @@ function requestKind(
   }
 }
 
+/**
+ * The context window the result message reported, where it reported one.
+ *
+ * `modelUsage` is keyed by model, and a turn can touch more than one. A single
+ * window is only a fact when they agree; where they do not, the cockpit has no
+ * one denominator to state and says nothing.
+ */
+function resultContextWindow(message: { modelUsage?: unknown }): number | null {
+  const usage = objectValue(message.modelUsage);
+  if (!usage) return null;
+  const windows = new Set<number>();
+  for (const entry of Object.values(usage)) {
+    const value = finiteNumber(objectValue(entry)?.contextWindow);
+    if (value !== null && value > 0) windows.add(value);
+  }
+  return windows.size === 1 ? [...windows][0]! : null;
+}
+
 function usageDraft(
   id: string,
   turnId: string,
@@ -965,6 +983,7 @@ export class ClaudeActivityProjector {
       state?: ActivityState;
       costUsd?: number | null;
       parentId?: string | null;
+      contextWindow?: number | null;
     } = {},
   ): Extract<ActivityItemDraft, { kind: "usage" }> | null {
     const projected = usageDraft(id, turnId, usage, options);
@@ -979,6 +998,9 @@ export class ClaudeActivityProjector {
       ?? previous?.reasoningTokens
       ?? null;
     const costUsd = projected.costUsd ?? previous?.costUsd ?? null;
+    // Claude reports the window once, on the result message, so it has to stick
+    // for the rest of the turn like the other totals do.
+    const contextWindow = options.contextWindow ?? previous?.contextWindow ?? null;
     const totalTokens = inputTokens === null && outputTokens === null
       && cachedInputTokens === null
       ? null
@@ -991,6 +1013,7 @@ export class ClaudeActivityProjector {
       reasoningTokens,
       totalTokens,
       costUsd,
+      contextWindow,
     };
     this.#usage.set(id, next);
     return next;
@@ -1043,7 +1066,11 @@ export class ClaudeActivityProjector {
       itemId("usage:turn", turnId),
       turnId,
       message.usage,
-      { state: failed ? "failed" : "complete", costUsd: message.total_cost_usd },
+      {
+        state: failed ? "failed" : "complete",
+        costUsd: message.total_cost_usd,
+        contextWindow: resultContextWindow(message),
+      },
     );
     if (usage) mutations.push({ type: "upsert", item: usage });
     for (const denial of message.permission_denials) {

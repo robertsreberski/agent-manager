@@ -81,3 +81,48 @@ describe("question activity projection", () => {
     expect(onRemove).toHaveBeenCalledWith("message-1");
   });
 });
+
+/*
+  A token count without a denominator says nothing about how full the context
+  is, and a denominator the provider never stated would be the cockpit guessing.
+  Both providers do state one; both projectors used to drop it.
+*/
+function controls(): ActivityDataControls {
+  return {
+    attention: { exactRequestIds: new Set(), mutationsReady: true, canRespond: false, busy: false, workspaceRoot: null, remoteHost: null, sessionsOnHost: null, onRespond: vi.fn(async () => undefined) },
+    files: { sessionId: "local:codex:thread-1", canOpenEditor: false, workspaceRoot: null, readKeys: new Set(), onReadChange: vi.fn() },
+    plans: { requestIds: new Map(), mutationsReady: true, canRespond: false, busy: false, loadFile: vi.fn(async () => { throw new Error("unused"); }), onRespond: vi.fn(async () => undefined) },
+    queue: { canRemove: false, busy: false, withheldReason: null },
+  };
+}
+
+describe("context usage", () => {
+  const usage = {
+    ...attention,
+    id: "usage-1",
+    kind: "usage" as const,
+    scope: "turn" as const,
+    inputTokens: 24_000,
+    outputTokens: 400,
+    cachedInputTokens: null,
+    reasoningTokens: 60,
+    totalTokens: 24_460,
+    costUsd: null,
+  };
+
+  it("shows how full the window is when the provider stated one", () => {
+    render(<>{renderActivityData("agent-manager.usage", { ...usage, contextWindow: 200_000 }, controls())}</>);
+
+    const meter = document.querySelector("[data-slot='context-display-trigger']");
+    expect(meter).toBeInTheDocument();
+    // 24,460 of 200,000.
+    expect(meter).toHaveAttribute("aria-label", expect.stringContaining("12%"));
+  });
+
+  it("shows the token counts and no meter when it did not", () => {
+    render(<>{renderActivityData("agent-manager.usage", { ...usage, contextWindow: null }, controls())}</>);
+
+    expect(screen.getByText("24,460 total")).toBeInTheDocument();
+    expect(document.querySelector("[data-slot='context-display-trigger']")).toBeNull();
+  });
+});
