@@ -206,6 +206,9 @@ function claudeModelOption(model: ClaudeModelInfo): SessionModelOption {
     value: model.value,
     label: model.displayName,
     description: model.description,
+    ...(typeof model.resolvedModel === "string" && model.resolvedModel.length > 0
+      ? { resolvedModel: model.resolvedModel }
+      : {}),
     ...(efforts.length > 0 ? { efforts } : {}),
   };
 }
@@ -956,19 +959,25 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
     providerSessionId: string,
     entry: ManagedEntry,
   ): Promise<SessionSettingsOptions> {
-    const generation = entry.session.snapshot.generation;
     const models = await entry.session.supportedModels();
-    this.#assertLiveSettingsEntry(providerSessionId, entry, generation);
+    this.#assertLiveSettingsEntry(providerSessionId, entry);
     return sessionSettingsOptionsSchema.parse({
       source: "provider-api",
       models: models.map(claudeModelOption),
     });
   }
 
+  /*
+    Identity and liveness only — deliberately not generation. Streamed
+    messages bump the snapshot generation continuously, and a fresh session
+    is always streaming, so a generation comparison would reject exactly the
+    reads a fresh session issues. The catalog does not depend on any state a
+    turn can change; entry replacement and ownership loss are what invalidate
+    it, and both are checked here.
+  */
   #assertLiveSettingsEntry(
     providerSessionId: string,
     entry: ManagedEntry,
-    expectedGeneration?: number,
   ): void {
     if (this.#entries.get(providerSessionId) !== entry) {
       throw new Error("The managed Claude session changed during settings lookup");
@@ -981,12 +990,6 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
       || snapshot.activity === "native"
     ) {
       throw new Error("Claude settings require a live manager-owned SDK query");
-    }
-    if (
-      expectedGeneration !== undefined
-      && snapshot.generation !== expectedGeneration
-    ) {
-      throw new Error("The managed Claude session changed during settings lookup");
     }
   }
 

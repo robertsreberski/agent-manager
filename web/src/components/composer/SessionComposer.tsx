@@ -3,6 +3,7 @@ import { ArrowUp, ChevronDown, CodeXml, Paperclip, RotateCcw, Square } from "luc
 import type { ReasoningEffort } from "@shared/session";
 import type { CockpitProvider, ExecutionProfile } from "../../lib/cockpit-view";
 import { isTypingTarget } from "../../lib/shortcuts";
+import { coveringModelOption } from "../../lib/model-catalog";
 import {
   ModelSelectorContent,
   ModelSelectorEffort,
@@ -39,6 +40,7 @@ export interface ComposerModelOption {
   value: string;
   label: string;
   description: string | null;
+  resolvedModel?: string | undefined;
   isDefault?: boolean | undefined;
   defaultEffort?: ReasoningEffort | undefined;
   efforts?: readonly ReasoningEffort[] | undefined;
@@ -131,13 +133,20 @@ export function SessionComposer(props: SessionComposerProps) {
     ? "Available when this turn finishes"
     : profileChangeUnavailableReason ?? "This harness does not expose live execution-profile changes.";
   /*
+    The session states its model as a wire id; the catalog lists alias rows.
+    The covering row — exact match, or the alias whose `resolvedModel` names
+    the same wire id — is what the selector marks selected and reads efforts
+    from.
+  */
+  const selectedOption = coveringModelOption(model, modelOptions);
+  /*
     The provider's catalog in the selector's shape. Efforts hang off the model
     because that is where the component looks for them. Each model keeps its
     own declared levels; the selected-model list is only a compatibility seam
     when a caller has not copied those levels onto the selected option yet.
   */
   const selectorModels: ModelSelectorOption[] = modelOptions.map((option) => {
-    const levels = option.efforts ?? (option.value === model ? effortOptions : []);
+    const levels = option.efforts ?? (option === selectedOption ? effortOptions : []);
     return {
       id: option.value,
       name: option.label,
@@ -335,9 +344,13 @@ export function SessionComposer(props: SessionComposerProps) {
           The gate stays outside it: unavailable mutations retain concise
           native and accessible descriptions without adding another copy wall.
         */}
+        {/*
+          Always controlled: an unmatched or absent model must check no row,
+          not fall back to the component's first-entry default.
+        */}
         <ModelSelectorRoot
           models={selectorModels}
-          {...(model ? { value: model } : {})}
+          value={selectedOption?.value ?? model ?? ""}
           onValueChange={(next) => onModelChange?.(next)}
           {...(effort ? { effort } : {})}
           onEffortChange={(next) => onEffortChange?.(next as NonNullable<SessionComposerProps["effort"]>)}

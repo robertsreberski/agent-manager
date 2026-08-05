@@ -257,6 +257,11 @@ export interface SessionModelOption {
   value: string;
   label: string;
   description: string | null;
+  /**
+   * Canonical wire model id this row's `value` resolves to. Lets a session's
+   * persisted explicit id match the alias row that covers it.
+   */
+  resolvedModel?: string | undefined;
   /** Present only when the provider catalog identifies its default model. */
   isDefault?: boolean | undefined;
   /** Present only when the provider catalog declares a model-specific default. */
@@ -305,6 +310,7 @@ export const sessionSettingsOptionsSchema: z.ZodType<SessionSettingsOptions> = z
     value: providerModelIdentifierSchema,
     label: providerModelLabelSchema,
     description: z.string().max(1_000).nullable(),
+    resolvedModel: providerModelIdentifierSchema.optional(),
     isDefault: z.boolean().optional(),
     defaultEffort: reasoningEffortSchema.optional(),
     efforts: z.array(reasoningEffortSchema).max(REASONING_EFFORTS.length).optional(),

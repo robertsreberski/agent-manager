@@ -111,6 +111,58 @@ describe("SessionComposer", () => {
     expect(screen.getByRole("menuitemradio", { name: /Plan/ })).toHaveAttribute("aria-checked", "false");
   });
 
+  it("checks the catalog row that covers the session's resolved model", async () => {
+    const onModelChange = vi.fn();
+    const onEffortChange = vi.fn();
+    renderComposer({
+      canQueue: true,
+      provider: "claude",
+      // The provider states the wire id; the catalog lists alias rows.
+      model: "claude-sonnet-5",
+      effort: "high",
+      modelOptions: [
+        { value: "sonnet", label: "Sonnet", description: null, resolvedModel: "claude-sonnet-5", efforts: ["low", "high"] },
+        { value: "opus", label: "Opus", description: null, resolvedModel: "claude-opus-5", efforts: ["medium", "max"] },
+      ],
+      onModelChange,
+      onEffortChange,
+    });
+
+    click(screen.getByRole("combobox", { name: /claude/i }));
+    const sonnet = await screen.findByRole("option", { name: /Sonnet/ });
+    expect(sonnet).toHaveAttribute("aria-selected", "true");
+    // The check glyph marks the covering row; the other row carries none.
+    expect(sonnet.querySelector("svg")).not.toBeNull();
+    expect(screen.getByRole("option", { name: /Opus/ }).querySelector("svg")).toBeNull();
+    // Efforts come from the covering row, not from a failed exact match.
+    expect(screen.getByRole("radio", { name: /high/i })).toHaveAttribute("aria-checked", "true");
+
+    fireEvent.click(screen.getByRole("radio", { name: /low/i }));
+    expect(onEffortChange).toHaveBeenCalledWith("low");
+    fireEvent.click(screen.getByRole("option", { name: /Opus/ }));
+    expect(onModelChange).toHaveBeenCalledWith("opus");
+  });
+
+  it("checks no model row while the session model is unknown", async () => {
+    renderComposer({
+      canQueue: true,
+      model: null,
+      modelOptions: [
+        { value: "sonnet", label: "Sonnet", description: null },
+        { value: "opus", label: "Opus", description: null },
+      ],
+      onModelChange: vi.fn(),
+    });
+
+    click(screen.getByRole("combobox", { name: /codex/i }));
+    // An unknown model must not silently present the first row as chosen.
+    // cmdk still highlights a row for the keyboard (aria-selected); what must
+    // not appear is the check glyph claiming a selection the session never made.
+    const sonnet = await screen.findByRole("option", { name: /Sonnet/ });
+    expect(sonnet.querySelector("svg")).toBeNull();
+    expect(screen.getByRole("option", { name: /Opus/ }).querySelector("svg")).toBeNull();
+  });
+
   it("reports the chosen execution profile and keeps full access marked as the loudest choice", async () => {
     const onProfileChange = vi.fn();
     renderComposer({ canQueue: true, onProfileChange });

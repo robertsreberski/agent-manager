@@ -13,6 +13,7 @@ import {
   notificationAwaySince,
   settingsUnavailableMessage,
   SetupDialog,
+  shouldRetrySettingsLookup,
 } from "./App";
 
 describe("hostSelectionSummary", () => {
@@ -92,6 +93,47 @@ describe("cockpit presentation contracts", () => {
     expect(modelCatalogEfforts("codex-deep", codex)).toEqual(["high", "xhigh", "ultra"]);
     expect(modelCatalogEfforts("opus", claude)).toEqual(["medium", "high", "max"]);
     expect(modelCatalogEfforts("missing", codex)).toEqual([]);
+  });
+
+  it("matches a session's wire model id to the alias row that resolves to it", () => {
+    const claude = {
+      available: true,
+      source: "provider-api",
+      models: [
+        { value: "sonnet", label: "Sonnet", description: null, resolvedModel: "claude-sonnet-5", efforts: ["low", "medium", "high"] },
+        { value: "opus", label: "Opus", description: null, resolvedModel: "claude-opus-5", efforts: ["medium", "high", "max"] },
+      ],
+    } satisfies NonNullable<Parameters<typeof modelCatalogEfforts>[1]>;
+    expect(modelCatalogEfforts("claude-opus-5", claude)).toEqual(["medium", "high", "max"]);
+    // An exact `value` match still wins over any alias resolution.
+    expect(modelCatalogEfforts("sonnet", claude)).toEqual(["low", "medium", "high"]);
+    expect(modelCatalogEfforts("claude-haiku-4-5", claude)).toEqual([]);
+  });
+
+  it("retries a failed catalog lookup only on the running-to-settled edge", () => {
+    const error = { state: "error", response: null } as const;
+    const unavailable: Parameters<typeof shouldRetrySettingsLookup>[2] = {
+      state: "loaded",
+      response: { available: false, reason: "provider-unavailable", models: [] },
+    };
+    expect(shouldRetrySettingsLookup("running", "idle", error)).toBe(true);
+    expect(shouldRetrySettingsLookup("running", "waiting", unavailable)).toBe(true);
+    // A repeated failure while settled never loops — it waits for the next edge.
+    expect(shouldRetrySettingsLookup("idle", "idle", error)).toBe(false);
+    // A fresh selection has no edge; the primary lookup owns that load.
+    expect(shouldRetrySettingsLookup(null, "idle", error)).toBe(false);
+    expect(shouldRetrySettingsLookup("running", "running", error)).toBe(false);
+    expect(shouldRetrySettingsLookup("running", "idle", null)).toBe(false);
+    expect(shouldRetrySettingsLookup("running", "idle", { state: "loading", response: null })).toBe(false);
+    expect(shouldRetrySettingsLookup("running", "idle", {
+      state: "loaded",
+      response: { available: true, source: "provider-api", models: [] },
+    })).toBe(false);
+    // Structural refusals are facts about the session, not transient weather.
+    expect(shouldRetrySettingsLookup("running", "idle", {
+      state: "loaded",
+      response: { available: false, reason: "not-manager-owned", models: [] },
+    })).toBe(false);
   });
 
   it("separates a configured empty cockpit from genuine first run", () => {

@@ -317,6 +317,118 @@ describe("SessionThreadComposer", () => {
 });
 
 /*
+  The one wiring no test pinned while the pickers shipped dead: a fresh
+  manager-owned Claude session grants `set-model` and `set-effort` from its
+  first record, and the composer must turn those grants into genuinely
+  selectable rows and radios.
+*/
+describe("a managed session with granted model and effort control", () => {
+  const managed = {
+    ...session,
+    id: "local:claude:managed-1",
+    provider: "claude",
+    model: { value: "claude-sonnet-5" },
+    effort: { value: "high" },
+    control: {
+      plane: "claude-sdk",
+      authority: "manager",
+      capabilities: ["queue", "interrupt", "set-profile", "set-model", "set-effort", "end"],
+      withheld: [],
+      takeover: null,
+    },
+  } as unknown as SessionView;
+  const catalog = [
+    { value: "sonnet", label: "Sonnet", description: null, resolvedModel: "claude-sonnet-5", efforts: ["low", "high"] as const },
+    { value: "opus", label: "Opus", description: null, resolvedModel: "claude-opus-5", efforts: ["medium", "max"] as const },
+  ];
+
+  function renderManaged(overrides: Partial<React.ComponentProps<typeof SessionThreadComposer>> = {}) {
+    const onSetModel = vi.fn(async () => undefined);
+    const onSetEffort = vi.fn(async () => undefined);
+    render(<SessionThreadComposer
+      session={managed}
+      activity={activity}
+      busy={false}
+      mutationsReady
+      onSend={vi.fn(async () => undefined)}
+      onInterrupt={vi.fn(async () => undefined)}
+      onSetProfile={vi.fn(async () => undefined)}
+      onSetModel={onSetModel}
+      onSetEffort={onSetEffort}
+      modelOptions={catalog}
+      modelOptionsStatus={null}
+      effortOptions={["low", "high"]}
+      {...overrides}
+    />);
+    return { onSetModel, onSetEffort };
+  }
+
+  function openRuntimeMenu() {
+    const trigger = screen.getByRole("combobox", { name: /claude/i });
+    expect(trigger).toBeEnabled();
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false, pointerId: 1 });
+    fireEvent.click(trigger);
+    return screen.getByRole("dialog", { name: "Harness, model, and effort" });
+  }
+
+  it("lets the operator pick a model and an effort", () => {
+    const { onSetModel, onSetEffort } = renderManaged();
+
+    const menu = openRuntimeMenu();
+    const sonnet = within(menu).getByRole("option", { name: /Sonnet/u });
+    const opus = within(menu).getByRole("option", { name: /Opus/u });
+    expect(sonnet).not.toHaveAttribute("aria-disabled", "true");
+    expect(opus).not.toHaveAttribute("aria-disabled", "true");
+    // The covering row — matched through `resolvedModel` — carries the check.
+    expect(sonnet.querySelector("svg")).not.toBeNull();
+    expect(opus.querySelector("svg")).toBeNull();
+
+    const high = within(menu).getByRole("radio", { name: /high/iu });
+    expect(high).toHaveAttribute("aria-checked", "true");
+    expect(high).toBeEnabled();
+    fireEvent.click(within(menu).getByRole("radio", { name: /low/iu }));
+    expect(onSetEffort).toHaveBeenCalledWith("low");
+
+    fireEvent.click(opus);
+    expect(onSetModel).toHaveBeenCalledWith("opus");
+  });
+
+  it("offers the provider effort vocabulary when the loaded row declares none", () => {
+    const bare = catalog.map(({ efforts: _efforts, ...option }) => option);
+    const { onSetEffort } = renderManaged({ modelOptions: bare, effortOptions: [] });
+
+    const menu = openRuntimeMenu();
+    const radios = within(menu).getAllByRole("radio");
+    expect(radios.map((radio) => radio.getAttribute("value"))).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    fireEvent.click(within(menu).getByRole("radio", { name: /medium/iu }));
+    expect(onSetEffort).toHaveBeenCalledWith("medium");
+  });
+
+  it("fabricates no effort radios where the capability is withheld", () => {
+    render(<SessionThreadComposer
+      session={session}
+      activity={activity}
+      busy={false}
+      mutationsReady
+      onSend={vi.fn(async () => undefined)}
+      onInterrupt={vi.fn(async () => undefined)}
+      onSetProfile={vi.fn(async () => undefined)}
+      onSetModel={vi.fn(async () => undefined)}
+      onSetEffort={vi.fn(async () => undefined)}
+      modelOptions={[{ value: "gpt-live", label: "Live", description: null }]}
+      modelOptionsStatus={null}
+      effortOptions={[]}
+    />);
+
+    const trigger = screen.getByRole("combobox", { name: /codex/i });
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false, pointerId: 1 });
+    fireEvent.click(trigger);
+    const menu = screen.getByRole("dialog", { name: "Harness, model, and effort" });
+    expect(within(menu).queryAllByRole("radio")).toHaveLength(0);
+  });
+});
+
+/*
   An ordinary CLI session exposes no queue or steer channel, so read-only is
   honest. What was missing is that the composer stated the fact without naming
   the one thing that changes it — and `cockpitContentMode` returns "board" as
