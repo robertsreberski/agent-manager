@@ -84,6 +84,7 @@ import {
 import { toCockpitSessionView, workspaceChangeFacts, workspaceChangeLabel } from "./lib/cockpit-view";
 import type { ProviderSettingsOptionsResponse, SessionSettingsOptionsResponse, SetupReadModel, TranscriptSearchMatch } from "./lib/api";
 import { isTypingTarget } from "./lib/shortcuts";
+import { coveringModelOption } from "./lib/model-catalog";
 import type { ActivityItem, HostOption, ReasoningEffort, SessionView } from "./types";
 
 const FILTERS = [
@@ -167,12 +168,32 @@ export function modelCatalogEfforts(
   response: SessionSettingsOptionsResponse | ProviderSettingsOptionsResponse | null,
 ): readonly ReasoningEffort[] | undefined {
   if (!response?.available) return undefined;
-  const option = model
-    ? response.models.find((candidate) => candidate.value === model)
-    : response.models.find((candidate) => candidate.isDefault === true);
+  const option = coveringModelOption(model, response.models);
   // A live catalog replaces every provider-wide guess. Missing metadata leaves
-  // the meter word-only instead of fabricating support the model never declared.
+  // the meter word-only instead of fabricating support the model never declared;
+  // the capability-gated vocabulary fallback lives at the composer wiring.
   return option?.efforts ?? [];
+}
+
+/**
+ * One quiet refetch per turn boundary. A catalog read can trip its provider
+ * bound while the session saturates the CLI streaming a turn; the settled
+ * edge is exactly when the provider can answer again. A persistent outage
+ * never loops — the next attempt needs another running→settled edge — and
+ * structural refusals (remote, foreign, unsupported) are not retried at all.
+ */
+export function shouldRetrySettingsLookup(
+  previousStatus: string | null,
+  status: string,
+  lookup:
+    | { state: "loading" | "error"; response: null }
+    | { state: "loaded"; response: SessionSettingsOptionsResponse | ProviderSettingsOptionsResponse }
+    | null,
+): boolean {
+  if (!lookup) return false;
+  const failed = lookup.state === "error"
+    || (lookup.state === "loaded" && !lookup.response.available && lookup.response.reason === "provider-unavailable");
+  return failed && previousStatus === "running" && (status === "idle" || status === "waiting");
 }
 
 const NOTIFICATION_SETTINGS_KEY = "agent-manager.notification-preferences.v1";
@@ -668,6 +689,35 @@ export default function App() {
     selected?.id,
     selected?.provider,
   ]);
+
+  /*
+    The lookup above runs once per selection, so a transient failure would
+    otherwise stand for the whole selection. `settingsOptions` rides a ref
+    here because the effect writes it: listing it as a dependency would
+    cancel the very request the retry starts.
+  */
+  const settingsLookupRef = useRef(settingsOptions);
+  useEffect(() => {
+    settingsLookupRef.current = settingsOptions;
+  }, [settingsOptions]);
+  const settingsStatusEdge = useRef<{ sessionId: string; status: string } | null>(null);
+  useEffect(() => {
+    const previous = settingsStatusEdge.current;
+    settingsStatusEdge.current = selected ? { sessionId: selected.id, status: selected.status } : null;
+    if (!selected || selected.control.authority !== "manager") return;
+    const sessionId = selected.id;
+    const previousStatus = previous?.sessionId === sessionId ? previous.status : null;
+    const lookup = settingsLookupRef.current?.sessionId === sessionId ? settingsLookupRef.current : null;
+    if (!shouldRetrySettingsLookup(previousStatus, selected.status, lookup)) return;
+    let cancelled = false;
+    setSettingsOptions({ sessionId, state: "loading", response: null });
+    void cockpit.loadSettingsOptions(sessionId).then((response) => {
+      if (!cancelled) setSettingsOptions({ sessionId, state: "loaded", response });
+    }).catch(() => {
+      if (!cancelled) setSettingsOptions({ sessionId, state: "error", response: null });
+    });
+    return () => { cancelled = true; };
+  }, [cockpit.loadSettingsOptions, selected?.control.authority, selected?.id, selected?.status]);
 
   const selectedModelCatalog = useMemo(() => {
     if (!settingsOptions || settingsOptions.sessionId !== selected?.id) return { models: [], status: null, effortOptions: undefined };

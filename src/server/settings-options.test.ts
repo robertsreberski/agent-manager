@@ -565,7 +565,14 @@ test("reports remote, foreign, unsupported, and failed catalogs as explicitly un
   assert.equal(claudeCalls, 1, "only the local manager-owned Claude session reaches the adapter");
 });
 
-test("withdraws a catalog when session generation changes during the provider read", async (t) => {
+/*
+  A fresh managed session is always mid-turn — creation requires an initial
+  message — and every streamed message bumps its generation. A catalog is
+  thread-scoped provider data, not generation-scoped record data, so churn in
+  unrelated fields must not withdraw it; only a change of identity or ownership
+  may.
+*/
+test("serves the catalog even when unrelated session state changes during the provider read", async (t) => {
   let markStarted!: () => void;
   const started = new Promise<void>((resolve) => {
     markStarted = resolve;
@@ -604,6 +611,113 @@ test("withdraws a catalog when session generation changes during the provider re
   const current = backend.state.get("local:claude:managed-1");
   assert.ok(current);
   backend.state.upsert({ ...current, name: "Changed during lookup" });
+  resolveOptions({
+    source: "provider-api",
+    models: [{ value: "sonnet", label: "Sonnet", description: "Balanced" }],
+  });
+
+  const response = await responsePromise;
+  assert.equal(response.statusCode, 200, response.body);
+  assert.deepEqual(response.json(), {
+    available: true,
+    source: "provider-api",
+    models: [{ value: "sonnet", label: "Sonnet", description: "Balanced" }],
+  });
+});
+
+test("withdraws a catalog when the session leaves manager ownership during the provider read", async (t) => {
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  let resolveOptions!: (options: {
+    source: "provider-api";
+    models: Array<{ value: string; label: string; description: string | null }>;
+  }) => void;
+  const pendingOptions = new Promise<{
+    source: "provider-api";
+    models: Array<{ value: string; label: string; description: string | null }>;
+  }>((resolve) => {
+    resolveOptions = resolve;
+  });
+  const backend = await createAgentManagerServer({
+    discovery: false,
+    staticDir: false,
+    adapters: {
+      claude: inertAdapter(async () => {
+        markStarted();
+        return pendingOptions;
+      }),
+    },
+    initialSessions: [managedSession()],
+  });
+  t.after(() => backend.close());
+  await backend.app.ready();
+  const cookie = await authenticatedCookie(backend);
+
+  const responsePromise = backend.app.inject({
+    method: "GET",
+    url: "/api/v1/sessions/local%3Aclaude%3Amanaged-1/settings-options",
+    headers: { host, cookie },
+  });
+  await started;
+  const current = backend.state.get("local:claude:managed-1");
+  assert.ok(current);
+  backend.state.upsert({
+    ...current,
+    control: { ...current.control, plane: "resume-only", authority: "foreign" },
+  });
+  resolveOptions({
+    source: "provider-api",
+    models: [{ value: "sonnet", label: "Sonnet", description: "Balanced" }],
+  });
+
+  const response = await responsePromise;
+  assert.equal(response.statusCode, 200, response.body);
+  assert.deepEqual(response.json(), {
+    available: false,
+    reason: "provider-unavailable",
+    models: [],
+  });
+});
+
+test("withdraws a catalog when the session disappears during the provider read", async (t) => {
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  let resolveOptions!: (options: {
+    source: "provider-api";
+    models: Array<{ value: string; label: string; description: string | null }>;
+  }) => void;
+  const pendingOptions = new Promise<{
+    source: "provider-api";
+    models: Array<{ value: string; label: string; description: string | null }>;
+  }>((resolve) => {
+    resolveOptions = resolve;
+  });
+  const backend = await createAgentManagerServer({
+    discovery: false,
+    staticDir: false,
+    adapters: {
+      claude: inertAdapter(async () => {
+        markStarted();
+        return pendingOptions;
+      }),
+    },
+    initialSessions: [managedSession()],
+  });
+  t.after(() => backend.close());
+  await backend.app.ready();
+  const cookie = await authenticatedCookie(backend);
+
+  const responsePromise = backend.app.inject({
+    method: "GET",
+    url: "/api/v1/sessions/local%3Aclaude%3Amanaged-1/settings-options",
+    headers: { host, cookie },
+  });
+  await started;
+  assert.ok(backend.state.remove("local:claude:managed-1"));
   resolveOptions({
     source: "provider-api",
     models: [{ value: "sonnet", label: "Sonnet", description: "Balanced" }],

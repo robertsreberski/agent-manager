@@ -52,6 +52,18 @@ because that panel is a full inventory rather than an alert.
   never gated on `set-model`; where the harness will not take the write, the list renders disabled
   with the harness's own reason. A control that is greyed out with nothing to show and nothing to
   say is indistinguishable from a broken one.
+- A catalog read survives unrelated session churn. A fresh managed session streams its first turn
+  from creation, so any generation comparison rejects exactly the sessions worth reading; only
+  identity or ownership changes — thread replaced, removed, adopted away — withdraw the result.
+  A read that failed transiently is retried once when the session settles from running, never in
+  a loop, and structural refusals are not retried at all.
+- The session states its model as a wire id while catalogs list alias rows, so the checked row
+  and its efforts come from the covering row: an exact `value` match, else the row whose
+  `resolvedModel` names the same wire id, else — for a null model — the row the catalog itself
+  marks default. An unmatched model checks no row rather than presenting the first as chosen.
+- Where `set-effort` is granted and the loaded covering row declares no effort metadata, the
+  radios offer the provider's own effort vocabulary — the grant is the harness's claim that a
+  write from that vocabulary will be accepted. A withheld `set-effort` fabricates nothing.
 
 ### Delivery
 

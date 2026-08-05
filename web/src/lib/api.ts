@@ -149,6 +149,7 @@ const sessionModelOptionSchema = z.object({
   value: z.string().trim().min(1).max(256).refine((value) => !/[\u0000-\u001f\u007f]/u.test(value)),
   label: z.string().trim().min(1).max(128).refine((value) => !/[\u0000-\u001f\u007f]/u.test(value)),
   description: z.string().trim().max(1_000).nullable(),
+  resolvedModel: z.string().trim().min(1).max(256).refine((value) => !/[\u0000-\u001f\u007f]/u.test(value)).optional(),
   isDefault: z.boolean().optional(),
   defaultEffort: z.enum(["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]).optional(),
   efforts: z.array(z.enum(["minimal", "low", "medium", "high", "xhigh", "max", "ultra"])).max(7).optional(),

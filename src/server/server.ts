@@ -1634,10 +1634,17 @@ export async function createAgentManagerServer(
           "provider settings lookup",
         ),
       );
+      /*
+        Identity and ownership only — deliberately not generation. A fresh
+        managed session streams its first turn from creation, and every
+        streamed message bumps the generation, so a generation comparison
+        withdraws the catalog from exactly the sessions reading it. The
+        catalog is thread-scoped provider data; only the thread being
+        replaced, removed, or leaving manager ownership invalidates it.
+      */
       const current = state.get(session.id);
       if (
         !current
-        || current.generation !== session.generation
         || current.provider !== session.provider
         || current.providerThreadId !== session.providerThreadId
         || current.hostId !== "local"

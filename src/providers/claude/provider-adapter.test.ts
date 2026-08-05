@@ -183,17 +183,41 @@ test("returns only the live bounded Claude model catalog", async () => {
   const query = runtime.queries[0];
   assert.ok(query);
   query.supportedModelCatalog = [
-    { value: "sonnet", displayName: "Sonnet", description: "Balanced" },
+    {
+      value: "sonnet",
+      displayName: "Sonnet",
+      description: "Balanced",
+      resolvedModel: "claude-sonnet-5",
+      supportsEffort: true,
+      supportedEffortLevels: ["low", "medium", "high"],
+    },
     { value: "opus", displayName: "Opus", description: "Deep reasoning" },
   ];
 
   assert.deepEqual(await adapter.getSettingsOptions(view, context()), {
     source: "provider-api",
     models: [
-      { value: "sonnet", label: "Sonnet", description: "Balanced" },
+      {
+        value: "sonnet",
+        label: "Sonnet",
+        description: "Balanced",
+        resolvedModel: "claude-sonnet-5",
+        efforts: ["low", "medium", "high"],
+      },
       { value: "opus", label: "Opus", description: "Deep reasoning" },
     ],
   });
+
+  query.supportedModelCatalog = [{
+    value: "sonnet",
+    displayName: "Sonnet",
+    description: "Balanced",
+    resolvedModel: "claude\nsonnet",
+  }];
+  await assert.rejects(
+    adapter.getSettingsOptions(view, context()),
+    /control characters/,
+  );
 
   query.supportedModelCatalog = [{
     value: "bad\nmodel",
@@ -225,7 +249,7 @@ test("returns only the live bounded Claude model catalog", async () => {
   adapter.dispose();
 });
 
-test("coalesces live model lookups and rejects a generation race", async () => {
+test("coalesces live model lookups and survives concurrent session churn", async () => {
   const runtime = new BridgeRuntime();
   const adapter = new ClaudeProviderControlAdapter({
     runtime,
@@ -252,6 +276,11 @@ test("coalesces live model lookups and rejects a generation race", async () => {
   const second = adapter.getSettingsOptions(view, context());
   assert.equal(query.supportedModelsCalls, 1);
 
+  /*
+    A write landing mid-read must not spoil the catalog: the model list does
+    not depend on which model is currently selected, and a fresh session
+    churns generations continuously while its first turn streams.
+  */
   const changed = await adapter.performAction(view, {
     type: "set-model",
     model: "opus",
@@ -260,8 +289,12 @@ test("coalesces live model lookups and rejects a generation race", async () => {
   }, context());
   assert.equal(changed.status, "succeeded");
   resolveModels([{ value: "sonnet", displayName: "Sonnet", description: "Balanced" }]);
-  await assert.rejects(first, /changed during settings lookup/);
-  await assert.rejects(second, /changed during settings lookup/);
+  const catalog = {
+    source: "provider-api",
+    models: [{ value: "sonnet", label: "Sonnet", description: "Balanced" }],
+  };
+  assert.deepEqual(await first, catalog);
+  assert.deepEqual(await second, catalog);
   assert.equal(query.supportedModelsCalls, 1, "both callers shared one SDK request");
   adapter.dispose();
 });
