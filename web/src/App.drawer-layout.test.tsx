@@ -182,3 +182,75 @@ describe("cockpit shell layout", () => {
     expect(screen.queryByRole("dialog", { name: "Setup and integrations" })).not.toBeInTheDocument();
   });
 });
+
+/*
+  `cockpitContentMode` returns "board" as soon as one session exists, so an
+  operator whose only sessions were started in a terminal never met the first-run
+  hook step and never learned that hooks are what make such a session answerable.
+  And because adding a hook edits a settings file — which emits no provider
+  event — nothing tells this browser the state has changed.
+*/
+describe("reaching hooks from an observation-only board", () => {
+  beforeEach(() => {
+    loadSetup.mockClear();
+    vi.useRealTimers();
+  });
+
+  it("reads the hook facts unprompted when the selected session is observation-only", async () => {
+    render(<App />);
+
+    await waitFor(() => expect(loadSetup).toHaveBeenCalled());
+    // Still only a read. The command stays the operator's to run.
+    expect(screen.queryByRole("button", { name: /install|apply/iu })).not.toBeInTheDocument();
+  });
+
+  async function openSetupDialog() {
+    fireEvent.click(screen.getByRole("button", { name: "Search sessions and commands" }));
+    fireEvent.click(await screen.findByRole("option", { name: /Setup and integrations/u }));
+    await screen.findByRole("dialog", { name: "Setup and integrations" });
+    await waitFor(() => expect(loadSetup).toHaveBeenCalled());
+    return loadSetup.mock.calls.length;
+  }
+
+  it("re-reads an unfinished hook while its dialog is open, so the state moves without a restart", async () => {
+    // The clock has to be fake before the component schedules on it.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(<App />);
+    const afterOpen = await openSetupDialog();
+
+    await vi.advanceTimersByTimeAsync(9_000);
+
+    expect(loadSetup.mock.calls.length).toBeGreaterThan(afterOpen);
+  });
+
+  it("stops re-reading once every hook has settled", async () => {
+    loadSetup.mockResolvedValue({
+      ...setupModel,
+      hooks: {
+        claude: { ...hookOffer("claude"), state: "active", changed: false, diff: "" },
+        codex: { ...hookOffer("codex"), state: "active", changed: false, diff: "" },
+      },
+    });
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(<App />);
+    const afterOpen = await openSetupDialog();
+
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    expect(loadSetup.mock.calls.length).toBe(afterOpen);
+    loadSetup.mockResolvedValue(setupModel);
+  });
+
+  it("gives up rather than polling a hook the operator never finishes", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(<App />);
+    await openSetupDialog();
+
+    // Fifteen probes at eight seconds is two minutes, under the endpoint's
+    // ten-reads-a-minute budget the whole way. Left uncapped, a dialog someone
+    // walked away from would read forever.
+    await vi.advanceTimersByTimeAsync(8_000 * 60);
+
+    expect(loadSetup.mock.calls.length).toBeLessThanOrEqual(17);
+  });
+});

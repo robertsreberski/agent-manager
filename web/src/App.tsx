@@ -193,6 +193,10 @@ export function notificationAwaySince(visibility: DocumentVisibilityState, now: 
 /** A draft has no provider activity, and the runtime still needs a thread. */
 const EMPTY_ACTIVITY_ITEMS: readonly ActivityItem[] = [];
 
+/** Under the endpoint's ten-reads-a-minute budget, and bounded to two minutes. */
+const SETUP_REPROBE_MS = 8_000;
+const SETUP_REPROBE_LIMIT = 15;
+
 export type CockpitContentMode = "board" | "empty" | "first-run";
 
 export function cockpitContentMode(sessionCount: number, workspaceCount: number): CockpitContentMode {
@@ -437,6 +441,7 @@ export default function App() {
   const [setupOpen, setSetupOpen] = useState(false);
   const setupLoadStarted = useRef(false);
   const setupRequest = useRef(0);
+  const setupProbes = useRef(0);
   const [selectedIds, setSelectedIds] = useState<ReadonlySet<string>>(() => new Set());
   const [reviewOpen, setReviewOpen] = useState(false);
   const [readKeys, setReadKeys] = useState<ReadonlySet<string>>(() => new Set());
@@ -469,12 +474,30 @@ export default function App() {
   }, [cockpit.loadSetup]);
   // Hook and host facts change outside this browser, so every explicit open
   // re-reads them instead of trusting a first-run snapshot.
-  const openSetup = useCallback(() => { setSetupOpen(true); refreshSetup(); }, [refreshSetup]);
+  const openSetup = useCallback(() => { setupProbes.current = 0; setSetupOpen(true); refreshSetup(); }, [refreshSetup]);
 
   useEffect(() => {
     if (!cockpit.ready || !cockpit.mutationsReady || cockpitContentMode(cockpit.sessions.length, cockpit.workspaces.length) !== "first-run" || setupLoadStarted.current) return;
     refreshSetup();
   }, [cockpit.mutationsReady, cockpit.ready, cockpit.sessions.length, cockpit.workspaces.length, refreshSetup]);
+
+
+  /*
+    Adding a hook edits a settings file, and a settings edit emits no provider
+    event — so a session stays "installed-unseen" until its next real event, and
+    "absent" until the operator has actually run the command. Neither transition
+    reaches this browser on its own. While the dialog is open on an unfinished
+    hook, re-read the facts so the state moves without a restart. `/api/v1/setup`
+    allows ten reads a minute; this stays under it and stops after two.
+  */
+  useEffect(() => {
+    if (!setupOpen || setupFacts?.state !== "loaded") return;
+    const unfinished = ([setupFacts.value.hooks.claude, setupFacts.value.hooks.codex] as const)
+      .some((hook) => hook.state === "absent" || hook.state === "installed-unseen");
+    if (!unfinished || setupProbes.current >= SETUP_REPROBE_LIMIT) return;
+    const timer = setTimeout(() => { setupProbes.current += 1; refreshSetup(); }, SETUP_REPROBE_MS);
+    return () => clearTimeout(timer);
+  }, [refreshSetup, setupFacts, setupOpen]);
 
   const phoneAttentionLabels = usePhoneAttentionLabels(
     cockpit.sessions,
@@ -515,6 +538,25 @@ export default function App() {
   });
 
   const selected = cockpit.selectedSession;
+
+  /*
+    `cockpitContentMode` returns "board" as soon as one session exists, so an
+    operator whose only sessions were discovered in a terminal never saw the
+    first-run wizard and never learned that hooks are what make such a session
+    answerable. Reading the facts once, when the first observation-only session
+    is opened, is what lets the drawer say so. Still a read: this browser never
+    writes provider settings.
+  */
+  useEffect(() => {
+    if (!cockpit.ready || !cockpit.mutationsReady || setupLoadStarted.current) return;
+    if (!selected || selected.control.plane !== "observe-only") return;
+    refreshSetup();
+  }, [cockpit.mutationsReady, cockpit.ready, refreshSetup, selected]);
+
+  /** The hook state for the selected session's own provider, once it is known. */
+  const selectedHookState = selected && setupFacts?.state === "loaded"
+    ? setupFacts.value.hooks[selected.provider].state
+    : null;
   const selectedPresentation = selected ? sessions.find((session) => session.id === selected.id) ?? null : null;
   const selectedPlanSessionId = selected?.id ?? null;
   const loadSelectedPlanFile = useCallback((itemId: string) => {
@@ -944,6 +986,7 @@ export default function App() {
             modelOptions={selectedModelCatalog.models}
             modelOptionsStatus={selectedModelCatalog.status}
             onOpenSetup={openSetup}
+            {...(selectedHookState ? { hookState: selectedHookState } : {})}
             {...(selectedModelCatalog.effortOptions !== undefined ? { effortOptions: selectedModelCatalog.effortOptions } : {})}
             {...(restoredDraft?.sessionId === selected.id ? { restoredDraft: { key: restoredDraft.key, text: restoredDraft.text } } : {})}
           /> : undefined}

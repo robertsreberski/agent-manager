@@ -134,3 +134,63 @@ describe("SessionThreadComposer", () => {
     expect(menu).toHaveTextContent("The hook can observe the model but cannot change it.");
   });
 });
+
+/*
+  An ordinary CLI session exposes no queue or steer channel, so read-only is
+  honest. What was missing is that the composer stated the fact without naming
+  the one thing that changes it — and `cockpitContentMode` returns "board" as
+  soon as any session exists, so the operator never met the hook step either.
+*/
+describe("the upgrade path off a read-only session", () => {
+  const observed = {
+    ...session,
+    control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [] },
+  } as unknown as SessionView;
+
+  function renderComposer(props: { hookState?: "absent" | "installed-unseen" | "active" } = {}) {
+    return render(<SessionThreadComposer
+      session={observed}
+      activity={activity}
+      busy={false}
+      mutationsReady
+      onSend={vi.fn(async () => undefined)}
+      onInterrupt={vi.fn(async () => undefined)}
+      onSetProfile={vi.fn(async () => undefined)}
+      onSetModel={vi.fn(async () => undefined)}
+      onSetEffort={vi.fn(async () => undefined)}
+      modelOptions={[]}
+      modelOptionsStatus={null}
+      onOpenSetup={vi.fn()}
+      {...props}
+    />);
+  }
+
+  it("names the missing hook, and offers the command rather than an explanation", () => {
+    renderComposer({ hookState: "absent" });
+
+    expect(document.querySelector('[data-hook-upgrade="absent"]'))
+      .toHaveTextContent("No codex hook is installed.");
+    expect(screen.getByRole("button", { name: "Show me the command" })).toBeInTheDocument();
+  });
+
+  it("says an installed hook is waiting for an event rather than repeating the ask", () => {
+    renderComposer({ hookState: "installed-unseen" });
+
+    expect(document.querySelector('[data-hook-upgrade="installed-unseen"]'))
+      .toHaveTextContent("attaches on this session's next provider event");
+    expect(screen.getByRole("button", { name: "Why is this read-only?" })).toBeInTheDocument();
+  });
+
+  it("claims nothing about hooks before the facts have been read", () => {
+    renderComposer();
+
+    expect(document.querySelector("[data-hook-upgrade]")).toBeNull();
+    expect(screen.getByRole("button", { name: "Why is this read-only?" })).toBeInTheDocument();
+  });
+
+  it("stays quiet when the hook is already doing its job", () => {
+    renderComposer({ hookState: "active" });
+
+    expect(document.querySelector("[data-hook-upgrade]")).toBeNull();
+  });
+});

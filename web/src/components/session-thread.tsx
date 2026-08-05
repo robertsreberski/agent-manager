@@ -38,7 +38,7 @@ import type {
   SessionView,
 } from "../types";
 import { toCockpitSessionView } from "../lib/cockpit-view";
-import type { PlanFileResponse, SelectedSessionFactsResponse } from "../lib/api";
+import type { PlanFileResponse, SelectedSessionFactsResponse, SetupHookOffer } from "../lib/api";
 
 function UserMessage() {
   return (
@@ -310,6 +310,7 @@ export function SessionThreadComposer({
   effortOptions,
   restoredDraft,
   onOpenSetup,
+  hookState,
 }: {
   session: SessionView;
   activity: SessionActivityView;
@@ -325,6 +326,8 @@ export function SessionThreadComposer({
   effortOptions?: readonly ReasoningEffort[];
   restoredDraft?: { key: string; text: string } | null;
   onOpenSetup?: () => void;
+  /** This provider's hook state, once the setup facts have been read. */
+  hookState?: SetupHookOffer["state"];
 }) {
   const [text, setText] = useState("");
   useEffect(() => {
@@ -380,8 +383,29 @@ export function SessionThreadComposer({
         {...(canSetEffort ? { onEffortChange: (effort: ReasoningEffort) => void onSetEffort(effort) } : {})}
         {...(canSetProfile ? { onProfileChange: (profile: ExecutionProfile) => void onSetProfile(profile) } : {})}
       />
+      {/*
+        Read-only is honest — an ordinary CLI session exposes no queue or steer
+        channel — but the composer used to state the fact without naming the one
+        thing that changes it. Where the provider's hook state is known, say
+        what it is; the browser still only reads, and the command is still the
+        operator's to run.
+      */}
       {noWriteReason && onOpenSetup && (
-        <button type="button" data-compact-control="height" className="min-h-9 justify-self-start text-code-sm text-[var(--text-muted)] underline" onClick={onOpenSetup}>Why is this read-only?</button>
+        <div className="grid justify-items-start gap-0.5">
+          {hookState === "absent" && (
+            <p className="text-code-sm text-[var(--text-muted)]" role="status" data-hook-upgrade="absent">
+              No {session.provider} hook is installed. Installing one lets this terminal-started session be answered from here.
+            </p>
+          )}
+          {hookState === "installed-unseen" && (
+            <p className="text-code-sm text-[var(--text-muted)]" role="status" data-hook-upgrade="installed-unseen">
+              The {session.provider} hook is installed but has not been seen yet — it attaches on this session's next provider event.
+            </p>
+          )}
+          <button type="button" data-read-only-explainer data-compact-control="height" className="min-h-9 text-code-sm text-[var(--text-muted)] underline" onClick={onOpenSetup}>
+            {hookState === "absent" ? "Show me the command" : "Why is this read-only?"}
+          </button>
+        </div>
       )}
       {!mutationsReady && (canQueue || canSteer) && <p className="text-center font-mono text-code-xs text-[var(--warning)]">Offline drafts stay on this device and are sent only if the session state is unchanged.</p>}
     </div>

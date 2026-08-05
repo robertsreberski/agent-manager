@@ -33,7 +33,7 @@ describe("touch targets", () => {
 
   it("gives every control a touch floor of its own", () => {
     for (const [file, marker] of [
-      ["web/src/components/session-thread.tsx", "Why is this read-only?"],
+      ["web/src/components/session-thread.tsx", "data-read-only-explainer"],
       ["web/src/components/system/SystemStates.tsx", 'aria-label="Browse folder path"'],
     ] as const) {
       const source = readFileSync(resolve(process.cwd(), file), "utf8");
