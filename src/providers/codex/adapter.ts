@@ -1947,12 +1947,26 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
       return;
     }
     const kind = requestKind(request.method);
+    const requestTurnId = stringField(request.params, "turnId");
+    if (!state.activeTurnId && requestTurnId) {
+      /*
+        A resumed paginated thread deliberately omits turns. Codex can then
+        deliver the first exact server request before it replays a
+        `turn/started` notification, leaving an active provider turn with no
+        local ID. The live request is provider-authoritative evidence for that
+        missing turn. Fill only an empty slot: a different known turn remains
+        a hard mismatch at the bridge's response fence.
+      */
+      state.activeTurnId = requestTurnId;
+      state.status = "running";
+      state.lastTurnStatus = "inProgress";
+    }
     const pending: CodexPendingRequest = {
       id: request.id,
       method: request.method,
       kind,
       threadId,
-      turnId: stringField(request.params, "turnId"),
+      turnId: requestTurnId,
       params: structuredClone(request.params),
       respondable: kind !== "unsupported",
       receivedAt: this.#now().toISOString(),

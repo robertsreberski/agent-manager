@@ -1716,6 +1716,93 @@ test("adopts by Thread.id and unsubscribe releases only this client", async () =
   await adapter.dispose();
 });
 
+test("recovers an omitted active turn from the first exact server request", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  const threadId = "recovered-active-thread";
+  const turnId = "recovered-active-turn";
+  const recovered = (): JsonObject => ({
+    cwd: "/workspace",
+    model: "gpt-5.6",
+    thread: {
+      id: threadId,
+      sessionId: "recovered-tree",
+      parentThreadId: null,
+      cwd: "/workspace",
+      status: { type: "active", activeFlags: [] },
+      // Managed recovery uses excludeTurns, so no turn array is available.
+    },
+  });
+  transport.handlers.set("thread/read", recovered);
+  transport.handlers.set("thread/resume", () => {
+    // This arrives while adoption is still validating identity and is replayed
+    // only after the exact thread has become writable.
+    transport.request("recovered-question", "item/tool/requestUserInput", {
+      threadId,
+      turnId,
+      itemId: "recovered-question-item",
+      questions: [{ id: "choice", header: "Choice", question: "Continue?" }],
+    });
+    return recovered();
+  });
+  const bridge = new CodexProviderBridge({
+    adapter,
+    resolveWorkspace: () => "/workspace",
+  });
+  const signal = new AbortController().signal;
+  const report = await bridge.restoreManagedSessions([{
+    managerSessionId: `local:codex:${threadId}`,
+    provider: "codex",
+    providerThreadId: threadId,
+    workspaceId: "workspace-1",
+    workspacePath: "/workspace",
+    name: "Recovered active thread",
+    profile: "plan",
+    providerTreeId: "recovered-tree",
+    providerParentThreadId: null,
+    createdAt: "2026-08-05T18:00:00.000Z",
+  }], signal);
+
+  assert.deepEqual(report.restoredSessionIds, [`local:codex:${threadId}`]);
+  const waiting = bridge.getManagedSession(threadId);
+  assert.ok(waiting);
+  assert.equal(waiting.providerTurnId, turnId);
+  assert.equal(waiting.status, "waiting");
+  assert.ok(waiting.control.capabilities.includes("respond"));
+  assert.deepEqual(await bridge.performAction(waiting, {
+    type: "respond",
+    requestId: "s:recovered-question",
+    response: {
+      kind: "answer",
+      value: "Continue",
+      selectedOptions: [],
+    },
+    expectedGeneration: waiting.generation,
+    expectedProviderTurnId: waiting.providerTurnId ?? undefined,
+    idempotencyKey: "answer-recovered-question",
+  }, {
+    actor: { id: "local", kind: "local", displayName: "Local user" },
+    requestId: "answer-recovered-question",
+    signal,
+    workspace: null,
+  }), {
+    status: "succeeded",
+    result: {
+      coordination: "first-response-wins",
+      resolution: "submitted",
+    },
+  });
+  assert.deepEqual(transport.messages.find((message) =>
+    message.id === "recovered-question" && Object.hasOwn(message, "result")
+  ), {
+    jsonrpc: "2.0",
+    id: "recovered-question",
+    result: { answers: { choice: { answers: ["Continue"] } } },
+  });
+
+  bridge.dispose();
+  await adapter.dispose();
+});
+
 test("rejects read and resume responses that substitute a different Thread.id", async () => {
   const { adapter, transport } = await initializedAdapter();
   transport.handlers.set("thread/read", () => threadResult("wrong-thread"));
@@ -2862,13 +2949,24 @@ test("execution-environment presence is observational and preserves writes", asy
     true,
   );
   const queued = await adapter.queueMessage("thread-1", "shared client input");
-  assert.equal(queued.status, "dispatched");
+  assert.equal(queued.status, "queued");
   transport.notify("thread/environment/disconnected", {
     threadId: "thread-1",
     environmentId: "other-client",
   });
   assert.deepEqual(adapter.getThreadState("thread-1")?.executionEnvironmentIds, []);
   assert.ok(adapter.getThreadState("thread-1"));
+  transport.notify("serverRequest/resolved", {
+    threadId: "thread-1",
+    requestId: "shared-question",
+  });
+  transport.notify("turn/completed", {
+    threadId: "thread-1",
+    turn: { id: "shared-turn", status: "completed", items: [] },
+  });
+  await eventually(() => {
+    assert.equal(methodMessages(transport, "turn/start").length, 1);
+  });
   await adapter.dispose();
 });
 
@@ -3370,15 +3468,15 @@ test("transport death atomically fails managed sessions and in-flight controls",
   });
   transport.handlers.set("turn/start", () => new Promise<JsonValue>(() => undefined));
   published.length = 0;
+  const dispatch = adapter.queueMessage("thread-1", "queued control");
+  await eventually(() => {
+    assert.equal(methodMessages(transport, "turn/start").length, 2);
+  });
   transport.request("pending-approval", "item/commandExecution/requestApproval", {
     threadId: "thread-1",
     turnId: "turn-1",
     itemId: "item-1",
     command: "git status",
-  });
-  const dispatch = adapter.queueMessage("thread-1", "queued control");
-  await eventually(() => {
-    assert.equal(methodMessages(transport, "turn/start").length, 2);
   });
 
   transport.disconnect(new Error("simulated socket reset"));

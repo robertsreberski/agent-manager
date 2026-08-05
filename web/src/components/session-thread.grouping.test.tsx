@@ -1,4 +1,4 @@
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { ACTIVITY_SCHEMA_VERSION, type ActivityItem, type SessionActivityView, type SessionView } from "../types";
@@ -88,6 +88,29 @@ function renderThread(items: readonly ActivityItem[], options: {
 }
 
 describe("thread-level transport and archive states", () => {
+  it("keeps healthy shared-control guidance inside the session-facts disclosure", () => {
+    const shared = {
+      ...session,
+      provider: "codex",
+      control: {
+        plane: "codex-private",
+        authority: "manager",
+        coordination: { mode: "shared", nativeAttach: "join", responseResolution: "first-response-wins" },
+        recovery: null,
+        capabilities: ["queue", "attach"],
+        withheld: [],
+        takeover: null,
+      },
+    } as SessionView;
+    renderThread([], { session: shared });
+
+    const facts = screen.getByRole("button", { name: "Session facts and capabilities" });
+    expect(facts).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText(/The first surface to answer a question or approval wins/iu)).not.toBeInTheDocument();
+    fireEvent.click(facts);
+    expect(screen.getByText(/The first surface to answer a question or approval wins/iu)).toBeInTheDocument();
+  });
+
   it("keeps retained history visible under a terminal activity banner and retries explicitly", () => {
     const onRetryActivity = vi.fn();
     renderThread([tool("t-1", "Read", 1, "turn-1")], { connection: "offline", onRetryActivity });

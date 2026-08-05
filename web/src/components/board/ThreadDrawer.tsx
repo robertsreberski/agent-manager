@@ -63,7 +63,7 @@ export function ThreadDrawer({ open, title, facts = [], todo = null, onClose, ch
       <DialogPrimitive.Content
         onOpenAutoFocus={() => { openerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null; }}
         onCloseAutoFocus={(event) => { event.preventDefault(); if (openerRef.current?.isConnected) openerRef.current.focus({ preventScroll: true }); }}
-        className="fixed inset-0 z-50 isolate flex w-full max-w-none flex-col overflow-hidden border-l-0 bg-[var(--ground)] shadow-none focus-visible:outline-none min-[901px]:absolute min-[901px]:inset-y-0 min-[901px]:right-0 min-[901px]:left-auto min-[901px]:z-40 min-[901px]:max-w-[760px] min-[901px]:border-l min-[901px]:border-[var(--border-strong)] min-[901px]:bg-[var(--drawer,var(--ground))] min-[901px]:shadow-[var(--shadow-drawer)] min-[901px]:motion-safe:animate-[p-in_160ms_ease-out]"
+        className="fixed inset-0 z-50 isolate flex w-full min-w-0 max-w-none flex-col overflow-hidden border-l-0 bg-[var(--ground)] shadow-none focus-visible:outline-none min-[901px]:absolute min-[901px]:inset-y-0 min-[901px]:right-0 min-[901px]:left-auto min-[901px]:z-40 min-[901px]:max-w-[760px] min-[901px]:border-l min-[901px]:border-[var(--border-strong)] min-[901px]:bg-[var(--drawer,var(--ground))] min-[901px]:shadow-[var(--shadow-drawer)] min-[901px]:motion-safe:animate-[p-in_160ms_ease-out]"
         style={keyboard > 0 ? { paddingBottom: `${keyboard}px` } : undefined}
         data-thread-drawer
         data-phone-surface="fullscreen"
@@ -121,8 +121,8 @@ export function ThreadDrawer({ open, title, facts = [], todo = null, onClose, ch
         </header>
         {/* The phone surface rules the header off; the desktop drawer does not. */}
         <Separator className="shrink-0 bg-[var(--border-hairline)] min-[901px]:hidden" />
-        <div ref={viewportRef} className="min-h-0 flex-1 overflow-y-auto overscroll-contain bg-inherit pt-4 pr-[calc(1rem_+_max(0px,env(safe-area-inset-right)))] pb-2 pl-[calc(1rem_+_max(0px,env(safe-area-inset-left)))] min-[901px]:px-6 min-[901px]:pt-2 min-[901px]:pb-3" data-thread-content>{children}</div>
-        {composer && <footer className="safe-area-bottom shrink-0 bg-inherit pt-2 pr-[calc(1rem_+_max(0px,env(safe-area-inset-right)))] pb-2 pl-[calc(1rem_+_max(0px,env(safe-area-inset-left)))] min-[901px]:px-6 min-[901px]:pt-0 min-[901px]:pb-[18px]" data-thread-composer>{composer}</footer>}
+        <div ref={viewportRef} className="min-h-0 min-w-0 max-w-full flex-1 overflow-x-hidden overflow-y-auto overscroll-contain bg-inherit pt-4 pr-[calc(1rem_+_max(0px,env(safe-area-inset-right)))] pb-2 pl-[calc(1rem_+_max(0px,env(safe-area-inset-left)))] min-[901px]:px-6 min-[901px]:pt-2 min-[901px]:pb-3" data-thread-content>{children}</div>
+        {composer && <footer className="safe-area-bottom w-full min-w-0 max-w-full shrink-0 overflow-x-clip bg-inherit pt-2 pr-[calc(1rem_+_max(0px,env(safe-area-inset-right)))] pb-2 pl-[calc(1rem_+_max(0px,env(safe-area-inset-left)))] min-[901px]:px-6 min-[901px]:pt-0 min-[901px]:pb-[18px]" data-thread-composer>{composer}</footer>}
       </DialogPrimitive.Content>
     </DialogPrimitive.Root>
   );

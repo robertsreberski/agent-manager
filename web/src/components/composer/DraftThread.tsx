@@ -86,8 +86,8 @@ export function DraftThread({
   }, [dispatch]);
 
   return (
-    <div className="grid min-h-full content-between gap-6">
-      <section className="mx-auto w-full max-w-2xl py-8 text-center">
+    <div className="grid min-h-full min-w-0 max-w-full content-between gap-6" data-draft-thread>
+      <section className="mx-auto w-full min-w-0 max-w-2xl py-8 text-center">
         <FolderGit2 size={24} className="mx-auto text-[var(--text-muted)]" />
         <h2 className="mt-3 text-display-sm">New thread</h2>
         {needsWorkspace && <p className="mt-1 text-meta text-[var(--text-muted)]">Choose where this session should run.</p>}

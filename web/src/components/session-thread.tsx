@@ -9,7 +9,7 @@ import {
   useThreadViewportAutoScroll,
   type ThreadMessageLike,
 } from "@assistant-ui/react";
-import { Archive, ArrowDown, LoaderCircle, RefreshCw, RotateCcw, Sparkles, WifiOff } from "lucide-react";
+import { Archive, ArrowDown, ChevronDown, LoaderCircle, RefreshCw, RotateCcw, Sparkles, WifiOff } from "lucide-react";
 import { Button, Collapsible, CollapsibleContent, CollapsibleTrigger } from "./ui";
 import { DISCLOSURE_SCROLL_LOCK_MS, GroupedActivityParts } from "./thread";
 import { MarkdownText } from "./assistant-ui/markdown-text";
@@ -696,7 +696,8 @@ export function SessionThreadComposer({
       ? effortOptions
       : reasoningEffortsForProvider(session.provider);
   const takeoverFailed = takeover?.state === "failed";
-  const showControlStatus = Boolean(noWriteReason || recovery || managedSharedCodex || canTakeControl || canResumeHere || takeoverFailed || resumeError);
+  const showControlStatus = Boolean(noWriteReason || recovery || canTakeControl || canResumeHere || takeoverFailed || resumeError);
+  const routineControlStatus = !recovery && !takeoverFailed && !resumeError && canResumeHere;
   const statusTitle = recovery
     ? recovery.state === "waiting-for-native-exit"
       ? "Claude Code has control"
@@ -707,10 +708,8 @@ export function SessionThreadComposer({
         : `${providerLabel(session)} control needs attention`
     : takeoverFailed
       ? "Web control was not connected"
-    : managedSharedCodex
-      ? "CLI + web connected"
-      : canResumeHere
-        ? "Ready to resume here"
+    : canResumeHere
+      ? "Ready to resume here"
       : session.provider === "codex" && session.control.authority === "foreign"
         ? "Codex CLI is running"
       : session.provider === "claude" && session.control.authority === "foreign"
@@ -730,49 +729,36 @@ export function SessionThreadComposer({
         : "History remains available while Agent Manager restores exact provider control."
     : takeoverFailed
       ? "The conversation history is preserved. Retry the provider-specific migration here; optional CLI access remains under Advanced session facts."
-    : managedSharedCodex
-      ? "Use Codex CLI and web together. The first surface to answer a question or approval wins."
-      : canResumeHere
-        ? "Continue this exact provider conversation in Agent Manager. No terminal command is required."
+    : canResumeHere
+      ? "Continue this exact provider conversation in Agent Manager. No terminal command is required."
       : noWriteReason;
   return (
-    <div className="grid gap-3">
+    <div className="grid min-w-0 max-w-full gap-3" data-session-thread-composer>
       {todo && <TodoList list={todoView(todo, session.todoProgress)} canMessage={canQueue} canStop={canStop && mutationsReady} onAsk={() => setText("What is happening with the current todo?")} onStop={() => void onInterrupt()} />}
       <QueuedMessageCount count={queued.length} />
-      <SessionComposer
-        value={text}
-        onChange={setText}
-        onSend={send}
-        onStop={onInterrupt}
-        isRunning={active}
-        canQueue={canQueue}
-        canSteer={canSteer}
-        canStop={canStop && mutationsReady}
-        readOnlyReason={noWriteReason}
-        provider={session.provider}
-        model={session.model.value}
-        effort={session.effort.value}
-        profile={session.profile.value}
-        sandbox={session.sandbox.value}
-        modelOptions={modelOptions}
-        modelOptionsStatus={modelOptionsStatus}
-        modelChangeUnavailableReason={canSetModel ? null : unavailableReason("set-model", "This harness does not expose live model changes.")}
-        effortChangeUnavailableReason={canSetEffort ? null : unavailableReason("set-effort", "This harness does not expose live effort changes.")}
-        profileChangeUnavailableReason={canSetProfile ? null : unavailableReason("set-profile", "This harness does not expose live execution-profile changes.")}
-        sandboxChangeUnavailableReason={canSetSandbox ? null : unavailableReason("set-sandbox", "This harness does not expose live sandbox changes.")}
-        effortOptions={composerEffortOptions}
-        profileOptions={canSetProfile ? PROFILES : session.profile.value ? [session.profile.value] : []}
-        busy={busy}
-        {...(canSetModel ? { onModelChange: (model: string) => void onSetModel(model) } : {})}
-        {...(canSetEffort ? { onEffortChange: (effort: ReasoningEffort) => void onSetEffort(effort) } : {})}
-        {...(canSetProfile ? { onProfileChange: (profile: ExecutionProfile) => void onSetProfile(profile) } : {})}
-        {...(canSetSandbox ? { onSandboxChange: (sandbox: SandboxPolicy) => void onSetSandbox(sandbox) } : {})}
-        {...(onSearchFiles ? { onSearchFiles } : {})}
-      />
       {showControlStatus && (
-        <div className="grid gap-2 px-0.5 text-code-sm text-[var(--text-muted)]" role="status" data-control-state>
+        <Collapsible
+          key={`${session.id}:${statusTitle}:${routineControlStatus ? "routine" : "active"}`}
+          defaultOpen={!routineControlStatus}
+          className="grid gap-1.5 px-0.5 text-code-xs text-[var(--text-muted)]"
+          role="status"
+          data-control-state
+          data-routine-control-state={routineControlStatus ? "true" : "false"}
+        >
           <div className="flex min-h-7 flex-wrap items-center gap-1.5">
-            <strong className="font-medium text-[var(--text-secondary)]">{statusTitle}</strong>
+            {statusDetail ? (
+              <CollapsibleTrigger
+                data-compact-control="height"
+                data-control-detail-trigger
+                className="group inline-flex min-w-0 items-center gap-1.5 rounded-full px-1.5 text-left font-medium text-[var(--text-faint)] transition-colors hover:bg-[var(--surface-selected)] hover:text-[var(--text-secondary)] data-[state=open]:text-[var(--text-secondary)]"
+              >
+                <span className="size-1.5 shrink-0 rounded-full bg-current opacity-60" aria-hidden="true" />
+                <span className="truncate">{statusTitle}</span>
+                <ChevronDown size={11} className="shrink-0 transition-transform group-data-[state=open]:rotate-180" aria-hidden="true" />
+              </CollapsibleTrigger>
+            ) : (
+              <strong className="font-medium text-[var(--text-secondary)]">{statusTitle}</strong>
+            )}
             {recovery && recovery.state !== "needs-attention" && recovery.state !== "waiting-for-native-exit" && <span aria-hidden="true">·</span>}
             {recovery && recovery.state !== "needs-attention" && recovery.state !== "waiting-for-native-exit" && <span>attempt {recovery.attempt}</span>}
             {deadlineCopy && <><span aria-hidden="true">·</span><span>{deadlineCopy}</span></>}
@@ -781,9 +767,13 @@ export function SessionThreadComposer({
             {hookSetupMissing && !recovery && <><span aria-hidden="true">·</span><button type="button" data-read-only-explainer data-compact-control="height" className="underline underline-offset-2" onClick={onOpenSetup}>Enable live activity</button></>}
             {canShowTakeControl && <><span aria-hidden="true">·</span><button type="button" data-compact-control="height" className="underline underline-offset-2" disabled={!mutationsReady || busy || takeoverBusy} onClick={() => setTakeoverMenuOpen((open) => !open)}>{takeoverFailed ? (codexSharedTarget ? "Retry shared-control migration" : "Retry moving Claude control") : codexSharedTarget ? "Migrate to shared web + CLI" : "Move Claude Code control here"}</button></>}
           </div>
-          {statusDetail && <p data-control-detail>{statusDetail}</p>}
-          {recovery?.state === "retrying" && recovery.nextRetryAt && <p>Agent Manager will retry automatically; the transcript remains available now.</p>}
-          {recovery?.error && !waitingForNativeExit && <Collapsible><CollapsibleTrigger data-compact-control className="cursor-pointer underline underline-offset-2">Technical details</CollapsibleTrigger><CollapsibleContent><pre className="mt-1 whitespace-pre-wrap break-words bg-[var(--surface-raised)] p-2 font-mono text-code-xs text-[var(--text-muted)]" data-recovery-technical-details>{recovery.error}</pre></CollapsibleContent></Collapsible>}
+          {statusDetail && (
+            <CollapsibleContent className="grid gap-1.5 pl-3 text-[var(--text-muted)]" data-control-detail-content>
+              <p data-control-detail>{statusDetail}</p>
+              {recovery?.state === "retrying" && recovery.nextRetryAt && <p>Agent Manager will retry automatically; the transcript remains available now.</p>}
+              {recovery?.error && !waitingForNativeExit && <Collapsible><CollapsibleTrigger data-compact-control className="cursor-pointer underline underline-offset-2">Technical details</CollapsibleTrigger><CollapsibleContent><pre className="mt-1 whitespace-pre-wrap break-words bg-[var(--surface-raised)] p-2 font-mono text-code-xs text-[var(--text-muted)]" data-recovery-technical-details>{recovery.error}</pre></CollapsibleContent></Collapsible>}
+            </CollapsibleContent>
+          )}
           {recoveryError && <p className="text-[var(--warning)]" data-recovery-error>{recoveryError}</p>}
           {resumeError && <p className="text-[var(--warning)]" data-resume-error>{resumeError}</p>}
 
@@ -829,9 +819,39 @@ export function SessionThreadComposer({
               </div>
             </div>
           )}
-        </div>
+        </Collapsible>
       )}
       {!mutationsReady && (canQueue || canSteer) && <p className="text-center font-mono text-code-xs text-[var(--warning)]">Offline drafts stay on this device and are sent only if the session state is unchanged.</p>}
+      <SessionComposer
+        value={text}
+        onChange={setText}
+        onSend={send}
+        onStop={onInterrupt}
+        isRunning={active}
+        canQueue={canQueue}
+        canSteer={canSteer}
+        canStop={canStop && mutationsReady}
+        readOnlyReason={noWriteReason}
+        provider={session.provider}
+        model={session.model.value}
+        effort={session.effort.value}
+        profile={session.profile.value}
+        sandbox={session.sandbox.value}
+        modelOptions={modelOptions}
+        modelOptionsStatus={modelOptionsStatus}
+        modelChangeUnavailableReason={canSetModel ? null : unavailableReason("set-model", "This harness does not expose live model changes.")}
+        effortChangeUnavailableReason={canSetEffort ? null : unavailableReason("set-effort", "This harness does not expose live effort changes.")}
+        profileChangeUnavailableReason={canSetProfile ? null : unavailableReason("set-profile", "This harness does not expose live execution-profile changes.")}
+        sandboxChangeUnavailableReason={canSetSandbox ? null : unavailableReason("set-sandbox", "This harness does not expose live sandbox changes.")}
+        effortOptions={composerEffortOptions}
+        profileOptions={canSetProfile ? PROFILES : session.profile.value ? [session.profile.value] : []}
+        busy={busy}
+        {...(canSetModel ? { onModelChange: (model: string) => void onSetModel(model) } : {})}
+        {...(canSetEffort ? { onEffortChange: (effort: ReasoningEffort) => void onSetEffort(effort) } : {})}
+        {...(canSetProfile ? { onProfileChange: (profile: ExecutionProfile) => void onSetProfile(profile) } : {})}
+        {...(canSetSandbox ? { onSandboxChange: (sandbox: SandboxPolicy) => void onSetSandbox(sandbox) } : {})}
+        {...(onSearchFiles ? { onSearchFiles } : {})}
+      />
     </div>
   );
 }

@@ -34,6 +34,7 @@ describe("ThreadDrawer", () => {
       "inset-0",
       "z-50",
       "isolate",
+      "min-w-0",
       "max-w-none",
       "overflow-hidden",
       "bg-[var(--ground)]",
@@ -46,8 +47,8 @@ describe("ThreadDrawer", () => {
     );
     expect(dialog).not.toHaveClass("motion-safe:animate-[p-in_160ms_ease-out]");
     expect(container.querySelector("[data-thread-header]")).toHaveClass("shrink-0", "bg-inherit");
-    expect(container.querySelector("[data-thread-content]")).toHaveClass("min-h-0", "flex-1", "bg-inherit");
-    expect(container.querySelector("[data-thread-composer]")).toHaveClass("shrink-0", "bg-inherit");
+    expect(container.querySelector("[data-thread-content]")).toHaveClass("min-h-0", "min-w-0", "max-w-full", "flex-1", "overflow-x-hidden", "bg-inherit");
+    expect(container.querySelector("[data-thread-composer]")).toHaveClass("w-full", "min-w-0", "max-w-full", "shrink-0", "overflow-x-clip", "bg-inherit");
   });
 
   it("stays in the tree it was rendered into rather than portalling to the page root", () => {

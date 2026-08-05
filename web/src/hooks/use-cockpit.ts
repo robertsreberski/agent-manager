@@ -41,6 +41,7 @@ import type {
   SessionAction,
   SessionView,
   StateEvent,
+  WireActionUpdate,
   WireStateSnapshot,
   WorkspaceOption,
 } from "../types";
@@ -150,6 +151,10 @@ function apiErrorCode(error: unknown): string | null {
 
 export function isStaleRequestRace(error: unknown): boolean {
   return apiErrorCode(error) === "REQUEST_STALE";
+}
+
+export function isStaleActionUpdate(update: WireActionUpdate): boolean {
+  return update.status === "failed" && update.error?.code === "REQUEST_STALE";
 }
 
 function conflictExpiry(error: unknown): string | null | undefined {
@@ -331,6 +336,7 @@ export function useCockpit() {
   const leasesRef = useRef<Record<string, ControlLease>>({});
   const leaseOperationsRef = useRef(new Map<string, Promise<ControlLease>>());
   const recoveryRef = useRef<Promise<boolean> | null>(null);
+  const staleActionReconciliationsRef = useRef(new Map<string, Promise<void>>());
   const archivedRequestRef = useRef(0);
   const previousSelectedLeaseSessionRef = useRef<string | null>(selectedId);
   const archivedCatalogRef = useRef(archivedCatalog); archivedCatalogRef.current = archivedCatalog;
@@ -354,6 +360,7 @@ export function useCockpit() {
   const clearSensitiveState = useCallback(() => {
     commitSnapshot(EMPTY_SNAPSHOT); setWorkspaces([]); setHosts([]); setLeases({}); leasesRef.current = {};
     leaseOperationsRef.current.clear(); setControlConflicts({}); setBusy({}); setOutbox([]); setOfflineReview([]);
+    staleActionReconciliationsRef.current.clear();
     setArchivedCatalog(EMPTY_ARCHIVED_CATALOG); setResolvedArchivedSession(null);
     setNotice(null); setActionError(null); setHasSuccessfulSnapshot(false); setSelectedId(null);
   }, [commitSnapshot, setSelectedId]);
@@ -396,6 +403,22 @@ export function useCockpit() {
     setHasSuccessfulSnapshot(true);
   }, [commitSnapshot]);
 
+  const reconcileStaleAction = useCallback((update: WireActionUpdate): Promise<void> | null => {
+    if (!isStaleActionUpdate(update)) return null;
+    const known = staleActionReconciliationsRef.current.get(update.id);
+    if (known) return known;
+    // HTTP and SSE carry the same final action record and may arrive in either
+    // order. Keep one bounded reconciliation promise per action so neither path
+    // can produce a toast or issue a second snapshot request.
+    if (staleActionReconciliationsRef.current.size >= 128) {
+      const oldest = staleActionReconciliationsRef.current.keys().next().value;
+      if (oldest !== undefined) staleActionReconciliationsRef.current.delete(oldest);
+    }
+    const reconciliation = refresh().catch(() => undefined);
+    staleActionReconciliationsRef.current.set(update.id, reconciliation);
+    return reconciliation;
+  }, [refresh]);
+
   useEffect(() => { void recoverBrowserSession(); }, [recoverBrowserSession]);
   useEffect(() => {
     function syncNavigation() {
@@ -430,7 +453,9 @@ export function useCockpit() {
         commitSnapshot(applyStateEvent(snapshotRef.current, event));
         if (event.type === "snapshot") setHasSuccessfulSnapshot(true);
         if (event.type === "action.updated") {
-          if (event.payload.status === "queued") setNotice("Message queued.");
+          const reconciliation = reconcileStaleAction(event.payload);
+          if (reconciliation) void reconciliation;
+          else if (event.payload.status === "queued") setNotice("Message queued.");
           else if (event.payload.status === "succeeded") setNotice("Action completed.");
           else if (event.payload.status === "failed" || event.payload.status === "unknown") setActionError(event.payload.error?.message ?? (event.payload.status === "unknown" ? "The action outcome is unknown and was not replayed." : "The action failed."));
         }
@@ -444,7 +469,7 @@ export function useCockpit() {
       onUpgradeRequired: (error) => { handleFailure(error); },
     });
     return () => { cancelled = true; disconnect(); };
-  }, [api, commitSnapshot, handleFailure, markDisconnected, refresh]);
+  }, [api, commitSnapshot, handleFailure, markDisconnected, reconcileStaleAction, refresh]);
 
   useEffect(() => {
     if (!api) return;
@@ -612,23 +637,25 @@ export function useCockpit() {
     const capability = requiredCapability(action.type, action.type === "send" ? action.delivery : undefined);
     if (!session.control.capabilities.includes(capability)) throw new Error(session.control.withheld.find((item) => item.capability === capability)?.reason ?? "This control plane does not support that action.");
     try {
-      await withBusy(`action:${session.id}`, async () => {
+      const update = await withBusy(`action:${session.id}`, async () => {
         let writer = await ensureLease(session);
-        try { await api.action(session.id, action, writer.token); }
+        try { return await api.action(session.id, action, writer.token); }
         catch (error) {
           const expiry = conflictExpiry(error);
           if (expiry !== undefined) { setControlConflicts((value) => ({ ...value, [session.id]: expiry })); throw error; }
           if (apiErrorCode(error) !== "LEASE_INVALID") throw error;
-          forgetLease(session.id); writer = await ensureLease(session); await api.action(session.id, action, writer.token);
+          forgetLease(session.id); writer = await ensureLease(session); return api.action(session.id, action, writer.token);
         }
       });
+      const reconciliation = reconcileStaleAction(update);
+      if (reconciliation) await reconciliation;
     } catch (error) {
       if (!isStaleRequestRace(error)) throw error;
       // Another surface or the provider won this exact request race. Reconcile
       // the controls without turning a normal first-winner outcome into a toast.
       await refresh().catch(() => undefined);
     }
-  }, [api, ensureLease, forgetLease, mutationsReady, refresh, withBusy]);
+  }, [api, ensureLease, forgetLease, mutationsReady, reconcileStaleAction, refresh, withBusy]);
 
   const sendMessage = useCallback(async (session: SessionView, text: string, delivery: "queue" | "steer") => {
     const trimmed = text.trim(); if (!trimmed) return;

@@ -433,6 +433,85 @@
   display: none;
 }
 
+/*
+  The composer lives in both a full-screen phone surface and a fixed 760px
+  desktop drawer. Viewport breakpoints cannot describe both: at a 1200px
+  viewport the composer still has only the drawer's inner width. Its own inline
+  size therefore decides whether the controls use one row or two.
+*/
+[data-session-composer] {
+  container: session-composer / inline-size;
+}
+
+.composer-toolbar {
+  display: grid;
+  grid-template-areas:
+    "runtime actions"
+    "policies policies";
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 0.625rem;
+  row-gap: 0.375rem;
+}
+
+.composer-toolbar__runtime {
+  grid-area: runtime;
+  display: flex;
+  min-width: 0;
+  max-width: 100%;
+  align-items: center;
+  gap: 0.625rem;
+}
+
+.composer-toolbar__policies {
+  grid-area: policies;
+  display: flex;
+  min-width: 0;
+  max-width: 100%;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.composer-toolbar__actions {
+  grid-area: actions;
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-self: end;
+  gap: 0.625rem;
+}
+
+/* A divider must never be stranded at the edge of a wrapped compact row. */
+.composer-wide-separator {
+  display: none;
+}
+
+/* 52rem leaves enough content width for the longest supported control row. */
+@container session-composer (min-width: 52rem) {
+  .composer-toolbar {
+    display: flex;
+    gap: 0.875rem;
+  }
+
+  .composer-toolbar__runtime,
+  .composer-toolbar__policies,
+  .composer-toolbar__actions {
+    display: flex;
+    flex-wrap: nowrap;
+    gap: 0.875rem;
+  }
+
+  .composer-toolbar__actions {
+    margin-left: auto;
+    justify-self: auto;
+  }
+
+  .composer-wide-separator {
+    display: block;
+  }
+}
+
 @media (max-width: 900px) {
   .approval-request__actions {
     flex-direction: column-reverse;
@@ -446,30 +525,36 @@
 
   .question-request__phone-footer {
     position: sticky;
-    bottom: -20px;
+    bottom: 0;
     z-index: 30;
-    display: flex;
-    width: calc(100% + 68px);
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
     min-height: 68px;
     margin-top: 10px;
-    margin-left: -52px;
     align-items: center;
     gap: 12px;
     border-top: 1px solid var(--border-hairline);
     background: var(--surface-raised);
-    padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
+    padding: 12px;
     box-shadow: 0 -12px 30px rgb(0 0 0 / 0.3);
   }
 
-  [data-thread-drawer]:has(.question-request__phone-footer) > [data-thread-composer] {
-    display: none;
+  .question-request__phone-footer > button {
+    max-width: 100%;
   }
 }
 
-@media (min-width: 640px) and (max-width: 900px) {
+@media (max-width: 360px) {
   .question-request__phone-footer {
-    width: calc(100% + 84px);
-    margin-left: -60px;
+    grid-template-columns: minmax(0, 1fr);
+    align-items: stretch;
+  }
+
+  .question-request__phone-footer > button {
+    width: 100%;
   }
 }
 

@@ -119,6 +119,7 @@ describe("SessionCapabilityPanel", () => {
     expect(screen.getByRole("button", { name: "Advanced · CLI access" })).toHaveAttribute("aria-expanded", "false");
     expect(screen.queryByRole("button", { name: "Show Codex CLI join command" })).not.toBeInTheDocument();
     expect(screen.getByText("Shared CLI + web")).toBeInTheDocument();
+    expect(screen.getByText("Use Codex CLI and web together. The first surface to answer a question or approval wins.")).toBeInTheDocument();
 
     const resumable = cockpitSession({ activity: "completed", control: { ...cockpitSession().control, capabilities: ["resume", "attach"] } });
     rerender(<SessionCapabilityPanel session={resumable} facts={facts} factsStatus="loaded" />);

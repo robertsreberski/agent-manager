@@ -263,9 +263,18 @@ describe("CockpitApi", () => {
 
   it("sends the CSRF and control-lease tokens on semantic actions", async () => {
     let capturedInit: RequestInit | undefined;
+    const update = {
+      id: "action-1",
+      sessionId: "managed-1",
+      type: "send" as const,
+      status: "queued" as const,
+      createdAt: "2026-08-05T20:00:00.000Z",
+      completedAt: null,
+      error: null,
+    };
     const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       capturedInit = init;
-      return new Response(JSON.stringify({ action: { status: "queued" } }), {
+      return new Response(JSON.stringify({ action: update }), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
@@ -273,13 +282,13 @@ describe("CockpitApi", () => {
     vi.stubGlobal("fetch", fetchMock);
     const api = new CockpitApi({ csrfToken: "csrf-token", actor: "Local" });
 
-    await api.action("managed-1", {
+    await expect(api.action("managed-1", {
       type: "send",
       delivery: "queue",
       text: "Continue",
       expectedGeneration: 3,
       idempotencyKey: "idempotency-key",
-    }, "lease-token");
+    }, "lease-token")).resolves.toEqual(update);
 
     const init = capturedInit;
     if (!init) throw new Error("fetch init was not captured");

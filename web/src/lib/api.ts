@@ -27,7 +27,11 @@ import {
   type SetupHookApplyResponse,
   type SetupReadModel,
 } from "../../../src/shared/setup.ts";
-import { assertCurrentWireIdentity } from "../../../src/shared/wire.ts";
+import {
+  actionUpdateSchema,
+  assertCurrentWireIdentity,
+  type WireActionUpdate,
+} from "../../../src/shared/wire.ts";
 import { parseSessionRecord, parseSnapshot } from "./normalize";
 import type {
   AttachInstruction,
@@ -88,6 +92,10 @@ const previewResponseSchema = z.object({
   truncated: z.boolean(),
   lineCount: z.number().int().nonnegative(),
   byteCount: z.number().int().nonnegative(),
+}).strict();
+
+const actionResponseSchema = z.object({
+  action: actionUpdateSchema,
 }).strict();
 
 const attachInstructionSchema = z.object({
@@ -566,12 +574,13 @@ export class CockpitApi {
     return session;
   }
 
-  async action(id: string, action: SessionAction, leaseToken: string): Promise<void> {
-    await this.request(`/api/v1/sessions/${encodeURIComponent(id)}/actions`, {
+  async action(id: string, action: SessionAction, leaseToken: string): Promise<WireActionUpdate> {
+    const result = await this.request<unknown>(`/api/v1/sessions/${encodeURIComponent(id)}/actions`, {
       method: "POST",
       headers: { "x-control-lease": leaseToken },
       body: JSON.stringify(action),
     });
+    return parseResponse(actionResponseSchema, result, "action").action;
   }
 
   async preview(id: string): Promise<PanePreview> {

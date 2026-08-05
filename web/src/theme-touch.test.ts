@@ -82,3 +82,39 @@ describe("safe areas on the phone surface", () => {
     }
   });
 });
+
+describe("composer width containment", () => {
+  it("responds to the composer's own width instead of the viewport", () => {
+    expect(block(/\[data-session-composer\]\s*\{[^}]+\}/u))
+      .toContain("container: session-composer / inline-size");
+    expect(styles).toContain("@container session-composer (min-width: 52rem)");
+
+    const compact = block(/\.composer-toolbar\s*\{[^}]+\}/u);
+    expect(compact).toContain("display: grid");
+    expect(compact).toContain('"runtime actions"');
+    expect(compact).toContain('"policies policies"');
+  });
+
+  it("keeps compact controls grouped and wide-only separators out of wrapped rows", () => {
+    expect(block(/\.composer-toolbar__policies\s*\{[^}]+\}/u)).toContain("flex-wrap: wrap");
+    expect(block(/\.composer-wide-separator\s*\{[^}]+\}/u)).toContain("display: none");
+  });
+});
+
+describe("question request containment", () => {
+  it("keeps the phone submit footer inside the thread scroller", () => {
+    const footer = block(/\.question-request__phone-footer\s*\{(?=[^}]*position:\s*sticky)[^}]+\}/u);
+    expect(footer).toContain("bottom: 0");
+    expect(footer).toContain("grid-template-columns: minmax(0, 1fr) auto");
+    expect(footer).toContain("width: 100%");
+    expect(footer).toContain("max-width: 100%");
+    expect(footer).not.toContain("calc(100% +");
+    expect(footer).not.toMatch(/margin-left:\s*-/u);
+  });
+
+  it("keeps the composer visible beside an expanded question request", () => {
+    expect(styles).not.toMatch(/:has\(\.question-request__phone-footer\)[^{]*\{[^}]*display:\s*none/u);
+    expect(styles).toContain("@media (max-width: 360px)");
+    expect(styles).toMatch(/\.question-request__phone-footer\s*>\s*button\s*\{[^}]*(?:^|\n)\s*width:\s*100%/u);
+  });
+});

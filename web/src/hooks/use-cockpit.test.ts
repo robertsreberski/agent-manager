@@ -4,12 +4,25 @@ import { ApiError, CockpitApi } from "../lib/api";
 import { BrowserSessionError } from "../lib/auth";
 import * as authModule from "../lib/auth";
 import * as sseModule from "../lib/sse";
-import type { ControlLease, HostOption, SessionView, StateEvent, WireStateSnapshot, WorkspaceOption } from "../types";
+import type { ControlLease, HostOption, SessionView, StateEvent, WireActionUpdate, WireStateSnapshot, WorkspaceOption } from "../types";
 import { AGENT_MANAGER_BUILD_ID, WireUpgradeRequiredError, WIRE_SCHEMA_VERSION } from "../types";
-import { acquireAutomaticLease, applyStateEvent, generateBrowserClientId, isStaleRequestRace, mutationsAreReady, releaseHeldSessionLease, releaseLeasesForPageExit, reloadForWireUpgrade, renewForegroundLease, resolveArchivedSelection, sensitiveBoundaryStatus, sessionNeedsForegroundLease, shouldRenewForegroundLease, useCockpit, WIRE_UPGRADE_RELOAD_STORAGE_KEY } from "./use-cockpit";
+import { acquireAutomaticLease, applyStateEvent, generateBrowserClientId, isStaleActionUpdate, isStaleRequestRace, mutationsAreReady, releaseHeldSessionLease, releaseLeasesForPageExit, reloadForWireUpgrade, renewForegroundLease, resolveArchivedSelection, sensitiveBoundaryStatus, sessionNeedsForegroundLease, shouldRenewForegroundLease, useCockpit, WIRE_UPGRADE_RELOAD_STORAGE_KEY } from "./use-cockpit";
 
 function lease(token: string, seconds = 300): ControlLease {
   return { token, clientId: "browser", expiresAt: new Date(Date.now() + seconds * 1_000).toISOString() };
+}
+
+function actionUpdate(overrides: Partial<WireActionUpdate> = {}): WireActionUpdate {
+  return {
+    id: "action-1",
+    sessionId: "local:codex:one",
+    type: "respond",
+    status: "succeeded",
+    createdAt: "2026-08-05T20:00:00.000Z",
+    completedAt: "2026-08-05T20:00:01.000Z",
+    error: null,
+    ...overrides,
+  };
 }
 
 const target = { id: "local:codex:one" } as SessionView;
@@ -229,7 +242,10 @@ describe("semantic web resume", () => {
       return () => undefined;
     });
     vi.spyOn(CockpitApi.prototype, "acquireLease").mockResolvedValue(lease("resume-writer", 60));
-    const action = vi.spyOn(CockpitApi.prototype, "action").mockResolvedValue(undefined);
+    const action = vi.spyOn(CockpitApi.prototype, "action").mockResolvedValue(actionUpdate({
+      sessionId: resumable.id,
+      type: "resume",
+    }));
 
     const { result } = renderHook(() => useCockpit());
     await waitFor(() => expect(result.current.mutationsReady).toBe(true));
@@ -243,6 +259,124 @@ describe("semantic web resume", () => {
       expectedGeneration: 7,
       idempotencyKey: expect.any(String),
     }), "resume-writer");
+  });
+});
+
+describe("first-response-wins reconciliation", () => {
+  const waiting = {
+    id: "local:codex:waiting",
+    provider: "codex",
+    providerThreadId: "waiting",
+    providerTurnId: "turn-waiting",
+    hostId: "local",
+    hostLabel: "This Mac",
+    archived: false,
+    status: "waiting",
+    generation: 9,
+    cwd: "/workspace",
+    workspaceIdentity: null,
+    attention: [{ id: "s:question", kind: "question", summary: "Choose" }],
+    updatedAt: "2026-08-05T20:00:00.000Z",
+    todoProgress: null,
+    model: { value: "gpt-5.6" },
+    effort: { value: "high" },
+    profile: { value: "plan" },
+    control: {
+      plane: "codex-private",
+      authority: "manager",
+      coordination: { mode: "shared", nativeAttach: "join", responseResolution: "first-response-wins" },
+      recovery: null,
+      capabilities: ["respond"],
+      withheld: [],
+      takeover: null,
+    },
+  } as unknown as SessionView;
+  const stale = actionUpdate({
+    id: "stale-answer",
+    sessionId: waiting.id,
+    status: "failed",
+    error: {
+      code: "REQUEST_STALE",
+      message: "the Codex request is no longer active; another provider peer may have responded first",
+    },
+  });
+
+  function connect() {
+    let onEvent: ((event: StateEvent) => void) | null = null;
+    vi.spyOn(authModule, "establishBrowserSession").mockResolvedValue({ csrfToken: "csrf", actor: "browser" });
+    const sessions = vi.spyOn(CockpitApi.prototype, "sessions")
+      .mockResolvedValueOnce({ ...snapshot, seq: 4, sessions: [waiting] })
+      .mockResolvedValue({ ...snapshot, seq: 6, sessions: [{ ...waiting, attention: [] }] });
+    vi.spyOn(CockpitApi.prototype, "workspaces").mockResolvedValue([]);
+    vi.spyOn(CockpitApi.prototype, "hosts").mockResolvedValue([]);
+    vi.spyOn(CockpitApi.prototype, "archivedSessions").mockResolvedValue({ sessions: [], nextCursor: null, total: 0, query: "" });
+    vi.spyOn(sseModule, "connectCockpitEvents").mockImplementation((options) => {
+      options.onConnection("open");
+      onEvent = options.onEvent;
+      return () => undefined;
+    });
+    vi.spyOn(CockpitApi.prototype, "acquireLease").mockResolvedValue(lease("response-writer", 60));
+    return {
+      sessions,
+      emit(event: StateEvent) {
+        if (!onEvent) throw new Error("SSE listener is not connected");
+        onEvent(event);
+      },
+    };
+  }
+
+  it("quietly reconciles a stale result returned directly by POST actions", async () => {
+    const { sessions } = connect();
+    vi.spyOn(CockpitApi.prototype, "action").mockResolvedValue(stale);
+    const { result } = renderHook(() => useCockpit());
+    await waitFor(() => expect(result.current.mutationsReady).toBe(true));
+
+    await act(async () => {
+      await result.current.respond(waiting, "s:question", {
+        kind: "answer",
+        value: "Continue",
+        selectedOptions: [],
+      });
+    });
+
+    expect(sessions).toHaveBeenCalledTimes(2);
+    expect(result.current.actionError).toBeNull();
+  });
+
+  it("deduplicates the same stale result when SSE wins the delivery race", async () => {
+    const connection = connect();
+    let finishAction!: (update: WireActionUpdate) => void;
+    const action = vi.spyOn(CockpitApi.prototype, "action").mockImplementation(() => new Promise((resolve) => {
+      finishAction = resolve;
+    }));
+    const { result } = renderHook(() => useCockpit());
+    await waitFor(() => expect(result.current.mutationsReady).toBe(true));
+
+    let response!: Promise<void>;
+    act(() => {
+      response = result.current.respond(waiting, "s:question", {
+        kind: "answer",
+        value: "Continue",
+        selectedOptions: [],
+      });
+    });
+    await waitFor(() => expect(action).toHaveBeenCalled());
+    act(() => connection.emit({
+      schemaVersion: WIRE_SCHEMA_VERSION,
+      buildId: AGENT_MANAGER_BUILD_ID,
+      seq: 5,
+      at: "2026-08-05T20:00:02.000Z",
+      type: "action.updated",
+      payload: stale,
+    }));
+    await waitFor(() => expect(connection.sessions).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      finishAction(stale);
+      await response;
+    });
+
+    expect(connection.sessions).toHaveBeenCalledTimes(2);
+    expect(result.current.actionError).toBeNull();
   });
 });
 
@@ -380,5 +514,13 @@ describe("browser identity and connectivity", () => {
       error: { code: "STALE_GENERATION", message: "refresh before retrying" },
     }))).toBe(false);
     expect(isStaleRequestRace(new Error("REQUEST_STALE"))).toBe(false);
+    expect(isStaleActionUpdate(actionUpdate({
+      status: "failed",
+      error: { code: "REQUEST_STALE", message: "already answered" },
+    }))).toBe(true);
+    expect(isStaleActionUpdate(actionUpdate({
+      status: "failed",
+      error: { code: "STALE_GENERATION", message: "refresh first" },
+    }))).toBe(false);
   });
 });

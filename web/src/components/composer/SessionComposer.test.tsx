@@ -372,6 +372,33 @@ describe("SessionComposer", () => {
     expect(screen.queryByRole("button", { name: "Stop turn" })).not.toBeInTheDocument();
   });
 
+  it("groups every control into a composer-width responsive toolbar", () => {
+    renderComposer({
+      model: "gpt-5.6-sol",
+      effort: "max",
+      effortOptions: ["low", "medium", "high", "max"],
+      profile: "full-access",
+      sandbox: null,
+      onProfileChange: vi.fn(),
+      onSandboxChange: vi.fn(),
+    });
+
+    const composer = document.querySelector<HTMLElement>("[data-session-composer]");
+    const toolbar = document.querySelector<HTMLElement>("[data-composer-toolbar]");
+    const runtime = toolbar?.querySelector<HTMLElement>(".composer-toolbar__runtime");
+    const policies = toolbar?.querySelector<HTMLElement>(".composer-toolbar__policies");
+    const actions = toolbar?.querySelector<HTMLElement>(".composer-toolbar__actions");
+
+    expect(composer).toHaveClass("w-full", "min-w-0", "max-w-full");
+    expect(toolbar).toHaveClass("min-w-0", "max-w-full");
+    expect(runtime).toContainElement(screen.getByRole("combobox", { name: /gpt-5\.6-sol/i }));
+    expect(runtime).toContainElement(screen.getByRole("img", { name: /Max effort/u }));
+    expect(policies).toContainElement(screen.getByRole("button", { name: /Full access/u }));
+    expect(policies).toContainElement(screen.getByRole("button", { name: /Sandbox unknown/u }));
+    expect(policies?.querySelectorAll(".composer-wide-separator")).toHaveLength(2);
+    expect(actions).toContainElement(screen.getByRole("button", { name: "Queue message" }));
+  });
+
   it("marks every compact primary composer control for coarse-pointer expansion", () => {
     const { unmount } = render(<SessionComposer value="Send this" onChange={vi.fn()} onSend={vi.fn()} isRunning={false} canQueue canSteer={false} canStop={false} provider="codex" model="gpt" effort="medium" profile="execute" onModelChange={vi.fn()} onProfileChange={vi.fn()} />);
     for (const control of [

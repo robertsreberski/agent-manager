@@ -333,7 +333,7 @@ export function SessionComposer(props: SessionComposerProps) {
   }
 
   return (
-    <div className="rounded-composer border border-[var(--border-hairline)] bg-[var(--surface-raised-hover)] px-3.5 pt-3.5 pb-2.5" data-session-composer>
+    <div className="w-full min-w-0 max-w-full rounded-composer border border-[var(--border-hairline)] bg-[var(--surface-raised-hover)] px-3.5 pt-3.5 pb-2.5" data-session-composer>
       {trigger && suggestions.length > 0 && (
         <ul
           className="mb-2 max-h-52 min-w-0 overflow-y-auto overscroll-contain border border-[var(--border)] bg-[var(--menu)]"
@@ -380,7 +380,8 @@ export function SessionComposer(props: SessionComposerProps) {
         aria-expanded={Boolean(trigger && suggestions.length > 0)}
         placeholder={readOnlyReason ? "" : isRunning ? "Queue a message…" : composerPlaceholder(provider, Boolean(onSearchFiles))}
       />
-      <div className="flex min-w-0 items-center gap-2.5 sm:gap-3.5">
+      <div className="composer-toolbar min-w-0 max-w-full" data-composer-toolbar>
+        <div className="composer-toolbar__runtime">
         {/*
           assistant-ui's ModelSelector, composed rather than taken whole: its
           default export registers the selection into `ModelContext`, where it
@@ -469,25 +470,27 @@ export function SessionComposer(props: SessionComposerProps) {
             )}
           </ModelSelectorContent>
         </ModelSelectorRoot>
-        <span
-          className="flex min-h-[17px] shrink-0 items-end gap-0.5 text-code-xs text-[var(--text-muted)]"
-          role="img"
-          aria-label={hasEffortScale ? `${effortLabel(effort)} effort, level ${effortIndex + 1} of ${effortOptions.length}` : `${effortLabel(effort)} effort`}
-          data-effort-meter={hasEffortScale ? "scaled" : "word-only"}
-        >
-          {hasEffortScale ? effortOptions.map((option, index) => {
-            const active = index <= effortIndex;
-            return <span
-              key={option}
-              data-effort-bar={active ? "active" : "inactive"}
-              data-effort-level={option}
-              className={`w-[3px] ${active ? "bg-[var(--accent)]" : "bg-[var(--border-strong)]"}`}
-              style={{ height: `${5 + index * 2}px` }}
-            />;
-          }) : <span data-effort-word>{effortLabel(effort)}</span>}
-          {hasEffortScale && (effort === "max" || effort === "ultra") && <span className="ml-1" data-effort-word>{effortLabel(effort)}</span>}
-        </span>
-        <span className="h-3.5 w-px shrink-0 bg-[var(--border)]" />
+          <span
+            className="flex min-h-[17px] shrink-0 items-end gap-0.5 text-code-xs text-[var(--text-muted)]"
+            role="img"
+            aria-label={hasEffortScale ? `${effortLabel(effort)} effort, level ${effortIndex + 1} of ${effortOptions.length}` : `${effortLabel(effort)} effort`}
+            data-effort-meter={hasEffortScale ? "scaled" : "word-only"}
+          >
+            {hasEffortScale ? effortOptions.map((option, index) => {
+              const active = index <= effortIndex;
+              return <span
+                key={option}
+                data-effort-bar={active ? "active" : "inactive"}
+                data-effort-level={option}
+                className={`w-[3px] ${active ? "bg-[var(--accent)]" : "bg-[var(--border-strong)]"}`}
+                style={{ height: `${5 + index * 2}px` }}
+              />;
+            }) : <span data-effort-word>{effortLabel(effort)}</span>}
+            {hasEffortScale && (effort === "max" || effort === "ultra") && <span className="ml-1" data-effort-word>{effortLabel(effort)}</span>}
+          </span>
+        </div>
+        <div className="composer-toolbar__policies">
+        <span className="composer-wide-separator h-3.5 w-px shrink-0 bg-[var(--border)]" />
         <DropdownMenu open={openMenu === "profile"} onOpenChange={(next) => setOpenMenu(next ? "profile" : null)}>
           <DropdownMenuTrigger asChild disabled={profileDisabled}>
             <Button
@@ -523,7 +526,7 @@ export function SessionComposer(props: SessionComposerProps) {
         */}
         {showSandbox && (
           <>
-            <span className="h-3.5 w-px shrink-0 bg-[var(--border)]" />
+            <span className="composer-wide-separator h-3.5 w-px shrink-0 bg-[var(--border)]" />
             <DropdownMenu open={openMenu === "sandbox"} onOpenChange={(next) => setOpenMenu(next ? "sandbox" : null)}>
               <DropdownMenuTrigger asChild disabled={sandboxDisabled}>
                 <Button
@@ -563,7 +566,8 @@ export function SessionComposer(props: SessionComposerProps) {
             </DropdownMenu>
           </>
         )}
-        <span className="min-w-0 flex-1" />
+        </div>
+        <div className="composer-toolbar__actions">
         <span className="hidden shrink-0 font-mono text-code-sm whitespace-nowrap text-[var(--text-muted)] md:inline">{isRunning ? "queues while running" : "↵ sends"}</span>
         {/*
           A withheld capability, not decoration: it stays visible, disabled, and
@@ -577,6 +581,7 @@ export function SessionComposer(props: SessionComposerProps) {
         ) : (
           <Button variant="primary" size="icon" data-compact-control disabled={sendDisabled} className="size-[30px]" aria-label={isRunning ? "Queue message" : "Send message"} onClick={() => void send("queue")}><ArrowUp size={15} strokeWidth={2} /></Button>
         )}
+        </div>
       </div>
     </div>
   );

@@ -115,6 +115,7 @@ describe("SessionThreadComposer", () => {
     expect(screen.getByRole("button", { name: /execute/i })).toBeDisabled();
     expect(screen.getByRole("button", { name: /execute/i })).toHaveAttribute("title", "The hook exposes no profile control.");
     expect(document.querySelector("[data-withheld-reasons]")).toBeNull();
+    expect(document.querySelector("[data-session-thread-composer]")).toHaveClass("min-w-0", "max-w-full");
   });
 
   it("hands a read-only session a way to reach the setup that would fix it", () => {
@@ -169,7 +170,7 @@ describe("SessionThreadComposer", () => {
     />);
 
     expect(screen.queryByRole("button", { name: "Enable live activity" })).not.toBeInTheDocument();
-    expect(screen.getByText("CLI + web connected")).toBeInTheDocument();
+    expect(document.querySelector("[data-control-state]")).not.toBeInTheDocument();
   });
 
   it("explains external Codex takeover as a one-time migration to shared control", () => {
@@ -354,7 +355,9 @@ describe("SessionThreadComposer", () => {
     />);
 
     expect(screen.getByRole("textbox", { name: "Message" })).toBeEnabled();
-    expect(screen.getByText("CLI + web connected")).toBeInTheDocument();
+    expect(document.querySelector("[data-control-state]")).not.toBeInTheDocument();
+    expect(screen.queryByText(/The first surface to answer a question or approval wins/iu)).not.toBeInTheDocument();
+    expect(document.querySelector("[data-session-thread-composer]")?.lastElementChild).toHaveAttribute("data-session-composer");
     expect(screen.queryByRole("button", { name: /CLI (?:join|resume) command/iu })).not.toBeInTheDocument();
     expect(screen.queryByText(/codex resume/iu)).not.toBeInTheDocument();
   });
@@ -455,7 +458,11 @@ describe("SessionThreadComposer", () => {
       onResumeInWeb={onResumeInWeb}
     />);
 
-    expect(screen.getByText("Ready to resume here")).toBeInTheDocument();
+    const details = screen.getByRole("button", { name: "Ready to resume here" });
+    expect(details).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText(/No terminal command is required/iu)).not.toBeInTheDocument();
+    expect(document.querySelector("[data-session-thread-composer]")?.lastElementChild).toHaveAttribute("data-session-composer");
+    fireEvent.click(details);
     expect(screen.getByText(/No terminal command is required/iu)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Resume here" }));
     await waitFor(() => expect(onResumeInWeb).toHaveBeenCalledOnce());

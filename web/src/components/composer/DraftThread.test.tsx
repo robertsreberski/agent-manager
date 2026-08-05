@@ -62,6 +62,12 @@ function workspaceRow(overrides: Partial<WorkspaceOption> & { path: string }): W
 }
 
 describe("DraftThread", () => {
+  it("contains the draft shell at the drawer's available width", () => {
+    const { view } = draftThread();
+    expect(view.container.querySelector("[data-draft-thread]")).toHaveClass("min-w-0", "max-w-full");
+    expect(view.container.querySelector("[data-session-composer]")).toHaveClass("w-full", "min-w-0", "max-w-full");
+  });
+
   it("offers each repository once, not one chip per worktree", () => {
     draftThread({
       workspaces: [
