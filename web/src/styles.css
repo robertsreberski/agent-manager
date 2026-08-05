@@ -1,4 +1,7 @@
 @import "tailwindcss";
+/* The shimmer the assistant-ui reasoning and tool-group triggers use while a
+   part is still streaming. Its own rules honour `prefers-reduced-motion`. */
+@import "tw-shimmer";
 
 @font-face {
   font-family: "Instrument Sans";
@@ -387,6 +390,21 @@
 @keyframes cockpit-p-out {
   from { opacity: 1; transform: translateY(0); }
   to { opacity: 0; transform: translateY(5px); }
+}
+
+/*
+  The assistant-ui reasoning and tool-group panels animate their height. Their
+  vendored source targets Base UI's `data-open`/`data-closed`; this app is on
+  Radix, which reports `data-state` and measures the panel into
+  `--radix-collapsible-content-height`, so the port drives these from there.
+*/
+@keyframes cockpit-collapsible-down {
+  from { height: 0; }
+  to { height: var(--radix-collapsible-content-height); }
+}
+@keyframes cockpit-collapsible-up {
+  from { height: var(--radix-collapsible-content-height); }
+  to { height: 0; }
 }
 
 .motion-p-in { animation: p-in 160ms ease-out; }

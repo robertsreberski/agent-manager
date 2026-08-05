@@ -2,6 +2,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { DISCLOSURE_SCROLL_LOCK_MS, ToolCall, ToolGroupShell } from "./GroupedActivityParts";
+import { TOOL_GROUP_ANIMATION_MS } from "../assistant-ui/tool-group";
 
 const CODEX_TOOL_NAME = `/bin/zsh -lc "sed -n '1,260p' 'README.md' && rg --files -g '*.ts' | head -200"`;
 const CODEX_ARGS = {
@@ -241,7 +242,9 @@ describe("transcript scroll stability", () => {
     fireEvent.scroll(transcript);
     expect(transcript.scrollTop).toBe(420);
 
-    vi.advanceTimersByTime(DISCLOSURE_SCROLL_LOCK_MS + 1);
+    // The group's panel now animates its height, so the lock has to outlive the
+    // animation rather than just the reflow a bare disclosure caused.
+    vi.advanceTimersByTime(TOOL_GROUP_ANIMATION_MS + 1);
     transcript.scrollTop = 96;
     fireEvent.scroll(transcript);
     expect(transcript.scrollTop).toBe(96);

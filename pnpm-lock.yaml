@@ -42,6 +42,9 @@ importers:
       '@radix-ui/react-dropdown-menu':
         specifier: ^2.1.24
         version: 2.1.24(@types/react-dom@19.2.3(@types/react@19.2.14))(@types/react@19.2.14)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
+      '@radix-ui/react-popover':
+        specifier: ^1.1.23
+        version: 1.1.23(@types/react-dom@19.2.3(@types/react@19.2.14))(@types/react@19.2.14)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
       '@radix-ui/react-radio-group':
         specifier: ^1.4.7
         version: 1.4.7(@types/react-dom@19.2.3(@types/react@19.2.14))(@types/react@19.2.14)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
@@ -117,6 +120,9 @@ importers:
       tsx:
         specifier: 4.23.5
         version: 4.23.5
+      tw-shimmer:
+        specifier: ^0.4.12
+        version: 0.4.12(tailwindcss@4.3.3)
       typescript:
         specifier: 7.0.2
         version: 7.0.2
@@ -4689,6 +4695,11 @@ packages:
     resolution: {integrity: sha512-rw55FUaqOoI7RvlQwLbhO4nSDApnQ4/CykPuiQ/EPvtrX3WA9Ig55jIt9VvbBJbzJuj12ueRu4PMZ2SxPVbihg==, tarball: https://registry.npmjs.org/tsx/-/tsx-4.23.5.tgz}
     engines: {node: '>=18.0.0'}
     hasBin: true
+
+  tw-shimmer@0.4.12:
+    resolution: {integrity: sha512-kWSpAeUC+MV0UDSf1LmuTDW4EMf9JLNqR9QaBQNN+cknE0NjIewfLFDn8pUXvh1YKXKWyEsE+R86uoSdTxXzyg==, tarball: https://registry.npmjs.org/tw-shimmer/-/tw-shimmer-0.4.12.tgz}
+    peerDependencies:
+      tailwindcss: '>=4.0.0-0'
 
   type-fest@0.16.0:
     resolution: {integrity: sha512-eaBzG6MxNzEn9kiwvtre90cXaNLkmadMWa1zQMs3XORCXNbsH/OewwbxC5ia9dCxIxnTAsSxXJaa/p5y8DlvJg==, tarball: https://registry.npmjs.org/type-fest/-/type-fest-0.16.0.tgz}
@@ -9881,6 +9892,10 @@ snapshots:
       esbuild: 0.28.1
     optionalDependencies:
       fsevents: 2.3.3
+
+  tw-shimmer@0.4.12(tailwindcss@4.3.3):
+    dependencies:
+      tailwindcss: 4.3.3
 
   type-fest@0.16.0: {}
 

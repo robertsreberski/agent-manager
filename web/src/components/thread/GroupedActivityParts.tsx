@@ -2,7 +2,8 @@ import { useRef, useState } from "react";
 import { MessagePrimitive, useAuiState, useScrollLock } from "@assistant-ui/react";
 import { Check, ChevronDown, Circle, GitBranch, LoaderCircle } from "lucide-react";
 import { MarkdownText } from "../assistant-ui/markdown-text";
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "../ui";
+import { ReasoningContent, ReasoningRoot, ReasoningText, ReasoningTrigger } from "../assistant-ui/reasoning";
+import { ToolGroupContent, ToolGroupRoot, ToolGroupTrigger } from "../assistant-ui/tool-group";
 import { jsonForDisplay } from "../../lib/session-activity";
 import type { ActivityItem, ActivityJsonValue, ActivityState } from "../../types";
 import {
@@ -48,23 +49,26 @@ const CONTAINED = "min-w-0 max-w-full overflow-hidden";
 const STACK = "grid grid-cols-[minmax(0,1fr)] min-w-0 max-w-full";
 const BLOCK = "min-w-0 max-w-full overflow-x-hidden bg-[var(--surface-raised)] px-[13px] py-[11px] font-mono text-code whitespace-pre-wrap break-words [overflow-wrap:anywhere]";
 
+/**
+ * assistant-ui's ToolGroup, wearing the cockpit's grammar.
+ *
+ * A run that is still going is held open and cannot be collapsed — a group
+ * whose calls are still landing is the one thing the operator is watching.
+ */
 export function ToolGroupShell({ status, count, duration, defaultOpen = false, children }: { status: { type: string }; count: number; duration: string | null; defaultOpen?: boolean; children: React.ReactNode }) {
-  const forced = status.type !== "complete";
+  const active = status.type !== "complete";
   const [chosenOpen, setChosenOpen] = useState(defaultOpen);
-  const shellRef = useRef<HTMLElement>(null);
-  const lockScroll = useScrollLock(shellRef, DISCLOSURE_SCROLL_LOCK_MS);
-  const open = forced || chosenOpen;
+  const open = active || chosenOpen;
   return (
-    <section ref={shellRef} className={`my-2 ${CONTAINED}`} data-tool-group-status={status.type}>
-      <button type="button" data-compact-control className="flex min-h-9 w-full min-w-0 items-center gap-2 py-1.5 text-left text-[var(--text-muted)]" aria-expanded={open} onClick={() => { if (forced) return; lockScroll(); setChosenOpen((value) => !value); }}>
-        <ChevronDown size={16} strokeWidth={1.75} className={`shrink-0 ${open ? "" : "-rotate-90"}`} />
-        <span className="min-w-0 flex-1 truncate text-meta-sm font-medium">{count} tool {count === 1 ? "call" : "calls"}</span>
-        {duration && <span className="shrink-0 text-meta-sm tabular-nums text-[var(--text-faint)]">{duration}</span>}
-        {forced && <span className="shrink-0 font-mono text-code-xs text-[var(--text-faint)]">active</span>}
-      </button>
-      {/* Frame 11b indents the group body 24px. */}
-      {open && <div className={`ml-6 gap-0.5 ${STACK}`} data-tool-group-body>{children}</div>}
-    </section>
+    <ToolGroupRoot
+      open={open}
+      onOpenChange={(next) => { if (!active) setChosenOpen(next); }}
+      className={CONTAINED}
+      data-tool-group-status={status.type}
+    >
+      <ToolGroupTrigger count={count} active={active} duration={duration} />
+      <ToolGroupContent>{children}</ToolGroupContent>
+    </ToolGroupRoot>
   );
 }
 
@@ -161,20 +165,21 @@ export function ToolCall({ part }: { part: ToolPart }) {
   moved to — wires `aria-expanded` and `aria-controls`, and its controlled
   `open` is what lets the reasoning body join the scroll lock above.
 */
-function ReasoningDisclosure({ text, label }: { text: string; label?: string | undefined }) {
-  const [open, setOpen] = useState(false);
-  const frameRef = useRef<HTMLDivElement>(null);
-  const lockScroll = useScrollLock(frameRef, DISCLOSURE_SCROLL_LOCK_MS);
+/**
+ * assistant-ui's Reasoning, carrying the provider's own name for the thought.
+ *
+ * Codex sends a summarised thought and its raw counterpart as two items; their
+ * labels are what tell them apart, and a fixed "Reasoning" made the pair read
+ * as one event rendered twice.
+ */
+function ReasoningDisclosure({ text, label, streaming = false }: { text: string; label?: string | undefined; streaming?: boolean }) {
   return (
-    <Collapsible ref={frameRef} open={open} onOpenChange={(next) => { lockScroll(); setOpen(next); }} className={`text-meta-sm text-[var(--text-muted)] ${CONTAINED}`}>
-      {/* Codex sends a summarised thought and its raw counterpart as two items.
-          Its own labels are what tell them apart; a fixed "Reasoning" made the
-          pair read as one event rendered twice. */}
-      <CollapsibleTrigger data-compact-control="height" className="min-h-8 cursor-pointer py-1.5" data-reasoning-label={label ?? "Reasoning"}>{label ?? "Reasoning"}</CollapsibleTrigger>
-      <CollapsibleContent>
-        <pre className="min-w-0 max-w-full overflow-x-hidden border-l border-[var(--rule)] pl-3 font-mono text-code-sm whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{text}</pre>
-      </CollapsibleContent>
-    </Collapsible>
+    <ReasoningRoot streaming={streaming} className={CONTAINED}>
+      <ReasoningTrigger active={streaming} {...(label ? { label } : {})} />
+      <ReasoningContent aria-busy={streaming}>
+        <ReasoningText>{text}</ReasoningText>
+      </ReasoningContent>
+    </ReasoningRoot>
   );
 }
 
