@@ -46,6 +46,7 @@ import {
   type ClaudeSdkRuntime,
   type ClaudeSdkUserMessage,
 } from "./types.ts";
+import { profileForClaudePermissionMode } from "./profile.ts";
 
 interface ManagedEntry {
   session: ClaudeManagedSession;
@@ -84,18 +85,6 @@ function profileMode(profile: ExecutionProfile): ClaudePermissionMode {
     case "plan": return "plan";
     case "execute": return "acceptEdits";
     case "full-access": return "bypassPermissions";
-  }
-}
-
-function modeProfile(mode: ClaudePermissionMode): ExecutionProfile {
-  switch (mode) {
-    case "plan": return "plan";
-    case "acceptEdits": return "execute";
-    case "bypassPermissions": return "full-access";
-    case "default":
-    case "dontAsk":
-    case "auto":
-      return "ask-first";
   }
 }
 
@@ -1000,7 +989,7 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
       statusSource: "provider-api",
       source: "claude-sdk",
       profile: {
-        value: modeProfile(snapshot.mode),
+        value: profileForClaudePermissionMode(snapshot.mode),
         providerValue: snapshot.mode,
         source: "provider-api",
         confidence: "exact",

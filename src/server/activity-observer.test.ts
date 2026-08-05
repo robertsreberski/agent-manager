@@ -300,6 +300,35 @@ test("projects transcript tool and reasoning items with transcript-derived prove
   hub.dispose();
 });
 
+test("does not invent a final phase for a complete transcript assistant message", () => {
+  const hub = new ActivityHub({ streamEpoch: "observer-message-phase" });
+  const session = externalSession();
+  hub.ensureSession(session.id, session.provider);
+  const observer = new SelectedTranscriptActivityObserver({
+    hub,
+    reader: {
+      read: () => available([{
+        kind: "message",
+        id: "assistant-between-tools",
+        role: "assistant",
+        text: "I checked the first result.",
+        createdAt: "2026-08-03T00:00:02.000Z",
+        status: "complete",
+        label: null,
+      }]),
+    },
+  });
+
+  const release = observer.acquire(session);
+  const item = hub.snapshot(session.id)?.items[0];
+  assert.equal(item?.kind, "message");
+  assert.equal(item?.kind === "message" ? item.phase : "unexpected", null);
+
+  release();
+  observer.dispose();
+  hub.dispose();
+});
+
 test("re-observes a tool call when only its result arrives", async () => {
   const hub = new ActivityHub({ streamEpoch: "observer-tool-result" });
   const session = externalSession();

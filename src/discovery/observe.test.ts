@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -280,4 +280,127 @@ test("marks transcript-only request_user_input as heuristic and non-respondable"
   ], false);
   assert.equal(resolved.status, "completed");
   assert.deepEqual(resolved.attention, []);
+});
+
+test("Codex profile resolution prefers rollout context and maps safe database facts to execute", () => {
+  const root = mkdtempSync(join(tmpdir(), "agent-manager-profile-"));
+  const sqliteDirectory = join(root, "sqlite");
+  mkdirSync(sqliteDirectory);
+  const now = Date.parse("2026-08-05T12:00:00.000Z");
+  const planRollout = join(root, "plan.jsonl");
+  const fullRollout = join(root, "full.jsonl");
+  writeFileSync(planRollout, `${JSON.stringify({
+    type: "turn_context",
+    payload: {
+      approval_policy: "on-request",
+      sandbox_policy: { type: "workspace-write" },
+      collaboration_mode: { mode: "plan" },
+    },
+  })}\n`);
+  writeFileSync(fullRollout, `${JSON.stringify({
+    type: "turn_context",
+    payload: {
+      approval_policy: "never",
+      sandbox_policy: { type: "danger-full-access" },
+      permission_profile: { type: "disabled" },
+      collaboration_mode: { mode: "plan" },
+    },
+  })}\n`);
+  const database = new DatabaseSync(join(sqliteDirectory, "state_5.sqlite"));
+  try {
+    database.exec(`
+      CREATE TABLE threads (
+        id TEXT PRIMARY KEY,
+        rollout_path TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        cwd TEXT NOT NULL,
+        sandbox_policy TEXT,
+        approval_mode TEXT
+      )
+    `);
+    const insert = database.prepare(
+      "INSERT INTO threads (id, rollout_path, created_at, updated_at, cwd, sandbox_policy, approval_mode) VALUES (?, ?, ?, ?, '/workspace', ?, ?)",
+    );
+    insert.run("plan-thread", planRollout, now / 1_000, now / 1_000, '{"type":"workspace-write"}', "on-request");
+    insert.run("full-thread", fullRollout, now / 1_000, now / 1_000, '{"type":"workspace-write"}', "on-request");
+    insert.run("safe-db-thread", "", now / 1_000, now / 1_000, '{"type":"read-only"}', "never");
+  } finally {
+    database.close();
+  }
+
+  try {
+    const runtime: Runtime = {
+      now: () => now,
+      homeDir: root,
+      env: { CODEX_HOME: root },
+      run: () => ({ stdout: "", stderr: "", status: 0, error: null }),
+    };
+    const sessions = new Map(scanObservedSessions({
+      recentWindowSeconds: 60,
+      providers: new Set(["codex"]),
+    }, runtime).sessions.map((session) => [session.providerThreadId, session]));
+
+    assert.equal(sessions.get("plan-thread")?.profile.value, "plan");
+    assert.equal(sessions.get("plan-thread")?.profile.source, "rollout-events");
+    assert.equal(sessions.get("full-thread")?.profile.value, "full-access");
+    assert.equal(sessions.get("safe-db-thread")?.profile.value, "execute");
+    assert.equal(sessions.get("safe-db-thread")?.profile.source, "provider-cli");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Claude profile resolution falls back to the latest transcript permission mode", () => {
+  const root = mkdtempSync(join(tmpdir(), "agent-manager-claude-profile-"));
+  // Matching by session identity remains reliable when Claude's project key no
+  // longer matches the cwd reported by the provider registry.
+  const projectDirectory = join(root, ".claude", "projects", "-moved-workspace");
+  mkdirSync(projectDirectory, { recursive: true });
+  const now = Date.parse("2026-08-05T12:00:00.000Z");
+  const sessionId = "d88345c7-36b7-4804-990f-db05a32916d4";
+  writeFileSync(join(projectDirectory, `${sessionId}.jsonl`), [
+    JSON.stringify({ type: "user", permissionMode: "plan" }),
+    JSON.stringify({ type: "assistant", message: { content: [] } }),
+    JSON.stringify({ type: "user", permissionMode: "acceptEdits" }),
+  ].join("\n"));
+
+  try {
+    const runtime: Runtime = {
+      now: () => now,
+      homeDir: root,
+      env: {},
+      run(command) {
+        if (command === "ps") return { stdout: "", stderr: "", status: 0, error: null };
+        if (command === "claude") {
+          return {
+            stdout: JSON.stringify([{
+              sessionId,
+              cwd: "/workspace",
+              kind: "interactive",
+              startedAt: now,
+              state: "done",
+            }]),
+            stderr: "",
+            status: 0,
+            error: null,
+          };
+        }
+        throw new Error(`Unexpected command: ${command}`);
+      },
+    };
+    const [session] = scanObservedSessions({
+      recentWindowSeconds: 60,
+      providers: new Set(["claude"]),
+    }, runtime).sessions;
+
+    assert.deepEqual(session?.profile, {
+      value: "execute",
+      providerValue: "acceptEdits",
+      source: "transcript",
+      confidence: "inferred",
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

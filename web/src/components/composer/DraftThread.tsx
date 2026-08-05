@@ -1,6 +1,5 @@
 import { useMemo, useState } from "react";
 import { AlertTriangle, FolderGit2 } from "lucide-react";
-import { reasoningEffortsForProvider } from "../../../../src/shared/session.ts";
 import type { ReasoningEffort } from "../../../../src/shared/session.ts";
 import type { HostOption, WorkspaceOption } from "../../types";
 import { Button, Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../ui";
@@ -75,7 +74,7 @@ export function DraftThread({
         modelOptions={modelOptions}
         modelOptionsStatus={modelOptionsStatus}
         effort={draft.effort}
-        effortOptions={effortOptions ?? reasoningEffortsForProvider(draft.provider)}
+        effortOptions={effortOptions ?? []}
         profile={draft.profile}
         draft
         readOnlyReason={mutationsReady ? null : "Reconnect before creating a session."}

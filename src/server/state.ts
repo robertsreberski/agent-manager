@@ -193,6 +193,14 @@ export class SessionStateStore {
       const metadata = metadataOnly(record);
       const candidate: SessionRecord = {
         ...metadata,
+        profile: metadata.profile.value === null
+          && metadata.profile.providerValue === null
+          && metadata.profile.source === "inferred"
+          && metadata.profile.confidence === "heuristic"
+          && previous !== undefined
+          && previous.profile.value !== null
+          ? clone(previous.profile)
+          : metadata.profile,
         todoProgress: this.#todoProgressOverrides.has(id)
           ? clone(this.#todoProgressOverrides.get(id) ?? null)
           : metadata.todoProgress,

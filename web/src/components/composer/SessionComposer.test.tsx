@@ -29,15 +29,35 @@ describe("SessionComposer", () => {
   });
 
   it("fills the harness tile and the reached effort bars lime, as frames 5a and 9a-2 show", () => {
-    renderComposer({ effort: "medium" });
+    renderComposer({ effort: "medium", effortOptions: ["low", "medium", "high", "max"] });
     expect(document.querySelector<HTMLElement>("[data-provider-mark]"))
       .toHaveClass("bg-[var(--accent)]", "text-[var(--accent-ink)]");
 
     // Only the bars the effort actually reaches. An unreached bar staying lime
     // would make every effort level look like the highest one.
     const bars = [...document.querySelectorAll<HTMLElement>("[data-effort-bar]")];
-    expect(bars.map((bar) => bar.getAttribute("data-effort-bar"))).toEqual(["active", "active", "inactive"]);
+    expect(bars.map((bar) => bar.dataset.effortBar)).toEqual(["active", "active", "inactive", "inactive"]);
+    expect(bars.map((bar) => bar.style.height)).toEqual(["5px", "7px", "9px", "11px"]);
     expect(bars.filter((bar) => bar.className.includes("var(--accent)"))).toHaveLength(2);
+  });
+
+  it.each([
+    ["max", ["medium", "high", "max", "ultra"], 3, "Max"],
+    ["ultra", ["high", "xhigh", "max", "ultra"], 4, "Ultra"],
+  ] as const)("shows the %s label beside its model-specific meter", (effort, effortOptions, activeCount, label) => {
+    renderComposer({ effort, effortOptions });
+
+    const bars = [...document.querySelectorAll<HTMLElement>("[data-effort-bar]")];
+    expect(bars).toHaveLength(effortOptions.length);
+    expect(bars.filter((bar) => bar.dataset.effortBar === "active")).toHaveLength(activeCount);
+    expect(screen.getByText(label)).toHaveAttribute("data-effort-word");
+  });
+
+  it("uses a word-only effort fallback when the selected model scale is unavailable", () => {
+    renderComposer({ effort: "high", effortOptions: [] });
+
+    expect(document.querySelectorAll("[data-effort-bar]")).toHaveLength(0);
+    expect(document.querySelector("[data-effort-meter='word-only']")).toHaveTextContent("High");
   });
 
   it("shows only model choices returned by the live provider catalog", async () => {
@@ -153,28 +173,34 @@ describe("SessionComposer", () => {
     expect(screen.getByRole("button", { name: /execute/i })).toHaveAttribute("title", "The hook exposes no profile control.");
   });
 
-  it("states every withheld reason as visible text, not only as a native tooltip", () => {
+  it("keeps withheld reasons on the controls without rendering a reason wall", () => {
     renderComposer({
       modelChangeUnavailableReason: "The hook can observe the model but cannot change it.",
       effortChangeUnavailableReason: "The hook exposes no effort control.",
       profileChangeUnavailableReason: "The hook exposes no profile control.",
     });
 
-    const reasons = document.querySelector<HTMLElement>("[data-withheld-reasons]");
-    expect(reasons).toHaveTextContent("The hook can observe the model but cannot change it.");
-    expect(reasons).toHaveTextContent("The hook exposes no profile control.");
-    expect(reasons).toHaveAttribute("role", "status");
+    expect(document.querySelector("[data-withheld-reasons]")).toBeNull();
+    expect(screen.getByRole("combobox", { name: /codex/i })).toHaveAttribute(
+      "aria-description",
+      "The hook can observe the model but cannot change it.",
+    );
+    expect(screen.getByRole("button", { name: /execute/i })).toHaveAttribute(
+      "aria-description",
+      "The hook exposes no profile control.",
+    );
   });
 
-  it("states one identical withheld reason once and never repeats the read-only sentence", () => {
+  it("uses the read-only reason only as state and does not repeat it as copy", () => {
     renderComposer({
       readOnlyReason: "This harness is observation-only.",
       modelChangeUnavailableReason: "This harness is observation-only.",
       profileChangeUnavailableReason: "This harness is observation-only.",
     });
 
-    expect(screen.getAllByText("This harness is observation-only.")).toHaveLength(1);
+    expect(screen.queryByText("This harness is observation-only.")).not.toBeInTheDocument();
     expect(document.querySelector("[data-withheld-reasons]")).toBeNull();
+    expect(screen.getByRole("textbox", { name: "Message" })).toHaveAttribute("placeholder", "");
   });
 
   it("keeps a readable-but-unwritable model catalog inspectable", async () => {
@@ -188,8 +214,17 @@ describe("SessionComposer", () => {
     expect(trigger).toBeEnabled();
     click(trigger);
     const menu = await screen.findByRole("dialog", { name: "Harness, model, and effort" });
-    expect(within(menu).getByRole("option", { name: /Live/u })).toHaveAttribute("aria-disabled", "true");
-    expect(menu).toHaveTextContent("Model choices stay in the CLI that owns this session.");
+    const option = within(menu).getByRole("option", { name: /Live/u });
+    expect(option).toHaveAttribute("aria-disabled", "true");
+    expect(option).toHaveAttribute(
+      "title",
+      "Model choices stay in the CLI that owns this session.",
+    );
+    expect(option).toHaveAttribute(
+      "aria-description",
+      "Model choices stay in the CLI that owns this session.",
+    );
+    expect(menu).not.toHaveTextContent("Model choices stay in the CLI that owns this session.");
   });
 
   it("still disables the runtime menu when there is nothing to read or change", () => {

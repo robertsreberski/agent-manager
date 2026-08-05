@@ -111,6 +111,44 @@ test("runtime diagnostics survive discovery diagnostic replacement", () => {
   assert.deepEqual(state.snapshot().diagnostics, [runtime]);
 });
 
+test("a transient unknown profile does not erase the last resolved profile", () => {
+  const state = new SessionStateStore();
+  state.replace([strictSession({
+    profile: {
+      value: "plan",
+      providerValue: "collaboration=plan",
+      source: "rollout-events",
+      confidence: "inferred",
+    },
+  })]);
+
+  state.replace([strictSession({
+    updatedAt: "2026-08-03T00:01:00.000Z",
+  })]);
+  assert.deepEqual(state.get("local:codex:thread-1")?.profile, {
+    value: "plan",
+    providerValue: "collaboration=plan",
+    source: "rollout-events",
+    confidence: "inferred",
+  });
+
+  state.replace([strictSession({
+    updatedAt: "2026-08-03T00:02:00.000Z",
+    profile: {
+      value: null,
+      providerValue: "future-provider-mode",
+      source: "provider-api",
+      confidence: "exact",
+    },
+  })]);
+  assert.deepEqual(state.get("local:codex:thread-1")?.profile, {
+    value: null,
+    providerValue: "future-provider-mode",
+    source: "provider-api",
+    confidence: "exact",
+  });
+});
+
 test("activity todo metadata survives discovery refresh and never carries content", () => {
   const state = new SessionStateStore();
   const movingProgress = {

@@ -110,6 +110,18 @@ describe("tool grouping in a rendered thread", () => {
     expect(screen.getAllByText("1 tool call")).toHaveLength(2);
   });
 
+  it("does not reach across an assistant message inside one stated turn", () => {
+    const { container } = renderThread([
+      tool("t-1", "Read", 1, "turn-1"),
+      { ...common, id: "m-1", seq: 2, turnId: "turn-1", kind: "message", role: "assistant", phase: "final", text: "The first file is clear.", label: null },
+      tool("t-2", "Grep", 3, "turn-1"),
+    ]);
+
+    expect(container.querySelectorAll("[data-tool-group-status]")).toHaveLength(2);
+    expect(screen.getAllByText("1 tool call")).toHaveLength(2);
+    expect(screen.getByText("The first file is clear.")).toBeInTheDocument();
+  });
+
   it("keeps a todo written mid-run from splitting the run in two", () => {
     const { container } = renderThread([
       tool("t-1", "Read", 1, "turn-1"),

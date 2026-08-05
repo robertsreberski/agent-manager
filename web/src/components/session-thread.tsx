@@ -10,7 +10,6 @@ import {
   type ThreadMessageLike,
 } from "@assistant-ui/react";
 import { ArrowDown, LoaderCircle, Sparkles } from "lucide-react";
-import { reasoningEffortsForProvider } from "../../../src/shared/session.ts";
 import { Button, Collapsible, CollapsibleContent, CollapsibleTrigger } from "./ui";
 import { DISCLOSURE_SCROLL_LOCK_MS, GroupedActivityParts } from "./thread";
 import { QueuedMessageCount, SessionComposer, type ComposerDelivery, type ComposerModelOption } from "./composer";
@@ -38,7 +37,7 @@ import type {
   SessionView,
 } from "../types";
 import { toCockpitSessionView } from "../lib/cockpit-view";
-import type { PlanFileResponse, SelectedSessionFactsResponse, SetupHookOffer } from "../lib/api";
+import type { PlanFileResponse, SelectedSessionFactsResponse } from "../lib/api";
 
 function UserMessage() {
   return (
@@ -341,7 +340,6 @@ export function SessionThreadComposer({
   effortOptions,
   restoredDraft,
   onOpenSetup,
-  hookState,
   onSearchFiles,
 }: {
   session: SessionView;
@@ -358,8 +356,6 @@ export function SessionThreadComposer({
   effortOptions?: readonly ReasoningEffort[];
   restoredDraft?: { key: string; text: string } | null;
   onOpenSetup?: () => void;
-  /** This provider's hook state, once the setup facts have been read. */
-  hookState?: SetupHookOffer["state"];
   /** Absent where the workspace is not readable from here, e.g. a remote host. */
   onSearchFiles?: (query: string) => Promise<readonly string[]>;
 }) {
@@ -383,7 +379,7 @@ export function SessionThreadComposer({
     setText("");
   }
   const noWriteReason = !canQueue && !canSteer
-    ? session.control.withheld.find((item) => item.capability === "queue")?.reason ?? "This harness is observation-only."
+    ? session.control.withheld.find((item) => item.capability === "queue")?.reason ?? "Replies are unavailable."
     : null;
   const unavailableReason = (capability: "set-model" | "set-effort" | "set-profile", fallback: string) =>
     session.control.withheld.find((item) => item.capability === capability)?.reason ?? fallback;
@@ -410,7 +406,7 @@ export function SessionThreadComposer({
         modelChangeUnavailableReason={canSetModel ? null : unavailableReason("set-model", "This harness does not expose live model changes.")}
         effortChangeUnavailableReason={canSetEffort ? null : unavailableReason("set-effort", "This harness does not expose live effort changes.")}
         profileChangeUnavailableReason={canSetProfile ? null : unavailableReason("set-profile", "This harness does not expose live execution-profile changes.")}
-        effortOptions={canSetEffort ? effortOptions ?? reasoningEffortsForProvider(session.provider) : session.effort.value ? [session.effort.value] : []}
+        effortOptions={effortOptions ?? []}
         profileOptions={canSetProfile ? PROFILES : session.profile.value ? [session.profile.value] : []}
         busy={busy}
         {...(canSetModel ? { onModelChange: (model: string) => void onSetModel(model) } : {})}
@@ -418,28 +414,15 @@ export function SessionThreadComposer({
         {...(canSetProfile ? { onProfileChange: (profile: ExecutionProfile) => void onSetProfile(profile) } : {})}
         {...(onSearchFiles ? { onSearchFiles } : {})}
       />
-      {/*
-        Read-only is honest — an ordinary CLI session exposes no queue or steer
-        channel — but the composer used to state the fact without naming the one
-        thing that changes it. Where the provider's hook state is known, say
-        what it is; the browser still only reads, and the command is still the
-        operator's to run.
-      */}
-      {noWriteReason && onOpenSetup && (
-        <div className="grid justify-items-start gap-0.5">
-          {hookState === "absent" && (
-            <p className="text-code-sm text-[var(--text-muted)]" role="status" data-hook-upgrade="absent">
-              No {session.provider} hook is installed. Installing one lets this terminal-started session be answered from here.
-            </p>
+      {noWriteReason && (
+        <div className="flex min-h-7 items-center gap-1.5 px-0.5 text-code-sm text-[var(--text-muted)]" role="status" data-read-only-state>
+          <span>Read only</span>
+          {onOpenSetup && (
+            <>
+              <span aria-hidden="true">·</span>
+              <button type="button" data-read-only-explainer data-compact-control="height" className="underline underline-offset-2" onClick={onOpenSetup}>Enable replies</button>
+            </>
           )}
-          {hookState === "installed-unseen" && (
-            <p className="text-code-sm text-[var(--text-muted)]" role="status" data-hook-upgrade="installed-unseen">
-              The {session.provider} hook is installed but has not been seen yet — it attaches on this session's next provider event.
-            </p>
-          )}
-          <button type="button" data-read-only-explainer data-compact-control="height" className="min-h-9 text-code-sm text-[var(--text-muted)] underline" onClick={onOpenSetup}>
-            {hookState === "absent" ? "Show me the command" : "Why is this read-only?"}
-          </button>
         </div>
       )}
       {!mutationsReady && (canQueue || canSteer) && <p className="text-center font-mono text-code-xs text-[var(--warning)]">Offline drafts stay on this device and are sent only if the session state is unchanged.</p>}

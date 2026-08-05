@@ -53,8 +53,7 @@ describe("SessionThreadComposer", () => {
     expect(screen.getByRole("combobox", { name: /codex/i })).toHaveAttribute("title", "The hook can observe the model but cannot change it.");
     expect(screen.getByRole("button", { name: /execute/i })).toBeDisabled();
     expect(screen.getByRole("button", { name: /execute/i })).toHaveAttribute("title", "The hook exposes no profile control.");
-    expect(document.querySelector("[data-withheld-reasons]"))
-      .toHaveTextContent("The hook can observe the model but cannot change it. · The hook exposes no profile control.");
+    expect(document.querySelector("[data-withheld-reasons]")).toBeNull();
   });
 
   it("hands a read-only session a way to reach the setup that would fix it", () => {
@@ -82,8 +81,9 @@ describe("SessionThreadComposer", () => {
       onOpenSetup={onOpenSetup}
     />);
 
-    expect(screen.getByText("This terminal-started session has no hook bridge.")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Why is this read-only?" }));
+    expect(screen.getByText("Read only")).toBeInTheDocument();
+    expect(screen.queryByText("This terminal-started session has no hook bridge.")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Enable replies" }));
     expect(onOpenSetup).toHaveBeenCalledOnce();
   });
 
@@ -103,7 +103,8 @@ describe("SessionThreadComposer", () => {
       onOpenSetup={vi.fn()}
     />);
 
-    expect(screen.queryByRole("button", { name: "Why is this read-only?" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Enable replies" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Read only")).not.toBeInTheDocument();
   });
 
   it("passes a catalog the session cannot write through as a read-only list", () => {
@@ -119,19 +120,22 @@ describe("SessionThreadComposer", () => {
       onSetEffort={vi.fn(async () => undefined)}
       modelOptions={[{ value: "gpt-live", label: "Live", description: null }]}
       modelOptionsStatus={null}
+      effortOptions={["low", "medium", "high", "max"]}
     />);
 
     const trigger = screen.getByRole("combobox", { name: /codex/i });
     expect(trigger).toBeEnabled();
-    // The composer's menus are Radix dropdowns now: they open on pointerdown,
-    // and a withheld choice is an `aria-disabled` menu item rather than a
-    // disabled <button>. The claim under test is unchanged — the catalog is
-    // readable and every row in it is unwritable.
+    // The assistant-ui picker opens on pointerdown; the catalog remains
+    // readable while each mutation stays disabled with an accessible reason.
     fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false, pointerId: 1 });
     fireEvent.click(trigger);
-    const menu = document.querySelector<HTMLElement>('[data-slot="model-selector-content"]')!;
-    expect(within(menu).getByRole("option", { name: /Live/u })).toHaveAttribute("aria-disabled", "true");
-    expect(menu).toHaveTextContent("The hook can observe the model but cannot change it.");
+    const menu = screen.getByRole("dialog", { name: "Harness, model, and effort" });
+    const option = within(menu).getByRole("option", { name: /Live/u });
+    expect(option).toHaveAttribute("aria-disabled", "true");
+    expect(option).toHaveAttribute("title", "The hook can observe the model but cannot change it.");
+    expect(menu).not.toHaveTextContent("The hook can observe the model but cannot change it.");
+    expect(document.querySelectorAll("[data-effort-bar]")).toHaveLength(4);
+    expect(document.querySelectorAll("[data-effort-bar='active']")).toHaveLength(3);
   });
 });
 
@@ -147,7 +151,7 @@ describe("the upgrade path off a read-only session", () => {
     control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [] },
   } as unknown as SessionView;
 
-  function renderComposer(props: { hookState?: "absent" | "installed-unseen" | "active" } = {}) {
+  function renderComposer() {
     return render(<SessionThreadComposer
       session={observed}
       activity={activity}
@@ -161,36 +165,15 @@ describe("the upgrade path off a read-only session", () => {
       modelOptions={[]}
       modelOptionsStatus={null}
       onOpenSetup={vi.fn()}
-      {...props}
     />);
   }
 
-  it("names the missing hook, and offers the command rather than an explanation", () => {
-    renderComposer({ hookState: "absent" });
-
-    expect(document.querySelector('[data-hook-upgrade="absent"]'))
-      .toHaveTextContent("No codex hook is installed.");
-    expect(screen.getByRole("button", { name: "Show me the command" })).toBeInTheDocument();
-  });
-
-  it("says an installed hook is waiting for an event rather than repeating the ask", () => {
-    renderComposer({ hookState: "installed-unseen" });
-
-    expect(document.querySelector('[data-hook-upgrade="installed-unseen"]'))
-      .toHaveTextContent("attaches on this session's next provider event");
-    expect(screen.getByRole("button", { name: "Why is this read-only?" })).toBeInTheDocument();
-  });
-
-  it("claims nothing about hooks before the facts have been read", () => {
+  it("keeps the state to one quiet label and setup link", () => {
     renderComposer();
 
     expect(document.querySelector("[data-hook-upgrade]")).toBeNull();
-    expect(screen.getByRole("button", { name: "Why is this read-only?" })).toBeInTheDocument();
-  });
-
-  it("stays quiet when the hook is already doing its job", () => {
-    renderComposer({ hookState: "active" });
-
-    expect(document.querySelector("[data-hook-upgrade]")).toBeNull();
+    expect(screen.getAllByText("Read only")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "Enable replies" })).toBeInTheDocument();
+    expect(screen.queryByText(/hook|observation-only|read-only session/iu)).not.toBeInTheDocument();
   });
 });

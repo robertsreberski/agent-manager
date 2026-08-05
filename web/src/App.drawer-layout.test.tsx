@@ -107,7 +107,11 @@ const cockpit = {
   loadTodoDetail: vi.fn(async () => undefined),
   searchTranscript: vi.fn(async () => ({ matches: [] })),
   loadSettingsOptions: vi.fn(async () => undefined),
-  loadProviderSettingsOptions: vi.fn(async () => undefined),
+  loadProviderSettingsOptions: vi.fn(async () => ({
+    available: true as const,
+    source: "provider-api" as const,
+    models: [{ value: "gpt-live", label: "GPT Live", description: null, efforts: ["low", "medium", "high", "max"] as const }],
+  })),
   loadSessionFacts: vi.fn(async () => undefined),
   loadPlanFile: vi.fn(async () => undefined),
   loadSetup,
@@ -136,6 +140,7 @@ const { default: App } = await import("./App");
 describe("cockpit shell layout", () => {
   beforeEach(() => {
     loadSetup.mockClear();
+    cockpit.loadProviderSettingsOptions.mockClear();
   });
 
   it("overlays the drawer on the board region instead of the whole page", () => {
@@ -193,15 +198,15 @@ describe("cockpit shell layout", () => {
 describe("reaching hooks from an observation-only board", () => {
   beforeEach(() => {
     loadSetup.mockClear();
+    cockpit.loadProviderSettingsOptions.mockClear();
     vi.useRealTimers();
   });
 
-  it("reads the hook facts unprompted when the selected session is observation-only", async () => {
+  it("reads model capabilities, but not setup copy, for an observation-only session", async () => {
     render(<App />);
 
-    await waitFor(() => expect(loadSetup).toHaveBeenCalled());
-    // Still only a read. The command stays the operator's to run.
-    expect(screen.queryByRole("button", { name: /install|apply/iu })).not.toBeInTheDocument();
+    await waitFor(() => expect(cockpit.loadProviderSettingsOptions).toHaveBeenCalledWith("codex", "local"));
+    expect(loadSetup).not.toHaveBeenCalled();
   });
 
   async function openSetupDialog() {

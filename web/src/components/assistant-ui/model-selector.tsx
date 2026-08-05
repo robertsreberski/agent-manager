@@ -8,10 +8,8 @@
   transport — a model change is an explicit, capability-gated action against the
   harness — so the registration must not happen.
 
-  The component has no way to express a withheld capability, so the composer
-  keeps its own gate around it: the trigger is disabled where the harness does
-  not offer `set-model`, and the reason is stated as text beside it, because a
-  native tooltip is invisible on touch and to screen readers.
+  The composer keeps the capability gate around it and supplies concise native
+  and accessible descriptions for any disabled model or effort choice.
 */
 import {
   memo,
@@ -60,6 +58,8 @@ export type ModelOption = {
   description?: string;
   icon?: ReactNode;
   disabled?: boolean;
+  /** Concise native and accessible description for a disabled model. */
+  disabledReason?: string;
   /** Extra terms matched by ModelSelector.Search, in addition to id and name. */
   keywords?: readonly string[];
   /**
@@ -583,7 +583,13 @@ function ModelSelectorItem({
       data-slot="model-selector-item"
       value={model.id}
       keywords={[model.name, ...(model.keywords ?? [])]}
-      {...(model.disabled ? { disabled: true } : undefined)}
+      {...(model.disabled ? {
+        disabled: true,
+        ...(model.disabledReason ? {
+          title: model.disabledReason,
+          "aria-description": model.disabledReason,
+        } : {}),
+      } : undefined)}
       onSelect={(selectedValue) => {
         setValue(model.id);
         setOpen(false);
@@ -621,10 +627,15 @@ function ModelSelectorItem({
 
 export type ModelSelectorEffortProps = ComponentPropsWithoutRef<"div"> & {
   label?: ReactNode;
+  disabled?: boolean;
+  /** Concise native and accessible description for disabled effort choices. */
+  disabledReason?: string;
 };
 
 function ModelSelectorEffort({
   label = "Thinking",
+  disabled = false,
+  disabledReason = "Effort changes unavailable.",
   className,
   onKeyDown,
   ...props
@@ -671,6 +682,9 @@ function ModelSelectorEffort({
           <RadioGroupPrimitive.Item
             key={option.id}
             value={option.id}
+            disabled={disabled}
+            title={disabled ? disabledReason : undefined}
+            aria-description={disabled ? disabledReason : undefined}
             className={cn(
               "focus-visible:ring-[var(--ring)]/50 text-[var(--text-muted)] hover:text-[var(--text)] rounded-md px-2 py-1 text-code-xs transition-colors outline-none focus-visible:ring-2",
               "data-[state=checked]:bg-[var(--surface-selected)] data-[state=checked]:text-[var(--text)] data-[state=checked]:font-medium",

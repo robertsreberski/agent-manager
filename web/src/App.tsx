@@ -155,18 +155,17 @@ export function effectiveDraftHostId(
     ?? "local";
 }
 
-/** Codex effort support is model-specific in the pinned provider catalog. */
-export function codexCatalogEfforts(
-  provider: SessionView["provider"],
+/** Effort support is model-specific in each provider's live catalog. */
+export function modelCatalogEfforts(
   model: string | null,
   response: SessionSettingsOptionsResponse | ProviderSettingsOptionsResponse | null,
 ): readonly ReasoningEffort[] | undefined {
-  if (provider !== "codex" || !response?.available) return undefined;
+  if (!response?.available) return undefined;
   const option = model
     ? response.models.find((candidate) => candidate.value === model)
     : response.models.find((candidate) => candidate.isDefault === true);
-  // A live Codex catalog replaces the global guess. Missing metadata therefore
-  // disables the choices instead of falling back to a fabricated superset.
+  // A live catalog replaces every provider-wide guess. Missing metadata leaves
+  // the meter word-only instead of fabricating support the model never declared.
   return option?.efforts ?? [];
 }
 
@@ -435,7 +434,7 @@ export default function App() {
   const [settingsOptions, setSettingsOptions] = useState<
     | { sessionId: string; state: "loading"; response: null }
     | { sessionId: string; state: "error"; response: null }
-    | { sessionId: string; state: "loaded"; response: SessionSettingsOptionsResponse }
+    | { sessionId: string; state: "loaded"; response: SessionSettingsOptionsResponse | ProviderSettingsOptionsResponse }
     | null
   >(null);
   const [draftSettingsOptions, setDraftSettingsOptions] = useState<{
@@ -552,24 +551,6 @@ export default function App() {
 
   const selected = cockpit.selectedSession;
 
-  /*
-    `cockpitContentMode` returns "board" as soon as one session exists, so an
-    operator whose only sessions were discovered in a terminal never saw the
-    first-run wizard and never learned that hooks are what make such a session
-    answerable. Reading the facts once, when the first observation-only session
-    is opened, is what lets the drawer say so. Still a read: this browser never
-    writes provider settings.
-  */
-  useEffect(() => {
-    if (!cockpit.ready || !cockpit.mutationsReady || setupLoadStarted.current) return;
-    if (!selected || selected.control.plane !== "observe-only") return;
-    refreshSetup();
-  }, [cockpit.mutationsReady, cockpit.ready, refreshSetup, selected]);
-
-  /** The hook state for the selected session's own provider, once it is known. */
-  const selectedHookState = selected && setupFacts?.state === "loaded"
-    ? setupFacts.value.hooks[selected.provider].state
-    : null;
   const selectedPresentation = selected ? sessions.find((session) => session.id === selected.id) ?? null : null;
   const selectedPlanSessionId = selected?.id ?? null;
   const loadSelectedPlanFile = useCallback((itemId: string) => {
@@ -583,8 +564,6 @@ export default function App() {
       && (session.status === "running" || session.status === "waiting")).length
     : null;
   const selectedBusy = selected ? Boolean(cockpit.busy[`action:${selected.id}`] || cockpit.busy[`writer:${selected.id}`]) : false;
-  const selectedCanSetModel = Boolean(selected?.control.capabilities.includes("set-model"));
-
   useEffect(() => {
     const request = ++draftSettingsRequest.current;
     if (draftProvider === null || draftHostId === null) {
@@ -607,20 +586,36 @@ export default function App() {
   }, [cockpit.loadProviderSettingsOptions, draftHostId, draftProvider]);
 
   useEffect(() => {
-    if (!selected || !selectedCanSetModel) {
+    if (!selected) {
       setSettingsOptions(null);
       return;
     }
     const sessionId = selected.id;
     let cancelled = false;
     setSettingsOptions({ sessionId, state: "loading", response: null });
-    void cockpit.loadSettingsOptions(sessionId).then((response) => {
+    const lookup = selected.control.authority === "manager"
+      ? cockpit.loadSettingsOptions(sessionId)
+      : selected.hostId === "local"
+        ? cockpit.loadProviderSettingsOptions(selected.provider, selected.hostId)
+        : null;
+    if (lookup === null) {
+      setSettingsOptions(null);
+      return;
+    }
+    void lookup.then((response) => {
       if (!cancelled) setSettingsOptions({ sessionId, state: "loaded", response });
     }).catch(() => {
       if (!cancelled) setSettingsOptions({ sessionId, state: "error", response: null });
     });
     return () => { cancelled = true; };
-  }, [cockpit.loadSettingsOptions, selected?.id, selectedCanSetModel]);
+  }, [
+    cockpit.loadProviderSettingsOptions,
+    cockpit.loadSettingsOptions,
+    selected?.control.authority,
+    selected?.hostId,
+    selected?.id,
+    selected?.provider,
+  ]);
 
   const selectedModelCatalog = useMemo(() => {
     if (!settingsOptions || settingsOptions.sessionId !== selected?.id) return { models: [], status: null, effortOptions: undefined };
@@ -628,7 +623,7 @@ export default function App() {
     if (settingsOptions.state === "error") return { models: [], status: "The provider model catalog could not be loaded.", effortOptions: undefined };
     const response = settingsOptions.response;
     return response.available
-      ? { models: response.models, status: null, effortOptions: codexCatalogEfforts(selected.provider, selected.model.value, response) }
+      ? { models: response.models, status: null, effortOptions: modelCatalogEfforts(selected.model.value, response) }
       : { models: [], status: settingsUnavailableMessage(response.reason), effortOptions: undefined };
   }, [selected?.id, selected?.model.value, selected?.provider, settingsOptions]);
   const draftModelCatalog = useMemo(() => {
@@ -646,7 +641,7 @@ export default function App() {
     const response = draftSettingsOptions.response;
     if (!response) return { models: [], status: "The provider model catalog could not be loaded.", effortOptions: undefined };
     return response.available
-      ? { models: response.models, status: null, effortOptions: codexCatalogEfforts(draftProvider, draft?.model ?? null, response) }
+      ? { models: response.models, status: null, effortOptions: modelCatalogEfforts(draft?.model ?? null, response) }
       : { models: [], status: settingsUnavailableMessage(response.reason), effortOptions: undefined };
   }, [draft?.model, draftHostId, draftProvider, draftSettingsOptions]);
 
@@ -1006,7 +1001,6 @@ export default function App() {
             modelOptions={selectedModelCatalog.models}
             modelOptionsStatus={selectedModelCatalog.status}
             onOpenSetup={openSetup}
-            {...(selectedHookState ? { hookState: selectedHookState } : {})}
             {...(selectedRemote ? {} : { onSearchFiles: (query: string) => cockpit.loadWorkspaceFiles(selected.id, query) })}
             {...(selectedModelCatalog.effortOptions !== undefined ? { effortOptions: selectedModelCatalog.effortOptions } : {})}
             {...(restoredDraft?.sessionId === selected.id ? { restoredDraft: { key: restoredDraft.key, text: restoredDraft.text } } : {})}

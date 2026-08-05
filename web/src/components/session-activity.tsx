@@ -338,11 +338,10 @@ function assistantMessage(
 }
 
 /**
- * Deterministic intra-turn bands. `ActivityHub` freezes an item's `seq` at its
- * first upsert, so a provider that streams the final answer before it reports
- * the turn totals — or reports usage before it reports the turn start — would
- * otherwise render the answer buried under its own footer. Provider order is
- * preserved inside each band, so tool calls never move relative to reasoning.
+ * Deterministic intra-turn bands. Turn lifecycle and aggregate facts move to
+ * their semantic edges, but messages, reasoning, and tools share the body band
+ * so a recorded message can never be moved across tool calls. That boundary is
+ * what keeps separate tool runs from collapsing into one per-turn group.
  *
  * The todo list and the turn diff are turn *artifacts*, not steps: a provider
  * emits one of each per turn (`todoKey = turnId`, and `preferredFileChangeItems`
@@ -356,7 +355,6 @@ function assistantMessage(
 function turnRank(
   item: ActivityItem,
   initialUserId: string | null,
-  finalIds: ReadonlySet<string>,
 ): number {
   if (initialUserId !== null && item.id === initialUserId) return 0;
   if (item.kind === "lifecycle") {
@@ -374,7 +372,6 @@ function turnRank(
     */
     return item.level === "info" ? 4 : 2;
   }
-  if (finalIds.has(item.id)) return 3;
   if (item.kind === "todo" || item.kind === "file-change") return 4;
   if (item.kind === "usage") return 5;
   return 2;
@@ -419,11 +416,8 @@ function messagesForTurn(turnKey: string, source: readonly ActivityItem[]): Thre
     .filter((item) => item.kind !== "file-change" || preferredFileIds.has(item.id))
     .sort((left, right) => left.seq - right.seq || left.id.localeCompare(right.id));
   const initialUser = ordered.find((item) => item.kind === "message" && item.role === "user");
-  const finalIds = new Set(ordered.flatMap((item) => (
-    item.kind === "message" && item.role === "assistant" && item.phase === "final" ? [item.id] : []
-  )));
   const semantic = placeUnderParent([...ordered].sort((left, right) =>
-    turnRank(left, initialUser?.id ?? null, finalIds) - turnRank(right, initialUser?.id ?? null, finalIds)
+    turnRank(left, initialUser?.id ?? null) - turnRank(right, initialUser?.id ?? null)
     || left.seq - right.seq
     || left.id.localeCompare(right.id)));
   const result: ThreadMessageLike[] = [];

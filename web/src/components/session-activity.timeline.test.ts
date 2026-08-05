@@ -71,15 +71,15 @@ function partLabels(message: { content: unknown }): string[] {
 }
 
 describe("turn timeline ordering", () => {
-  it("renders prompt, body, final answer, then turn totals regardless of provider seq", () => {
+  it("keeps a recorded assistant message in sequence with body activity", () => {
     const messages = activityToThreadMessages(invertedTurn());
 
     expect(messages.map((message) => message.role)).toEqual(["user", "assistant"]);
     expect(partLabels(messages[1]!)).toEqual([
       "data:agent-manager.lifecycle",
+      "text",
       "reasoning",
       "tool-call",
-      "text",
       "data:agent-manager.turn-marker",
     ]);
   });
@@ -153,10 +153,10 @@ describe("turn timeline ordering", () => {
 
     expect(partLabels({ content: parts })).toEqual([
       "data:agent-manager.lifecycle",
+      "text",
       "reasoning",
       "tool-call",
       "tool-call",
-      "text",
       "data:agent-manager.todo",
       "data:agent-manager.turn-marker",
     ]);
@@ -168,10 +168,10 @@ describe("turn timeline ordering", () => {
     ));
     const parts = activityToThreadMessages(items)[1]!.content as ReadonlyArray<{ type: string }>;
 
-    // lifecycle · tool · reasoning · answer · turn marker. Swapping the tool's
-    // seq above the reasoning item swaps them here too, and nothing else moves.
+    // lifecycle · answer · tool · reasoning · turn marker. The assistant
+    // message keeps its recorded boundary while body activity retains seq order.
     expect(parts.map((part) => part.type)).toEqual([
-      "data", "tool-call", "reasoning", "text", "data",
+      "data", "text", "tool-call", "reasoning", "data",
     ]);
   });
 });
@@ -205,6 +205,17 @@ describe("turns a provider never stated", () => {
 
     expect(messages.map((message) => message.role)).toEqual(["user", "assistant"]);
     expect(partLabels(messages[1]!)).toEqual(["tool-call", "tool-call", "tool-call", "text"]);
+  });
+
+  it("keeps an assistant message between two tool runs in the same stated turn", () => {
+    const messages = activityToThreadMessages([
+      { ...tool("t-1", 1), turnId: "turn-1" },
+      { ...unassociated, turnId: "turn-1", id: "m-between", seq: 2, kind: "message", role: "assistant", phase: "final", text: "First result checked", label: null },
+      { ...tool("t-2", 3), turnId: "turn-1" },
+    ]);
+
+    expect(messages).toHaveLength(1);
+    expect(partLabels(messages[0]!)).toEqual(["tool-call", "text", "tool-call"]);
   });
 
   it("opens a new turn at an operator message and closes one at a turn end", () => {

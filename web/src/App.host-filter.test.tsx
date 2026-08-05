@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   boardScrollBehavior,
   cockpitContentMode,
-  codexCatalogEfforts,
+  modelCatalogEfforts,
   effectiveDraftHostId,
   Header,
   hostSelectionSummary,
@@ -71,19 +71,27 @@ describe("cockpit presentation contracts", () => {
     );
   });
 
-  it("uses only the selected Codex model's provider-declared efforts", () => {
-    const response = {
+  it("uses only the selected model's provider-declared efforts for either provider", () => {
+    const codex = {
       available: true,
       source: "provider-api",
       models: [
         { value: "codex-default", label: "Default", description: null, isDefault: true, defaultEffort: "high", efforts: ["low", "high"] },
         { value: "codex-deep", label: "Deep", description: null, isDefault: false, defaultEffort: "xhigh", efforts: ["high", "xhigh", "ultra"] },
       ],
-    } satisfies NonNullable<Parameters<typeof codexCatalogEfforts>[2]>;
-    expect(codexCatalogEfforts("codex", null, response)).toEqual(["low", "high"]);
-    expect(codexCatalogEfforts("codex", "codex-deep", response)).toEqual(["high", "xhigh", "ultra"]);
-    expect(codexCatalogEfforts("codex", "missing", response)).toEqual([]);
-    expect(codexCatalogEfforts("claude", "codex-deep", response)).toBeUndefined();
+    } satisfies NonNullable<Parameters<typeof modelCatalogEfforts>[1]>;
+    const claude = {
+      available: true,
+      source: "provider-api",
+      models: [
+        { value: "sonnet", label: "Sonnet", description: null, isDefault: true, defaultEffort: "medium", efforts: ["low", "medium", "high"] },
+        { value: "opus", label: "Opus", description: null, defaultEffort: "high", efforts: ["medium", "high", "max"] },
+      ],
+    } satisfies NonNullable<Parameters<typeof modelCatalogEfforts>[1]>;
+    expect(modelCatalogEfforts(null, codex)).toEqual(["low", "high"]);
+    expect(modelCatalogEfforts("codex-deep", codex)).toEqual(["high", "xhigh", "ultra"]);
+    expect(modelCatalogEfforts("opus", claude)).toEqual(["medium", "high", "max"]);
+    expect(modelCatalogEfforts("missing", codex)).toEqual([]);
   });
 
   it("separates a configured empty cockpit from genuine first run", () => {

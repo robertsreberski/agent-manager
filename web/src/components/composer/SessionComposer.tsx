@@ -30,13 +30,7 @@ import {
   RadioGroupItem,
 } from "../ui";
 
-/*
-  A withheld control still has to say why. `Button` disables pointer events so a
-  disabled control cannot be hovered at all, which would swallow the native
-  `title`; these two composer triggers opt back in. The reason is also printed
-  as visible text in `data-withheld-reasons`, so the tooltip is the secondary
-  channel, never the only one.
-*/
+/* Disabled controls keep their concise native and accessible descriptions. */
 const KEEPS_ITS_TOOLTIP = "disabled:pointer-events-auto disabled:cursor-default";
 
 export type ComposerDelivery = "queue" | "steer";
@@ -99,15 +93,17 @@ function profileLabel(profile: ExecutionProfile | null): string {
   return profile === null ? "Profile unknown" : PROFILE_LABEL[profile];
 }
 
-function effortBars(effort: SessionComposerProps["effort"]): number {
-  return effort === "ultra" || effort === "max" || effort === "xhigh" || effort === "high" ? 3 : effort === "medium" ? 2 : effort === "low" || effort === "minimal" ? 1 : 0;
+function effortLabel(effort: ReasoningEffort | null): string {
+  if (effort === null) return "Unknown";
+  if (effort === "xhigh") return "XHigh";
+  return `${effort.slice(0, 1).toUpperCase()}${effort.slice(1)}`;
 }
 
 export function SessionComposer(props: SessionComposerProps) {
   const {
     value, onChange, onSend, onStop, isRunning, canQueue, canSteer, canStop,
     readOnlyReason, provider, model, effort, profile, providerOptions = ["codex", "claude"],
-    modelOptions = [], modelOptionsStatus = null, effortOptions = ["low", "medium", "high"],
+    modelOptions = [], modelOptionsStatus = null, effortOptions = [],
     modelChangeUnavailableReason = null, effortChangeUnavailableReason = null,
     profileChangeUnavailableReason = null,
     profileOptions = ["ask-first", "plan", "execute", "full-access"],
@@ -134,32 +130,33 @@ export function SessionComposer(props: SessionComposerProps) {
   const profileDisabledReason = settingsDisabled
     ? "Available when this turn finishes"
     : profileChangeUnavailableReason ?? "This harness does not expose live execution-profile changes.";
-  // A native tooltip is invisible on touch and to screen readers, so every
-  // withheld control states its reason as plain text in the composer itself.
-  const withheldReasons = [...new Set([
-    runtimeDisabled ? runtimeDisabledReason : null,
-    profileDisabled ? profileDisabledReason : null,
-  ].flatMap((reason) => reason && reason !== readOnlyReason ? [reason] : []))];
   /*
     The provider's catalog in the selector's shape. Efforts hang off the model
-    because that is where the component looks for them, and a model the harness
-    will not let this cockpit write is still worth reading — it appears
-    disabled, with the reason stated below the list.
+    because that is where the component looks for them. Each model keeps its
+    own declared levels; the selected-model list is only a compatibility seam
+    when a caller has not copied those levels onto the selected option yet.
   */
-  const selectorModels: ModelSelectorOption[] = modelOptions.map((option) => ({
-    id: option.value,
-    name: option.label,
-    // The id disambiguates two models with the same friendly name, so it stays
-    // visible — the menu this replaced printed it on its own line — and it is
-    // searchable alongside the label.
-    description: option.description ? `${option.value} · ${option.description}` : option.value,
-    keywords: [option.value],
-    ...(onModelChange ? {} : { disabled: true }),
-    ...(effortOptions.length > 0
-      ? { efforts: effortOptions.map((level) => ({ id: level, name: level })) }
-      : {}),
-  }));
+  const selectorModels: ModelSelectorOption[] = modelOptions.map((option) => {
+    const levels = option.efforts ?? (option.value === model ? effortOptions : []);
+    return {
+      id: option.value,
+      name: option.label,
+      // The id disambiguates two models with the same friendly name, so it
+      // remains searchable and visible below the label.
+      description: option.description ? `${option.value} · ${option.description}` : option.value,
+      keywords: [option.value],
+      ...(!onModelChange ? {
+        disabled: true,
+        ...(modelChangeUnavailableReason ? { disabledReason: modelChangeUnavailableReason } : {}),
+      } : {}),
+      ...(levels.length > 0
+        ? { efforts: levels.map((level) => ({ id: level, name: effortLabel(level) })) }
+        : {}),
+    };
+  });
   const sendDisabled = busy || value.trim().length === 0 || !canQueue;
+  const effortIndex = effort === null ? -1 : effortOptions.indexOf(effort);
+  const hasEffortScale = effortOptions.length > 0 && effortIndex >= 0;
   useEffect(() => {
     const element = textareaRef.current;
     if (!element) return;
@@ -281,12 +278,6 @@ export function SessionComposer(props: SessionComposerProps) {
 
   return (
     <div className="rounded-composer border border-[var(--border-hairline)] bg-[var(--surface-raised-hover)] px-3.5 pt-3.5 pb-2.5" data-session-composer>
-      {readOnlyReason && (
-        <p className="mb-2 text-meta-sm text-[var(--text-muted)]" role="status">{readOnlyReason}</p>
-      )}
-      {withheldReasons.length > 0 && (
-        <p className="mb-2 text-code-sm text-[var(--text-muted)]" role="status" data-withheld-reasons>{withheldReasons.join(" · ")}</p>
-      )}
       {trigger && suggestions.length > 0 && (
         <ul
           className="mb-2 max-h-52 min-w-0 overflow-y-auto overscroll-contain border border-[var(--border)] bg-[var(--menu)]"
@@ -331,7 +322,7 @@ export function SessionComposer(props: SessionComposerProps) {
         aria-label="Message"
         aria-autocomplete="list"
         aria-expanded={Boolean(trigger && suggestions.length > 0)}
-        placeholder={readOnlyReason ? "This session is read-only" : isRunning ? "Queue a message…" : composerPlaceholder(provider, Boolean(onSearchFiles))}
+        placeholder={readOnlyReason ? "" : isRunning ? "Queue a message…" : composerPlaceholder(provider, Boolean(onSearchFiles))}
       />
       <div className="flex min-w-0 items-center gap-2.5 sm:gap-3.5">
         {/*
@@ -341,10 +332,8 @@ export function SessionComposer(props: SessionComposerProps) {
           here is an explicit, capability-gated action against the harness, so
           that registration must not happen.
 
-          The component has no notion of a withheld capability, so the gate
-          stays outside it — the trigger is disabled with the harness's own
-          reason, and that reason is also stated as text above, because a native
-          tooltip is invisible on touch and to screen readers.
+          The gate stays outside it: unavailable mutations retain concise
+          native and accessible descriptions without adding another copy wall.
         */}
         <ModelSelectorRoot
           models={selectorModels}
@@ -362,6 +351,7 @@ export function SessionComposer(props: SessionComposerProps) {
             // harness and model have to be stated for anyone not reading the
             // tile. The dropdown this replaced was a button, which did.
             aria-label={model ? `${provider}, model ${model}` : provider}
+            aria-description={runtimeDisabled ? runtimeDisabledReason : undefined}
             className={`inline-flex h-auto min-h-8 min-w-0 items-center gap-2 rounded-full px-1.5 text-left text-meta text-[var(--text)] hover:bg-[var(--surface-selected-hover)] disabled:pointer-events-none disabled:opacity-45 data-[state=open]:bg-[var(--surface-selected)] sm:px-2 ${KEEPS_ITS_TOOLTIP}`}
             {...(runtimeDisabled ? { title: runtimeDisabledReason } : {})}
           >
@@ -385,10 +375,13 @@ export function SessionComposer(props: SessionComposerProps) {
               </div>
             )}
             <ModelSelectorList />
-            <ModelSelectorEffort />
+            <ModelSelectorEffort
+              disabled={!onEffortChange}
+              {...(!onEffortChange && effortChangeUnavailableReason
+                ? { disabledReason: effortChangeUnavailableReason }
+                : {})}
+            />
             {modelOptions.length === 0 && modelOptionsStatus && <p className="px-2.5 py-1.5 text-code-sm text-[var(--text-muted)]" role="status">{modelOptionsStatus}</p>}
-            {!onModelChange && modelChangeUnavailableReason && <p className="px-2.5 py-1.5 text-code-sm text-[var(--text-muted)]">{modelChangeUnavailableReason}</p>}
-            {!onEffortChange && effortChangeUnavailableReason && <p className="px-2.5 py-1.5 text-code-sm text-[var(--text-muted)]">{effortChangeUnavailableReason}</p>}
             {onResetSettings && (
               <div className="border-t border-[var(--rule)] p-1">
                 <Button variant="ghost" size="sm" data-compact-control="height" disabled={settingsDisabled} className="w-full justify-start gap-2 text-meta-sm text-[var(--text-muted)]" onClick={() => onResetSettings()}>
@@ -398,9 +391,23 @@ export function SessionComposer(props: SessionComposerProps) {
             )}
           </ModelSelectorContent>
         </ModelSelectorRoot>
-        <span className="flex shrink-0 items-end gap-0.5" role="img" aria-label={`${effort ?? "unknown"} effort`}>
-          {/* Frames 5a and 9a-2 fill the reached bars lime. */}
-          {[1, 2, 3].map((bar) => <span key={bar} data-effort-bar={bar <= effortBars(effort) ? "active" : "inactive"} className={`w-[3px] ${bar <= effortBars(effort) ? "h-[11px] bg-[var(--accent)]" : "h-[7px] bg-[var(--border-strong)]"}`} />)}
+        <span
+          className="flex min-h-[17px] shrink-0 items-end gap-0.5 text-code-xs text-[var(--text-muted)]"
+          role="img"
+          aria-label={hasEffortScale ? `${effortLabel(effort)} effort, level ${effortIndex + 1} of ${effortOptions.length}` : `${effortLabel(effort)} effort`}
+          data-effort-meter={hasEffortScale ? "scaled" : "word-only"}
+        >
+          {hasEffortScale ? effortOptions.map((option, index) => {
+            const active = index <= effortIndex;
+            return <span
+              key={option}
+              data-effort-bar={active ? "active" : "inactive"}
+              data-effort-level={option}
+              className={`w-[3px] ${active ? "bg-[var(--accent)]" : "bg-[var(--border-strong)]"}`}
+              style={{ height: `${5 + index * 2}px` }}
+            />;
+          }) : <span data-effort-word>{effortLabel(effort)}</span>}
+          {hasEffortScale && (effort === "max" || effort === "ultra") && <span className="ml-1" data-effort-word>{effortLabel(effort)}</span>}
         </span>
         <span className="h-3.5 w-px shrink-0 bg-[var(--border)]" />
         <DropdownMenu open={openMenu === "profile"} onOpenChange={(next) => setOpenMenu(next ? "profile" : null)}>
@@ -411,6 +418,7 @@ export function SessionComposer(props: SessionComposerProps) {
               data-compact-control
               className={`h-auto min-h-8 gap-1.5 rounded-full px-2 text-meta data-[state=open]:bg-[var(--surface-selected)] ${KEEPS_ITS_TOOLTIP}`}
               title={profileDisabled ? profileDisabledReason : undefined}
+              aria-description={profileDisabled ? profileDisabledReason : undefined}
             >
               <span className={profile === "full-access" ? "text-[var(--access)]" : "text-[var(--text-secondary)]"}>{profileLabel(profile)}</span>
               <ChevronDown size={12} strokeWidth={1.75} className="text-[var(--text-faint)]" />

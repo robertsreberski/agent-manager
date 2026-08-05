@@ -1,4 +1,13 @@
-import { readFileSync, readdirSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  readSync,
+  readdirSync,
+} from "node:fs";
 import { basename, join } from "node:path";
 
 import {
@@ -8,12 +17,12 @@ import {
   unknownProfile,
   type AdapterResult,
   type Diagnostic,
-  type ExecutionProfile,
   type ProcessInfo,
   type Runtime,
   type SessionRecord,
   type SessionStatus,
 } from "../core/types.ts";
+import { profileForClaudePermissionMode } from "../providers/claude/profile.ts";
 import {
   baseRecord,
   iso,
@@ -25,6 +34,8 @@ import {
 } from "./observe-values.ts";
 
 const MAX_PROVIDER_ROWS = 750;
+const MAX_TRANSCRIPT_TAIL_BYTES = 512 * 1024;
+const SAFE_CLAUDE_SESSION_ID = /^[a-zA-Z0-9_-]{1,256}$/u;
 
 function commandIsClaude(process: ProcessInfo): boolean {
   const words = process.command.trim().split(/\s+/u);
@@ -32,14 +43,80 @@ function commandIsClaude(process: ProcessInfo): boolean {
     (/^(?:node|nodejs)$/u.test(basename(words[0] ?? "")) && basename(words[1] ?? "") === "claude");
 }
 
-function claudeProfile(value: unknown): ExecutionProfile | null {
-  switch (value) {
-    case "plan": return "plan";
-    case "acceptEdits": return "execute";
-    case "bypassPermissions": return "full-access";
-    case "default": return "ask-first";
-    default: return null;
+function claudeProjectDirectory(cwd: string): string {
+  return cwd.replace(/[^a-zA-Z0-9-]/gu, "-");
+}
+
+function transcriptCandidates(
+  configDirectory: string,
+  cwd: string,
+  sessionId: string,
+): string[] {
+  if (!SAFE_CLAUDE_SESSION_ID.test(sessionId)) return [];
+  const projectsDirectory = join(configDirectory, "projects");
+  const preferred = join(projectsDirectory, claudeProjectDirectory(cwd), `${sessionId}.jsonl`);
+  const candidates = [preferred];
+  try {
+    for (const entry of readdirSync(projectsDirectory, { withFileTypes: true }).slice(0, MAX_PROVIDER_ROWS)) {
+      if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+      const candidate = join(projectsDirectory, entry.name, `${sessionId}.jsonl`);
+      if (candidate !== preferred) candidates.push(candidate);
+    }
+  } catch {
+    // The preferred provider-owned path may still be readable.
   }
+  return candidates.flatMap((path) => {
+    try {
+      const stat = lstatSync(path);
+      return stat.isFile() ? [{ path, modifiedAt: stat.mtimeMs }] : [];
+    } catch {
+      return [];
+    }
+  }).sort((left, right) => right.modifiedAt - left.modifiedAt).map(({ path }) => path);
+}
+
+function transcriptPermissionMode(path: string): string | null {
+  let descriptor: number | null = null;
+  try {
+    descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const stat = fstatSync(descriptor);
+    if (!stat.isFile()) return null;
+    const size = stat.size;
+    const length = Math.min(size, MAX_TRANSCRIPT_TAIL_BYTES);
+    const buffer = Buffer.alloc(length);
+    const bytesRead = readSync(descriptor, buffer, 0, length, Math.max(0, size - length));
+    let text = buffer.subarray(0, bytesRead).toString("utf8");
+    if (size > length) text = text.slice(text.indexOf("\n") + 1);
+    const lines = text.split("\n");
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      const line = lines[index];
+      if (!line) continue;
+      try {
+        const value = object(JSON.parse(line));
+        const mode = string(value?.permissionMode);
+        if (profileForClaudePermissionMode(mode) !== null) return mode;
+      } catch {
+        // A partially-written final transcript row is not evidence.
+      }
+    }
+  } catch {
+    return null;
+  } finally {
+    if (descriptor !== null) closeSync(descriptor);
+  }
+  return null;
+}
+
+function latestTranscriptPermissionMode(
+  configDirectory: string,
+  cwd: string,
+  sessionId: string,
+): string | null {
+  for (const path of transcriptCandidates(configDirectory, cwd, sessionId)) {
+    const mode = transcriptPermissionMode(path);
+    if (mode !== null) return mode;
+  }
+  return null;
 }
 
 function claudeStatus(value: unknown, live: boolean): SessionStatus {
@@ -92,6 +169,7 @@ export function discoverClaude(
   const cutoff = now - recentWindowSeconds * 1_000;
   const processMap = new Map(processes.map((process) => [process.pid, process]));
   const registry = validClaudeRegistry(runtime, processMap);
+  const configDirectory = runtime.env.CLAUDE_CONFIG_DIR ?? join(runtime.homeDir, ".claude");
   const byId = new Map<string, SessionRecord>();
   const result = runtime.run("claude", ["agents", "--json", "--all"], 5_000);
   let values: unknown[] = [];
@@ -118,15 +196,21 @@ export function discoverClaude(
     const live = liveValue !== null;
     const startedAt = number(value.startedAt) ?? number(liveValue?.startedAt) ?? now;
     if (!live && startedAt < cutoff) continue;
+    const cwd = string(value.cwd) ?? string(liveValue?.cwd);
     const statusValue = liveValue?.status ?? value.state ?? value.status;
     const status = claudeStatus(statusValue, live);
-    const profileValue = claudeProfile(liveValue?.permissionMode ?? value.permissionMode);
+    const directPermissionMode = string(liveValue?.permissionMode ?? value.permissionMode);
+    const transcriptPermissionMode = directPermissionMode === null && cwd
+      ? latestTranscriptPermissionMode(configDirectory, cwd, id)
+      : null;
+    const permissionMode = directPermissionMode ?? transcriptPermissionMode;
+    const profileValue = profileForClaudePermissionMode(permissionMode);
     const effortValue = string(liveValue?.effort);
     const pid = number(liveValue?.pid);
     byId.set(id, {
       ...baseRecord("claude", id, now),
       name: normalizedText(value.name ?? liveValue?.name),
-      cwd: string(value.cwd) ?? string(liveValue?.cwd),
+      cwd,
       kind: value.kind === "background" ? "background" : "interactive",
       presence: live ? "live" : "recent",
       status,
@@ -137,11 +221,11 @@ export function discoverClaude(
       updatedAt: iso(number(liveValue?.updatedAt) ?? startedAt, now),
       statusSource: live ? "live-registry" : "provider-cli",
       source: string(value.kind),
-      profile: profileValue ? {
+      profile: permissionMode ? {
         value: profileValue,
-        providerValue: string(liveValue?.permissionMode ?? value.permissionMode),
-        source: live ? "live-registry" : "provider-cli",
-        confidence: "exact",
+        providerValue: permissionMode,
+        source: transcriptPermissionMode ? "transcript" : live ? "live-registry" : "provider-cli",
+        confidence: transcriptPermissionMode ? "inferred" : "exact",
       } : unknownProfile(),
       model: string(liveValue?.model) ? {
         value: string(liveValue?.model),

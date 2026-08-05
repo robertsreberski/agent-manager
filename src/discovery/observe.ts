@@ -25,6 +25,7 @@ import {
   type Provider,
   type Runtime,
   type SessionAttention,
+  type SessionProfile,
   type SessionRecord,
   type SessionStatus,
 } from "../core/types.ts";
@@ -342,12 +343,21 @@ function readJsonlTail(path: string): JsonObject[] {
 export function analyzeCodexEvents(
   events: readonly JsonObject[],
   live: boolean,
-): { status: SessionStatus; providerStatus: string | null; attention: SessionAttention[] } {
+): {
+  status: SessionStatus;
+  providerStatus: string | null;
+  attention: SessionAttention[];
+  profile: SessionProfile | null;
+} {
   let status: SessionStatus = live ? "running" : "unknown";
   let providerStatus: string | null = null;
+  let profile: SessionProfile | null = null;
   const pendingQuestions = new Map<string, string | null>();
   for (const event of events) {
     const payload = object(event.payload);
+    if (event.type === "turn_context" && payload) {
+      profile = codexProfileFromTurnContext(payload) ?? profile;
+    }
     if (event.type === "event_msg") {
       const type = string(payload?.type);
       if (!type) continue;
@@ -381,14 +391,71 @@ export function analyzeCodexEvents(
     },
   }));
   if (attention.length > 0 && live) status = "waiting";
-  return { status, providerStatus, attention };
+  return { status, providerStatus, attention, profile };
 }
 
-function codexProfile(row: CodexRow): ExecutionProfile | null {
-  if (row.approvalMode === "never" && /danger/i.test(row.sandboxPolicy ?? "")) {
-    return "full-access";
+function codexFactType(value: unknown): string | null {
+  const direct = string(value);
+  if (direct) {
+    try {
+      return codexFactType(JSON.parse(direct)) ?? direct.toLowerCase();
+    } catch {
+      return direct.toLowerCase();
+    }
+  }
+  return string(object(value)?.type)?.toLowerCase() ?? null;
+}
+
+function codexCollaborationMode(value: unknown): string | null {
+  return string(object(value)?.mode)?.toLowerCase() ?? string(value)?.toLowerCase() ?? null;
+}
+
+function codexProfileEvidence(
+  value: ExecutionProfile,
+  source: SessionProfile["source"],
+  facts: ReadonlyArray<readonly [string, string | null]>,
+): SessionProfile {
+  return {
+    value,
+    providerValue: facts.flatMap(([name, fact]) => fact ? [`${name}=${fact}`] : []).join("; ") || null,
+    source,
+    confidence: "inferred",
+  };
+}
+
+function unrestrictedCodexPolicy(...values: Array<string | null>): boolean {
+  return values.some((value) => value === "disabled" || value === "danger-full-access" || value === "dangerfullaccess");
+}
+
+function codexProfileFromTurnContext(payload: JsonObject): SessionProfile | null {
+  const approval = string(payload.approval_policy)?.toLowerCase() ?? null;
+  const sandbox = codexFactType(payload.sandbox_policy);
+  const permission = codexFactType(payload.permission_profile);
+  const collaboration = codexCollaborationMode(payload.collaboration_mode);
+  const facts = [
+    ["approval", approval],
+    ["sandbox", sandbox],
+    ["permission", permission],
+    ["collaboration", collaboration],
+  ] as const;
+  if (unrestrictedCodexPolicy(sandbox, permission)) {
+    return codexProfileEvidence("full-access", "rollout-events", facts);
+  }
+  if (collaboration === "plan") return codexProfileEvidence("plan", "rollout-events", facts);
+  if (collaboration === "default" || approval || sandbox || permission) {
+    return codexProfileEvidence("execute", "rollout-events", facts);
   }
   return null;
+}
+
+function codexProfile(row: CodexRow): SessionProfile | null {
+  const sandbox = codexFactType(row.sandboxPolicy);
+  const approval = row.approvalMode?.toLowerCase() ?? null;
+  const facts = [["approval", approval], ["sandbox", sandbox]] as const;
+  if (unrestrictedCodexPolicy(sandbox)) {
+    return codexProfileEvidence("full-access", "provider-cli", facts);
+  }
+  return approval || sandbox ? codexProfileEvidence("execute", "provider-cli", facts) : null;
 }
 
 function rootOf(id: string, parentByChild: ReadonlyMap<string, string>): string {
@@ -429,7 +496,7 @@ function discoverCodex(
         row.rolloutPath ? readJsonlTail(row.rolloutPath) : [],
         active !== null,
       );
-      const profile = codexProfile(row);
+      const profile = analysis.profile ?? codexProfile(row);
       const parent = queried.parentByChild.get(row.id) ?? null;
       return {
         ...baseRecord("codex", row.id, now),
@@ -448,12 +515,7 @@ function discoverCodex(
         updatedAt: iso(row.updatedAtMs, now),
         statusSource: row.rolloutPath ? "rollout-events" : "inferred",
         source: row.threadSource ?? row.source,
-        profile: profile === null ? unknownProfile() : {
-          value: profile,
-          providerValue: row.approvalMode,
-          source: "provider-cli",
-          confidence: "inferred",
-        },
+        profile: profile ?? unknownProfile(),
         model: row.model ? {
           value: row.model,
           providerValue: row.model,

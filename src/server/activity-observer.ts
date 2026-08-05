@@ -101,7 +101,10 @@ function activityDraft(item: TranscriptItem): ActivityItemDraft {
     kind: "message",
     id: `${TRANSCRIPT_ID_PREFIX}${item.id}`,
     role: item.role,
-    phase: item.role === "assistant" && complete ? "final" : null,
+    // Transcript rows preserve message order but do not expose the provider's
+    // commentary/final channel. Treating every complete assistant row as final
+    // let the UI move it past later tool calls and erase a real message boundary.
+    phase: null,
     text: item.text,
     label: item.label,
     state: transcriptState(item.status),
