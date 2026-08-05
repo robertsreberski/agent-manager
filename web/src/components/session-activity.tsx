@@ -335,6 +335,36 @@ function turnRank(
   return 2;
 }
 
+/**
+ * Moves an item that names a parent to sit directly after it.
+ *
+ * A question or approval is raised *by* a tool call, but every provider emits
+ * the request before the call it belongs to — Claude asks permission and only
+ * then reports the tool — and `seq` freezes at first upsert, so the question
+ * kept the earlier position permanently and rendered above the thing that
+ * asked it.
+ *
+ * Only `parentId` moves an item, and only within its own turn, so a provider
+ * that states no parent keeps provider order exactly as before.
+ */
+function placeUnderParent(items: readonly ActivityItem[]): ActivityItem[] {
+  const present = new Set(items.map((item) => item.id));
+  const children = new Map<string, ActivityItem[]>();
+  const roots: ActivityItem[] = [];
+  for (const item of items) {
+    const parentId = item.parentId;
+    if (parentId === null || parentId === item.id || !present.has(parentId)) {
+      roots.push(item);
+      continue;
+    }
+    const siblings = children.get(parentId);
+    if (siblings) siblings.push(item);
+    else children.set(parentId, [item]);
+  }
+  if (children.size === 0) return [...items];
+  return roots.flatMap((item) => [item, ...children.get(item.id) ?? []]);
+}
+
 function messagesForTurn(turnKey: string, source: readonly ActivityItem[]): ThreadMessageLike[] {
   const hierarchy = buildSubagentHierarchy(source);
   const turnFactFileIds = new Set(preferredFileChangeItems(source).map((item) => item.id));
@@ -347,10 +377,10 @@ function messagesForTurn(turnKey: string, source: readonly ActivityItem[]): Thre
   const finalIds = new Set(ordered.flatMap((item) => (
     item.kind === "message" && item.role === "assistant" && item.phase === "final" ? [item.id] : []
   )));
-  const semantic = [...ordered].sort((left, right) =>
+  const semantic = placeUnderParent([...ordered].sort((left, right) =>
     turnRank(left, initialUser?.id ?? null, finalIds) - turnRank(right, initialUser?.id ?? null, finalIds)
     || left.seq - right.seq
-    || left.id.localeCompare(right.id));
+    || left.id.localeCompare(right.id)));
   const result: ThreadMessageLike[] = [];
   let assistantItems: ActivityItem[] = [];
   let segment = 0;

@@ -306,3 +306,79 @@ describe("provider status lines", () => {
     expect(lifecycleTitles).toEqual(["PostToolUse · Bash", "Turn failed"]);
   });
 });
+
+/*
+  A question or approval is raised *by* a tool call, but every provider emits
+  the request before the call it belongs to — Claude asks permission and only
+  then reports the tool — and the hub freezes an item's seq at its first upsert.
+  So the question kept the earlier position permanently and rendered above the
+  thing that asked it. This ordering had no coverage at all.
+*/
+describe("a request sits under the tool call that raised it", () => {
+  function tool(id: string, seq: number): ActivityItem {
+    return {
+      ...common, id, seq,
+      kind: "tool", toolCallId: id, name: "AskUserQuestion", category: "other",
+      arguments: null, result: "ok", output: "",
+    };
+  }
+
+  function question(id: string, seq: number, parentId: string | null): ActivityItem {
+    return {
+      ...common, id, seq, parentId,
+      kind: "attention", requestId: id, attentionKind: "question",
+      title: "Claude requests AskUserQuestion", summary: null, questions: [],
+      approvalFacts: null, respondable: true, resolved: false, isSecret: false,
+      state: "waiting",
+    };
+  }
+
+  it("places the question after its tool call even though it was seen first", () => {
+    const parts = activityToThreadMessages([
+      question("ask-1", 1, "tool-1"),
+      tool("tool-1", 2),
+    ])[0]!.content as ReadonlyArray<{ type: string; name?: string }>;
+
+    expect(partLabels({ content: parts })).toEqual([
+      "tool-call",
+      "data:agent-manager.attention",
+    ]);
+  });
+
+  it("leaves provider order alone when the provider named no parent", () => {
+    const parts = activityToThreadMessages([
+      question("ask-1", 1, null),
+      tool("tool-1", 2),
+    ])[0]!.content as ReadonlyArray<{ type: string; name?: string }>;
+
+    expect(partLabels({ content: parts })).toEqual([
+      "data:agent-manager.attention",
+      "tool-call",
+    ]);
+  });
+
+  it("does not reach into another turn for a parent", () => {
+    const messages = activityToThreadMessages([
+      { ...tool("tool-1", 1), turnId: "turn-a" },
+      { ...question("ask-1", 2, "tool-1"), turnId: "turn-b" },
+    ]);
+
+    // Two turns, and the question stays in its own.
+    expect(messages).toHaveLength(2);
+    expect(partLabels(messages[1]!)).toEqual(["data:agent-manager.attention"]);
+  });
+
+  it("keeps two questions with the same parent in provider order", () => {
+    const parts = activityToThreadMessages([
+      question("ask-1", 1, "tool-1"),
+      question("ask-2", 2, "tool-1"),
+      tool("tool-1", 3),
+    ])[0]!.content as ReadonlyArray<{ type: string; name?: string }>;
+
+    expect(partLabels({ content: parts })).toEqual([
+      "tool-call",
+      "data:agent-manager.attention",
+      "data:agent-manager.attention",
+    ]);
+  });
+});

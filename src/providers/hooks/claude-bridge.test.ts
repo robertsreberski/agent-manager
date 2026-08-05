@@ -630,3 +630,74 @@ test("bridge returns provider permission suggestions only for explicit persisten
   await withoutSuggestions;
   bridge.shutdown();
 });
+
+/*
+  Claude asks permission before it has a tool-use id — `PermissionRequestHookInput`
+  carries no `tool_use_id` — so at the moment the question is projected there is
+  nothing to point it at. The hub freezes an item's seq at its first upsert, so
+  the question kept the earlier position permanently and the cockpit rendered it
+  above the tool call that raised it. The id arrives one hook later.
+*/
+test("a permission request adopts the tool call it belongs to once its id arrives", () => {
+  const projector = new ClaudeHookActivityProjector();
+  const asked = projector.project(permission(), { permissionRequestId: "held-1" });
+  const attention = asked.mutations.flatMap((mutation) =>
+    mutation.type === "upsert" && mutation.item.kind === "attention" ? [mutation.item] : []
+  );
+  assert.equal(attention.length, 1);
+  assert.equal(attention[0]?.parentId ?? null, null, "nothing to point at yet");
+
+  const ran = projector.project(parseClaudeHookInput({
+    ...common("PreToolUse"),
+    tool_name: "Bash",
+    tool_use_id: "toolu_1",
+    tool_input: { command: "echo ok" },
+  }) as never);
+
+  const upserted = ran.mutations.flatMap((mutation) =>
+    mutation.type === "upsert" ? [mutation.item] : []
+  );
+  const tool = upserted.find((item) => item.kind === "tool");
+  const adopted = upserted.find((item) => item.kind === "attention");
+  assert.ok(tool, "the tool call is projected");
+  assert.equal(adopted?.id, attention[0]?.id, "the same question, not a second one");
+  assert.equal(adopted?.parentId, tool?.id);
+});
+
+test("a tool call nobody asked permission for adopts nothing", () => {
+  const projector = new ClaudeHookActivityProjector();
+  const ran = projector.project(parseClaudeHookInput({
+    ...common("PreToolUse"),
+    tool_name: "Read",
+    tool_use_id: "toolu_2",
+    tool_input: { file_path: "/workspace/a.ts" },
+  }) as never);
+
+  assert.equal(
+    ran.mutations.filter((mutation) => mutation.type === "upsert" && mutation.item.kind === "attention").length,
+    0,
+  );
+});
+
+test("a second tool call does not steal the first one's question", () => {
+  const projector = new ClaudeHookActivityProjector();
+  projector.project(permission(), { permissionRequestId: "held-1" });
+  const first = projector.project(parseClaudeHookInput({
+    ...common("PreToolUse"),
+    tool_name: "Bash",
+    tool_use_id: "toolu_1",
+    tool_input: { command: "echo ok" },
+  }) as never);
+  const second = projector.project(parseClaudeHookInput({
+    ...common("PreToolUse"),
+    tool_name: "Bash",
+    tool_use_id: "toolu_2",
+    tool_input: { command: "echo again" },
+  }) as never);
+
+  const adopted = (projection: typeof first) => projection.mutations.filter(
+    (mutation) => mutation.type === "upsert" && mutation.item.kind === "attention",
+  ).length;
+  assert.equal(adopted(first), 1);
+  assert.equal(adopted(second), 0, "the question was already claimed");
+});

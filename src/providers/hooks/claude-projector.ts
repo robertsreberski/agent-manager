@@ -163,6 +163,18 @@ export class ClaudeHookActivityProjector {
   readonly #todos = new Map<string, ActivityTodoRewriteState>();
   readonly #tasks = new Map<string, Map<string, TaskProjectionStep>>();
   readonly #taskTodos = new Map<string, ActivityTodoRewriteState>();
+  /*
+    A permission request the tool call has not arrived for yet, keyed
+    `<session>\0<tool_name>`.
+
+    `PermissionRequestHookInput` carries no `tool_use_id` — Claude asks before
+    it has one — so at the moment the question is projected there is nothing to
+    point it at, and the cockpit rendered the question above the tool call that
+    raised it. Claude fires `PermissionRequest` for a tool and then `PreToolUse`
+    for that same tool, so the id arrives one hook later; this remembers the
+    question until it does.
+  */
+  readonly #awaitingToolUse = new Map<string, Extract<ActivityItemDraft, { kind: "attention" }>>();
 
   project(
     input: ClaudeHookInput,
@@ -211,10 +223,11 @@ export class ClaudeHookActivityProjector {
         break;
       }
 
-      case "PreToolUse":
+      case "PreToolUse": {
+        const toolItemId = itemId(input, "tool", input.tool_use_id);
         mutations.push(upsert({
           ...base,
-          id: itemId(input, "tool", input.tool_use_id),
+          id: toolItemId,
           kind: "tool",
           toolCallId: input.tool_use_id,
           name: redactActivityText(input.tool_name),
@@ -222,11 +235,24 @@ export class ClaudeHookActivityProjector {
           arguments: safeJson(input.tool_input),
           state: "running",
         }));
+        /*
+          The tool id Claude withheld when it asked. Re-upserting the question
+          with it fills in the parent the cockpit places by; the hub merges on
+          id and freezes seq at first upsert, so this moves the question under
+          its tool call without disturbing anything else in the turn.
+        */
+        const awaitingKey = `${input.session_id}\u0000${input.tool_name}`;
+        const awaiting = this.#awaitingToolUse.get(awaitingKey);
+        if (awaiting) {
+          this.#awaitingToolUse.delete(awaitingKey);
+          mutations.push(upsert({ ...awaiting, parentId: toolItemId }));
+        }
         if (input.tool_name === "TodoWrite") {
           const todo = this.#todoMutation(input);
           if (todo) mutations.push(todo);
         }
         break;
+      }
 
       case "PostToolUse":
         mutations.push(upsert({
@@ -300,16 +326,16 @@ export class ClaudeHookActivityProjector {
             }));
           }
         }
-        mutations.push(upsert({
+        const attention = {
           ...base,
           id: itemId(input, "attention", requestId),
-          kind: "attention",
+          kind: "attention" as const,
           requestId,
           attentionKind: input.tool_name === "AskUserQuestion"
-            ? "question"
+            ? "question" as const
             : input.tool_name === "ExitPlanMode"
-              ? "approval"
-              : "permission",
+              ? "approval" as const
+              : "permission" as const,
           title: `Claude requests ${redactActivityText(input.tool_name)}`,
           summary: JSON.stringify(safeJson(input.tool_input)).slice(0, 2_000),
           questions,
@@ -323,8 +349,14 @@ export class ClaudeHookActivityProjector {
           respondable: true,
           resolved: false,
           isSecret: questions.some((question) => question.isSecret),
-          state: "waiting",
-        }));
+          state: "waiting" as const,
+        };
+        mutations.push(upsert(attention));
+        // The tool id arrives one hook later, on `PreToolUse`.
+        this.#awaitingToolUse.set(
+          `${input.session_id}\u0000${input.tool_name}`,
+          attention,
+        );
         break;
       }
 
