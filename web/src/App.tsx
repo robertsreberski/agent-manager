@@ -59,7 +59,7 @@ import {
   type NotificationReducerState,
   type NotificationPreferences,
 } from "./components/system";
-import { SessionThread, SessionThreadComposer } from "./components/session-thread";
+import { SessionRuntimeProvider, SessionThread, SessionThreadComposer } from "./components/session-thread";
 import { preferredFileChangeItems, sessionTodoProgress } from "./components/session-activity";
 import { useCockpit } from "./hooks/use-cockpit";
 import { usePhoneAttentionLabels } from "./hooks/use-phone-attention-labels";
@@ -80,7 +80,7 @@ import {
 import { toCockpitSessionView } from "./lib/cockpit-view";
 import type { ProviderSettingsOptionsResponse, SessionSettingsOptionsResponse, SetupReadModel, TranscriptSearchMatch } from "./lib/api";
 import { isTypingTarget } from "./lib/shortcuts";
-import type { HostOption, ReasoningEffort, SessionView } from "./types";
+import type { ActivityItem, HostOption, ReasoningEffort, SessionView } from "./types";
 
 const FILTERS = [
   ["all", "All"],
@@ -189,6 +189,9 @@ function loadNotificationPreferences(): ClientNotificationPreferences {
 export function notificationAwaySince(visibility: DocumentVisibilityState, now: number): number | null {
   return visibility === "hidden" ? now : null;
 }
+
+/** A draft has no provider activity, and the runtime still needs a thread. */
+const EMPTY_ACTIVITY_ITEMS: readonly ActivityItem[] = [];
 
 export type CockpitContentMode = "board" | "empty" | "first-run";
 
@@ -912,7 +915,17 @@ export default function App() {
           </>
         )}
 
+        {/*
+          The thread runtime wraps the drawer rather than sitting inside it. The
+          drawer owns the only scroll container the thread has, so a viewport
+          created below it would nest a second scroller inside the first; and
+          the composer is a sibling prop, which kept it outside the runtime
+          entirely. Neither provider renders an element, so the drawer is still
+          a direct child of `[data-board-region]`.
+        */}
+        <SessionRuntimeProvider items={selected ? activity.items : EMPTY_ACTIVITY_ITEMS}>{(viewportRef) => (
         <ThreadDrawer
+          viewportRef={viewportRef}
           open={drawerOpen}
           title={drawerTitle}
           facts={drawerInfo}
@@ -954,6 +967,7 @@ export default function App() {
             onContinueInWorkspace={() => openDraft({ hostId: selected.hostId, path: selected.workspaceIdentity?.worktreePath ?? selected.cwd ?? "" })}
           /> : draft ? <DraftThread draft={draft} hosts={cockpit.hosts} workspaces={cockpit.workspaces} busy={Boolean(cockpit.busy.create)} mutationsReady={cockpit.mutationsReady} modelOptions={draftModelCatalog.models} modelOptionsStatus={draftModelCatalog.status} {...(draftModelCatalog.effortOptions !== undefined ? { effortOptions: draftModelCatalog.effortOptions } : {})} dispatch={dispatchDraft} onFirstSend={firstSend} /> : null}
         </ThreadDrawer>
+        )}</SessionRuntimeProvider>
       </div>
 
       {reviewOpen && selected && <DiffReview changes={changedFiles} branch={selected.workspaceIdentity?.branch ?? null} uncommitted={selected.workspaceIdentity?.dirtyCount === null ? null : (selected.workspaceIdentity?.dirtyCount ?? 0) > 0} readKeys={readKeys} onReadChange={(key, read) => setReadKeys((current) => { const next = new Set(current); if (read) next.add(key); else next.delete(key); return next; })} {...(selected.control.capabilities.includes("open-editor") ? { onOpenEditor: (relativePath: string) => void cockpit.openEditor(selected, relativePath), resolveEditorPath: (path: string) => relativeEditorPath(selected.workspaceIdentity?.worktreePath ?? selected.cwd, path) } : {})} onClose={() => setReviewOpen(false)} />}

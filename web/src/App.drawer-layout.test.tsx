@@ -121,8 +121,12 @@ vi.mock("./hooks/use-cockpit", () => ({
   useCockpit: () => cockpit,
 }));
 vi.mock("./hooks/use-session-activity", () => ({ useSessionActivity: () => activity }));
-// The shell layout, not the thread body, is under test here.
+// The shell layout, not the thread body, is under test here. The runtime
+// provider is stubbed as a pass-through so the assertions below still see the
+// drawer as a direct child of the board region — which is the point: neither
+// the runtime nor the viewport store may put an element between them.
 vi.mock("./components/session-thread", () => ({
+  SessionRuntimeProvider: ({ children }: { children: (ref: () => void) => React.ReactNode }) => children(() => undefined),
   SessionThread: () => null,
   SessionThreadComposer: () => null,
 }));

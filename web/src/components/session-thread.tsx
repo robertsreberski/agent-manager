@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode, type RefCallback } from "react";
 import {
   AuiIf,
   AssistantRuntimeProvider,
@@ -6,11 +6,12 @@ import {
   ThreadPrimitive,
   useExternalStoreRuntime,
   useScrollLock,
+  useThreadViewportAutoScroll,
   type ThreadMessageLike,
 } from "@assistant-ui/react";
-import { LoaderCircle, Sparkles } from "lucide-react";
+import { ArrowDown, LoaderCircle, Sparkles } from "lucide-react";
 import { reasoningEffortsForProvider } from "../../../src/shared/session.ts";
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "./ui";
+import { Button, Collapsible, CollapsibleContent, CollapsibleTrigger } from "./ui";
 import { DISCLOSURE_SCROLL_LOCK_MS, GroupedActivityParts } from "./thread";
 import { QueuedMessageCount, SessionComposer, type ComposerDelivery, type ComposerModelOption } from "./composer";
 import { TodoList } from "./plans";
@@ -28,6 +29,7 @@ import {
   type ActivityDataControls,
 } from "./session-activity";
 import type {
+  ActivityItem,
   AttachInstruction,
   ExecutionProfile,
   ReasoningEffort,
@@ -108,6 +110,60 @@ function SessionDetails({ session, remote, facts, factsStatus, attachInstruction
   );
 }
 
+/**
+ * Owns the thread runtime for whatever surface the drawer is showing, and hands
+ * that surface a ref for its own scroll container.
+ *
+ * The runtime has to sit *above* the drawer. The only scroller in the drawer is
+ * `[data-thread-content]`, which the drawer itself renders; a viewport created
+ * inside `SessionThread` would nest a second scroller inside that one and
+ * reintroduce the chaining the drawer avoids. Hoisting it also puts the
+ * composer — passed to the drawer as a sibling prop — inside the runtime for
+ * the first time.
+ *
+ * `AssistantRuntimeProvider` already supplies a thread viewport store and
+ * neither provider renders an element, so the drawer stays a direct child of
+ * `[data-board-region]`.
+ */
+export function SessionRuntimeProvider({
+  items,
+  children,
+}: {
+  items: readonly ActivityItem[];
+  children: (viewportRef: RefCallback<HTMLDivElement>) => ReactNode;
+}) {
+  const messages = useMemo(() => activityToThreadMessages(items), [items]);
+  const runtime = useExternalStoreRuntime<ThreadMessageLike>({
+    messages,
+    convertMessage: (message) => message,
+    // Per-item status is authoritative. The runtime must not invent an empty
+    // assistant message merely because the provider has an active turn.
+    isRunning: false,
+    isDisabled: true,
+    onNew: async () => undefined,
+  });
+  return (
+    <AssistantRuntimeProvider runtime={runtime}>
+      <ThreadViewportBridge>{children}</ThreadViewportBridge>
+    </AssistantRuntimeProvider>
+  );
+}
+
+function ThreadViewportBridge({ children }: { children: (viewportRef: RefCallback<HTMLDivElement>) => ReactNode }) {
+  /*
+    `scrollToBottomOnRunStart` is deliberately absent: `isRunning` is pinned to
+    false above, so it could never fire. New activity is what moves the view,
+    and `autoScroll` only follows while the operator is already at the bottom —
+    scrolling up detaches, returning re-attaches.
+  */
+  const viewportRef = useThreadViewportAutoScroll<HTMLDivElement>({
+    autoScroll: true,
+    scrollToBottomOnInitialize: true,
+    scrollToBottomOnThreadSwitch: true,
+  });
+  return <>{children(viewportRef)}</>;
+}
+
 export function SessionThread({
   session,
   activity,
@@ -146,18 +202,8 @@ export function SessionThread({
   const [loadingAttach, setLoadingAttach] = useState(false);
   const [facts, setFacts] = useState<SelectedSessionFactsResponse | null>(null);
   const [factsStatus, setFactsStatus] = useState<"loading" | "loaded" | "error">("loading");
-  const messages = useMemo(() => activityToThreadMessages(activity.items), [activity.items]);
   const exactRequestIds = useMemo(() => exactCurrentActivityRequestIds(activity.items), [activity.items]);
   const planApprovalRequestIds = useMemo(() => exactPlanApprovalRequestIds(activity.items, exactRequestIds), [activity.items, exactRequestIds]);
-  const runtime = useExternalStoreRuntime<ThreadMessageLike>({
-    messages,
-    convertMessage: (message) => message,
-    // Per-item status is authoritative. The runtime must not invent an empty
-    // assistant message merely because the provider has an active turn.
-    isRunning: false,
-    isDisabled: true,
-    onNew: async () => undefined,
-  });
   useEffect(() => {
     let cancelled = false;
     setFacts(null);
@@ -216,20 +262,34 @@ export function SessionThread({
     },
   };
   return (
-    <AssistantRuntimeProvider runtime={runtime}>
-      <ThreadPrimitive.Root>
-        {/* Drawer body: 20px between turn parts (spec 05 R7, frame 4a). */}
-        <div className="flex min-w-0 flex-col gap-5" role="log" aria-label="Provider activity" aria-live="polite" aria-relevant="additions text">
-          <SessionDetails session={session} remote={remote} facts={facts} factsStatus={factsStatus} attachInstruction={attachInstruction} attachError={attachError} loadingAttach={loadingAttach} onRevealAttach={() => void revealAttach()} />
-          {activity.truncated && <ActivityRetentionBoundary />}
-          <AuiIf condition={(state) => state.thread.isEmpty}><EmptyActivity connection={activity.connection} /></AuiIf>
-          <ThreadPrimitive.Messages>
-            {({ message }) => message.role === "user" ? <UserMessage /> : message.role === "system" ? <SystemMessage /> : <AssistantMessage controls={controls} />}
-          </ThreadPrimitive.Messages>
-          {["completed", "failed", "interrupted"].includes(session.status) && <div><SessionEndedState canResume={session.control.capabilities.includes("resume")} resumeCommand={attachInstruction?.available ? attachInstruction.command : null} resumeDescription={attachInstruction?.description ?? null} resumeError={attachError} resumeUnavailableReason={session.control.withheld.find(({ capability }) => capability === "resume")?.reason ?? null} loadingResume={loadingAttach} onResume={() => void revealAttach()} canContinue={Boolean(session.workspaceIdentity?.worktreePath ?? session.cwd)} onContinue={onContinueInWorkspace} /></div>}
-        </div>
-      </ThreadPrimitive.Root>
-    </AssistantRuntimeProvider>
+    <ThreadPrimitive.Root>
+      {/* Drawer body: 20px between turn parts (spec 05 R7, frame 4a). */}
+      <div className="flex min-w-0 flex-col gap-5" role="log" aria-label="Provider activity" aria-live="polite" aria-relevant="additions text">
+        <SessionDetails session={session} remote={remote} facts={facts} factsStatus={factsStatus} attachInstruction={attachInstruction} attachError={attachError} loadingAttach={loadingAttach} onRevealAttach={() => void revealAttach()} />
+        {activity.truncated && <ActivityRetentionBoundary />}
+        <AuiIf condition={(state) => state.thread.isEmpty}><EmptyActivity connection={activity.connection} /></AuiIf>
+        <ThreadPrimitive.Messages>
+          {({ message }) => message.role === "user" ? <UserMessage /> : message.role === "system" ? <SystemMessage /> : <AssistantMessage controls={controls} />}
+        </ThreadPrimitive.Messages>
+        {["completed", "failed", "interrupted"].includes(session.status) && <div><SessionEndedState canResume={session.control.capabilities.includes("resume")} resumeCommand={attachInstruction?.available ? attachInstruction.command : null} resumeDescription={attachInstruction?.description ?? null} resumeError={attachError} resumeUnavailableReason={session.control.withheld.find(({ capability }) => capability === "resume")?.reason ?? null} loadingResume={loadingAttach} onResume={() => void revealAttach()} canContinue={Boolean(session.workspaceIdentity?.worktreePath ?? session.cwd)} onContinue={onContinueInWorkspace} /></div>}
+        {/*
+          Auto-scroll detaches the moment the operator scrolls up, so a long
+          turn needs a way back. The primitive renders nothing while the view is
+          already at the bottom.
+        */}
+        <ThreadPrimitive.ScrollToBottom asChild>
+          <Button
+            variant="secondary"
+            size="sm"
+            data-compact-control="height"
+            data-scroll-to-latest
+            className="sticky bottom-2 z-10 place-self-center rounded-full border-[var(--border-strong)] bg-[var(--surface-raised)] px-3 shadow-[var(--shadow-drawer)] disabled:hidden"
+          >
+            <ArrowDown size={13} strokeWidth={2} aria-hidden="true" />Jump to latest
+          </Button>
+        </ThreadPrimitive.ScrollToBottom>
+      </div>
+    </ThreadPrimitive.Root>
   );
 }
 

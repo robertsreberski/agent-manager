@@ -1,6 +1,7 @@
 import { useRef } from "react";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { X } from "lucide-react";
+import { useKeyboardInset } from "../../hooks/use-keyboard-inset";
 import type { TodoProgressView } from "../../lib/cockpit-view";
 import { Badge, Button, Separator } from "../ui";
 import { TodoProgressMeter } from "./TodoProgressMeter";
@@ -23,6 +24,13 @@ export interface ThreadDrawerProps {
   onClose: () => void;
   children: React.ReactNode;
   composer?: React.ReactNode;
+  /**
+   * Attaches the thread viewport to this drawer's own scroller. The drawer owns
+   * the only scroll container the thread has, but the runtime that follows new
+   * activity lives above it, so the ref is how the two meet — no second
+   * scroller is nested inside this one.
+   */
+  viewportRef?: React.Ref<HTMLDivElement>;
 }
 
 /*
@@ -38,7 +46,15 @@ export interface ThreadDrawerProps {
   drawer takes no scrim, no outside-pointer blocking, and `onInteractOutside` is
   prevented so a board click selects instead of dismissing.
 */
-export function ThreadDrawer({ open, title, facts = [], todo = null, onClose, children, composer }: ThreadDrawerProps) {
+export function ThreadDrawer({ open, title, facts = [], todo = null, onClose, children, composer, viewportRef }: ThreadDrawerProps) {
+  /*
+    iOS paints the keyboard over the page instead of resizing the layout
+    viewport, so `fixed inset-0` keeps its full height and the composer ends up
+    behind the keys. Lifting the whole surface by the covered strip keeps the
+    composer — and the newest activity above it — in the visible area, and
+    leaves the desktop drawer untouched because a pointer device reports none.
+  */
+  const keyboard = useKeyboardInset();
   // There is no `DialogTrigger` to hand focus back to — the drawer is opened by
   // a board card, a shortcut or the palette — so it remembers its own opener.
   const openerRef = useRef<HTMLElement | null>(null);
@@ -48,9 +64,11 @@ export function ThreadDrawer({ open, title, facts = [], todo = null, onClose, ch
         onOpenAutoFocus={() => { openerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null; }}
         onCloseAutoFocus={(event) => { event.preventDefault(); if (openerRef.current?.isConnected) openerRef.current.focus({ preventScroll: true }); }}
         className="fixed inset-0 z-50 isolate flex w-full max-w-none flex-col overflow-hidden border-l-0 bg-[var(--ground)] shadow-none focus-visible:outline-none min-[901px]:absolute min-[901px]:inset-y-0 min-[901px]:right-0 min-[901px]:left-auto min-[901px]:z-40 min-[901px]:max-w-[760px] min-[901px]:border-l min-[901px]:border-[var(--border-strong)] min-[901px]:bg-[var(--drawer,var(--ground))] min-[901px]:shadow-[var(--shadow-drawer)] min-[901px]:motion-safe:animate-[p-in_160ms_ease-out]"
+        style={keyboard > 0 ? { paddingBottom: `${keyboard}px` } : undefined}
         data-thread-drawer
         data-phone-surface="fullscreen"
         data-desktop-surface="drawer"
+        data-keyboard-inset={keyboard > 0 ? keyboard : undefined}
         onInteractOutside={(event) => event.preventDefault()}
       >
         {/*
@@ -99,7 +117,7 @@ export function ThreadDrawer({ open, title, facts = [], todo = null, onClose, ch
         </header>
         {/* The phone surface rules the header off; the desktop drawer does not. */}
         <Separator className="shrink-0 bg-[var(--border-hairline)] min-[901px]:hidden" />
-        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain bg-inherit pt-4 pr-[calc(1rem_+_max(0px,env(safe-area-inset-right)))] pb-2 pl-[calc(1rem_+_max(0px,env(safe-area-inset-left)))] min-[901px]:px-6 min-[901px]:pt-2 min-[901px]:pb-3" data-thread-content>{children}</div>
+        <div ref={viewportRef} className="min-h-0 flex-1 overflow-y-auto overscroll-contain bg-inherit pt-4 pr-[calc(1rem_+_max(0px,env(safe-area-inset-right)))] pb-2 pl-[calc(1rem_+_max(0px,env(safe-area-inset-left)))] min-[901px]:px-6 min-[901px]:pt-2 min-[901px]:pb-3" data-thread-content>{children}</div>
         {composer && <footer className="safe-area-bottom shrink-0 bg-inherit pt-2 pr-[calc(1rem_+_max(0px,env(safe-area-inset-right)))] pb-2 pl-[calc(1rem_+_max(0px,env(safe-area-inset-left)))] min-[901px]:px-6 min-[901px]:pt-0 min-[901px]:pb-[18px]" data-thread-composer>{composer}</footer>}
       </DialogPrimitive.Content>
     </DialogPrimitive.Root>

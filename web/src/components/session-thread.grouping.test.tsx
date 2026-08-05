@@ -2,7 +2,7 @@ import { render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { ACTIVITY_SCHEMA_VERSION, type ActivityItem, type SessionActivityView, type SessionView } from "../types";
-import { SessionThread } from "./session-thread";
+import { SessionRuntimeProvider, SessionThread } from "./session-thread";
 
 /*
   Nothing rendered `GroupedActivityParts` before: the grouping unit tests
@@ -58,7 +58,7 @@ function tool(id: string, name: string, seq: number, turnId: string | null): Act
 }
 
 function renderThread(items: readonly ActivityItem[]) {
-  return render(<SessionThread
+  return render(<SessionRuntimeProvider items={items}>{() => <SessionThread
     session={session}
     activity={{ items, truncated: false, connection: "live" } as unknown as SessionActivityView}
     remote={false}
@@ -74,7 +74,7 @@ function renderThread(items: readonly ActivityItem[]) {
     loadPlanFile={vi.fn(async () => ({}) as never)}
     onContinueInWorkspace={vi.fn()}
     sessionsOnHost={null}
-  />);
+  />}</SessionRuntimeProvider>);
 }
 
 describe("tool grouping in a rendered thread", () => {
