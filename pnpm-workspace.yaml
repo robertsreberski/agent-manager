@@ -1,5 +1,11 @@
 allowBuilds:
   esbuild: true
+  # Reached only through `@vite-pwa/assets-generator`, which `generate:pwa-assets`
+  # runs by hand and whose icons are committed — no build, test, or deploy path
+  # touches it. The native code comes from the prebuilt `@img/sharp-*` binaries
+  # either way; this only declines its install script, which pnpm otherwise stops
+  # to ask about on every command.
+  sharp: false
 minimumReleaseAgeExclude:
   - '@assistant-ui/core@0.3.3'
   - '@assistant-ui/react@0.15.2'
