@@ -254,14 +254,17 @@ export function FirstRun({
           <div className="flex min-w-0 flex-1 items-center gap-2.5 border border-[var(--border)] bg-[var(--surface-raised-hover)] px-[13px] py-[11px]">
             <FolderGit2 size={15} strokeWidth={1.75} aria-hidden="true" className="shrink-0 text-[var(--text-muted)]" />
             <Select value={hostId} onValueChange={(next) => { setHostId(next); setPaths([]); setError(null); }}>
-              <SelectTrigger size="sm" aria-label="Browse host" className="h-auto max-w-32 shrink-0 border-0 px-0 font-mono text-code-sm text-[var(--text-muted)] hover:bg-transparent">
+              {/* `h-auto` cancels the size preset, so without the touch floor
+                  this collapses to its line box — an 18px target on the one
+                  screen a first-run operator has to get through. */}
+              <SelectTrigger size="sm" data-compact-control="height" aria-label="Browse host" className="h-auto max-w-32 shrink-0 border-0 px-0 font-mono text-code-sm text-[var(--text-muted)] hover:bg-transparent">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
                 {hosts.map((host) => <SelectItem key={host.id} value={host.id}>{host.label}</SelectItem>)}
               </SelectContent>
             </Select>
-            <input aria-label="Browse folder path" value={path} onChange={(event) => { setPath(event.target.value); setPaths([]); setError(null); }} className="min-w-0 flex-1 border-0 bg-transparent font-mono text-[13.5px] leading-[1.4] outline-none placeholder:text-[var(--text-faint)]" placeholder="~/" autoComplete="off" />
+            <input aria-label="Browse folder path" data-compact-control="height" value={path} onChange={(event) => { setPath(event.target.value); setPaths([]); setError(null); }} className="min-w-0 flex-1 border-0 bg-transparent font-mono text-[13.5px] leading-[1.4] outline-none placeholder:text-[var(--text-faint)]" placeholder="~/" autoComplete="off" />
           </div>
           {/* R3: finding the folder is the operator's own action on this screen. */}
           <Button type="submit" variant="primary" size="touch" className="shrink-0 px-5 font-semibold" disabled={loading}>{loading ? "Finding…" : "Find"}</Button>

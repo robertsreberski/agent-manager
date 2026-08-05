@@ -53,8 +53,16 @@ export function ThreadDrawer({ open, title, facts = [], todo = null, onClose, ch
         data-desktop-surface="drawer"
         onInteractOutside={(event) => event.preventDefault()}
       >
+        {/*
+          The phone surface is `fixed inset-0`, so it covers the app header —
+          the only element carrying `safe-area-top`. With `viewport-fit=cover`
+          and a black-translucent status bar, the title would otherwise sit
+          under the notch, and a landscape phone would put the close control
+          under the rounded corner. The desktop drawer is inset inside an
+          already-padded region and keeps its own spacing.
+        */}
         <header
-          className="flex shrink-0 items-center gap-2 bg-inherit px-4 pt-1 pb-3 min-[901px]:px-[22px] min-[901px]:pt-4 min-[901px]:pb-3"
+          className="flex shrink-0 items-center gap-2 bg-inherit pt-[calc(0.25rem_+_max(0px,env(safe-area-inset-top)))] pr-[calc(1rem_+_max(0px,env(safe-area-inset-right)))] pb-3 pl-[calc(1rem_+_max(0px,env(safe-area-inset-left)))] min-[901px]:px-[22px] min-[901px]:pt-4 min-[901px]:pb-3"
           data-thread-header
         >
           <div className="min-w-0 flex-1 min-[901px]:flex min-[901px]:items-center min-[901px]:gap-2">
@@ -91,8 +99,8 @@ export function ThreadDrawer({ open, title, facts = [], todo = null, onClose, ch
         </header>
         {/* The phone surface rules the header off; the desktop drawer does not. */}
         <Separator className="shrink-0 bg-[var(--border-hairline)] min-[901px]:hidden" />
-        <div className="min-h-0 flex-1 overflow-y-auto bg-inherit px-4 pt-4 pb-2 min-[901px]:px-6 min-[901px]:pt-2 min-[901px]:pb-3" data-thread-content>{children}</div>
-        {composer && <footer className="safe-area-bottom shrink-0 bg-inherit px-4 pt-2 pb-2 min-[901px]:px-6 min-[901px]:pt-0 min-[901px]:pb-[18px]" data-thread-composer>{composer}</footer>}
+        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain bg-inherit pt-4 pr-[calc(1rem_+_max(0px,env(safe-area-inset-right)))] pb-2 pl-[calc(1rem_+_max(0px,env(safe-area-inset-left)))] min-[901px]:px-6 min-[901px]:pt-2 min-[901px]:pb-3" data-thread-content>{children}</div>
+        {composer && <footer className="safe-area-bottom shrink-0 bg-inherit pt-2 pr-[calc(1rem_+_max(0px,env(safe-area-inset-right)))] pb-2 pl-[calc(1rem_+_max(0px,env(safe-area-inset-left)))] min-[901px]:px-6 min-[901px]:pt-0 min-[901px]:pb-[18px]" data-thread-composer>{composer}</footer>}
       </DialogPrimitive.Content>
     </DialogPrimitive.Root>
   );

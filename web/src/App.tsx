@@ -382,7 +382,7 @@ export function Header({
               // Wants you stays lime whether or not it is the active scope
               // (spec 05 R1); frame 7a quietens the inactive lime rather than
               // dropping it to grey.
-              return <button key={value} type="button" data-compact-control aria-current={active ? "page" : undefined} aria-label={`${label}, ${counts[value]} ${counts[value] === 1 ? "session" : "sessions"}`} className={`shrink-0 border-0 bg-transparent p-0 text-[13.5px] leading-none ${active ? "font-semibold" : "font-normal"} ${wantsYou ? (active ? "text-[var(--accent)]" : "text-[var(--accent-quiet)]") : active ? "text-[var(--text)]" : "text-[var(--text-muted)]"}`} onClick={() => onScope(value)}><span>{label}</span><span className={`ml-[5px] font-mono text-[11.5px] font-normal ${wantsYou ? "text-[var(--accent)]" : "text-[var(--text-faint)]"}`}>{counts[value]}</span></button>;
+              return <button key={value} type="button" data-compact-control="height" aria-current={active ? "page" : undefined} aria-label={`${label}, ${counts[value]} ${counts[value] === 1 ? "session" : "sessions"}`} className={`shrink-0 border-0 bg-transparent p-0 text-[13.5px] leading-none ${active ? "font-semibold" : "font-normal"} ${wantsYou ? (active ? "text-[var(--accent)]" : "text-[var(--accent-quiet)]") : active ? "text-[var(--text)]" : "text-[var(--text-muted)]"}`} onClick={() => onScope(value)}><span>{label}</span><span className={`ml-[5px] font-mono text-[11.5px] font-normal ${wantsYou ? "text-[var(--accent)]" : "text-[var(--text-faint)]"}`}>{counts[value]}</span></button>;
             })}
           </nav>
           <span className="h-4 w-px shrink-0 bg-[var(--border-hairline)]" aria-hidden="true" />
@@ -393,7 +393,7 @@ export function Header({
                 ? host.kind === "ssh" ? "text-[var(--remote)]" : "text-[var(--text)]"
                 : host.kind === "ssh" ? "text-[var(--remote-dim)] opacity-50" : "text-[var(--text-faint)] opacity-50";
               const HostIcon = host.kind === "ssh" ? Server : Laptop;
-              return <button key={host.id} type="button" data-compact-control aria-pressed={selected} aria-label={`${host.label}, ${host.count} ${host.count === 1 ? "session" : "sessions"}`} title={`${host.label} · ${host.status}`} className={`flex shrink-0 items-center gap-1.5 border-0 bg-transparent p-0 ${tone}`} onClick={() => onToggleHost(host.id)}><HostIcon size={13} strokeWidth={1.75} aria-hidden="true" /><span>{host.label}</span><span className={host.kind === "ssh" ? "text-[var(--remote-dim)]" : "text-[var(--text-faint)]"}>{host.count}</span></button>;
+              return <button key={host.id} type="button" data-compact-control="height" aria-pressed={selected} aria-label={`${host.label}, ${host.count} ${host.count === 1 ? "session" : "sessions"}`} title={`${host.label} · ${host.status}`} className={`flex shrink-0 items-center gap-1.5 border-0 bg-transparent p-0 ${tone}`} onClick={() => onToggleHost(host.id)}><HostIcon size={13} strokeWidth={1.75} aria-hidden="true" /><span>{host.label}</span><span className={host.kind === "ssh" ? "text-[var(--remote-dim)]" : "text-[var(--text-faint)]"}>{host.count}</span></button>;
             })}
             {hosts.length === 0 && <span className="text-[var(--text-faint)]">No hosts</span>}
           </nav>

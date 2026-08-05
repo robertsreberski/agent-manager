@@ -21,7 +21,7 @@ function workspaceLine(session: BoardSession): string | null {
  */
 export function PhoneBoardBands({ bands, onOpenSession }: PhoneBoardBandsProps) {
   return (
-    <section className="min-h-0 flex-1 overflow-y-auto bg-[var(--app)] pb-5 min-[901px]:hidden" aria-label="Agent sessions" data-phone-board>
+    <section className="min-h-0 flex-1 overflow-y-auto overscroll-contain bg-[var(--app)] pb-5 min-[901px]:hidden" aria-label="Agent sessions" data-phone-board>
       {bands.map((band, bandIndex) => (
         <section key={band.state} aria-labelledby={`band-${band.state}`}>
           <h2

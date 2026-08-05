@@ -430,9 +430,35 @@
 }
 
 @media (hover: none), (pointer: coarse) {
+  /*
+    An icon button is square, so it grows in both directions. A control whose
+    width is its own label must only grow taller: forcing 44px of width on the
+    scope tabs and host chips — which sit in `overflow-x-auto` rows — pushed the
+    filter strip into sideways scrolling on every phone.
+  */
   [data-compact-control] {
     min-width: var(--touch-target);
     min-height: var(--touch-target);
+  }
+
+  [data-compact-control="height"] {
+    min-width: 0;
+    min-height: var(--touch-target);
+  }
+
+  /*
+    Safari zooms the page when a focused field is under 16px, and every field in
+    the cockpit is: the composer is 15px, a path input 11.5px. The page never
+    zooms back out on blur, so one tap on the composer leaves the board
+    permanently magnified. `-webkit-text-size-adjust` above does not prevent
+    this — it only stops reflow inflation. 16px is a floor, not a size: a field
+    already at or above it is left alone.
+  */
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+  textarea,
+  select,
+  [contenteditable]:not([contenteditable="false"]) {
+    font-size: max(16px, 1em);
   }
 }
 

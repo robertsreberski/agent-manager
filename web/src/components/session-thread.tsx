@@ -321,7 +321,7 @@ export function SessionThreadComposer({
         {...(canSetProfile ? { onProfileChange: (profile: ExecutionProfile) => void onSetProfile(profile) } : {})}
       />
       {noWriteReason && onOpenSetup && (
-        <button type="button" className="min-h-9 justify-self-start text-code-sm text-[var(--text-muted)] underline" onClick={onOpenSetup}>Why is this read-only?</button>
+        <button type="button" data-compact-control="height" className="min-h-9 justify-self-start text-code-sm text-[var(--text-muted)] underline" onClick={onOpenSetup}>Why is this read-only?</button>
       )}
       {!mutationsReady && (canQueue || canSteer) && <p className="text-center font-mono text-code-xs text-[var(--warning)]">Offline drafts stay on this device and are sent only if the session state is unchanged.</p>}
     </div>
