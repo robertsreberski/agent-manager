@@ -233,3 +233,76 @@ describe("turns a provider never stated", () => {
     expect(messages).toHaveLength(2);
   });
 });
+
+/*
+  Every lifecycle fixture in this file was a turn boundary, so nothing covered
+  the rows an operator actually complained about: hook notifications, session
+  status, compaction. Those took the same bordered card as an approval request
+  — a hook firing and a command needing an answer looked equally urgent — and
+  sat in the body band, where one of them split a tool run in two.
+*/
+describe("provider status lines", () => {
+  function status(id: string, seq: number, level: "info" | "warning" | "error"): ActivityItem {
+    return {
+      ...common, id, seq,
+      kind: "lifecycle", event: "hook", level,
+      title: "PostToolUse · Bash", details: null,
+    };
+  }
+
+  function tool(id: string, seq: number): ActivityItem {
+    return {
+      ...common, id, seq,
+      kind: "tool", toolCallId: id, name: "Read", category: "other",
+      arguments: { path: `${id}.ts` }, result: "ok", output: "",
+    };
+  }
+
+  it("bands an info status with the turn facts instead of interrupting the work", () => {
+    const parts = activityToThreadMessages([
+      tool("t-1", 1),
+      status("hook-1", 2, "info"),
+      tool("t-2", 3),
+    ])[0]!.content as ReadonlyArray<{ type: string; name?: string }>;
+
+    // Both tool calls adjacent, so the group survives; the status follows.
+    expect(partLabels({ content: parts })).toEqual([
+      "tool-call",
+      "tool-call",
+      "data:agent-manager.lifecycle",
+    ]);
+  });
+
+  it("leaves a warning where the work is, because it is about the work", () => {
+    const parts = activityToThreadMessages([
+      tool("t-1", 1),
+      status("hook-1", 2, "warning"),
+      tool("t-2", 3),
+    ])[0]!.content as ReadonlyArray<{ type: string; name?: string }>;
+
+    expect(partLabels({ content: parts })).toEqual([
+      "tool-call",
+      "data:agent-manager.lifecycle",
+      "tool-call",
+    ]);
+  });
+
+  it("keeps a turn end in the turn-fact band, not the status band", () => {
+    // `turn-completed` carries level "info" too, so ordering the checks the
+    // other way round would demote it out of the footer.
+    const parts = activityToThreadMessages([
+      tool("t-1", 1),
+      { ...common, id: "end", seq: 2, kind: "lifecycle", event: "turn-failed", level: "error", title: "Turn failed", details: null },
+      status("hook-1", 3, "info"),
+    ])[0]!.content as ReadonlyArray<{ type: string; name?: string }>;
+
+    // The marker still closes the turn; the status sits just above it.
+    expect(partLabels({ content: parts }).at(-1)).toBe("data:agent-manager.turn-marker");
+    const lifecycleTitles = parts.flatMap((part) => (
+      part.type === "data" && part.name === "agent-manager.lifecycle"
+        ? [(part as unknown as { data: { title: string } }).data.title]
+        : []
+    ));
+    expect(lifecycleTitles).toEqual(["PostToolUse · Bash", "Turn failed"]);
+  });
+});

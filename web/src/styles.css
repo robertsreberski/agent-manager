@@ -297,6 +297,23 @@
     -webkit-tap-highlight-color: transparent;
   }
 
+  /*
+    Anything that responds to a click says so. `Button`, `SelectTrigger` and the
+    menu items carry `cursor-pointer` themselves, but much of the cockpit is
+    raw `<button>` — board cards, scope tabs, tool rows, disclosures — and those
+    kept the default arrow. Layered under `base`, so a component that
+    deliberately wants `cursor-default` still wins with a utility.
+  */
+  button:not(:disabled):not([aria-disabled="true"]),
+  [role="button"]:not([aria-disabled="true"]),
+  [role="option"]:not([aria-disabled="true"]),
+  summary,
+  a[href],
+  label:has(> input[type="checkbox"]:not(:disabled)),
+  label:has(> input[type="radio"]:not(:disabled)) {
+    cursor: pointer;
+  }
+
   :focus-visible {
     outline: 2px solid var(--ring);
     outline-offset: 2px;

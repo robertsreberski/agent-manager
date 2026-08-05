@@ -314,10 +314,24 @@ function turnRank(
   finalIds: ReadonlySet<string>,
 ): number {
   if (initialUserId !== null && item.id === initialUserId) return 0;
-  if (item.kind === "lifecycle" && item.event === "turn-started") return 1;
+  if (item.kind === "lifecycle") {
+    if (item.event === "turn-started") return 1;
+    // The event list directly, not `isTurnEnd`: its guard narrows to the whole
+    // lifecycle type, so the negative branch would leave nothing behind it.
+    if (TURN_END_EVENTS.includes(item.event)) return 5;
+    /*
+      A provider status line — a hook firing, a compaction, the session going
+      idle — is a fact about the turn, not a step in it. Left in the body band
+      it read as work and, because adjacent-prefix grouping closes a group at
+      the first part that is not a tool call, one hook notification mid-run
+      split the run in two. `warning` and `error` stay in the body: those are
+      about the work and belong where the work is.
+    */
+    return item.level === "info" ? 4 : 2;
+  }
   if (finalIds.has(item.id)) return 3;
   if (item.kind === "todo" || item.kind === "file-change") return 4;
-  if (item.kind === "usage" || isTurnEnd(item)) return 5;
+  if (item.kind === "usage") return 5;
   return 2;
 }
 
@@ -589,9 +603,30 @@ function Attention({ item, controls }: { item: ActivityAttentionItem; controls: 
   );
 }
 
+/**
+ * A provider status line. `level` decides how loud it is.
+ *
+ * These used to take the same bordered card as an approval request — a hook
+ * firing, a session going idle and a command needing an answer all looked
+ * equally like something to deal with. `level` was already on the wire and
+ * already reached this component; it just wasn't used for anything but the
+ * border colour. An `info` row now takes the same quiet treatment `Usage` has:
+ * one mono line, muted, no card. A `warning` or `error` keeps the card, because
+ * those are the ones worth interrupting for.
+ */
 function Lifecycle({ item }: { item: Extract<ActivityItem, { kind: "lifecycle" }> }) {
+  if (item.level === "info") {
+    return (
+      <p className="my-1.5 flex flex-wrap items-baseline gap-x-2 gap-y-0.5 font-mono text-code-xs text-[var(--text-muted)]" data-lifecycle-level="info">
+        <Radio size={11} className="shrink-0 self-center" aria-hidden="true" />
+        <span>{item.title}</span>
+        {/* Muted, not faint: the details are the only rendering of that text. */}
+        {item.details && <span className="min-w-0 whitespace-pre-wrap">{item.details}</span>}
+      </p>
+    );
+  }
   return (
-    <section className={`my-2 border-l-2 p-3 text-meta-sm ${item.level === "error" ? "border-[var(--danger)] bg-[var(--danger-field)]" : item.level === "warning" ? "border-[var(--warning)] bg-[var(--warning-field)]" : "border-[var(--border)] bg-[var(--surface-raised)]"}`}>
+    <section className={`my-2 border-l-2 p-3 text-meta-sm ${item.level === "error" ? "border-[var(--danger)] bg-[var(--danger-field)]" : "border-[var(--warning)] bg-[var(--warning-field)]"}`} data-lifecycle-level={item.level}>
       <p className="flex items-center gap-2"><Radio size={13} /><strong>{item.title}</strong></p>
       {item.details && <p className="mt-1 whitespace-pre-wrap text-[var(--text-muted)]">{item.details}</p>}
       {item.truncated && <p className="mt-1 text-[var(--warning)]">Details were truncated by the provider.</p>}

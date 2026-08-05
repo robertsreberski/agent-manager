@@ -1556,7 +1556,15 @@ export class ClaudeActivityProjector {
         mutations.push({
           type: "upsert",
           item: {
-            id: itemId("notification", message.uuid),
+            /*
+              Keyed on the notification's own `key`, not the per-emission
+              `uuid`. The SDK mirrors the REPL notification queue, where one
+              notification is re-emitted as its state changes; keying on `uuid`
+              made each re-emission a brand-new row, so the operator watched the
+              same sentence stack up. `key` is what identifies the notification;
+              `uuid` identifies the delivery.
+            */
+            id: itemId("notification", message.key || message.uuid),
             kind: "lifecycle",
             event: "warning",
             level: message.priority === "high" || message.priority === "immediate"

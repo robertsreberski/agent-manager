@@ -987,3 +987,62 @@ test("renders Claude rate-limit reset timestamps from Unix seconds", () => {
     "Resets at 2026-08-01T00:00:00.000Z",
   );
 });
+
+/*
+  The SDK mirrors the interactive REPL's notification queue, where one
+  notification is re-emitted as its state changes. Each emission carries a fresh
+  `uuid` and the same `key`, so keying the activity item on `uuid` made every
+  re-emission a brand-new row and the operator watched one sentence stack up.
+*/
+test("a re-emitted provider notification replaces its row rather than stacking another", () => {
+  const projector = new ClaudeActivityProjector();
+  const notification = (uuid: string, text: string) => sdk({
+    ...baseMessage("system", uuid),
+    subtype: "notification",
+    key: "usage-limit",
+    text,
+    priority: "medium",
+  });
+
+  const first = upserts(projector.projectMessage(notification("emit-1", "Approaching the usage limit")));
+  const second = upserts(projector.projectMessage(notification("emit-2", "Usage limit reached")));
+
+  assert.equal(first.length, 1);
+  assert.equal(second.length, 1);
+  assert.equal(first[0]?.id, second[0]?.id, "one notification, one row");
+  assert.equal(second[0]?.kind === "lifecycle" ? second[0].title : null, "Usage limit reached");
+});
+
+test("two genuinely different notifications keep their own rows", () => {
+  const projector = new ClaudeActivityProjector();
+  const first = upserts(projector.projectMessage(sdk({
+    ...baseMessage("system", "emit-1"),
+    subtype: "notification",
+    key: "usage-limit",
+    text: "Approaching the usage limit",
+    priority: "medium",
+  })));
+  const second = upserts(projector.projectMessage(sdk({
+    ...baseMessage("system", "emit-2"),
+    subtype: "notification",
+    key: "update-available",
+    text: "An update is available",
+    priority: "low",
+  })));
+
+  assert.notEqual(first[0]?.id, second[0]?.id);
+});
+
+test("a notification without a key still gets a row of its own", () => {
+  // `key` is required by the SDK type, but the wire is not the type system.
+  const projector = new ClaudeActivityProjector();
+  const mutations = upserts(projector.projectMessage(sdk({
+    ...baseMessage("system", "emit-1"),
+    subtype: "notification",
+    text: "Something happened",
+    priority: "high",
+  })));
+
+  assert.equal(mutations.length, 1);
+  assert.equal(mutations[0]?.kind === "lifecycle" ? mutations[0].level : null, "warning");
+});
