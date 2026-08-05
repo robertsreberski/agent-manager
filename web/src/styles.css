@@ -202,10 +202,19 @@
   --text-title-sm--letter-spacing: -0.015em;
   --text-title-sm--font-weight: 600;
 
-  --text-card: 13.5px;
-  --text-card--line-height: 1.3;
-  --text-card--letter-spacing: -0.01em;
-  --text-card--font-weight: 600;
+  /*
+    Named `card-title`, not `card`, because a type-scale name that also exists
+    in the shadcn colour bridge is ambiguous to Tailwind — and it resolves the
+    ambiguity as a colour. `--text-card` alongside `--color-card` emitted
+    `.text-card{color:var(--card)}`, which painted every board card's session
+    name in the card's own background: the names were in the DOM, at the right
+    size in the DOM, and invisible. No `--color-card-title` exists, so this
+    cannot be read as anything but a size.
+  */
+  --text-card-title: 13.5px;
+  --text-card-title--line-height: 1.3;
+  --text-card-title--letter-spacing: -0.01em;
+  --text-card-title--font-weight: 600;
 
   --text-body: 15px;
   --text-body--line-height: 22px;

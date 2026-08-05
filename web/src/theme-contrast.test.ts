@@ -188,3 +188,42 @@ describe("faint is never the sole source of a fact", () => {
     }
   });
 });
+
+/*
+  `text-card` was both a type-scale step (`--text-card`) and a colour in the
+  shadcn bridge (`--color-card`). Tailwind resolves that ambiguity as a colour,
+  so it emitted `.text-card{color:var(--card)}` — and every board card rendered
+  its session name in the card's own background. The name was in the DOM, at the
+  right size, and invisible.
+
+  `cn`'s tailwind-merge config had already been taught this scale, which is why
+  it looked handled: that teaches the *merger*, while Tailwind's generator
+  resolves the same ambiguity independently. Only a name that is unique across
+  both namespaces is safe.
+*/
+describe("type scale and colour tokens cannot be confused for each other", () => {
+  function tokenNames(prefix: string): string[] {
+    // Skip the `--text-x--line-height` style modifiers, which are not names.
+    return [...styles.matchAll(new RegExp(`^\\s*--${prefix}-([a-z0-9-]+):`, "gmu"))]
+      .map((match) => match[1]!)
+      .filter((name) => !name.includes("--"));
+  }
+
+  it("shares no name between a font-size step and a colour", () => {
+    const sizes = tokenNames("text").filter((name) => new RegExp(`--text-${name}:\\s*[\\d.]+(px|rem)`, "u").test(styles));
+    const colours = tokenNames("color");
+
+    expect(sizes).toContain("card-title");
+    expect(sizes.filter((name) => colours.includes(name))).toEqual([]);
+  });
+
+  it("keeps the board card's session name a size, not a colour", () => {
+    const card = readFileSync(resolve(process.cwd(), "web/src/components/board/SessionCard.tsx"), "utf8");
+    const line = card.split("\n").find((candidate) => candidate.includes("data-session-name"));
+
+    expect(line, "session name").toBeDefined();
+    expect(line).toContain("text-card-title");
+    // The tier that actually colours it has to survive beside the size.
+    expect(line).toContain("text-[var(--text-secondary)]");
+  });
+});

@@ -94,7 +94,7 @@ export function SessionCard({
         )}
         <span className="min-w-0 flex-1">
           <span className="flex items-baseline gap-2">
-            <span className={`min-w-0 flex-1 truncate text-card leading-[1.35] ${session.boardState === "idle" ? "text-[var(--text-secondary)]" : "text-[var(--text)]"}`}>{session.name}</span>
+            <span className={`min-w-0 flex-1 truncate text-card-title leading-[1.35] ${session.boardState === "idle" ? "text-[var(--text-secondary)]" : "text-[var(--text)]"}`} data-session-name>{session.name}</span>
             <time className="shrink-0 font-mono text-code-xs leading-none text-[var(--text-faint)]" dateTime={session.updatedAt ?? undefined}>
               {relativeTime(session.updatedAt)}
             </time>

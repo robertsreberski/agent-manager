@@ -8,11 +8,17 @@ import { extendTailwindMerge } from "tailwind-merge";
  * `text-[var(--accent-ink)]` from the same group. On a filled lime button that
  * left near-white ink on `--accent`, roughly 1.2:1. Declaring the scale as
  * font-size puts the two in different groups so both survive.
+ *
+ * Tailwind's own generator resolves the same ambiguity separately, and teaching
+ * one does not teach the other: while this list said `card`, the stylesheet's
+ * `--text-card` collided with the shadcn bridge's `--color-card` and Tailwind
+ * emitted `.text-card{color:var(--card)}`. Every name here must therefore stay
+ * distinct from a colour token; `theme-contrast.test.ts` holds that line.
  */
 const TYPE_SCALE = [
   "display", "display-md", "display-sm",
   "title", "title-md", "title-sm",
-  "card",
+  "card-title",
   "body", "body-sm",
   "meta", "meta-sm",
   "code", "code-sm", "code-xs",

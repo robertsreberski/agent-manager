@@ -17,7 +17,7 @@ describe("cn", () => {
     for (const size of [
       "text-display", "text-display-md", "text-display-sm",
       "text-title", "text-title-md", "text-title-sm",
-      "text-card",
+      "text-card-title",
       "text-body", "text-body-sm",
       "text-meta", "text-meta-sm",
       "text-code", "text-code-sm", "text-code-xs",
