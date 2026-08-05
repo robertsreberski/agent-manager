@@ -60,7 +60,7 @@ import {
   type NotificationPreferences,
 } from "./components/system";
 import { SessionRuntimeProvider, SessionThread, SessionThreadComposer } from "./components/session-thread";
-import { preferredFileChangeItems, sessionTodoProgress } from "./components/session-activity";
+import { currentQueue, preferredFileChangeItems, sessionTodoProgress } from "./components/session-activity";
 import { useCockpit } from "./hooks/use-cockpit";
 import { usePhoneAttentionLabels } from "./hooks/use-phone-attention-labels";
 import { useSessionActivity } from "./hooks/use-session-activity";
@@ -966,7 +966,14 @@ export default function App() {
           entirely. Neither provider renders an element, so the drawer is still
           a direct child of `[data-board-region]`.
         */}
-        <SessionRuntimeProvider items={selected ? activity.items : EMPTY_ACTIVITY_ITEMS}>{(viewportRef) => (
+        <SessionRuntimeProvider
+          items={selected ? activity.items : EMPTY_ACTIVITY_ITEMS}
+          {...(selected ? { queue: {
+            messages: currentQueue(activity),
+            canRemove: cockpit.mutationsReady && selected.control.capabilities.includes("remove-queued"),
+            onRemove: (messageId: string) => void cockpit.removeQueued(selected, messageId),
+          } } : {})}
+        >{(viewportRef) => (
         <ThreadDrawer
           viewportRef={viewportRef}
           open={drawerOpen}

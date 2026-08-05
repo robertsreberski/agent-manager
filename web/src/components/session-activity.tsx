@@ -62,7 +62,14 @@ export interface ActivityPlanControls {
 export interface ActivityQueueControls {
   canRemove: boolean;
   busy: boolean;
-  onRemove: (messageId: string) => Promise<void>;
+  /**
+   * Why removal is unavailable, where the harness said. Removal itself now runs
+   * through the runtime's queue adapter, which is what lets
+   * `QueueItemPrimitive.Remove` render the button — but the primitive is
+   * always enabled, so a withheld capability has to be stated in words rather
+   * than offered as a control that would fail.
+   */
+  withheldReason: string | null;
 }
 
 export interface ActivityDataControls {
@@ -635,7 +642,7 @@ export function renderActivityData(name: string, data: unknown, controls: Activi
     case "todo": return <div className="my-3"><TodoList list={todoView(item)} /></div>;
     case "file-change": return <FileChanges item={item} controls={controls.files} />;
     case "attention": return <Attention item={item} controls={controls.attention} />;
-    case "queue": return <div className="my-3"><QueuedMessages messages={item.messages.flatMap((message) => message.status === "dispatched" ? [] : [{ id: message.id, text: message.text, status: message.status }])} canRemove={controls.queue.canRemove && !controls.queue.busy} onRemove={(id) => void controls.queue.onRemove(id)} /></div>;
+    case "queue": return <div className="my-3"><QueuedMessages messages={item.messages.flatMap((message) => message.status === "dispatched" ? [] : [{ id: message.id, text: message.text, status: message.status }])} canRemove={controls.queue.canRemove && !controls.queue.busy} withheldReason={controls.queue.withheldReason} /></div>;
     case "lifecycle": return <Lifecycle item={item} />;
     case "usage": return <Usage item={item} />;
     case "subagent": return null; // GroupedActivityParts owns the subagent frame.

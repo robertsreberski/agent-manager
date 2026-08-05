@@ -125,14 +125,41 @@ function SessionDetails({ session, remote, facts, factsStatus, attachInstruction
  * neither provider renders an element, so the drawer stays a direct child of
  * `[data-board-region]`.
  */
+export interface SessionQueueControls {
+  /** The harness's queue, as the provider reported it. */
+  messages: readonly { id: string; text: string; status: string }[];
+  canRemove: boolean;
+  onRemove: (messageId: string) => void;
+}
+
 export function SessionRuntimeProvider({
   items,
+  queue,
   children,
 }: {
   items: readonly ActivityItem[];
+  queue?: SessionQueueControls;
   children: (viewportRef: RefCallback<HTMLDivElement>) => ReactNode;
 }) {
   const messages = useMemo(() => activityToThreadMessages(items), [items]);
+  /*
+    `createMessageQueue` builds a queue the *runtime* owns. This cockpit's queue
+    belongs to the harness — it arrives as `kind:"queue"` activity items — so
+    the adapter reads from those and never holds a message of its own. What the
+    primitives get is provider truth; what they can do to it is whatever the
+    capability list actually offers.
+  */
+  const queueMessages = queue?.messages;
+  const queueAdapter = useMemo(() => (queueMessages === undefined ? undefined : {
+    items: queueMessages.map((message) => ({ id: message.id, prompt: message.text })),
+    // Sending is gated in `useCockpit.sendMessage`, and every send in this
+    // cockpit goes through it. Routing an enqueue around that would hand the
+    // composer a delivery the harness never advertised.
+    enqueue: () => undefined,
+    steer: () => undefined,
+    remove: (id: string) => { if (queue?.canRemove) queue.onRemove(id); },
+    clear: () => undefined,
+  }), [queue, queueMessages]);
   const runtime = useExternalStoreRuntime<ThreadMessageLike>({
     messages,
     convertMessage: (message) => message,
@@ -141,6 +168,7 @@ export function SessionRuntimeProvider({
     isRunning: false,
     isDisabled: true,
     onNew: async () => undefined,
+    ...(queueAdapter ? { queue: queueAdapter } : {}),
   });
   return (
     <AssistantRuntimeProvider runtime={runtime}>
@@ -258,7 +286,10 @@ export function SessionThread({
     queue: {
       canRemove: mutationsReady && session.control.capabilities.includes("remove-queued"),
       busy,
-      onRemove: onRemoveQueued,
+      withheldReason: session.control.capabilities.includes("remove-queued")
+        ? null
+        : session.control.withheld.find((item) => item.capability === "remove-queued")?.reason
+          ?? "This harness does not expose removing a queued message.",
     },
   };
   return (

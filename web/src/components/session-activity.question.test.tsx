@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { ActivityAttentionItem, ActivityQueueItem } from "../types";
 import { questionView, renderActivityData, type ActivityDataControls } from "./session-activity";
+import { SessionRuntimeProvider } from "./session-thread";
 
 const attention: ActivityAttentionItem = {
   schemaVersion: 3,
@@ -61,14 +62,19 @@ describe("question activity projection", () => {
       state: "running",
       messages: [{ id: "message-1", text: "Run the focused tests", status: "queued", enqueuedAt: "2026-08-04T12:00:00.000Z", turnId: "turn-1" }],
     };
-    const onRemove = vi.fn(async () => undefined);
+    const onRemove = vi.fn();
     const controls: ActivityDataControls = {
       attention: { exactRequestIds: new Set(), mutationsReady: true, canRespond: false, busy: false, workspaceRoot: null, remoteHost: null, sessionsOnHost: null, onRespond: vi.fn(async () => undefined) },
       files: { sessionId: queue.sessionId, canOpenEditor: false, workspaceRoot: null, readKeys: new Set(), onReadChange: vi.fn() },
       plans: { requestIds: new Map(), mutationsReady: true, canRespond: false, busy: false, loadFile: vi.fn(async () => { throw new Error("unused"); }), onRespond: vi.fn(async () => undefined) },
-      queue: { canRemove: true, busy: false, onRemove },
+      queue: { canRemove: true, busy: false, withheldReason: null },
     };
-    render(<>{renderActivityData("agent-manager.queue", queue, controls)}</>);
+    // Removal now runs through the runtime queue adapter, which is what lets
+    // the primitive render the button at all.
+    render(<SessionRuntimeProvider
+      items={[]}
+      queue={{ messages: queue.messages, canRemove: true, onRemove }}
+    >{() => <>{renderActivityData("agent-manager.queue", queue, controls)}</>}</SessionRuntimeProvider>);
 
     expect(screen.getByText("Run the focused tests")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Remove queued message 1" }));

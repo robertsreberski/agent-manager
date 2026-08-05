@@ -55,7 +55,7 @@ describe("plan file activity integration", () => {
         loadFile: (itemId) => api.planFile(item.sessionId, itemId),
         onRespond: vi.fn(async () => undefined),
       },
-      queue: { canRemove: false, busy: false, onRemove: vi.fn(async () => undefined) },
+      queue: { canRemove: false, busy: false, withheldReason: null },
     };
     render(<>{renderActivityData("agent-manager.plan", item, controls)}</>);
 
