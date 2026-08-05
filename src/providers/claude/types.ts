@@ -114,6 +114,13 @@ export interface ClaudeInterruptReceipt {
 }
 
 export interface ClaudeSdkQuery extends AsyncIterable<ClaudeSdkMessage> {
+  /**
+   * Completes the provider initialize handshake without submitting a user
+   * message. Claude does not yield `system/init` until streaming input has a
+   * first message, so an exact resume with an intentionally empty inbox uses
+   * this control response to prove that the persisted session exists.
+   */
+  initializationResult(): Promise<unknown>;
   interrupt(): Promise<ClaudeInterruptReceipt | undefined>;
   setPermissionMode(mode: ClaudePermissionMode): Promise<void>;
   setModel(model?: string): Promise<void>;
@@ -133,6 +140,8 @@ export interface ClaudeSdkRuntime {
   readonly sdkVersion: string;
   /** Canonical executable selected by Agent Manager's production composition. */
   readonly claudeCodeExecutable?: string;
+  /** Exact version read from that executable before it can own a resume. */
+  readonly claudeCodeVersion: string | null;
   createQuery(params: ClaudeSdkQueryParams): ClaudeSdkQuery;
   randomUUID(): string;
   now(): Date;

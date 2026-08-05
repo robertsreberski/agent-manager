@@ -848,6 +848,20 @@ export class ClaudeManagedSession {
       this.#query = query;
       consumer = this.#consume(query, epoch);
       this.#consumerPromise = consumer;
+      if (resumeSessionId && initialMessage === undefined) {
+        // Streaming-input query() waits for the first user message before it
+        // publishes system/init. A resume intentionally has no synthetic turn,
+        // so use the SDK's control handshake to validate the persisted identity
+        // without mutating the conversation, then retain the same live Query for
+        // future input. The selected binary was independently version-probed.
+        await Promise.race([
+          waitWithSignal(query.initializationResult(), signal),
+          this.#ready.promise,
+        ]);
+        if (epoch === this.#epoch && !this.#initialized) {
+          this.#acceptInitializedResume(resumeSessionId);
+        }
+      }
       await this.#ready.promise;
       signal?.throwIfAborted();
       if (epoch !== this.#epoch || this.#query !== query || !this.#initialized) {
@@ -867,6 +881,35 @@ export class ClaudeManagedSession {
     } finally {
       signal?.removeEventListener("abort", abortFromSignal);
     }
+  }
+
+  #acceptInitializedResume(sessionId: string): void {
+    const selectedExecutable =
+      this.#config.claudeCodeExecutable ?? this.#runtime.claudeCodeExecutable;
+    if (
+      !selectedExecutable
+      || this.#runtime.claudeCodeVersion === null
+    ) {
+      throw new Error(
+        "Claude resume requires the selected Claude Code executable to be version-verified",
+      );
+    }
+    if (this.#runtime.claudeCodeVersion !== CLAUDE_CODE_VERSION) {
+      throw new Error(
+        `Unsupported Claude Code ${this.#runtime.claudeCodeVersion}; expected ${CLAUDE_CODE_VERSION}`,
+      );
+    }
+    this.#initialized = true;
+    this.#sessionId = sessionId;
+    this.#claudeCodeVersion = this.#runtime.claudeCodeVersion;
+    this.#model = this.#config.model ?? null;
+    this.#capabilities = [];
+    this.#canSteer = this.#runtime.sdkVersion === CLAUDE_AGENT_SDK_VERSION;
+    this.#mode = this.#desiredMode;
+    this.#providerActivity = this.#outstandingMessageIds.size > 0 ? "running" : "idle";
+    this.#lastError = null;
+    this.#touch();
+    this.#ready.resolve();
   }
 
   async #consume(query: ClaudeSdkQuery, epoch: number): Promise<void> {
@@ -1002,7 +1045,13 @@ export class ClaudeManagedSession {
         this.#stillQueuedMessageIds.delete(completedMessage);
       }
       if (message.subtype !== "success") {
-        this.#lastError = message.errors.join("; ") || message.subtype;
+        const providerError = message.errors.join("; ") || message.subtype;
+        this.#lastError = providerError;
+        if (!this.#initialized) {
+          const error = new Error(`Claude resume initialization failed: ${providerError}`);
+          this.#ready.reject(error);
+          throw error;
+        }
         this.#deactivateConsumer(query, epoch);
         this.#providerActivity = "failed";
         this.#abortAllPending();

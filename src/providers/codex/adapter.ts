@@ -284,6 +284,15 @@ function settingsMatchCollaboration(
   return collaboration === providerMode(profile) && settings.approvalPolicy === approval;
 }
 
+function isFullThreadSettings(settings: Record<string, unknown>): boolean {
+  return typeof settings.cwd === "string"
+    && typeof settings.model === "string"
+    && "effort" in settings
+    && typeof settings.approvalPolicy === "string"
+    && isObject(settings.sandboxPolicy)
+    && isObject(settings.collaborationMode);
+}
+
 /**
  * The sandbox a settings payload actually describes, or null when the payload
  * is silent or names something this build does not know. An unrecognized policy
@@ -883,6 +892,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
   async adoptThread(
     threadId: string,
     expectedIdentity: CodexThreadIdentity,
+    options: ResumeCodexThreadOptions = {},
   ): Promise<CodexThreadState> {
     if (expectedIdentity.threadId !== threadId) {
       throw new Error("Codex adoption received a mismatched expected thread ID");
@@ -901,7 +911,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     const pending: PendingAdoption = { events: [], overflowed: false };
     this.#pendingAdoptions.set(threadId, pending);
     try {
-      await this.#resumeThread(threadId, {}, expectedIdentity);
+      await this.#resumeThread(threadId, options, expectedIdentity);
       this.#pendingAdoptions.delete(threadId);
       if (pending.overflowed) {
         await this.releaseThread(threadId).catch(() => undefined);
@@ -1570,6 +1580,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
       ?? state.source;
     state.model = stringField(response, "model") ?? state.model;
     state.effort = stringField(response, "reasoningEffort") ?? state.effort;
+    state.sandbox = parseSandboxPolicy(response.sandbox) ?? state.sandbox;
     state.status = normalizedThreadStatus(thread.status);
 
     if (Array.isArray(thread.turns)) {
@@ -1809,6 +1820,18 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
           const effortConfirmed = !pending.effort || state.effort === pending.effort;
           if (profileConfirmed && sandboxConfirmed && modelConfirmed && effortConfirmed) {
             state.pendingSettings = null;
+          } else if (isFullThreadSettings(settings)) {
+            // Notifications are the full effective state. If another shared
+            // client superseded an accepted update before it settled, stop
+            // projecting the stale intent and publish the provider truth.
+            state.pendingSettings = null;
+            this.#emit({
+              type: "diagnostic",
+              level: "warning",
+              code: "codex.settings.superseded",
+              message: `Accepted Codex settings for thread ${state.threadId} were superseded before confirmation`,
+              threadId: state.threadId,
+            });
           }
         }
         this.#touch(state);

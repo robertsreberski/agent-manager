@@ -1625,6 +1625,39 @@ test("an unrecognized sandbox policy leaves the last known one rather than guess
   await adapter.dispose();
 });
 
+test("a full conflicting settings notification retires superseded accepted intent", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("thread/start", () => threadResult());
+  transport.handlers.set("thread/settings/update", () => ({}));
+  await adapter.startThread({ cwd: "/workspace" });
+  await adapter.setProfile("thread-1", "plan");
+  assert.equal(adapter.getThreadState("thread-1")?.pendingSettings?.profile, "plan");
+  const diagnostics: string[] = [];
+  const unsubscribe = adapter.subscribe((event) => {
+    if (event.type === "diagnostic") diagnostics.push(event.code);
+  });
+
+  transport.notify("thread/settings/updated", {
+    threadId: "thread-1",
+    threadSettings: {
+      cwd: "/workspace",
+      model: "gpt-5.6",
+      effort: null,
+      approvalPolicy: "on-request",
+      sandboxPolicy: { type: "readOnly" },
+      collaborationMode: {
+        mode: "default",
+        settings: { model: "gpt-5.6", developer_instructions: null },
+      },
+    },
+  });
+  assert.equal(adapter.getThreadState("thread-1")?.pendingSettings, null);
+  assert.equal(adapter.getThreadState("thread-1")?.profile, null);
+  assert.ok(diagnostics.includes("codex.settings.superseded"));
+  unsubscribe();
+  await adapter.dispose();
+});
+
 test("a profile and a sandbox changed together both survive the next-turn fallback", async () => {
   const { adapter, transport } = await initializedAdapter();
   transport.handlers.set("thread/start", () => threadResult());
@@ -1651,15 +1684,32 @@ test("a profile and a sandbox changed together both survive the next-turn fallba
 
 test("adopts by Thread.id and unsubscribe releases only this client", async () => {
   const { adapter, transport } = await initializedAdapter();
-  transport.handlers.set("thread/resume", () => threadResult("foreign-thread"));
+  transport.handlers.set("thread/resume", () => ({
+    ...threadResult("foreign-thread"),
+    sandbox: { type: "readOnly", networkAccess: false },
+  }));
   transport.handlers.set("thread/unsubscribe", () => ({ status: "unsubscribed" }));
   const state = await adapter.adoptThread("foreign-thread", {
     threadId: "foreign-thread",
     treeId: null,
     parentThreadId: null,
     cwd: "/workspace",
+  }, {
+    cwd: "/workspace",
+    model: "gpt-5.6",
+    approvalPolicy: "on-request",
+    sandbox: sandboxPolicy("read-only"),
   });
   assert.equal(state.threadId, "foreign-thread");
+  assert.deepEqual(state.sandbox, sandboxPolicy("read-only"));
+  assert.deepEqual(methodMessages(transport, "thread/resume")[0]?.params, {
+    threadId: "foreign-thread",
+    cwd: "/workspace",
+    model: "gpt-5.6",
+    approvalPolicy: "on-request",
+    sandbox: "read-only",
+    excludeTurns: true,
+  });
   await adapter.releaseThread("foreign-thread");
   assert.equal(adapter.getThreadState("foreign-thread"), null);
   assert.equal(methodMessages(transport, "thread/unsubscribe").length, 1);
@@ -1761,6 +1811,10 @@ test("external Codex adoption keeps provisional controls inert and publishes onl
   assert.equal(methodMessages(transport, "thread/resume").length, 1);
   assert.deepEqual(methodMessages(transport, "thread/resume")[0]?.params, {
     threadId: external.providerThreadId,
+    cwd: "/workspace",
+    model: "gpt-5.6",
+    approvalPolicy: "on-request",
+    sandbox: "workspace-write",
     excludeTurns: true,
   });
   assert.equal(provisional.providerThreadId, external.providerThreadId);
@@ -1818,6 +1872,66 @@ test("external Codex adoption keeps provisional controls inert and publishes onl
   assert.ok(published.control.capabilities.includes("queue"));
   await bridge.abortExternalAdoption(external.providerThreadId);
   assert.ok(bridge.getManagedSession(external.providerThreadId));
+  bridge.dispose();
+  await adapter.dispose();
+});
+
+test("external Codex adoption preserves accepted settings before the async notification", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  const external = externalCodexSession();
+  const exact = (): JsonObject => ({
+    ...threadResultWithIdentity(
+      external.providerThreadId,
+      external.providerTreeId,
+      null,
+      external.cwd!,
+    ),
+    reasoningEffort: "high",
+  });
+  transport.handlers.set("thread/read", exact);
+  transport.handlers.set("thread/resume", exact);
+  transport.handlers.set("thread/unsubscribe", () => ({}));
+  const effectiveSettings: JsonObject = {
+    cwd: "/workspace",
+    model: "gpt-5.6",
+    effort: "high",
+  };
+  transport.handlers.set("thread/settings/update", (params) => {
+    Object.assign(effectiveSettings, params);
+    // Acceptance is intentionally separate from effective-state confirmation.
+    return {};
+  });
+  const bridge = new CodexProviderBridge({
+    adapter,
+    resolveWorkspace: () => "/workspace",
+  });
+  const takeoverContext = {
+    actor: { id: "local", kind: "local" as const, displayName: "Local user" },
+    requestId: "adopt-after-async-settings-confirmation",
+    signal: new AbortController().signal,
+    workspace: { id: "workspace", label: "Workspace", path: "/workspace" },
+  };
+
+  const provisional = await bridge.adoptExternalSession(external, "plan", takeoverContext);
+  assert.equal(methodMessages(transport, "thread/settings/update").length, 2);
+  assert.equal(provisional.profile.value, "plan");
+  assert.deepEqual(provisional.sandbox.value, sandboxPolicy("workspace-write"));
+  assert.equal(provisional.model.value, "gpt-5.6");
+  assert.equal(provisional.effort.value, "high");
+  assert.notEqual(
+    adapter.getThreadState(external.providerThreadId)?.pendingSettings,
+    null,
+    "accepted settings remain explicit until the provider publishes its full state",
+  );
+
+  transport.notify("thread/settings/updated", {
+    threadId: external.providerThreadId,
+    threadSettings: effectiveSettings,
+  });
+  assert.equal(adapter.getThreadState(external.providerThreadId)?.pendingSettings, null);
+  const committed = bridge.commitExternalAdoption(external.providerThreadId);
+  assert.equal(committed.profile.value, "plan");
+  assert.deepEqual(committed.sandbox.value, sandboxPolicy("workspace-write"));
   bridge.dispose();
   await adapter.dispose();
 });
@@ -2819,7 +2933,11 @@ test("ProviderControlAdapter bridge creates normalized sessions and streams chan
     responseResolution: "first-response-wins",
   });
   assert.ok(view.control.capabilities.includes("steer"));
-  assert.equal(view.profile.value, null);
+  assert.equal(
+    view.profile.value,
+    "plan",
+    "provider-accepted pending settings remain visible until full confirmation",
+  );
   assert.equal(view.providerTurnId, "turn-bridge");
 
   transport.notify("turn/completed", {

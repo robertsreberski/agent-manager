@@ -235,6 +235,7 @@ export interface ManagedCodexAdapter {
   adoptThread(
     threadId: string,
     expectedIdentity: CodexThreadIdentity,
+    options?: ResumeCodexThreadOptions,
   ): Promise<CodexThreadState>;
   releaseThread(threadId: string): Promise<void>;
   queueMessage(threadId: string, text: string): Promise<CodexQueuedMessage>;

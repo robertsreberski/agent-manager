@@ -28,6 +28,9 @@ class FakeQuery implements ClaudeSdkQuery, AsyncIterator<ClaudeSdkMessage> {
     still_queued: [],
   };
   interruptCalls = 0;
+  initializationCalls = 0;
+  initializationError: Error | null = null;
+  initializationHangs = false;
   closed = false;
   closeCalls = 0;
   closeEndsOutput = true;
@@ -40,6 +43,15 @@ class FakeQuery implements ClaudeSdkQuery, AsyncIterator<ClaudeSdkMessage> {
 
   emit(message: Record<string, unknown>): void {
     this.output.push(message as unknown as ClaudeSdkMessage);
+  }
+
+  initializationResult(): Promise<unknown> {
+    this.initializationCalls += 1;
+    return this.initializationError
+      ? Promise.reject(this.initializationError)
+      : this.initializationHangs
+        ? new Promise<never>(() => undefined)
+        : Promise.resolve({});
   }
 
   interrupt(): Promise<ClaudeInterruptReceipt | undefined> {
@@ -100,6 +112,8 @@ class FakeRuntime implements ClaudeSdkRuntime {
   initMode: ClaudePermissionMode | null = null;
   autoInitialize = true;
   claudeCodeExecutable = "claude";
+  initializationError: Error | null = null;
+  initializationHangs = false;
   createError: Error | null = null;
   #uuid = 0;
   #time = Date.parse("2026-08-03T12:00:00.000Z");
@@ -107,6 +121,8 @@ class FakeRuntime implements ClaudeSdkRuntime {
   createQuery(params: ClaudeSdkQueryParams): ClaudeSdkQuery {
     if (this.createError) throw this.createError;
     const query = new FakeQuery(params);
+    query.initializationError = this.initializationError;
+    query.initializationHangs = this.initializationHangs;
     this.queries.push(query);
     const sessionId = params.options.resume ?? `session-${this.queries.length}`;
     if (this.autoInitialize) {
@@ -121,6 +137,10 @@ class FakeRuntime implements ClaudeSdkRuntime {
       });
     }
     return query;
+  }
+
+  get claudeCodeVersion(): string {
+    return this.codeVersion;
   }
 
   randomUUID(): string {
@@ -319,22 +339,67 @@ test("surfaces synchronous SDK construction failure without leaving a query", as
   assert.deepEqual(runtime.queries, []);
 });
 
-test("rejects readiness when a resumed stream ends before init", async () => {
+test("resumes an empty streaming inbox through the control handshake without a synthetic turn", async () => {
   const runtime = new FakeRuntime();
   runtime.autoInitialize = false;
-  const pending = ClaudeManagedSession.resume(runtime, {
+  const session = await ClaudeManagedSession.resume(runtime, {
     sessionId: "resume-me",
+    cwd: "/workspace",
+    mode: "plan",
+    model: "sonnet",
+    effort: "high",
+  });
+  const query = runtime.queries[0];
+  assert.ok(query);
+  assert.equal(query.initializationCalls, 1);
+  assert.deepEqual(query.input, []);
+  assert.equal(session.snapshot.sessionId, "resume-me");
+  assert.equal(session.snapshot.resumedFrom, "resume-me");
+  assert.equal(session.snapshot.mode, "plan");
+  assert.equal(session.snapshot.model, "sonnet");
+  assert.equal(session.snapshot.effort, "high");
+  assert.equal(session.snapshot.claudeCodeVersion, CLAUDE_CODE_VERSION);
+  assert.equal(session.snapshot.canSteer, true);
+  assert.equal(session.snapshot.activity, "idle");
+  await session.dispose();
+});
+
+test("fails closed when the provider rejects an empty resumed handshake", async () => {
+  const runtime = new FakeRuntime();
+  runtime.autoInitialize = false;
+  runtime.initializationError = new Error("No conversation found with session ID: missing");
+
+  await assert.rejects(ClaudeManagedSession.resume(runtime, {
+    sessionId: "missing",
+    cwd: "/workspace",
+    mode: "default",
+  }), /No conversation found/u);
+  const query = runtime.queries[0];
+  assert.ok(query);
+  assert.equal(query.initializationCalls, 1);
+  assert.equal(query.closeCalls, 1);
+  assert.equal(query.params.options.abortController.signal.aborted, true);
+});
+
+test("preserves a provider error result emitted before resumed initialization", async () => {
+  const runtime = new FakeRuntime();
+  runtime.autoInitialize = false;
+  runtime.initializationHangs = true;
+  const pending = ClaudeManagedSession.resume(runtime, {
+    sessionId: "provider-rejected",
     cwd: "/workspace",
     mode: "default",
   });
   await eventually(() => runtime.queries.length === 1);
-  const query = runtime.queries[0];
-  assert.ok(query);
-  query.output.close();
+  runtime.queries[0]?.emit({
+    type: "result",
+    subtype: "error_during_execution",
+    errors: ["No conversation found with session ID: provider-rejected"],
+    session_id: "provider-rejected",
+  });
 
-  await assert.rejects(pending, /ended before initialization/);
-  assert.equal(query.closeCalls, 1);
-  assert.equal(query.params.options.abortController.signal.aborted, true);
+  await assert.rejects(pending, /No conversation found with session ID: provider-rejected/u);
+  assert.equal(runtime.queries[0]?.closeCalls, 1);
 });
 
 test("aborts a hanging initialization and closes its query exactly once", async () => {
@@ -436,6 +501,7 @@ test("dormant resume rejects workspace and provider identity drift without chang
   assert.equal(runtime.queries.length, 0);
 
   runtime.autoInitialize = false;
+  runtime.initializationHangs = true;
   const pending = dormant.resumeDormantExact({
     sessionId: "exact-session",
     cwd: "/workspace",
@@ -460,6 +526,7 @@ test("dormant resume rejects workspace and provider identity drift without chang
 test("aborting a dormant resume closes only the provisional writer", async () => {
   const runtime = new FakeRuntime();
   runtime.autoInitialize = false;
+  runtime.initializationHangs = true;
   const dormant = ClaudeManagedSession.dormant(runtime, {
     sessionId: "cancelled-resume",
     cwd: "/workspace",
@@ -485,6 +552,7 @@ test("aborting a dormant resume closes only the provisional writer", async () =>
 test("dormant resume fails closed if ownership changes during provider initialization", async () => {
   const runtime = new FakeRuntime();
   runtime.autoInitialize = false;
+  runtime.initializationHangs = true;
   const dormant = ClaudeManagedSession.dormant(runtime, {
     sessionId: "ownership-race",
     cwd: "/workspace",
@@ -805,6 +873,7 @@ test("hands off with the configured executable only after the owned query settle
   await assert.rejects(session.reclaimFromCli(handoff.id), /expected exited/);
   session.markCliExited(handoff.id, 0);
   runtime.autoInitialize = false;
+  runtime.initializationHangs = true;
   const reclaim = session.reclaimFromCli(handoff.id);
   await eventually(() => runtime.queries.length === 2);
   assert.equal(session.snapshot.owner, "native");

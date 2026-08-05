@@ -39,6 +39,7 @@ import type {
   CodexThreadState,
   JsonObject,
   JsonRpcId,
+  ResumeCodexThreadOptions,
 } from "./types.ts";
 import {
   normalizeCodexQuestions,
@@ -69,6 +70,17 @@ interface QuarantinedResume {
   releasePromise: Promise<void> | null;
 }
 
+interface CodexAdoptionExpectation {
+  threadId: string;
+  treeId: string | null;
+  parentThreadId: string | null;
+  cwd: string;
+  profile: CreateSessionInput["profile"];
+  sandbox: SandboxPolicy;
+  model: string | null;
+  effort: CodexThreadState["effort"];
+}
+
 export interface CodexProviderBridgeOptions {
   adapter: CodexManagedAdapter;
   resolveWorkspace(
@@ -83,6 +95,8 @@ export interface CodexProviderBridgeOptions {
   workspaceIdentityResolver?: Pick<WorkspaceIdentityResolver, "resolveMany">;
   /** Bounds the git work one publish may spend; exhaustion yields a null identity. */
   workspaceIdentityBudgetMs?: number;
+  /** Bounds the wait for thread/settings/updated after update RPC acceptance. */
+  adoptionConfirmationTimeoutMs?: number;
   now?: () => Date;
   onSessionChanged?: (session: SessionView) => void;
   onSessionRemoved?: (
@@ -96,6 +110,7 @@ const MAX_BUFFERED_ACTIVITY_MUTATIONS = 4_096;
 const MAX_RECOVERY_RECORDS = 100;
 const RECOVERY_CONCURRENCY = 4;
 const WORKSPACE_IDENTITY_BUDGET_MS = 2_500;
+const ADOPTION_CONFIRMATION_TIMEOUT_MS = 5_000;
 const UNLOADED_CAPABILITIES: SessionView["control"]["withheld"][number]["capability"][] = [
   "queue",
   "steer",
@@ -159,6 +174,45 @@ function boundedText(value: string, maxCodePoints = 1_000): string {
   return points.length <= maxCodePoints
     ? value
     : `${points.slice(0, maxCodePoints).join("")}…`;
+}
+
+function adoptionIdentityMatches(
+  state: CodexThreadState,
+  expected: CodexAdoptionExpectation,
+): boolean {
+  return state.threadId === expected.threadId
+    && state.treeId === expected.treeId
+    && state.parentThreadId === expected.parentThreadId
+    && state.cwd === expected.cwd;
+}
+
+function adoptionSettingsMismatches(
+  state: CodexThreadState | null,
+  expected: CodexAdoptionExpectation,
+): string[] {
+  if (!state) return ["provider state disappeared"];
+  const mismatches: string[] = [];
+  const accepted = state.pendingSettings;
+  const profile = accepted?.profile ?? state.profile;
+  const sandbox = accepted?.sandbox ?? state.sandbox;
+  const model = accepted?.model ?? state.model;
+  const effort = accepted?.effort ?? state.effort;
+  if (!adoptionIdentityMatches(state, expected)) {
+    mismatches.push("provider identity or workspace changed");
+  }
+  if (profile !== expected.profile) {
+    mismatches.push(`profile expected ${expected.profile}, saw ${profile ?? "unknown"}`);
+  }
+  if (!sandboxEquals(sandbox, expected.sandbox)) {
+    mismatches.push("sandbox did not match the confirmed selection");
+  }
+  if (expected.model !== null && model !== expected.model) {
+    mismatches.push(`model expected ${expected.model}, saw ${model ?? "unknown"}`);
+  }
+  if (expected.effort !== null && effort !== expected.effort) {
+    mismatches.push(`effort expected ${expected.effort}, saw ${effort ?? "unknown"}`);
+  }
+  return mismatches;
 }
 
 function attentionQuestions(request: CodexPendingRequest): AttentionQuestion[] {
@@ -502,6 +556,7 @@ export class CodexProviderBridge implements ProviderControlAdapter {
   #resolveWorkspace: CodexProviderBridgeOptions["resolveWorkspace"];
   #workspaceIdentityResolver: Pick<WorkspaceIdentityResolver, "resolveMany">;
   #workspaceIdentityBudgetMs: number;
+  #adoptionConfirmationTimeoutMs: number;
   #workspaceIdentities = new Map<string, WorkspaceIdentity | null>();
   #now: () => Date;
   #onActivity: CodexProviderBridgeOptions["onActivity"];
@@ -530,6 +585,10 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     this.#workspaceIdentityBudgetMs = Math.max(
       1,
       options.workspaceIdentityBudgetMs ?? WORKSPACE_IDENTITY_BUDGET_MS,
+    );
+    this.#adoptionConfirmationTimeoutMs = Math.max(
+      1,
+      options.adoptionConfirmationTimeoutMs ?? ADOPTION_CONFIRMATION_TIMEOUT_MS,
     );
     this.#workspaceIdentityResolver = options.workspaceIdentityResolver
       ?? new WorkspaceIdentityResolver({ totalBudgetMs: this.#workspaceIdentityBudgetMs });
@@ -685,12 +744,18 @@ export class CodexProviderBridge implements ProviderControlAdapter {
         settled: Promise.resolve(),
       };
       this.#managedThreads.set(threadId, subscription);
+      const resumeOptions: ResumeCodexThreadOptions = {
+        cwd: metadata.workspacePath,
+        sandbox,
+        approvalPolicy: profile === "full-access" ? "never" : "on-request",
+        ...(session.model.value === null ? {} : { model: session.model.value }),
+      };
       const adopted = await this.adapter.adoptThread(threadId, {
         threadId: read.threadId,
         treeId: read.treeId,
         parentThreadId: read.parentThreadId,
         cwd: read.cwd,
-      });
+      }, resumeOptions);
       this.#assertSelectedIdentity(adopted, read, metadata);
       context.signal.throwIfAborted();
 
@@ -703,20 +768,21 @@ export class CodexProviderBridge implements ProviderControlAdapter {
         await this.adapter.setEffort(threadId, session.effort.value);
       }
       context.signal.throwIfAborted();
-      const confirmed = this.adapter.getThreadState(threadId) ?? adopted;
-      if (
-        confirmed.threadId !== threadId
-        || confirmed.cwd !== metadata.workspacePath
-        || confirmed.treeId !== read.treeId
-        || confirmed.parentThreadId !== read.parentThreadId
-        || confirmed.profile !== profile
-        // A sandbox whose update fell back to next-turn delivery is still
-        // pending rather than wrong, so a staged request counts as applied.
-        || !(sandboxEquals(confirmed.sandbox, sandbox)
-          || sandboxEquals(confirmed.pendingSettings?.sandbox ?? null, sandbox))
-        || (session.model.value !== null && confirmed.model !== session.model.value)
-        || (session.effort.value !== null && confirmed.effort !== session.effort.value)
-      ) throw new Error("Codex adoption did not preserve the confirmed profile, sandbox, model, effort, or identity");
+      // thread/settings/update acknowledges request acceptance with `{}` and
+      // confirms effective changes separately through thread/settings/updated.
+      // That notification may arrive after the response and is deliberately
+      // omitted for a no-op. An exact accepted pending value therefore counts
+      // as preserved; the later full notification converges and clears it.
+      const confirmed = await this.#waitForAdoptionConfirmation({
+        threadId,
+        treeId: read.treeId,
+        parentThreadId: read.parentThreadId,
+        cwd: metadata.workspacePath,
+        profile,
+        sandbox,
+        model: session.model.value,
+        effort: session.effort.value,
+      }, context.signal);
 
       await this.#resolveWorkspaceIdentity(confirmed.cwd);
       context.signal.throwIfAborted();
@@ -741,6 +807,66 @@ export class CodexProviderBridge implements ProviderControlAdapter {
       }
       throw error;
     }
+  }
+
+  #waitForAdoptionConfirmation(
+    expected: CodexAdoptionExpectation,
+    signal: AbortSignal,
+  ): Promise<CodexThreadState> {
+    signal.throwIfAborted();
+    const immediate = this.adapter.getThreadState(expected.threadId);
+    if (immediate && adoptionSettingsMismatches(immediate, expected).length === 0) {
+      return Promise.resolve(immediate);
+    }
+
+    return new Promise<CodexThreadState>((resolve, reject) => {
+      let settled = false;
+      let unsubscribe = (): void => undefined;
+      const finish = (complete: () => void): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        signal.removeEventListener("abort", abort);
+        unsubscribe();
+        complete();
+      };
+      const abort = (): void => finish(() => reject(
+        signal.reason ?? new Error("Codex adoption settings confirmation was cancelled"),
+      ));
+      const check = (state: CodexThreadState | null): void => {
+        if (!state) return;
+        if (!adoptionIdentityMatches(state, expected)) {
+          finish(() => reject(new Error(
+            "Codex adoption identity or workspace changed while settings were being confirmed",
+          )));
+          return;
+        }
+        if (adoptionSettingsMismatches(state, expected).length === 0) {
+          finish(() => resolve(state));
+        }
+      };
+      const timeout = setTimeout(() => {
+        const current = this.adapter.getThreadState(expected.threadId);
+        const detail = adoptionSettingsMismatches(current, expected).join("; ");
+        finish(() => reject(new Error(
+          `Codex adoption settings confirmation timed out: ${detail || "unknown mismatch"}`,
+        )));
+      }, this.#adoptionConfirmationTimeoutMs);
+
+      signal.addEventListener("abort", abort, { once: true });
+      unsubscribe = this.adapter.subscribe((event) => {
+        if (event.type === "state.changed" && event.threadId === expected.threadId) {
+          check(event.state);
+        }
+      });
+      if (signal.aborted) {
+        abort();
+        return;
+      }
+      // Recheck after subscribing so a notification cannot land between the
+      // optimistic read above and listener registration.
+      check(this.adapter.getThreadState(expected.threadId));
+    });
   }
 
   /**
@@ -1217,6 +1343,10 @@ export class CodexProviderBridge implements ProviderControlAdapter {
       workspacePath: state.cwd ?? "",
     };
     const cwd = state.cwd ?? metadata.workspacePath;
+    const effectiveProfile = state.pendingSettings?.profile ?? state.profile;
+    const effectiveSandbox = state.pendingSettings?.sandbox ?? state.sandbox;
+    const effectiveModel = state.pendingSettings?.model ?? state.model;
+    const effectiveEffort = state.pendingSettings?.effort ?? state.effort;
     const updatedAt = this.#now().toISOString();
     const recoveryAttention: SessionView["attention"] = metadata.creationIssue
       ? [{
@@ -1282,26 +1412,26 @@ export class CodexProviderBridge implements ProviderControlAdapter {
       statusSource: "provider-api",
       source: state.source ?? "appServer",
       profile: {
-        value: state.profile,
-        providerValue: state.profile,
+        value: effectiveProfile,
+        providerValue: effectiveProfile,
         source: "provider-api",
-        confidence: state.profile === null ? "heuristic" : "exact",
+        confidence: effectiveProfile === null ? "heuristic" : "exact",
       },
       sandbox: {
-        value: state.sandbox,
-        providerValue: state.sandbox
-          ? `${state.sandbox.mode};network=${String(state.sandbox.networkAccess)}`
+        value: effectiveSandbox,
+        providerValue: effectiveSandbox
+          ? `${effectiveSandbox.mode};network=${String(effectiveSandbox.networkAccess)}`
           : null,
         source: "provider-api",
-        confidence: state.sandbox === null ? "heuristic" : "exact",
+        confidence: effectiveSandbox === null ? "heuristic" : "exact",
       },
       model: {
-        value: state.model,
-        providerValue: state.model,
+        value: effectiveModel,
+        providerValue: effectiveModel,
         source: "provider-api",
-        confidence: state.model === null ? "heuristic" : "exact",
+        confidence: effectiveModel === null ? "heuristic" : "exact",
       },
-      effort: providerEffort("codex", state.effort, "provider-api"),
+      effort: providerEffort("codex", effectiveEffort, "provider-api"),
       attention: [...recoveryAttention, ...pendingAttention],
       terminal: null,
       control: {

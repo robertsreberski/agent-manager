@@ -32,6 +32,7 @@ class BridgeQuery implements ClaudeSdkQuery, AsyncIterator<ClaudeSdkMessage> {
   readonly modes: ClaudePermissionMode[] = [];
   readonly models: Array<string | undefined> = [];
   readonly efforts: Array<ClaudeEffortLevel | null> = [];
+  initializationHangs = false;
   supportedModelCatalog: ClaudeModelInfo[] = [{
     value: "sonnet",
     displayName: "Sonnet",
@@ -52,6 +53,12 @@ class BridgeQuery implements ClaudeSdkQuery, AsyncIterator<ClaudeSdkMessage> {
 
   emit(message: Record<string, unknown>): void {
     this.output.push(message as unknown as ClaudeSdkMessage);
+  }
+
+  initializationResult(): Promise<unknown> {
+    return this.initializationHangs
+      ? new Promise<never>(() => undefined)
+      : Promise.resolve({});
   }
 
   interrupt(): Promise<ClaudeInterruptReceipt> {
@@ -103,15 +110,18 @@ class BridgeQuery implements ClaudeSdkQuery, AsyncIterator<ClaudeSdkMessage> {
 
 class BridgeRuntime implements ClaudeSdkRuntime {
   readonly sdkVersion = CLAUDE_AGENT_SDK_VERSION;
+  readonly claudeCodeExecutable = "claude";
   readonly queries: BridgeQuery[] = [];
   nextQueryHook: ((query: BridgeQuery) => void) | null = null;
   autoInitialize = true;
+  initializationHangs = false;
   codeVersion = CLAUDE_CODE_VERSION;
   initModelOverride: string | null = null;
   #id = 0;
 
   createQuery(params: ClaudeSdkQueryParams): ClaudeSdkQuery {
     const query = new BridgeQuery(params);
+    query.initializationHangs = this.initializationHangs;
     this.queries.push(query);
     this.nextQueryHook?.(query);
     if (this.autoInitialize) {
@@ -126,6 +136,10 @@ class BridgeRuntime implements ClaudeSdkRuntime {
       });
     }
     return query;
+  }
+
+  get claudeCodeVersion(): string {
+    return this.codeVersion;
   }
 
   randomUUID(): string {
@@ -1396,6 +1410,7 @@ test("returns the provider handoff id with native Claude attach instructions", a
   adapter.markCliAttached("managed-claude-1", handoffId, 4242);
   adapter.markCliExited("managed-claude-1", handoffId, 0);
   runtime.autoInitialize = false;
+  runtime.initializationHangs = true;
   const reclaim = adapter.reclaimFromCli("managed-claude-1", handoffId);
   await eventually(() => runtime.queries.length === 2);
   assert.equal(
@@ -1630,6 +1645,7 @@ test("in-web resume rejects identity drift and leaves the dormant manager record
 test("duplicate or aborted in-web resume never creates a second Claude writer", async () => {
   const runtime = new BridgeRuntime();
   runtime.autoInitialize = false;
+  runtime.initializationHangs = true;
   const adapter = new ClaudeProviderControlAdapter({ runtime });
   const record = stoppedRecoveryRecord();
   await adapter.restoreManagedSessions([record], new AbortController().signal);
@@ -1656,6 +1672,7 @@ test("duplicate or aborted in-web resume never creates a second Claude writer", 
 test("cancels a hanging managed Claude recovery without leaking its query", async () => {
   const runtime = new BridgeRuntime();
   runtime.autoInitialize = false;
+  runtime.initializationHangs = true;
   const adapter = new ClaudeProviderControlAdapter({ runtime });
   const controller = new AbortController();
   const record: ManagedSessionRecoveryRecord = {
@@ -2411,6 +2428,7 @@ test("external Claude adoption cancellation closes the provisional query", async
   const runtime = new BridgeRuntime();
   const external = await externalClaudeView(runtime);
   runtime.autoInitialize = false;
+  runtime.initializationHangs = true;
   const changes: SessionView[] = [];
   const adapter = new ClaudeProviderControlAdapter({
     runtime,
