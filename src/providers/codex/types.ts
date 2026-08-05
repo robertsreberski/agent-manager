@@ -1,5 +1,8 @@
 import type { ActivityMutation } from "../../activity/index.ts";
 import type { AvailableSessionAccountFacts } from "../../shared/session-facts.ts";
+import type { SandboxPolicy } from "../../shared/session.ts";
+
+export type { SandboxPolicy } from "../../shared/session.ts";
 
 export type JsonRpcId = string | number;
 
@@ -52,6 +55,7 @@ export type CodexControlCapability =
   | "turn.interrupt"
   | "request.respond"
   | "profile.set"
+  | "sandbox.set"
   | "model.set"
   | "effort.set"
   | "native.attach";
@@ -106,6 +110,7 @@ export interface CodexThreadState {
   model: string | null;
   effort: CodexReasoningEffort | null;
   profile: CodexExecutionProfile | null;
+  sandbox: SandboxPolicy | null;
   status: CodexThreadStatus;
   activeTurnId: string | null;
   lastTurnStatus: CodexTurnStatus | null;
@@ -126,6 +131,7 @@ export interface CodexThreadIdentity {
 
 export interface CodexPendingSettings {
   profile?: CodexExecutionProfile;
+  sandbox?: SandboxPolicy;
   model?: string;
   effort?: CodexReasoningEffort;
   delivery: Exclude<CodexSettingsDelivery, "unavailable">;
@@ -151,7 +157,7 @@ export interface StartCodexThreadOptions {
   model?: string;
   effort?: CodexReasoningEffort;
   approvalPolicy?: "untrusted" | "on-request" | "never";
-  sandbox?: "read-only" | "workspace-write" | "danger-full-access";
+  sandbox?: SandboxPolicy;
   permissions?: string;
   profile?: CodexExecutionProfile;
   initialMessage?: string;
@@ -162,7 +168,7 @@ export interface ResumeCodexThreadOptions {
   model?: string;
   effort?: CodexReasoningEffort;
   approvalPolicy?: "untrusted" | "on-request" | "never";
-  sandbox?: "read-only" | "workspace-write" | "danger-full-access";
+  sandbox?: SandboxPolicy;
   permissions?: string;
 }
 
@@ -244,6 +250,7 @@ export interface ManagedCodexAdapter {
     response: JsonObject,
   ): Promise<void>;
   setProfile(threadId: string, profile: CodexExecutionProfile): Promise<void>;
+  setSandbox(threadId: string, sandbox: SandboxPolicy): Promise<void>;
   setModel(threadId: string, model: string): Promise<void>;
   setEffort(threadId: string, effort: CodexReasoningEffort): Promise<void>;
   removeQueuedMessage(threadId: string, messageId: string): Promise<void>;

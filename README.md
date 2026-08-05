@@ -38,10 +38,20 @@ There is one provider-neutral execution profile:
 ask-first | plan | execute | full-access
 ```
 
-The adapter maps it atomically to provider permission/sandbox semantics. Full access is always
-orange. Codex model/effort/profile controls are idle-only: the pinned experimental API updates
-them when available, with provider confirmation and next-turn overrides after exact method
-withdrawal. Claude SDK controls use its pinned live methods when available.
+It decides whether the harness asks before it acts, and the adapter maps it atomically to provider
+approval semantics. Codex sessions carry a second, separate setting for what a permitted action
+may reach:
+
+```text
+read-only | workspace-write | danger-full-access
+```
+
+with network access selectable for `workspace-write`, defaulting to off. The two compose freely —
+never-ask with a read-only sandbox is a coherent request — and Claude has no sandbox at all. Full
+access and the danger sandbox are each always orange, on the one control that sets them. Codex
+model/effort/profile/sandbox controls are idle-only: the pinned experimental API updates them when
+available, with provider confirmation and next-turn overrides after exact method withdrawal.
+Claude SDK controls use its pinned live methods when available.
 
 ## Cockpit
 

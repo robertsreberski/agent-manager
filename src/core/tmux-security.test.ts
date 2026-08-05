@@ -6,7 +6,7 @@ import test from "node:test";
 
 import { attachTmuxTerminals, discoverTmuxPanes } from "./tmux.ts";
 import type { Runtime, SessionRecord } from "./types.ts";
-import { observeOnlyControl } from "../shared/session.ts";
+import { observeOnlyControl, unknownSandbox } from "../shared/session.ts";
 
 test("tmux discovery never probes regular files or an unsafe shared directory", () => {
   const root = mkdtempSync(join(tmpdir(), "agent-manager-tmux-security-"));
@@ -96,6 +96,7 @@ test("tmux discovery uses the pinned executable from its runtime", () => {
 
 test("local tmux evidence never attaches to a remote session with a colliding pid", () => {
   const remote: SessionRecord = {
+    sandbox: unknownSandbox(),
     id: "studio:codex:thread-1",
     provider: "codex",
     providerThreadId: "thread-1",

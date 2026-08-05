@@ -19,6 +19,7 @@ import {
   setupReadModelSchema,
 } from "../shared/setup.ts";
 import { createAgentManagerServer } from "./server.ts";
+import { unknownSandbox } from "../shared/session.ts";
 
 const host = "127.0.0.1:43127";
 const origin = "http://127.0.0.1:43127";
@@ -26,6 +27,7 @@ const legacyClaudeToken = "legacy-claude-hook-token-with-more-than-thirty-two-ch
 
 function discoveredSession(path: string): SessionView {
   return {
+    sandbox: unknownSandbox(),
     id: "local:codex:observed-thread",
     provider: "codex",
     providerThreadId: "observed-thread",

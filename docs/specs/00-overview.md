@@ -18,8 +18,12 @@ a routine ownership control.
 - This is a pre-prototype personal tool. Replace contracts in place, cold-reset Agent
   Manager-owned state, and delete old code in the same slice. Do not add migrations, aliases,
   deprecated fields, feature flags, backup flows, or parallel compatibility paths.
-- There is one execution profile: `ask-first | plan | execute | full-access`. Profile is atomic;
-  raw provider permission/sandbox strings never become a second public setting.
+- There are two public execution settings, and they are different questions. The execution profile
+  `ask-first | plan | execute | full-access` is the intent axis: whether the harness asks before
+  it acts. The Codex-only sandbox `read-only | workspace-write | danger-full-access`, plus a
+  network toggle that only workspace-write can carry, is the containment axis: what acting can
+  reach. Each maps atomically at the adapter boundary, they compose freely, and raw provider
+  permission/sandbox strings still never render or become vocabulary.
 - Full access is an immediate orange menu action. There is no confirmation dialog and no
   browser arming period.
 - There is no global control-stop switch. No persistent sentinel, CLI/owner-socket command,

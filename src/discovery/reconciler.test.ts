@@ -9,6 +9,7 @@ import {
   type DiscoveryUpdate,
   type WorkerPort,
 } from "./reconciler.ts";
+import { unknownSandbox } from "../shared/session.ts";
 
 class FakeWorker implements WorkerPort {
   readonly requests: Array<{ type: "scan"; id: number; recentWindowSeconds: number }> = [];
@@ -57,6 +58,7 @@ function session(
   workspaceIdentity: WorkspaceIdentity | null = null,
 ): SessionRecord {
   return {
+    sandbox: unknownSandbox(),
     id: sessionRecordId(hostId, "codex", providerThreadId),
     provider: "codex",
     providerThreadId,

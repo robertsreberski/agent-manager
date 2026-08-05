@@ -17,6 +17,7 @@ import type { SessionView } from "../core/types.ts";
 import { providerControlCoordination } from "../shared/session.ts";
 import { LocalPlanFileReader } from "./plan-file.ts";
 import { createAgentManagerServer } from "./server.ts";
+import { unknownSandbox } from "../shared/session.ts";
 
 const host = "127.0.0.1:43127";
 const origin = "http://127.0.0.1:43127";
@@ -61,6 +62,7 @@ function session(overrides: Partial<SessionView> = {}): SessionView {
       source: "provider-api",
       confidence: "exact",
     },
+    sandbox: unknownSandbox(),
     model: {
       value: null,
       providerValue: null,

@@ -24,6 +24,7 @@ function session(overrides: Partial<CockpitSessionView> & Pick<CockpitSessionVie
       takeover: null,
     },
     profile: null, model: null, effort: null, todo: null, ...overrides,
+    sandbox: null,
   };
 }
 

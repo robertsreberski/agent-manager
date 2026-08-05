@@ -29,6 +29,7 @@ function session(id: string, capabilities: CockpitSessionView["control"]["capabi
       takeover: null,
     },
     profile: null,
+    sandbox: null,
     model: null,
     effort: null,
     todo: null,

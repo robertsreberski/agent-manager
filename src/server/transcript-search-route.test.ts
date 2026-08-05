@@ -8,6 +8,7 @@ import type {
   TranscriptSearchResult,
 } from "./transcript.ts";
 import { createAgentManagerServer } from "./server.ts";
+import { unknownSandbox } from "../shared/session.ts";
 
 const host = "127.0.0.1:43127";
 const origin = "http://127.0.0.1:43127";
@@ -52,6 +53,7 @@ function session(overrides: Partial<SessionView> = {}): SessionView {
       source: "inferred",
       confidence: "heuristic",
     },
+    sandbox: unknownSandbox(),
     model: {
       value: null,
       providerValue: null,

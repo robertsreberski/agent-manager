@@ -7,12 +7,14 @@ import type {
   WorkspaceIdentity,
 } from "./session.ts";
 import {
+  CODEX_SANDBOX_MODES,
+  isCanonicalSandboxPolicy,
   normalizeProviderReasoningEffort,
   REASONING_EFFORTS,
   sessionRecordId,
 } from "./session.ts";
 
-export const WIRE_SCHEMA_VERSION = 5 as const;
+export const WIRE_SCHEMA_VERSION = 6 as const;
 
 export interface WireIdentity {
   schemaVersion: number | null;
@@ -70,12 +72,24 @@ const evidenceConfidenceSchema = z.enum(["exact", "inferred", "heuristic"]);
 const providerSchema = z.enum(["codex", "claude"]);
 const executionProfileSchema = z.enum(["ask-first", "plan", "execute", "full-access"]);
 const reasoningEffortSchema = z.enum(REASONING_EFFORTS);
+const codexSandboxModeSchema = z.enum(CODEX_SANDBOX_MODES);
+/*
+  A policy has exactly one canonical form: read-only cannot reach the network
+  and full access always can, so only workspace-write carries an operator
+  choice. Rejecting the other combinations keeps two spellings of one fact off
+  the wire entirely.
+*/
+const sandboxPolicySchema = z.object({
+  mode: codexSandboxModeSchema,
+  networkAccess: z.boolean(),
+}).strict().refine(isCanonicalSandboxPolicy, "sandbox network access must match its mode");
 const controlCapabilitySchema = z.enum([
   "queue",
   "steer",
   "interrupt",
   "respond",
   "set-profile",
+  "set-sandbox",
   "set-model",
   "set-effort",
   "remove-queued",
@@ -107,6 +121,7 @@ const sessionTakeoverSchema = z.object({
   requestedAt: z.string().nullable(),
   deadlineAt: z.string().nullable(),
   fallbackProfile: executionProfileSchema.nullable(),
+  fallbackSandbox: sandboxPolicySchema.nullable(),
   error: z.string().nullable(),
 }).strict().superRefine((takeover, context) => {
   const available = takeover.state === "available";
@@ -322,6 +337,7 @@ export const sessionRecordSchema: z.ZodType<SessionRecord> = z.object({
   statusSource: evidenceSourceSchema,
   source: z.string().nullable(),
   profile: evidencedValue(executionProfileSchema.nullable()),
+  sandbox: evidencedValue(sandboxPolicySchema.nullable()),
   model: evidencedValue(z.string().nullable()),
   effort: evidencedValue(reasoningEffortSchema.nullable()),
   todoProgress: z.object({
@@ -385,6 +401,13 @@ export const sessionRecordSchema: z.ZodType<SessionRecord> = z.object({
       code: "custom",
       message: `${session.provider} does not support ${session.effort.value} effort`,
       path: ["effort", "value"],
+    });
+  }
+  if (session.provider === "claude" && session.sandbox.value !== null) {
+    context.addIssue({
+      code: "custom",
+      message: "claude has no sandbox setting",
+      path: ["sandbox", "value"],
     });
   }
   if (session.todoProgress && session.todoProgress.completed > session.todoProgress.total) {
@@ -497,6 +520,7 @@ export const sessionActionTypeSchema = z.enum([
   "respond",
   "interrupt",
   "set-profile",
+  "set-sandbox",
   "set-model",
   "set-effort",
   "remove-queued",

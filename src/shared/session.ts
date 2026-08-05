@@ -10,6 +10,54 @@ export type ExecutionProfile =
   | "execute"
   | "full-access";
 
+/**
+ * How far a Codex thread may reach outside its own conversation.
+ *
+ * This is the containment axis, and it is independent of the execution profile:
+ * the profile decides whether the harness asks before acting, this decides what
+ * acting can touch at all. Claude has no equivalent setting and never carries
+ * one.
+ */
+export type CodexSandboxMode = "read-only" | "workspace-write" | "danger-full-access";
+
+export const CODEX_SANDBOX_MODES: readonly CodexSandboxMode[] = [
+  "read-only",
+  "workspace-write",
+  "danger-full-access",
+] as const;
+
+export interface SandboxPolicy {
+  mode: CodexSandboxMode;
+  /**
+   * Operator-controllable only for `workspace-write`. The other two modes each
+   * have exactly one truthful value, so a policy has one canonical form.
+   */
+  networkAccess: boolean;
+}
+
+export const DEFAULT_SANDBOX_POLICY: SandboxPolicy = Object.freeze({
+  mode: "workspace-write",
+  networkAccess: false,
+});
+
+/** The canonical policy for a mode, which is the only form ever transmitted. */
+export function sandboxPolicy(mode: CodexSandboxMode, networkAccess = false): SandboxPolicy {
+  if (mode === "read-only") return { mode, networkAccess: false };
+  if (mode === "danger-full-access") return { mode, networkAccess: true };
+  return { mode, networkAccess };
+}
+
+export function isCanonicalSandboxPolicy(policy: SandboxPolicy): boolean {
+  if (policy.mode === "read-only") return policy.networkAccess === false;
+  if (policy.mode === "danger-full-access") return policy.networkAccess === true;
+  return true;
+}
+
+export function sandboxEquals(left: SandboxPolicy | null, right: SandboxPolicy | null): boolean {
+  if (left === null || right === null) return left === right;
+  return left.mode === right.mode && left.networkAccess === right.networkAccess;
+}
+
 /** The complete public effort vocabulary exposed by at least one harness. */
 export const REASONING_EFFORTS = [
   "minimal",
@@ -80,6 +128,8 @@ export interface SessionTakeover {
   deadlineAt: string | null;
   /** Conservative mode applied only when discovery could not prove one. */
   fallbackProfile: ExecutionProfile | null;
+  /** Conservative sandbox applied only when discovery could not prove one. */
+  fallbackSandbox: SandboxPolicy | null;
   error: string | null;
 }
 
@@ -121,6 +171,8 @@ export interface EvidencedValue<T> {
 export type SessionProfile = EvidencedValue<ExecutionProfile | null>;
 export type SessionModel = EvidencedValue<string | null>;
 export type SessionEffort = EvidencedValue<ReasoningEffort | null>;
+/** Null both for Claude, which has no sandbox, and for an unproven Codex one. */
+export type SessionSandbox = EvidencedValue<SandboxPolicy | null>;
 
 export type AttentionKind =
   | "question"
@@ -213,6 +265,7 @@ export type ControlCapability =
   | "interrupt"
   | "respond"
   | "set-profile"
+  | "set-sandbox"
   | "set-model"
   | "set-effort"
   | "remove-queued"
@@ -347,6 +400,7 @@ export interface SessionRecord {
   statusSource: EvidenceSource;
   source: string | null;
   profile: SessionProfile;
+  sandbox: SessionSandbox;
   model: SessionModel;
   effort: SessionEffort;
   todoProgress: TodoProgress | null;
@@ -396,6 +450,25 @@ export function unknownProfile(): SessionProfile {
     providerValue: null,
     source: "inferred",
     confidence: "heuristic",
+  };
+}
+
+export function unknownSandbox(): SessionSandbox {
+  return {
+    value: null,
+    providerValue: null,
+    source: "inferred",
+    confidence: "heuristic",
+  };
+}
+
+/** Claude having no sandbox is an exact fact, not an unproven one. */
+export function noSandbox(): SessionSandbox {
+  return {
+    value: null,
+    providerValue: null,
+    source: "provider-api",
+    confidence: "exact",
   };
 }
 

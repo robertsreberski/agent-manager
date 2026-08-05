@@ -1,9 +1,11 @@
-import type { ExecutionProfile, SessionCapability } from "../../lib/cockpit-view";
+import { sandboxEquals } from "../../../../src/shared/session.ts";
+import type { ExecutionProfile, SandboxPolicy, SessionCapability } from "../../lib/cockpit-view";
 
 export interface OutboxSessionState {
   id: string;
   providerTurnId: string | null;
   profile: ExecutionProfile | null;
+  sandbox: SandboxPolicy | null;
   status: "running" | "waiting" | "idle" | "completed" | "failed" | "interrupted" | "unknown";
   exactRequestIds: readonly string[];
   capabilities: readonly SessionCapability[];
@@ -33,6 +35,7 @@ export function decideOfflineFlush(message: OfflineMessage, current: OutboxSessi
   if (!current) return { kind: "missing", reason: "The session is no longer available." };
   if (current.providerTurnId !== message.baseline.providerTurnId) return { kind: "review", reason: "The active turn changed while the cockpit was offline." };
   if (current.profile !== message.baseline.profile) return { kind: "review", reason: "The execution profile changed while the cockpit was offline." };
+  if (!sandboxEquals(current.sandbox, message.baseline.sandbox)) return { kind: "review", reason: "The sandbox changed while the cockpit was offline." };
   if (!sameSet(current.exactRequestIds, message.baseline.exactRequestIds)) return { kind: "review", reason: "A question or approval changed while the cockpit was offline." };
   if (current.status !== message.baseline.status) {
     return {

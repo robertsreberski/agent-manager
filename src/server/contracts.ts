@@ -12,7 +12,7 @@ import type {
   SessionTerminal,
   SessionView,
 } from "../shared/session.ts";
-import { REASONING_EFFORTS } from "../shared/session.ts";
+import { CODEX_SANDBOX_MODES, isCanonicalSandboxPolicy, REASONING_EFFORTS } from "../shared/session.ts";
 import type {
   StateEvent,
   StateEventType,
@@ -20,6 +20,7 @@ import type {
   WireStateSnapshot,
 } from "../shared/wire.ts";
 import type { AvailableSessionAccountFacts } from "../shared/session-facts.ts";
+import { validWorktreeName, WORKTREE_NAME_RULE } from "../shared/workspace.ts";
 
 export type { StateEvent, StateEventType } from "../shared/wire.ts";
 export type {
@@ -48,6 +49,14 @@ export const executionProfileSchema = z.enum([
 ]);
 
 export const reasoningEffortSchema = z.enum(REASONING_EFFORTS);
+
+export const codexSandboxModeSchema = z.enum(CODEX_SANDBOX_MODES);
+
+/** One canonical spelling per policy; see the wire schema for the same rule. */
+export const sandboxPolicySchema = z.object({
+  mode: codexSandboxModeSchema,
+  networkAccess: z.boolean(),
+}).strict().refine(isCanonicalSandboxPolicy, "sandbox network access must match its mode");
 
 const requestResponseSchema = z.discriminatedUnion("kind", [
   z.object({
@@ -100,6 +109,11 @@ export const sessionActionSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("set-profile"),
     profile: executionProfileSchema,
+    ...expectedState,
+  }).strict(),
+  z.object({
+    type: z.literal("set-sandbox"),
+    sandbox: sandboxPolicySchema,
     ...expectedState,
   }).strict(),
   z.object({
@@ -181,6 +195,7 @@ export const createSessionSchema = z.object({
   name: z.string().trim().min(1).max(120).optional(),
   initialMessage: z.string().min(1).max(100_000),
   profile: executionProfileSchema.default("plan"),
+  sandbox: sandboxPolicySchema.nullable().default(null),
   model: z.string().trim().min(1).max(256).nullable().default(null),
   effort: reasoningEffortSchema.nullable().default(null),
   idempotencyKey,
@@ -193,6 +208,13 @@ export const createSessionSchema = z.object({
       code: "custom",
       message: `Claude does not support ${input.effort} effort`,
       path: ["effort"],
+    });
+  }
+  if (input.provider === "claude" && input.sandbox !== null) {
+    context.addIssue({
+      code: "custom",
+      message: "Claude has no sandbox setting",
+      path: ["sandbox"],
     });
   }
 });
@@ -208,6 +230,16 @@ export const directoryCompletionQuerySchema = z.object({
 export const resolveWorkspaceSchema = z.object({
   hostId: z.string().min(1).max(128),
   path: z.string().trim().min(1).max(4_096),
+}).strict();
+
+export const gitContextQuerySchema = z.object({
+  path: z.string().trim().min(1).max(4_096),
+}).strict();
+
+export const createWorktreeSchema = z.object({
+  hostId: z.string().min(1).max(128),
+  repoRoot: z.string().trim().min(1).max(4_096),
+  name: z.string().trim().min(1).max(64).refine(validWorktreeName, WORKTREE_NAME_RULE),
 }).strict();
 
 export const leaseRequestSchema = z.object({
@@ -469,6 +501,8 @@ export interface ManagedSessionRecoveryRecord {
   workspacePath: string;
   name: string | null;
   profile: CreateSessionInput["profile"];
+  /** Absent on records written before the sandbox became its own setting. */
+  sandbox?: CreateSessionInput["sandbox"];
   model?: string | null;
   effort?: CreateSessionInput["effort"];
   createdAt: string;
@@ -559,6 +593,8 @@ export function requiredCapability(action: SessionAction): ControlCapability {
       return "interrupt";
     case "set-profile":
       return "set-profile";
+    case "set-sandbox":
+      return "set-sandbox";
     case "set-model":
       return "set-model";
     case "set-effort":

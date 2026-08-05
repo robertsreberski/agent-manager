@@ -19,6 +19,7 @@ import {
 import { requestHooksReloadFromControlSocket } from "./control-socket.ts";
 import { ManagerDatabase } from "./persistence.ts";
 import { createAgentManagerServer } from "./server.ts";
+import { unknownSandbox } from "../shared/session.ts";
 
 const HOST = "127.0.0.1:43127";
 const ORIGIN = "http://127.0.0.1:43127";
@@ -27,6 +28,7 @@ const CODEX_TOKEN = "codex-server-hook-token-with-more-than-thirty-two-character
 
 function session(provider: "claude" | "codex", providerThreadId: string): SessionRecord {
   return {
+    sandbox: unknownSandbox(),
     id: sessionRecordId("local", provider, providerThreadId),
     provider,
     providerThreadId,

@@ -291,6 +291,7 @@ test("session creation intent is durable without storing the initial message", (
     workspaceId: "workspace-one",
     initialMessage: "create-private-needle",
     profile: "plan" as const,
+    sandbox: null,
     model: null,
     effort: null,
     idempotencyKey: "idempotency-create-test",
@@ -377,6 +378,35 @@ test("one-shot operational intents remain claimed across database reopen", () =>
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("workspaces are listed most recently opened first, never-opened ones last", () => {
+  const database = new ManagerDatabase();
+  database.addWorkspace({ id: "alpha", label: "Alpha", path: "/repos/alpha" });
+  database.addWorkspace({ id: "bravo", label: "Bravo", path: "/repos/bravo" });
+  database.addWorkspace({ id: "charlie", label: "Charlie", path: "/repos/charlie" });
+
+  assert.deepEqual(
+    database.listWorkspaces().map((workspace) => workspace.id),
+    ["alpha", "bravo", "charlie"],
+    "unopened workspaces keep the alphabetical ordering",
+  );
+
+  assert.equal(database.touchWorkspaceOpened("charlie", "2026-08-04T09:00:00.000Z"), true);
+  assert.equal(database.touchWorkspaceOpened("alpha", "2026-08-04T10:00:00.000Z"), true);
+  assert.equal(database.touchWorkspaceOpened("missing", "2026-08-04T11:00:00.000Z"), false);
+
+  assert.deepEqual(
+    database.listWorkspaces().map((workspace) => workspace.id),
+    ["alpha", "charlie", "bravo"],
+  );
+  assert.equal(database.getWorkspace("alpha")?.lastOpenedAt, "2026-08-04T10:00:00.000Z");
+  assert.equal(database.getWorkspace("bravo")?.lastOpenedAt, null);
+
+  // Re-resolving a known path must not erase the recency it already earned.
+  database.addWorkspace({ label: "Alpha", path: "/repos/alpha" });
+  assert.equal(database.getWorkspace("alpha")?.lastOpenedAt, "2026-08-04T10:00:00.000Z");
+  database.close();
 });
 
 test("rejects an incompatible database without migrating or deleting its records", () => {

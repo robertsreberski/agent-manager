@@ -566,6 +566,7 @@ function externalSession(provider: Provider, providerSessionId: string, cwd: str
     statusSource: "hook",
     source: "hook",
     profile: { value: null, providerValue: null, source: "inferred", confidence: "heuristic" },
+    sandbox: { value: null, providerValue: null, source: "inferred", confidence: "heuristic" },
     model: { value: null, providerValue: null, source: "inferred", confidence: "heuristic" },
     effort: { value: null, providerValue: null, source: "inferred", confidence: "heuristic" },
     todoProgress: null,

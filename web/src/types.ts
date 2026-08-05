@@ -25,6 +25,7 @@ export type {
   ExecutionProfile,
   Provider,
   ReasoningEffort,
+  SandboxPolicy,
   SessionAttention,
   SessionControl,
   SessionEffort,

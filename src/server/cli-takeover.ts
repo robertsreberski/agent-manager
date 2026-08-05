@@ -19,11 +19,13 @@ import { DatabaseSync } from "node:sqlite";
 import type {
   ExecutionProfile,
   Provider,
+  SandboxPolicy,
   SessionRecord,
   SessionTakeover,
   SessionView,
   TakeoverMethod,
 } from "../shared/session.ts";
+import { DEFAULT_SANDBOX_POLICY } from "../shared/session.ts";
 
 export interface LocalCliProcessMemberIdentity {
   pid: number;
@@ -116,6 +118,7 @@ interface TakeoverAttempt {
   requestedAt: string;
   deadlineAt: string | null;
   fallbackProfile: ExecutionProfile | null;
+  fallbackSandbox: SandboxPolicy | null;
   error: string | null;
   controller: AbortController;
   signalled: boolean;
@@ -222,6 +225,11 @@ class MemorySignalJournal implements CliTakeoverSignalJournal {
 
 function fallbackProfile(provider: Provider): ExecutionProfile {
   return provider === "claude" ? "ask-first" : "plan";
+}
+
+/** Claude has no sandbox; an unproven Codex one is contained, not trusted. */
+function fallbackSandbox(provider: Provider): SandboxPolicy | null {
+  return provider === "claude" ? null : DEFAULT_SANDBOX_POLICY;
 }
 
 function takeoverMethods(session: SessionView): readonly TakeoverMethod[] {
@@ -492,6 +500,7 @@ export class CliTakeoverCoordinator {
         requestedAt: attempt.requestedAt,
         deadlineAt: attempt.deadlineAt,
         fallbackProfile: attempt.fallbackProfile,
+        fallbackSandbox: attempt.fallbackSandbox,
         error: attempt.error,
       };
       if (attempt.state === "awaiting-confirmation") {
@@ -512,6 +521,9 @@ export class CliTakeoverCoordinator {
         deadlineAt: null,
         fallbackProfile: session.profile.value === null
           ? fallbackProfile(session.provider)
+          : null,
+        fallbackSandbox: session.sandbox.value === null
+          ? fallbackSandbox(session.provider)
           : null,
         error: null,
       };
@@ -811,6 +823,7 @@ export class CliTakeoverCoordinator {
         requestedAt: new Date(this.#now()).toISOString(),
         deadlineAt: null,
         fallbackProfile: session.profile.value === null ? fallbackProfile(session.provider) : null,
+        fallbackSandbox: session.sandbox.value === null ? fallbackSandbox(session.provider) : null,
         error: null,
         controller: new AbortController(),
         signalled: false,
@@ -892,6 +905,7 @@ export class CliTakeoverCoordinator {
           ? new Date(now + this.#guidedTimeoutMs).toISOString()
           : null,
         fallbackProfile: session.profile.value === null ? fallbackProfile(session.provider) : null,
+        fallbackSandbox: session.sandbox.value === null ? fallbackSandbox(session.provider) : null,
         error: null,
         controller: new AbortController(),
         signalled: false,

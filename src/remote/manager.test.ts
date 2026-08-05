@@ -71,6 +71,7 @@ function remoteSession() {
     statusSource: "provider-api",
     source: "fixture",
     profile: { value: "execute", providerValue: "default", source: "provider-api", confidence: "exact" },
+    sandbox: { value: { mode: "workspace-write", networkAccess: false }, providerValue: "workspace-write;network=false", source: "provider-api", confidence: "exact" },
     model: { value: "gpt-fixture", providerValue: "gpt-fixture", source: "provider-api", confidence: "exact" },
     effort: { value: "medium", providerValue: "medium", source: "provider-api", confidence: "exact" },
     todoProgress: null,
@@ -171,6 +172,7 @@ function fakeRemote(t: TestContext): string {
     hostKind: "local",
     remoteWorkspaceId: null,
     createdAt: AT,
+    lastOpenedAt: null,
     workspaceIdentity: remoteSession().workspaceIdentity,
   };
   const activity = {

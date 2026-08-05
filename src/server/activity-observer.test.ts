@@ -6,9 +6,11 @@ import type { SessionView } from "../core/types.ts";
 import { observeOnlyControl } from "../shared/session.ts";
 import { SelectedTranscriptActivityObserver } from "./activity-observer.ts";
 import type { TranscriptItem, TranscriptReadResult } from "./transcript.ts";
+import { unknownSandbox } from "../shared/session.ts";
 
 function externalSession(): SessionView {
   return {
+    sandbox: unknownSandbox(),
     id: "codex:external-thread",
     provider: "codex",
     providerThreadId: "external-thread",

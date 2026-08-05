@@ -25,6 +25,9 @@ test("uses one execution profile for creation and live updates", () => {
     workspaceId: "workspace-1",
     initialMessage: "Start",
     profile: "full-access",
+    // Full access is the approval axis; the sandbox is an unrelated choice
+    // the adapter defaults conservatively when none was requested.
+    sandbox: null,
     model: null,
     effort: null,
     idempotencyKey: "create-contract-key",
@@ -61,6 +64,45 @@ test("uses one execution profile for creation and live updates", () => {
       idempotencyKey: `claude-${effort}-create`,
     }), new RegExp(`Claude does not support ${effort} effort`, "u"));
   }
+});
+
+test("carries the Codex sandbox as its own setting with one canonical spelling", () => {
+  assert.equal(createSessionSchema.parse({
+    provider: "codex",
+    workspaceId: "workspace-1",
+    initialMessage: "Start",
+    sandbox: { mode: "workspace-write", networkAccess: true },
+    idempotencyKey: "sandbox-create-key",
+  }).sandbox?.networkAccess, true);
+
+  // Read-only cannot reach the network and full access always can, so the
+  // other spellings of those two policies are refused rather than normalized.
+  for (const sandbox of [
+    { mode: "read-only", networkAccess: true },
+    { mode: "danger-full-access", networkAccess: false },
+  ]) {
+    assert.throws(() => createSessionSchema.parse({
+      provider: "codex",
+      workspaceId: "workspace-1",
+      initialMessage: "Start",
+      sandbox,
+      idempotencyKey: "sandbox-noncanonical",
+    }), /network access must match its mode/u);
+  }
+
+  assert.throws(() => createSessionSchema.parse({
+    provider: "claude",
+    workspaceId: "workspace-1",
+    initialMessage: "Start",
+    sandbox: { mode: "read-only", networkAccess: false },
+    idempotencyKey: "claude-sandbox-create",
+  }), /Claude has no sandbox setting/u);
+
+  assert.equal(requiredCapability(sessionActionSchema.parse({
+    type: "set-sandbox",
+    sandbox: { mode: "danger-full-access", networkAccess: true },
+    ...expectedState,
+  })), "set-sandbox");
 });
 
 test("maps every session action to its exact capability", () => {

@@ -15,7 +15,7 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import type { SessionView } from "../core/types.ts";
-import { providerControlCoordination } from "../shared/session.ts";
+import { providerControlCoordination, unknownSandbox } from "../shared/session.ts";
 import { sessionRecordSchema } from "../shared/wire.ts";
 import {
   CliTakeoverCoordinator,
@@ -55,6 +55,7 @@ function session(overrides: Partial<SessionView> = {}): SessionView {
     statusSource: "process",
     source: "fixture",
     profile: { value: null, providerValue: null, source: "inferred", confidence: "heuristic" },
+    sandbox: unknownSandbox(),
     model: { value: "gpt-test", providerValue: "gpt-test", source: "provider-cli", confidence: "exact" },
     effort: { value: "high", providerValue: "high", source: "provider-cli", confidence: "exact" },
     todoProgress: null,
@@ -466,6 +467,7 @@ test("remote takeover and resume capabilities remain owned by the remote node", 
         requestedAt: "2026-08-05T10:00:00.000Z",
         deadlineAt: "2026-08-05T10:05:00.000Z",
         fallbackProfile: null,
+        fallbackSandbox: null,
         error: null,
       },
     },

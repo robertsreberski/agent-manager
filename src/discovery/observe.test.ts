@@ -290,7 +290,7 @@ test("marks transcript-only request_user_input as heuristic and non-respondable"
   assert.deepEqual(resolved.attention, []);
 });
 
-test("Codex profile resolution prefers rollout context and maps safe database facts to execute", () => {
+test("Codex profile follows approval and the sandbox is evidenced on its own axis", () => {
   const root = mkdtempSync(join(tmpdir(), "agent-manager-profile-"));
   const sqliteDirectory = join(root, "sqlite");
   mkdirSync(sqliteDirectory);
@@ -314,6 +314,17 @@ test("Codex profile resolution prefers rollout context and maps safe database fa
       collaboration_mode: { mode: "plan" },
     },
   })}\n`);
+  // A CLI running wide open while still asking for approval: the sandbox is
+  // permissive but the profile is not, and neither one implies the other.
+  const wideOpenRollout = join(root, "wide-open.jsonl");
+  writeFileSync(wideOpenRollout, `${JSON.stringify({
+    type: "turn_context",
+    payload: {
+      approval_policy: "on-request",
+      sandbox_policy: { type: "danger-full-access" },
+      collaboration_mode: { mode: "default" },
+    },
+  })}\n`);
   const database = new DatabaseSync(join(sqliteDirectory, "state_5.sqlite"));
   try {
     database.exec(`
@@ -332,7 +343,8 @@ test("Codex profile resolution prefers rollout context and maps safe database fa
     );
     insert.run("plan-thread", planRollout, now / 1_000, now / 1_000, '{"type":"workspace-write"}', "on-request");
     insert.run("full-thread", fullRollout, now / 1_000, now / 1_000, '{"type":"workspace-write"}', "on-request");
-    insert.run("safe-db-thread", "", now / 1_000, now / 1_000, '{"type":"read-only"}', "never");
+    insert.run("wide-open-thread", wideOpenRollout, now / 1_000, now / 1_000, '{"type":"workspace-write"}', "on-request");
+    insert.run("db-thread", "", now / 1_000, now / 1_000, '{"type":"read-only"}', "on-request");
   } finally {
     database.close();
   }
@@ -351,9 +363,19 @@ test("Codex profile resolution prefers rollout context and maps safe database fa
 
     assert.equal(sessions.get("plan-thread")?.profile.value, "plan");
     assert.equal(sessions.get("plan-thread")?.profile.source, "rollout-events");
+    assert.deepEqual(sessions.get("plan-thread")?.sandbox.value, { mode: "workspace-write", networkAccess: false });
     assert.equal(sessions.get("full-thread")?.profile.value, "full-access");
-    assert.equal(sessions.get("safe-db-thread")?.profile.value, "execute");
-    assert.equal(sessions.get("safe-db-thread")?.profile.source, "provider-cli");
+    assert.deepEqual(sessions.get("full-thread")?.sandbox.value, { mode: "danger-full-access", networkAccess: true });
+
+    // A permissive sandbox no longer implies a permissive profile.
+    assert.equal(sessions.get("wide-open-thread")?.profile.value, "execute");
+    assert.deepEqual(sessions.get("wide-open-thread")?.sandbox.value, { mode: "danger-full-access", networkAccess: true });
+    assert.equal(sessions.get("wide-open-thread")?.sandbox.confidence, "exact");
+
+    assert.equal(sessions.get("db-thread")?.profile.value, "execute");
+    assert.equal(sessions.get("db-thread")?.profile.source, "provider-cli");
+    assert.deepEqual(sessions.get("db-thread")?.sandbox.value, { mode: "read-only", networkAccess: false });
+    assert.equal(sessions.get("db-thread")?.sandbox.source, "provider-cli");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

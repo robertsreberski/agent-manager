@@ -31,6 +31,7 @@ function session(id: string, updatedAt: string, activity: CockpitSessionView["ac
       takeover: null,
     },
     profile: null,
+    sandbox: null,
     model: null,
     effort: null,
     todo: null,

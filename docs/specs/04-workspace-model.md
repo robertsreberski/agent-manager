@@ -116,11 +116,29 @@ buildBoard(sessions, { scope, hostFilter }): BoardColumn[]
 
 Pure and unit-testable, like the rest of that module.
 
+## Creating a worktree
+
+The new-thread draft may create one worktree, and that is the only write this product makes to a
+repository. It lives in `src/core/worktree-admin.ts`, separate from the read-only
+`src/core/worktree.ts`, so the observation module's guarantee stays literal.
+
+- The write surface is exactly `git worktree add -b <name> -- <repoRoot>/.worktrees/<name>
+  <defaultBranch>`, plus one append of `/.worktrees/` to `info/exclude` so created worktrees never
+  read as untracked changes.
+- The base is always the repository's default branch, resolved in order: `origin/HEAD`,
+  `init.defaultBranch`, `main`, `master`, the current branch — each confirmed to exist as a local
+  head. A repository with none has no base, and the option says so rather than failing at creation.
+- The name is validated before any process is spawned, and is both the directory and the branch.
+  Argv-only, bounded output, explicit timeouts, as everywhere else git is run.
+- Collisions are refused, never resolved: an existing directory or branch is the operator's to
+  reuse or rename, and nothing here deletes either.
+- Local hosts only. A remote host says so plainly instead of offering a control that cannot work.
+
 ## Non-goals
 
-- Creating, removing or switching worktrees. The design mentions a switcher (`github.md`); it is
-  not in any frame and is not in this pass.
-- Git operations of any kind that write. This module is read-only.
+- Removing or switching worktrees. The design mentions a switcher (`github.md`); it is not in any
+  frame and is not in this pass.
+- Any other git write. Outside the one creation path above, this product only reads.
 - Intercepting the harnesses' own worktree hooks (Claude's `WorktreeCreate`/`WorktreeRemove`).
   Reading git is simpler and works for sessions that predate the bridge.
 
@@ -136,3 +154,6 @@ Pure and unit-testable, like the rest of that module.
 6. `buildBoard` has unit tests for ordering stability, host-qualified repo keys, and the
    no-identity fallback group.
 7. Remote sessions resolve via the bridge or degrade to `null` — never by running local git.
+8. Worktree creation refuses an unusable name before spawning any process, refuses an existing
+   directory or branch without deleting either, places the tree under `.worktrees/` excluded from
+   status, and bases its branch on the repository's default branch.

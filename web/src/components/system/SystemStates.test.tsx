@@ -53,6 +53,7 @@ function cockpitSession(overrides: Partial<CockpitSessionView> = {}): CockpitSes
       takeover: null,
     },
     profile: "execute",
+    sandbox: null,
     model: "gpt-5.6",
     effort: "high",
     todo: null,

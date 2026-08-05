@@ -10,12 +10,14 @@ import { defaultPaths } from "../ops/config.ts";
 import { observeOnlyControl } from "../shared/session.ts";
 import { ConfigRemoteHostRegistry } from "./remote-host-registry.ts";
 import { createAgentManagerServer } from "./server.ts";
+import { unknownSandbox } from "../shared/session.ts";
 
 const host = "127.0.0.1:43127";
 const origin = "http://127.0.0.1:43127";
 
 function remoteSession(hostId: string): SessionRecord {
   return {
+    sandbox: unknownSandbox(),
     id: `${hostId}:codex:remote-thread`,
     provider: "codex",
     providerThreadId: "remote-thread",

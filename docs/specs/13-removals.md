@@ -43,7 +43,9 @@ feature flags, dormant supervisors, or “temporary” second timelines.
 ### Controls and safety surfaces
 
 - Delete `planning | execution`, `set-mode`, `accessMode`, `effectiveAccess`, `set-access`, and
-  all mapping/normalization code. One `ExecutionProfile` and `set-profile` replace them.
+  all mapping/normalization code. One `ExecutionProfile` and `set-profile` replace them. The
+  Codex `SandboxPolicy` and `set-sandbox` added later are a distinct containment setting, not a
+  revival of the removed access mode: the removed vocabulary stays gone.
 - Delete every routine lease affordance/string/disabled condition. Retain only the internal
   writer coordinator and conflict/takeover outcome.
 - Delete the obsolete global control-stop feature completely: CLI/parser/help, sentinel and

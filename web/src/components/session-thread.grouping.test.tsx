@@ -46,6 +46,7 @@ const session = {
   model: { value: "sonnet" },
   effort: { value: "high" },
   profile: { value: "ask-first" },
+  sandbox: { value: null },
   control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [], takeover: null },
 } as unknown as SessionView;
 

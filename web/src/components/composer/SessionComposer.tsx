@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { ArrowUp, ChevronDown, CodeXml, Paperclip, RotateCcw, Square } from "lucide-react";
-import type { ReasoningEffort } from "@shared/session";
+import type { CodexSandboxMode, ReasoningEffort, SandboxPolicy } from "@shared/session";
+import { CODEX_SANDBOX_MODES, sandboxPolicy } from "../../../../src/shared/session.ts";
 import type { CockpitProvider, ExecutionProfile } from "../../lib/cockpit-view";
 import { isTypingTarget } from "../../lib/shortcuts";
 import { coveringModelOption } from "../../lib/model-catalog";
@@ -22,9 +23,11 @@ import {
 import {
   Button,
   DropdownMenu,
+  DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuRadioGroup,
   DropdownMenuRadioItem,
+  DropdownMenuSeparator,
   DropdownMenuShortcut,
   DropdownMenuTrigger,
   RadioGroup,
@@ -60,12 +63,15 @@ export interface SessionComposerProps {
   model: string | null;
   effort: ReasoningEffort | null;
   profile: ExecutionProfile | null;
+  /** Codex-only containment setting; Claude sessions render no control. */
+  sandbox?: SandboxPolicy | null;
   providerOptions?: readonly CockpitProvider[];
   modelOptions?: readonly ComposerModelOption[];
   modelOptionsStatus?: string | null;
   modelChangeUnavailableReason?: string | null;
   effortChangeUnavailableReason?: string | null;
   profileChangeUnavailableReason?: string | null;
+  sandboxChangeUnavailableReason?: string | null;
   effortOptions?: readonly NonNullable<SessionComposerProps["effort"]>[];
   profileOptions?: readonly ExecutionProfile[];
   settingsIdleOnly?: boolean;
@@ -75,6 +81,7 @@ export interface SessionComposerProps {
   onModelChange?: (model: string) => void;
   onEffortChange?: (effort: NonNullable<SessionComposerProps["effort"]>) => void;
   onProfileChange?: (profile: ExecutionProfile) => void;
+  onSandboxChange?: (sandbox: SandboxPolicy) => void;
   onResetSettings?: () => void;
   /**
    * Workspace-relative paths matching a query, for `@mention`. Absent where the
@@ -95,6 +102,24 @@ function profileLabel(profile: ExecutionProfile | null): string {
   return profile === null ? "Profile unknown" : PROFILE_LABEL[profile];
 }
 
+const SANDBOX_LABEL: Record<CodexSandboxMode, string> = {
+  "read-only": "Read-only",
+  "workspace-write": "Workspace",
+  "danger-full-access": "Danger: full access",
+};
+
+/*
+  The sandbox is a second public setting, not a restatement of the profile: the
+  profile says whether Codex asks before it acts, this says what acting can
+  reach. Network access is only a question for workspace-write — read-only
+  cannot reach it and full access always can.
+*/
+function sandboxLabel(sandbox: SandboxPolicy | null): string {
+  if (sandbox === null) return "Sandbox unknown";
+  const base = SANDBOX_LABEL[sandbox.mode];
+  return sandbox.mode === "workspace-write" && sandbox.networkAccess ? `${base} · network` : base;
+}
+
 function effortLabel(effort: ReasoningEffort | null): string {
   if (effort === null) return "Unknown";
   if (effort === "xhigh") return "XHigh";
@@ -107,18 +132,19 @@ export function SessionComposer(props: SessionComposerProps) {
     readOnlyReason, provider, model, effort, profile, providerOptions = ["codex", "claude"],
     modelOptions = [], modelOptionsStatus = null, effortOptions = [],
     modelChangeUnavailableReason = null, effortChangeUnavailableReason = null,
-    profileChangeUnavailableReason = null,
+    profileChangeUnavailableReason = null, sandboxChangeUnavailableReason = null,
     profileOptions = ["ask-first", "plan", "execute", "full-access"],
+    sandbox = null,
     settingsIdleOnly = false, draft = false, busy = false,
-    onProviderChange, onModelChange, onEffortChange, onProfileChange, onResetSettings,
-    onSearchFiles,
+    onProviderChange, onModelChange, onEffortChange, onProfileChange, onSandboxChange,
+    onResetSettings, onSearchFiles,
   } = props;
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // The only state the composer still keeps for its menus: which one is open.
   // Radix owns focus, dismissal, roving tabindex and positioning; this exists
   // solely so ⌘⇧M and M can drive the same menus the triggers do, and so the
   // two menus stay mutually exclusive.
-  const [openMenu, setOpenMenu] = useState<"runtime" | "profile" | null>(null);
+  const [openMenu, setOpenMenu] = useState<"runtime" | "profile" | "sandbox" | null>(null);
   const settingsDisabled = !draft && settingsIdleOnly && isRunning;
   const runtimeHasAction = Boolean(onProviderChange || onModelChange || onEffortChange || onResetSettings);
   // A catalog the harness will not let this cockpit write is still worth
@@ -126,12 +152,19 @@ export function SessionComposer(props: SessionComposerProps) {
   const runtimeIsReadable = modelOptions.length > 0 || Boolean(modelOptionsStatus);
   const runtimeDisabled = settingsDisabled || (!runtimeHasAction && !runtimeIsReadable);
   const profileDisabled = settingsDisabled || !onProfileChange;
+  // Claude has no sandbox at all, so it gets no control rather than a disabled
+  // one: an unavailable setting and a nonexistent setting are different facts.
+  const showSandbox = provider === "codex";
+  const sandboxDisabled = settingsDisabled || !onSandboxChange;
   const runtimeDisabledReason = settingsDisabled
     ? "Available when this turn finishes"
     : modelChangeUnavailableReason ?? effortChangeUnavailableReason ?? "This harness does not expose live model or effort changes.";
   const profileDisabledReason = settingsDisabled
     ? "Available when this turn finishes"
     : profileChangeUnavailableReason ?? "This harness does not expose live execution-profile changes.";
+  const sandboxDisabledReason = settingsDisabled
+    ? "Available when this turn finishes"
+    : sandboxChangeUnavailableReason ?? "This harness does not expose live sandbox changes.";
   /*
     The session states its model as a wire id; the catalog lists alias rows.
     The covering row — exact match, or the alias whose `resolvedModel` names
@@ -233,6 +266,10 @@ export function SessionComposer(props: SessionComposerProps) {
         if (profileDisabled) return;
         event.preventDefault();
         setOpenMenu((current) => current === "profile" ? null : "profile");
+      } else if (!event.metaKey && !event.ctrlKey && !event.altKey && event.key.toLowerCase() === "s") {
+        if (!showSandbox || sandboxDisabled) return;
+        event.preventDefault();
+        setOpenMenu((current) => current === "sandbox" ? null : "sandbox");
       } else if ((event.metaKey || event.ctrlKey) && !event.shiftKey && event.key === "." && isRunning && canStop) {
         event.preventDefault();
         void onStop?.();
@@ -240,7 +277,7 @@ export function SessionComposer(props: SessionComposerProps) {
     }
     window.addEventListener("keydown", shortcut);
     return () => window.removeEventListener("keydown", shortcut);
-  }, [canStop, isRunning, onStop, profileDisabled, runtimeDisabled]);
+  }, [canStop, isRunning, onStop, profileDisabled, runtimeDisabled, sandboxDisabled, showSandbox]);
 
   async function send(delivery: ComposerDelivery) {
     if (!value.trim() || busy) return;
@@ -452,8 +489,52 @@ export function SessionComposer(props: SessionComposerProps) {
           Full access used to be badged three times over — here, on the profile
           trigger above, and again as a drawer-header fact chip. Saying it once,
           orange, on the control that changes it is the whole point of an
-          alarming colour; repeating it spends the alarm.
+          alarming colour; repeating it spends the alarm. The same rule governs
+          the danger sandbox below: orange on the control that sets it, nowhere
+          else.
         */}
+        {showSandbox && (
+          <>
+            <span className="h-3.5 w-px shrink-0 bg-[var(--border)]" />
+            <DropdownMenu open={openMenu === "sandbox"} onOpenChange={(next) => setOpenMenu(next ? "sandbox" : null)}>
+              <DropdownMenuTrigger asChild disabled={sandboxDisabled}>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  data-compact-control
+                  className={`h-auto min-h-8 gap-1.5 rounded-full px-2 text-meta data-[state=open]:bg-[var(--surface-selected)] ${KEEPS_ITS_TOOLTIP}`}
+                  title={sandboxDisabled ? sandboxDisabledReason : undefined}
+                  aria-description={sandboxDisabled ? sandboxDisabledReason : undefined}
+                >
+                  <span className={sandbox?.mode === "danger-full-access" ? "text-[var(--access)]" : "text-[var(--text-secondary)]"}>{sandboxLabel(sandbox)}</span>
+                  <ChevronDown size={12} strokeWidth={1.75} className="text-[var(--text-faint)]" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent side="top" align="start" aria-labelledby={undefined} aria-label="Sandbox" className="min-w-52">
+                <DropdownMenuRadioGroup
+                  value={sandbox?.mode ?? ""}
+                  onValueChange={(next) => onSandboxChange?.(
+                    sandboxPolicy(next as CodexSandboxMode, sandbox?.networkAccess ?? false),
+                  )}
+                >
+                  {CODEX_SANDBOX_MODES.map((mode) => (
+                    <DropdownMenuRadioItem key={mode} value={mode} className={mode === "danger-full-access" ? "text-[var(--access)]" : ""}>
+                      {SANDBOX_LABEL[mode]}
+                    </DropdownMenuRadioItem>
+                  ))}
+                </DropdownMenuRadioGroup>
+                <DropdownMenuSeparator />
+                <DropdownMenuCheckboxItem
+                  checked={sandbox?.networkAccess ?? false}
+                  disabled={sandbox?.mode !== "workspace-write"}
+                  onCheckedChange={(checked) => onSandboxChange?.(sandboxPolicy("workspace-write", checked === true))}
+                >
+                  Network access
+                </DropdownMenuCheckboxItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </>
+        )}
         <span className="min-w-0 flex-1" />
         <span className="hidden shrink-0 font-mono text-code-sm whitespace-nowrap text-[var(--text-muted)] md:inline">{isRunning ? "queues while running" : "↵ sends"}</span>
         {/*

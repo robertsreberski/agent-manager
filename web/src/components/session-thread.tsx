@@ -34,6 +34,7 @@ import type {
   ExecutionProfile,
   ReasoningEffort,
   RequestResponse,
+  SandboxPolicy,
   SessionActivityView,
   SessionView,
   TakeoverMethod,
@@ -491,6 +492,7 @@ export function SessionThreadComposer({
   onSend,
   onInterrupt,
   onSetProfile,
+  onSetSandbox,
   onSetModel,
   onSetEffort,
   modelOptions,
@@ -511,6 +513,7 @@ export function SessionThreadComposer({
   onSend: (text: string, delivery: "queue" | "steer") => Promise<void>;
   onInterrupt: () => Promise<void>;
   onSetProfile: (profile: ExecutionProfile) => Promise<void>;
+  onSetSandbox: (sandbox: SandboxPolicy) => Promise<void>;
   onSetModel: (model: string) => Promise<void>;
   onSetEffort: (effort: ReasoningEffort) => Promise<void>;
   modelOptions: readonly ComposerModelOption[];
@@ -551,6 +554,7 @@ export function SessionThreadComposer({
   const canSteer = session.control.capabilities.includes("steer");
   const canStop = session.control.capabilities.includes("interrupt");
   const canSetProfile = session.control.capabilities.includes("set-profile");
+  const canSetSandbox = session.control.capabilities.includes("set-sandbox");
   const canSetModel = session.control.capabilities.includes("set-model");
   const canSetEffort = session.control.capabilities.includes("set-effort");
   const active = session.status === "running" || session.status === "waiting";
@@ -672,7 +676,7 @@ export function SessionThreadComposer({
       setResumeBusy(false);
     }
   }
-  const unavailableReason = (capability: "set-model" | "set-effort" | "set-profile", fallback: string) =>
+  const unavailableReason = (capability: "set-model" | "set-effort" | "set-profile" | "set-sandbox", fallback: string) =>
     session.control.withheld.find((item) => item.capability === capability)?.reason ?? fallback;
   /*
     A granted `set-effort` is the harness's own claim that a write drawn from
@@ -744,17 +748,20 @@ export function SessionThreadComposer({
         model={session.model.value}
         effort={session.effort.value}
         profile={session.profile.value}
+        sandbox={session.sandbox.value}
         modelOptions={modelOptions}
         modelOptionsStatus={modelOptionsStatus}
         modelChangeUnavailableReason={canSetModel ? null : unavailableReason("set-model", "This harness does not expose live model changes.")}
         effortChangeUnavailableReason={canSetEffort ? null : unavailableReason("set-effort", "This harness does not expose live effort changes.")}
         profileChangeUnavailableReason={canSetProfile ? null : unavailableReason("set-profile", "This harness does not expose live execution-profile changes.")}
+        sandboxChangeUnavailableReason={canSetSandbox ? null : unavailableReason("set-sandbox", "This harness does not expose live sandbox changes.")}
         effortOptions={composerEffortOptions}
         profileOptions={canSetProfile ? PROFILES : session.profile.value ? [session.profile.value] : []}
         busy={busy}
         {...(canSetModel ? { onModelChange: (model: string) => void onSetModel(model) } : {})}
         {...(canSetEffort ? { onEffortChange: (effort: ReasoningEffort) => void onSetEffort(effort) } : {})}
         {...(canSetProfile ? { onProfileChange: (profile: ExecutionProfile) => void onSetProfile(profile) } : {})}
+        {...(canSetSandbox ? { onSandboxChange: (sandbox: SandboxPolicy) => void onSetSandbox(sandbox) } : {})}
         {...(onSearchFiles ? { onSearchFiles } : {})}
       />
       {showControlStatus && (
@@ -810,6 +817,7 @@ export function SessionThreadComposer({
                 ? "This is a one-time migration onto Agent Manager's Codex server. After it completes, Codex CLI and web remain writable together."
                 : "Claude Code supports one writer. Agent Manager becomes writable only after Claude Code exits and the same conversation is confirmed."}</p>
               {takeover.fallbackProfile && <p className="text-[var(--warning)]">The current profile was not exposed. Web control will start in <strong>{takeover.fallbackProfile}</strong>; you can change it immediately after connection.</p>}
+              {takeover.fallbackSandbox && <p className="text-[var(--warning)]">The current sandbox was not exposed. Web control will contain this session to its workspace without network access; you can change it immediately after connection.</p>}
               <div className="flex flex-wrap gap-2">
                 {takeover.methods.includes("graceful-stop") && <Button variant="primary" size="sm" disabled={!mutationsReady || takeoverBusy} onClick={() => void beginTakeover("graceful-stop")}>{takeoverBusy ? "Pinning exact process…" : codexSharedTarget ? "Prepare graceful Codex stop…" : "Prepare graceful Claude Code stop…"}</Button>}
                 {takeover.methods.includes("guided-exit") && <Button variant="secondary" size="sm" disabled={!mutationsReady || takeoverBusy} onClick={() => void beginTakeover("guided-exit")}>{takeoverBusy ? "Starting…" : codexSharedTarget ? "I’ll exit Codex myself" : "I’ll exit Claude Code myself"}</Button>}
