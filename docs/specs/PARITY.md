@@ -46,19 +46,27 @@ Tokens added, each traceable to a frame or spec line rather than invented: `--bo
 and less saturated than the `+`/`−` markers, so a fully-changed line reads as prose rather than
 glowing; a test now asserts both halves and that neither carries the other's token.
 
-### Deliberate departures from the frames
+### Departures from the frames, resolved
 
-These are recorded so a later pass does not "correct" them back:
+All seven recorded departures now follow the frame. Four of them only because
+the behaviour the frame assumed has since been built.
 
-| Frame | What it shows | What ships, and why |
+| Frame | What it shows | What ships |
 | --- | --- | --- |
-| `5a`, `9a-2`, `9b` | The composer's harness tile and active effort bars filled with lime | Neutral fill, with the frame's `CodeXml` glyph adopted. The handoff's own `NOTES.md` states the accent "carries the 'wants you' state and must mean exactly one thing"; a lime harness tile makes "this session wants you" and "this session is Codex" look identical. The frames contradict the handoff's stated rule, not the implementation. |
-| `9b`, `13c` | Capability ticks in lime, a present harness in green | `--text`. Same accent rule, plus spec 12 reserves green for added lines. |
-| `7a` | A lime connection status dot | Neutral. Same accent rule. |
-| `8a` | The tier-1 approval hint reads `⏎ allow` | `⌘↵ allow`. The implementation requires ⌘↵ (`isCommandEnter`); printing `⏎` would document a shortcut that does not exist. |
-| `11b` | Tool-call step indent 24px; tool name `flex-shrink: 0` | 22px (prototype `4b` and spec 05 R10 both say 22px, so two sources beat one) and a truncating name — `shrink-0` is what caused tool rows to reach 2551px inside a 390px viewport. |
-| `9a-3` | Headline "Allow this command to delete your cache directory?" | Omitted. No provider payload yields that sentence, and spec 07 R7 forbids inventing a delete count. |
-| `5a` | Placeholder "@mention files, run /commands" | "Message the agent…". Neither affordance exists. |
+| `5a`, `9a-2`, `9b` | The composer's harness tile and active effort bars filled with lime | As shown, with the frame's `CodeXml` glyph. Only the bars the effort actually reaches are filled. |
+| `9b`, `13c` | Capability ticks in lime, a present harness in green | As shown. |
+| `7a` | A lime connection status dot | As shown; anything other than a live connection stays a warning. |
+| `8a` | The tier-1 approval hint reads `⏎ allow` | As shown — Enter now allows, guarded exactly as ⌘↵ was: routine tier only, only while exactly one such request is ready, never while typing. ⌘↵ still works. |
+| `11b` | Tool-call step indent 24px; tool name `flex-shrink: 0` | As shown, with the name bounded to `max-w-[60%]`. Codex names a `commandExecution` with the whole shell command, and an unbounded `shrink-0` on one of those is what produced a 2551px row inside a 390px viewport. |
+| `9a-3` | Headline "Allow this command to delete your cache directory?" | A headline naming the delete target, built from what the provider actually sent. Spec 07 R7 forbids globbing for a count and permits naming a path the tool input gave, so it appears when `deleteCount` is provider-supplied and stays silent otherwise. |
+| `5a` | Placeholder "@mention files, run /commands" | As shown. Both affordances exist: `@` completes against the session's own worktree through a bounded, symlink-refusing read that returns workspace-relative paths, and `/` offers commands the provider's CLI accepts. The placeholder names only the half a given session can do. |
+
+The accent rule that motivated the original colour departures is narrowed
+rather than dropped. What it still forbids is the accent standing in for state
+the board is *scanned* for — a session card, assistant bubble or plan artifact
+tinted lime would make "this session wants you" and "this session exists" the
+same glance, and that distinction is the board's only job.
+`web/src/theme-contrast.test.ts` guards the narrowed rule.
 
 ## Not audited
 
