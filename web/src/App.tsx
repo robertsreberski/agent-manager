@@ -14,7 +14,6 @@ import {
   RefreshCw,
   Search,
   Server,
-  Shield,
   Tag,
   TriangleAlert,
   WifiOff,
@@ -117,7 +116,13 @@ function drawerFacts(session: SessionView, remote: boolean) {
   const changes = workspaceChangeFacts(toCockpitSessionView(session, { remote }).workspaceIdentity);
   return [
     { label: session.provider, icon: CodeXml },
-    session.profile.value ? { label: session.profile.value, icon: Shield, tone: session.profile.value === "full-access" ? "dirty" as const : "default" as const } : null,
+    /*
+      The execution profile is deliberately absent. It was badged here, on the
+      composer's profile trigger, and a third time as a shield chip beside that
+      trigger; full access shouted from three places at once reads as decoration
+      rather than warning. It now appears once, orange, on the control that
+      changes it, and neutrally in the Session facts panel.
+    */
     session.model.value ? { label: session.model.value, icon: Cpu } : null,
     session.workspaceIdentity?.branch ? { label: session.workspaceIdentity.branch, icon: GitBranch } : null,
     changes ? { label: workspaceChangeLabel(changes), icon: FileDiff, tone: "dirty" as const } : null,
@@ -585,6 +590,16 @@ export default function App() {
     };
   }, [cockpit.loadProviderSettingsOptions, draftHostId, draftProvider]);
 
+  /*
+    Reading a catalog is not writing to it, so nothing here waits on
+    `set-model`. Gating the read on the write left the model control dead for
+    exactly the sessions worth inspecting — a Codex thread for the whole of
+    every turn — greyed out with the reason unfetched and therefore unsayable.
+    A manager-owned session reads its own catalog; a local session someone
+    else owns falls back to the provider's, which is the same list without a
+    claim about that thread. Either way the menu opens, and whether the answer
+    may be applied is the harness's own withheld reason to state.
+  */
   useEffect(() => {
     if (!selected) {
       setSettingsOptions(null);
@@ -622,6 +637,11 @@ export default function App() {
     if (settingsOptions.state === "loading") return { models: [], status: "Loading the provider model catalog…", effortOptions: undefined };
     if (settingsOptions.state === "error") return { models: [], status: "The provider model catalog could not be loaded.", effortOptions: undefined };
     const response = settingsOptions.response;
+    // A settled lookup that produced nothing is a failed lookup, not a licence
+    // to read `available` off `undefined`. The draft catalog below has always
+    // guarded this; this one only ever ran behind a capability check that made
+    // the case unreachable.
+    if (!response) return { models: [], status: "The provider model catalog could not be loaded.", effortOptions: undefined };
     return response.available
       ? { models: response.models, status: null, effortOptions: modelCatalogEfforts(selected.model.value, response) }
       : { models: [], status: settingsUnavailableMessage(response.reason), effortOptions: undefined };

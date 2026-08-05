@@ -175,6 +175,58 @@ test("serves an authenticated Codex catalog with provider-declared model efforts
   assert.equal(calls, 1);
 });
 
+/*
+  A running Codex thread withholds `set-model` for the whole of its turn. The
+  route used to refuse the catalog under exactly that condition, which left the
+  browser with nothing to render and no reason to state — the model control went
+  dead for the duration. Reading is not writing; the browser disables the rows.
+*/
+test("serves the catalog to a manager-owned session that cannot currently set a model", async (t) => {
+  let calls = 0;
+  const adapter = inertAdapter(async () => {
+    calls += 1;
+    return {
+      source: "provider-api",
+      models: [{ value: "gpt-codex", label: "Codex", description: "Balanced" }],
+    };
+  });
+  const busyCodexSession = managedSession({
+    id: "local:codex:managed-busy",
+    provider: "codex",
+    providerThreadId: "managed-busy",
+    providerTreeId: "managed-busy",
+    status: "running",
+    control: {
+      plane: "codex-private",
+      authority: "manager",
+      capabilities: ["queue", "interrupt"],
+      withheld: [{ capability: "set-model", reason: "Available when the Codex turn is idle" }],
+    },
+  });
+  const backend = await createAgentManagerServer({
+    discovery: false,
+    staticDir: false,
+    adapters: { codex: adapter },
+    initialSessions: [busyCodexSession],
+  });
+  t.after(() => backend.close());
+  await backend.app.ready();
+  const cookie = await authenticatedCookie(backend);
+
+  const response = await backend.app.inject({
+    method: "GET",
+    url: "/api/v1/sessions/local%3Acodex%3Amanaged-busy/settings-options",
+    headers: { host, cookie },
+  });
+  assert.equal(response.statusCode, 200, response.body);
+  assert.deepEqual(response.json(), {
+    available: true,
+    source: "provider-api",
+    models: [{ value: "gpt-codex", label: "Codex", description: "Balanced" }],
+  });
+  assert.equal(calls, 1);
+});
+
 test("serves a Codex draft catalog without any session", async (t) => {
   let calls = 0;
   const codex = inertAdapter(undefined, async () => {

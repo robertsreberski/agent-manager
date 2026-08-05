@@ -1013,6 +1013,47 @@ test("a re-emitted provider notification replaces its row rather than stacking a
   assert.equal(second[0]?.kind === "lifecycle" ? second[0].title : null, "Usage limit reached");
 });
 
+/*
+  Slash-command output and status banners used to share one branch, which threw
+  away the banner's `level` and left command output anonymous. `/clear` then
+  arrived as an unlabelled slab of grey text indistinguishable from a warning.
+*/
+test("slash-command output is a labelled message and a loud banner is a lifecycle row", () => {
+  const projector = new ClaudeActivityProjector();
+
+  const command = upserts(projector.projectMessage(sdk({
+    ...baseMessage("system", "command-1"),
+    subtype: "local_command_output",
+    content: "## Context\n\n42% used",
+  })));
+  assert.equal(command.length, 1);
+  assert.equal(command[0]?.kind, "message");
+  assert.equal(command[0]?.kind === "message" ? command[0].role : null, "system");
+  assert.equal(command[0]?.kind === "message" ? command[0].label : null, "Command output");
+  assert.equal(command[0]?.kind === "message" ? command[0].text : null, "## Context\n\n42% used");
+
+  const loud = upserts(projector.projectMessage(sdk({
+    ...baseMessage("system", "banner-1"),
+    subtype: "informational",
+    content: "A Stop hook denied continuation",
+    level: "warning",
+  })));
+  assert.equal(loud.length, 1);
+  assert.equal(loud[0]?.kind, "lifecycle");
+  assert.equal(loud[0]?.kind === "lifecycle" ? loud[0].level : null, "warning");
+  assert.equal(loud[0]?.kind === "lifecycle" ? loud[0].title : null, "A Stop hook denied continuation");
+
+  const quiet = upserts(projector.projectMessage(sdk({
+    ...baseMessage("system", "banner-2"),
+    subtype: "informational",
+    content: "Reading the workspace",
+    level: "info",
+  })));
+  assert.equal(quiet.length, 1);
+  assert.equal(quiet[0]?.kind, "message");
+  assert.equal(quiet[0]?.kind === "message" ? quiet[0].label : "unset", null);
+});
+
 test("two genuinely different notifications keep their own rows", () => {
   const projector = new ClaudeActivityProjector();
   const first = upserts(projector.projectMessage(sdk({

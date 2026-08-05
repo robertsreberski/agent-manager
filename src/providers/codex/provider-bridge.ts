@@ -932,21 +932,20 @@ export class CodexProviderBridge implements ProviderControlAdapter {
       session.provider !== "codex"
       || session.hostId !== "local"
       || session.control.authority !== "manager"
-      || !session.control.capabilities.includes("set-model")
     ) {
-      throw new Error("Codex settings require a local, idle, manager-owned thread");
+      throw new Error("Codex settings require a local manager-owned thread");
     }
-    const before = this.adapter.getThreadState(session.providerThreadId);
-    if (!before || before.activeTurnId || before.status === "running" || before.writeBlockedReason) {
-      throw new Error("Codex settings require a loaded, idle, writable thread");
-    }
-    const options = await this.getCreateSettingsOptions(context);
-    const current = this.adapter.getThreadState(session.providerThreadId);
-    if (!current || current.generation !== before.generation || current.activeTurnId ||
-        current.status === "running" || current.writeBlockedReason) {
-      throw new Error("Codex thread changed while its model catalog was loading");
-    }
-    return options;
+    /*
+      No idle, generation, or `set-model` guard. This is `model/list` on the
+      private App Server — a provider-wide read that says nothing about this
+      thread, so nothing about this thread can invalidate it. Those guards were
+      here because reading the catalog used to imply intent to write it; that
+      cost the operator any sight of the catalog for the whole of every turn,
+      which is exactly when they most want to know what else is on offer.
+      Whether the answer may be *applied* is `set-model`'s business, and the
+      browser renders the list disabled with that reason.
+    */
+    return await this.getCreateSettingsOptions(context);
   }
 
   toSessionView(state: CodexThreadState): SessionView {
@@ -1050,7 +1049,14 @@ export class CodexProviderBridge implements ProviderControlAdapter {
           ? withheldCapabilities(this.adapter, state)
           : UNLOADED_CAPABILITIES.map((capability) => ({
               capability,
-              reason: "Select this session to load exact Codex controls",
+              /*
+                A state, not an instruction. Every reader of `withheld` is
+                already inside the drawer, which is what acquires the thread
+                lease in the first place — telling them to "select this
+                session" named an internal lease phase as if it were something
+                left undone.
+              */
+              reason: "Loading exact Codex controls…",
             })),
       },
       workspaceIdentity: structuredClone(this.#workspaceIdentities.get(cwd) ?? null),

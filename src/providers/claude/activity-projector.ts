@@ -1559,9 +1559,14 @@ export class ClaudeActivityProjector {
           },
         });
         break;
-      case "informational":
-      case "local_command_output": {
-        const content = message.content;
+      /*
+        The output of a slash command — `/clear`, `/context`, `/cost`. The SDK
+        documents it as "assistant-style text", meaning markdown, and it is the
+        entire answer to something the operator explicitly asked for. It gets a
+        label so the drawer can title it rather than rendering an anonymous
+        block of grey text under the command that produced it.
+      */
+      case "local_command_output":
         mutations.push({
           type: "upsert",
           item: {
@@ -1569,7 +1574,8 @@ export class ClaudeActivityProjector {
             kind: "message",
             role: "system",
             phase: null,
-            text: content,
+            label: "Command output",
+            text: message.content,
             state: "complete",
             turnId: this.#currentTurnId,
             source: "provider-api",
@@ -1578,7 +1584,50 @@ export class ClaudeActivityProjector {
           },
         });
         break;
-      }
+      /*
+        A status banner, and `level` is the SDK's own statement of how loudly to
+        render it. Sharing one branch with command output discarded that, so a
+        hook's block reason and a passing status line arrived looking identical.
+        The two prominent levels are what the lifecycle warning row already
+        exists for; the quiet two stay inline messages.
+      */
+      case "informational":
+        mutations.push(
+          message.level === "warning" || message.level === "suggestion"
+            ? {
+              type: "upsert",
+              item: {
+                id: itemId("informational", message.uuid),
+                kind: "lifecycle",
+                event: "warning",
+                level: message.level === "warning" ? "warning" : "info",
+                title: message.content,
+                details: null,
+                state: "complete",
+                turnId: this.#currentTurnId,
+                source: "provider-api",
+                confidence: "exact",
+                exposure: "provider-exposed",
+              },
+            }
+            : {
+              type: "upsert",
+              item: {
+                id: itemId("message", message.uuid),
+                kind: "message",
+                role: "system",
+                phase: null,
+                label: null,
+                text: message.content,
+                state: "complete",
+                turnId: this.#currentTurnId,
+                source: "provider-api",
+                confidence: "exact",
+                exposure: "provider-exposed",
+              },
+            },
+        );
+        break;
       case "notification":
         mutations.push({
           type: "upsert",

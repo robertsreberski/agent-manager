@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowUp, ChevronDown, CodeXml, Mic, Paperclip, RotateCcw, Shield, Square } from "lucide-react";
+import { ArrowUp, ChevronDown, CodeXml, Paperclip, RotateCcw, Square } from "lucide-react";
 import type { ReasoningEffort } from "@shared/session";
 import type { CockpitProvider, ExecutionProfile } from "../../lib/cockpit-view";
 import { isTypingTarget } from "../../lib/shortcuts";
@@ -435,14 +435,21 @@ export function SessionComposer(props: SessionComposerProps) {
             </DropdownMenuRadioGroup>
           </DropdownMenuContent>
         </DropdownMenu>
-        {profile === "full-access" && (
-          <span className="hidden shrink-0 items-center gap-1 bg-[var(--access-field)] px-2 py-1 text-code-xs whitespace-nowrap text-[var(--access)] lg:flex"><Shield size={11} />Full access</span>
-        )}
+        {/*
+          Full access used to be badged three times over — here, on the profile
+          trigger above, and again as a drawer-header fact chip. Saying it once,
+          orange, on the control that changes it is the whole point of an
+          alarming colour; repeating it spends the alarm.
+        */}
         <span className="min-w-0 flex-1" />
         <span className="hidden shrink-0 font-mono text-code-sm whitespace-nowrap text-[var(--text-muted)] md:inline">{isRunning ? "queues while running" : "↵ sends"}</span>
-        {/* Both are withheld capabilities, not decoration: they stay visible, disabled, and say why. */}
-        <Button variant="ghost" size="icon" disabled aria-label="Attach files unavailable" title="Attachments are not supported by this harness" className={`hidden size-8 text-[var(--text-faint)] sm:inline-flex ${KEEPS_ITS_TOOLTIP}`}><Paperclip size={16} strokeWidth={1.75} /></Button>
-        <Button variant="ghost" size="icon" disabled aria-label="Dictation unavailable" title="Dictation is not configured" className={`hidden size-8 text-[var(--text-faint)] sm:inline-flex ${KEEPS_ITS_TOOLTIP}`}><Mic size={16} strokeWidth={1.75} /></Button>
+        {/*
+          A withheld capability, not decoration: it stays visible, disabled, and
+          says why. Dictation used to sit beside it and was removed instead —
+          spec 06 permits either treatment, and a control with no path forward
+          is noise, where attachments are tracked work.
+        */}
+        <Button variant="ghost" size="icon" disabled aria-label="Attach files unavailable" title="Attachments are not supported yet — tracked in #6" className={`hidden size-8 text-[var(--text-faint)] sm:inline-flex ${KEEPS_ITS_TOOLTIP}`}><Paperclip size={16} strokeWidth={1.75} /></Button>
         {isRunning && canStop ? (
           <Button variant="ghost" size="icon" data-compact-control className="size-[30px] rounded-full bg-[var(--text)] text-[var(--app)] hover:bg-[var(--text-secondary)] hover:text-[var(--app)]" aria-label="Stop turn" onClick={() => void onStop?.()}><Square size={11} strokeWidth={2} /></Button>
         ) : (

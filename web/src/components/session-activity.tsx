@@ -450,6 +450,10 @@ function messagesForTurn(turnKey: string, source: readonly ActivityItem[]): Thre
         id: item.id,
         role: "system",
         content: [{ type: "text", text: item.text, status: partStatus(item.state) }],
+        // What produced this — "Command output" for a slash command. Without it
+        // the drawer can only render an anonymous block of text, which is how
+        // `/clear` came to look like an error rather than an answer.
+        ...(item.label ? { metadata: { custom: { label: item.label } } } : {}),
         ...(itemDate(item) ? { createdAt: itemDate(item) } : {}),
       });
     } else {

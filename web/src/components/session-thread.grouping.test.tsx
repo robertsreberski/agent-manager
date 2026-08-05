@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { ACTIVITY_SCHEMA_VERSION, type ActivityItem, type SessionActivityView, type SessionView } from "../types";
@@ -198,5 +198,35 @@ describe("a tool run held open across the gaps between its calls", () => {
     // long turn in its own detail.
     expect(group(container, 0).getAttribute("aria-expanded")).toBe("false");
     expect(group(container, 1).getAttribute("aria-expanded")).toBe("true");
+  });
+});
+
+/*
+  `/clear` and friends answer through a system message. It rendered as an
+  anonymous slab of pre-line text, so the operator got markdown source in a grey
+  box and no statement of what had produced it.
+*/
+describe("system messages in a rendered thread", () => {
+  function systemMessage(label: string | null, text: string): ActivityItem {
+    return { ...common, id: "sys-1", seq: 1, turnId: null, kind: "message", role: "system", phase: null, text, label };
+  }
+
+  it("titles labelled output and renders its markdown", () => {
+    const { container } = renderThread([systemMessage("Command output", "## Context\n\n42% used")]);
+
+    const panel = container.querySelector("[data-system-message]");
+    expect(panel).toBeInTheDocument();
+    expect(within(panel as HTMLElement).getByText("Command output")).toBeInTheDocument();
+    expect(panel?.querySelector("h2")?.textContent).toBe("Context");
+    expect(panel?.textContent).not.toContain("##");
+  });
+
+  it("renders an unlabelled banner without inventing a title", () => {
+    const { container } = renderThread([systemMessage(null, "Reading the workspace")]);
+
+    const panel = container.querySelector("[data-system-message]");
+    expect(panel).toBeInTheDocument();
+    expect(panel?.querySelector("h3")).toBeNull();
+    expect(panel?.textContent).toContain("Reading the workspace");
   });
 });

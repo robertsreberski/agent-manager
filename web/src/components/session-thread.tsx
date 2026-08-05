@@ -12,6 +12,7 @@ import {
 import { ArrowDown, LoaderCircle, Sparkles } from "lucide-react";
 import { Button, Collapsible, CollapsibleContent, CollapsibleTrigger } from "./ui";
 import { DISCLOSURE_SCROLL_LOCK_MS, GroupedActivityParts } from "./thread";
+import { MarkdownText } from "./assistant-ui/markdown-text";
 import { QueuedMessageCount, SessionComposer, type ComposerDelivery, type ComposerModelOption } from "./composer";
 import { TodoList } from "./plans";
 import { SessionCapabilityPanel, SessionEndedState } from "./system";
@@ -50,10 +51,34 @@ function UserMessage() {
   );
 }
 
-function SystemMessage() {
+/*
+  `MarkdownText` reads its text from part context rather than props, so the
+  part props assistant-ui passes a `Text` component are deliberately dropped.
+*/
+const SystemMarkdown = () => <MarkdownText />;
+
+/** The projector's own name for what produced this banner, where it named one. */
+function systemMessageLabel(message: { metadata?: { custom?: Record<string, unknown> } }): string | null {
+  const label = message.metadata?.custom?.["label"];
+  return typeof label === "string" && label.length > 0 ? label : null;
+}
+
+/*
+  A harness banner, or the answer to a slash command the operator typed. This
+  rendered as a bare grey slab of `white-space: pre-line` text, which is how
+  `/clear` — whose output is markdown, and is the whole point of having asked —
+  came out looking like a malfunction. It now reads as a titled panel with the
+  same markdown the assistant's own turns get.
+*/
+function SystemMessage({ label }: { label: string | null }) {
   return (
-    <MessagePrimitive.Root className="border-l-2 border-[var(--border)] bg-[var(--surface-raised)] px-3 py-2 text-meta-sm text-[var(--text-muted)]" aria-label="System message">
-      <MessagePrimitive.Parts />
+    <MessagePrimitive.Root
+      className="grid min-w-0 gap-1.5 border border-[var(--border-hairline)] bg-[var(--surface-raised)] px-3 py-[9px] text-body-sm text-[var(--text-secondary)]"
+      aria-label={label ?? "System message"}
+      data-system-message
+    >
+      {label && <h3 className="font-mono text-eyebrow uppercase leading-none tracking-[0.08em] text-[var(--text-faint)]">{label}</h3>}
+      <MessagePrimitive.Parts components={{ Text: SystemMarkdown }} />
     </MessagePrimitive.Root>
   );
 }
@@ -299,7 +324,7 @@ export function SessionThread({
         {activity.truncated && <ActivityRetentionBoundary />}
         <AuiIf condition={(state) => state.thread.isEmpty}><EmptyActivity connection={activity.connection} /></AuiIf>
         <ThreadPrimitive.Messages>
-          {({ message }) => message.role === "user" ? <UserMessage /> : message.role === "system" ? <SystemMessage /> : <AssistantMessage controls={controls} />}
+          {({ message }) => message.role === "user" ? <UserMessage /> : message.role === "system" ? <SystemMessage label={systemMessageLabel(message)} /> : <AssistantMessage controls={controls} />}
         </ThreadPrimitive.Messages>
         {["completed", "failed", "interrupted"].includes(session.status) && <div><SessionEndedState canResume={session.control.capabilities.includes("resume")} resumeCommand={attachInstruction?.available ? attachInstruction.command : null} resumeDescription={attachInstruction?.description ?? null} resumeError={attachError} resumeUnavailableReason={session.control.withheld.find(({ capability }) => capability === "resume")?.reason ?? null} loadingResume={loadingAttach} onResume={() => void revealAttach()} canContinue={Boolean(session.workspaceIdentity?.worktreePath ?? session.cwd)} onContinue={onContinueInWorkspace} /></div>}
         {/*

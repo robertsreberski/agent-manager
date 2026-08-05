@@ -251,16 +251,18 @@ describe("SessionComposer", () => {
     expect(document.activeElement).toBe(trigger);
   });
 
-  it("keeps unsupported attachment and dictation visible, disabled, and explained", () => {
+  it("keeps the unsupported attachment visible, disabled, and explained", () => {
     renderComposer();
-    for (const [name, reason] of [
-      ["Attach files unavailable", "Attachments are not supported by this harness"],
-      ["Dictation unavailable", "Dictation is not configured"],
-    ] as const) {
-      const control = screen.getByRole("button", { name });
-      expect(control).toBeDisabled();
-      expect(control).toHaveAttribute("title", reason);
-    }
+    const control = screen.getByRole("button", { name: "Attach files unavailable" });
+    expect(control).toBeDisabled();
+    expect(control).toHaveAttribute("title", "Attachments are not supported yet — tracked in #6");
+  });
+
+  // Dictation has no path forward, so it was removed rather than left disabled.
+  // A dead control that can never become live is noise, not an honest capability.
+  it("renders no dictation control at all", () => {
+    renderComposer();
+    expect(screen.queryByRole("button", { name: /dictation/iu })).not.toBeInTheDocument();
   });
 
   it("disables one send control rather than hiding it while the draft is unsendable", () => {

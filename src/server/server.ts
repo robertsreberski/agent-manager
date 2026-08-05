@@ -1492,9 +1492,15 @@ export async function createAgentManagerServer(
     if (session.control.authority !== "manager") {
       return { available: false as const, reason: "not-manager-owned" as const, models: [] };
     }
-    if (!session.control.capabilities.includes("set-model")) {
-      return { available: false as const, reason: "provider-unavailable" as const, models: [] };
-    }
+    /*
+      Deliberately not gated on `set-model`. Reading the catalog is a bounded
+      provider read, not a write, and gating it on the write capability made the
+      cockpit's model control dead precisely when it was most worth reading: a
+      Codex thread withholds `set-model` for the whole of every turn, so the
+      browser could neither change the model nor show what the alternatives
+      were. The browser renders the list disabled with the harness's own
+      withheld reason instead.
+    */
     const adapter = adapters[session.provider];
     if (!adapter?.getSettingsOptions) {
       return { available: false as const, reason: "unsupported-provider" as const, models: [] };
@@ -1515,7 +1521,6 @@ export async function createAgentManagerServer(
         || current.providerThreadId !== session.providerThreadId
         || current.hostId !== "local"
         || current.control.authority !== "manager"
-        || !current.control.capabilities.includes("set-model")
       ) {
         return { available: false as const, reason: "provider-unavailable" as const, models: [] };
       }
