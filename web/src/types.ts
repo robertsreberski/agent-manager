@@ -77,6 +77,8 @@ export type {
   ActivityItemBase,
   ActivityJsonValue,
   ActivityLifecycleItem,
+  ActivityMemoryCitation,
+  ActivityMemoryCitationEntry,
   ActivityMessageItem,
   ActivityPlanItem,
   ActivityQueueItem,

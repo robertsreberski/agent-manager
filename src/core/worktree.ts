@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { basename, dirname, isAbsolute, normalize, resolve } from "node:path";
+import { basename, dirname, isAbsolute, normalize, relative, resolve, sep } from "node:path";
 
 import type { SessionRecord, WorkspaceIdentity } from "../shared/session.ts";
 
@@ -124,7 +124,27 @@ function parseShortstat(line: string | null): { insertions: number | null; delet
   };
 }
 
-function countPorcelainRecords(output: Buffer): number | null {
+function normalizeStatusPath(path: string): string {
+  return path.replace(/\/+$/u, "");
+}
+
+function registeredNestedWorktreePaths(output: Buffer, worktreePath: string): ReadonlySet<string> {
+  const paths = new Set<string>();
+  for (const field of output.toString("utf8").split("\0")) {
+    if (!field.startsWith("worktree ")) continue;
+    const candidate = normalize(field.slice("worktree ".length));
+    if (!isAbsolute(candidate)) continue;
+    const nested = relative(worktreePath, candidate);
+    if (!nested || nested === ".." || nested.startsWith(`..${sep}`) || isAbsolute(nested)) continue;
+    paths.add(normalizeStatusPath(nested));
+  }
+  return paths;
+}
+
+function countPorcelainRecords(
+  output: Buffer,
+  ignoredUntrackedPaths: ReadonlySet<string> = new Set(),
+): number | null {
   const records = output.toString("utf8").split("\0");
   if (records.at(-1) === "") records.pop();
   let count = 0;
@@ -134,7 +154,9 @@ function countPorcelainRecords(output: Buffer): number | null {
     const x = record[0] ?? "";
     const y = record[1] ?? "";
     if (!" MADRCU?!".includes(x) || !" MADRCU?!".includes(y)) return null;
-    count += 1;
+    const path = normalizeStatusPath(record.slice(3));
+    if (!path) return null;
+    if (!(x === "?" && y === "?" && ignoredUntrackedPaths.has(path))) count += 1;
     if (x === "R" || x === "C") {
       index += 1;
       if (index >= records.length) return null;
@@ -373,10 +395,16 @@ export class WorkspaceIdentityResolver {
   }
 
   async #resolveExpensive(worktreePath: string, deadline: number): Promise<ExpensiveFacts> {
-    const [statusResult, divergenceResult, diffstatResult] = await Promise.all([
+    const [statusResult, worktreesResult, divergenceResult, diffstatResult] = await Promise.all([
       this.#command(
         worktreePath,
-        ["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
+        ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        deadline,
+        STATUS_OUTPUT_BYTES,
+      ),
+      this.#command(
+        worktreePath,
+        ["worktree", "list", "--porcelain", "-z"],
         deadline,
         STATUS_OUTPUT_BYTES,
       ),
@@ -401,11 +429,17 @@ export class WorkspaceIdentityResolver {
         deadline,
       ),
     ]);
+    const ignoredWorktrees = worktreesResult
+        && worktreesResult.status === 0
+        && !worktreesResult.timedOut
+        && !worktreesResult.truncated
+      ? registeredNestedWorktreePaths(worktreesResult.stdout, worktreePath)
+      : new Set<string>();
     const dirtyCount = statusResult
       && statusResult.status === 0
       && !statusResult.timedOut
       && !statusResult.truncated
-      ? countPorcelainRecords(statusResult.stdout)
+      ? countPorcelainRecords(statusResult.stdout, ignoredWorktrees)
       : null;
     const divergence = divergenceResult ? cleanLine(divergenceResult) : null;
     const match = divergence?.match(/^(\d+)\s+(\d+)$/u) ?? null;

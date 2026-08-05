@@ -103,6 +103,33 @@ test("assistant deltas use UTF-8 offsets and completed snapshots remain authorit
   }
 });
 
+test("completed messages expose memory citations as data instead of raw XML", () => {
+  const item = onlyItem(projectCodexNotification(notification("item/completed", {
+    threadId: "thread/one",
+    turnId: "turn-1",
+    item: {
+      type: "agentMessage",
+      id: "message-cited",
+      phase: "final_answer",
+      text: `Answer from memory.
+<oai-mem-citation>
+<citation_entries>
+MEMORY.md:1-3|note=[prior project context]
+</citation_entries>
+<rollout_ids>
+</rollout_ids>
+</oai-mem-citation>`,
+    },
+  })));
+  assert.equal(item.kind, "message");
+  if (item.kind !== "message") return;
+  assert.equal(item.text, "Answer from memory.");
+  assert.deepEqual(item.memoryCitation, {
+    entries: [{ path: "MEMORY.md", lineStart: 1, lineEnd: 3, note: "prior project context" }],
+    rolloutIds: [],
+  });
+});
+
 test("reasoning streams stay distinct and only structured Codex plans become todos", () => {
   const part = onlyItem(projectCodexNotification(notification(
     "item/reasoning/summaryPartAdded",

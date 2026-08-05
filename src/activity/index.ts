@@ -12,6 +12,7 @@ export {
   stripUnsafeControlCharacters,
 } from "./redaction.ts";
 export { ActivityWireError, parseActivityFrame, parseActivityItem } from "./wire.ts";
+export { extractTrailingMemoryCitation, parseMemoryCitation } from "./memory-citation.ts";
 export {
   reconcileTodoRewrite,
   type ActivityTodoInputStep,

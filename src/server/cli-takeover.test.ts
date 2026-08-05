@@ -1759,6 +1759,14 @@ test("Codex owner discovery ignores only peers on the exact manager socket", (t)
     tty: "ttys005",
     command: `${rogueCodex} --remote unix://${managerSocket} resume thread-1`,
   });
+  const appServer = processLine({
+    pid: 606,
+    ppid: 1,
+    pgid: 606,
+    uid,
+    tty: "??",
+    command: `${codex} app-server --listen unix://${managerSocket}`,
+  });
   let psOutput = [standaloneOne, standaloneTwo, remotePeer, remotePeerLeaf].join("\n");
   const inspector = new SystemLocalCliProcessInspector({
     uid,
@@ -1769,9 +1777,9 @@ test("Codex owner discovery ignores only peers on the exact manager socket", (t)
       if (command === "ps") return { stdout: psOutput, status: 0, error: null };
       const requested = new Set((args[args.indexOf("-p") + 1] ?? "").split(","));
       return {
-        stdout: [101, 202, 303, 304, 404, 505]
+        stdout: [101, 202, 303, 304, 404, 505, 606]
           .filter((pid) => requested.has(String(pid)))
-          .map((pid) => `p${String(pid)}\nfcwd\nn${workspace}\nf10\nn${rollout}\n`)
+          .map((pid) => `p${String(pid)}\nfcwd\nn${pid === 606 ? root : workspace}\nf10\nn${rollout}\n`)
           .join(""),
         status: 0,
         error: null,
@@ -1791,6 +1799,13 @@ test("Codex owner discovery ignores only peers on the exact manager socket", (t)
 
   psOutput = [remotePeer, remotePeerLeaf].join("\n");
   assert.deepEqual(inspector.findAssociated(selected), { state: "exited" });
+
+  psOutput = appServer;
+  assert.deepEqual(
+    inspector.findAssociated(selected),
+    { state: "exited" },
+    "a service that happens to have the rollout open is not a standalone session owner",
+  );
 
   psOutput = [remotePeer, remotePeerLeaf, otherRemote].join("\n");
   const withOtherRemote = inspector.findAssociated(selected);

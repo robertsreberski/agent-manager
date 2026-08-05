@@ -73,6 +73,7 @@ function activityDraft(item: TranscriptItem): ActivityItemDraft {
       kind: "reasoning",
       id: `${TRANSCRIPT_ID_PREFIX}${item.id}`,
       correlationId: item.correlationId ?? null,
+      turnId: item.turnId,
       reasoningKind: "summary",
       label: item.label,
       text: item.text,
@@ -86,6 +87,7 @@ function activityDraft(item: TranscriptItem): ActivityItemDraft {
       kind: "tool",
       id: `${TRANSCRIPT_ID_PREFIX}${item.id}`,
       correlationId: item.correlationId ?? null,
+      turnId: item.turnId,
       toolCallId: item.toolCallId,
       name: item.name,
       // The transcript names a tool but never states which category the
@@ -103,6 +105,7 @@ function activityDraft(item: TranscriptItem): ActivityItemDraft {
     kind: "message",
     id: `${TRANSCRIPT_ID_PREFIX}${item.id}`,
     correlationId: item.correlationId ?? null,
+    turnId: item.turnId,
     role: item.role,
     // Transcript rows preserve message order but do not expose the provider's
     // commentary/final channel. Treating every complete assistant row as final
@@ -110,6 +113,7 @@ function activityDraft(item: TranscriptItem): ActivityItemDraft {
     phase: null,
     text: item.text,
     label: item.label,
+    memoryCitation: item.memoryCitation,
     state: transcriptState(item.status),
     ...timing,
     ...TRANSCRIPT_PROVENANCE,
@@ -125,6 +129,7 @@ function changed(previous: TranscriptItem, next: TranscriptItem): boolean {
   if (
     previous.kind !== next.kind
     || previous.id !== next.id
+    || previous.turnId !== next.turnId
     || previous.createdAt !== next.createdAt
     || previous.status !== next.status
   ) return true;
@@ -138,7 +143,8 @@ function changed(previous: TranscriptItem, next: TranscriptItem): boolean {
   if (previous.kind === "message" && next.kind === "message") {
     return previous.role !== next.role
       || previous.text !== next.text
-      || previous.label !== next.label;
+      || previous.label !== next.label
+      || JSON.stringify(previous.memoryCitation) !== JSON.stringify(next.memoryCitation);
   }
   if (previous.kind === "reasoning" && next.kind === "reasoning") {
     return previous.text !== next.text || previous.label !== next.label;
@@ -223,7 +229,6 @@ export class SelectedTranscriptActivityObserver {
   readonly #resolveSession: ((id: string) => SessionView | null) | undefined;
   readonly #eligible: ((session: SessionView) => boolean) | undefined;
   readonly #runningPollMs: number;
-  readonly #idlePollMs: number;
   readonly #active = new Map<string, ActiveObservation>();
 
   constructor(options: SelectedTranscriptActivityObserverOptions) {
@@ -232,7 +237,6 @@ export class SelectedTranscriptActivityObserver {
     this.#resolveSession = options.resolveSession;
     this.#eligible = options.eligible;
     this.#runningPollMs = Math.max(100, options.runningPollMs ?? 500);
-    this.#idlePollMs = Math.max(this.#runningPollMs, options.idlePollMs ?? 2_000);
   }
 
   seedOnce(session: SessionView): void {
@@ -396,13 +400,11 @@ export class SelectedTranscriptActivityObserver {
 
   #schedule(observation: ActiveObservation): void {
     if (observation.stopped) return;
-    const active = observation.session.status === "running"
-      || observation.session.status === "waiting";
     observation.timer = setTimeout(() => {
       observation.timer = null;
       this.#refresh(observation);
       this.#schedule(observation);
-    }, active ? this.#runningPollMs : this.#idlePollMs);
+    }, this.#runningPollMs);
     observation.timer.unref();
   }
 }

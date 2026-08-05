@@ -47,6 +47,16 @@ import {
 const MAX_PROVIDER_ROWS = 750;
 const MAX_PROCESSES = 4_096;
 const MAX_TRANSCRIPT_TAIL_BYTES = 512 * 1024;
+const MAX_CODEX_LIFECYCLE_CACHE = 1_024;
+
+interface CodexLifecycleCacheEntry {
+  dev: number;
+  ino: number;
+  size: number;
+  event: JsonObject | null;
+}
+
+const codexLifecycleCache = new Map<string, CodexLifecycleCacheEntry>();
 
 interface CodexRow {
   id: string;
@@ -342,6 +352,132 @@ function readJsonlTail(path: string): JsonObject[] {
   }
 }
 
+function codexLifecycleType(event: JsonObject): string | null {
+  if (event.type !== "event_msg") return null;
+  const type = string(object(event.payload)?.type);
+  return type === "task_started" || type === "task_complete" || type === "turn_aborted"
+    ? type
+    : null;
+}
+
+function parseJsonObjectLine(line: Buffer): JsonObject | null {
+  try {
+    return object(JSON.parse(line.toString("utf8").replace(/\r$/u, "")));
+  } catch {
+    return null;
+  }
+}
+
+/** Finds the latest durable turn transition without treating a tail window as state. */
+function readLatestCodexLifecycle(path: string, size: number): JsonObject | null {
+  let descriptor: number | null = null;
+  try {
+    descriptor = openSync(path, "r");
+    let end = size;
+    let suffix = Buffer.alloc(0);
+    while (end > 0) {
+      const start = Math.max(0, end - MAX_TRANSCRIPT_TAIL_BYTES);
+      const chunk = Buffer.alloc(end - start);
+      readSync(descriptor, chunk, 0, chunk.length, start);
+      const combined = Buffer.concat([chunk, suffix]);
+      let cursor = combined.length;
+      while (cursor > 0) {
+        const newline = combined.lastIndexOf(0x0a, cursor - 1);
+        if (newline < 0) {
+          suffix = combined.subarray(0, cursor);
+          break;
+        }
+        const line = combined.subarray(newline + 1, cursor);
+        cursor = newline;
+        if (line.length === 0) continue;
+        const event = parseJsonObjectLine(line);
+        if (event && codexLifecycleType(event)) return event;
+      }
+      if (start === 0) {
+        const event = suffix.length > 0 ? parseJsonObjectLine(suffix) : null;
+        return event && codexLifecycleType(event) ? event : null;
+      }
+      end = start;
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    if (descriptor !== null) closeSync(descriptor);
+  }
+}
+
+/** Scans only bytes appended since the cached observation, with bounded carry. */
+function readLatestCodexLifecycleSince(
+  path: string,
+  start: number,
+  end: number,
+  fallback: JsonObject | null,
+): JsonObject | null {
+  let descriptor: number | null = null;
+  try {
+    descriptor = openSync(path, "r");
+    let offset = Math.max(0, start - MAX_TRANSCRIPT_TAIL_BYTES);
+    let carry = Buffer.alloc(0);
+    let latest = fallback;
+    while (offset < end) {
+      const length = Math.min(MAX_TRANSCRIPT_TAIL_BYTES, end - offset);
+      const chunk = Buffer.alloc(length);
+      const bytesRead = readSync(descriptor, chunk, 0, length, offset);
+      if (bytesRead <= 0) break;
+      offset += bytesRead;
+      const combined = carry.length > 0
+        ? Buffer.concat([carry, chunk.subarray(0, bytesRead)])
+        : chunk.subarray(0, bytesRead);
+      let lineStart = 0;
+      for (let index = 0; index < combined.length; index += 1) {
+        if (combined[index] !== 0x0a) continue;
+        const event = parseJsonObjectLine(combined.subarray(lineStart, index));
+        if (event && codexLifecycleType(event)) latest = event;
+        lineStart = index + 1;
+      }
+      carry = combined.subarray(lineStart);
+      if (carry.length > MAX_TRANSCRIPT_TAIL_BYTES) {
+        carry = carry.subarray(carry.length - MAX_TRANSCRIPT_TAIL_BYTES);
+      }
+    }
+    const event = carry.length > 0 ? parseJsonObjectLine(carry) : null;
+    return event && codexLifecycleType(event) ? event : latest;
+  } catch {
+    return fallback;
+  } finally {
+    if (descriptor !== null) closeSync(descriptor);
+  }
+}
+
+function readCodexObservation(path: string): JsonObject[] {
+  const tail = readJsonlTail(path);
+  let info: ReturnType<typeof statSync>;
+  try {
+    info = statSync(path);
+  } catch {
+    return tail;
+  }
+  const inTail = [...tail].reverse().find((event) => codexLifecycleType(event) !== null) ?? null;
+  const cached = codexLifecycleCache.get(path);
+  const sameFile = cached?.dev === info.dev && cached.ino === info.ino && info.size >= cached.size;
+  const lifecycle = inTail ?? (
+    sameFile
+      ? info.size === cached.size
+        ? cached.event
+        : readLatestCodexLifecycleSince(path, cached.size, info.size, cached.event)
+      : readLatestCodexLifecycle(path, info.size)
+  );
+  codexLifecycleCache.delete(path);
+  codexLifecycleCache.set(path, { dev: info.dev, ino: info.ino, size: info.size, event: lifecycle });
+  while (codexLifecycleCache.size > MAX_CODEX_LIFECYCLE_CACHE) {
+    const oldest = codexLifecycleCache.keys().next().value as string | undefined;
+    if (!oldest) break;
+    codexLifecycleCache.delete(oldest);
+  }
+  return lifecycle && !inTail ? [lifecycle, ...tail] : tail;
+}
+
 export function analyzeCodexEvents(
   events: readonly JsonObject[],
   live: boolean,
@@ -366,10 +502,16 @@ export function analyzeCodexEvents(
     if (event.type === "event_msg") {
       const type = string(payload?.type);
       if (!type) continue;
-      providerStatus = type;
-      if (type === "task_started") status = "running";
-      else if (type === "task_complete") status = live ? "idle" : "completed";
-      else if (type === "turn_aborted") status = "interrupted";
+      if (type === "task_started") {
+        providerStatus = type;
+        status = "running";
+      } else if (type === "task_complete") {
+        providerStatus = type;
+        status = live ? "idle" : "completed";
+      } else if (type === "turn_aborted") {
+        providerStatus = type;
+        status = "interrupted";
+      }
     }
     if (event.type !== "response_item" || !payload) continue;
     if (payload.type === "function_call" && payload.name === "request_user_input") {
@@ -536,7 +678,7 @@ function discoverCodex(
     const sessions = queried.rows.map((row): SessionRecord => {
       const active = loaded.get(row.id) ?? null;
       const analysis = analyzeCodexEvents(
-        row.rolloutPath ? readJsonlTail(row.rolloutPath) : [],
+        row.rolloutPath ? readCodexObservation(row.rolloutPath) : [],
         active !== null,
       );
       const profile = analysis.profile ?? codexProfile(row);

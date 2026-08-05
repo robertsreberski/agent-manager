@@ -209,6 +209,7 @@ function fakeRemote(t: TestContext): string {
       phase: "commentary",
       text: "Remote activity",
       label: null,
+      memoryCitation: null,
     }],
     truncated: false,
   };

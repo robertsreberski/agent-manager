@@ -66,7 +66,11 @@ function orderedUnique(items: readonly ActivityItem[]): ActivityItem[] {
     const previous = byId.get(item.id);
     if (!previous || item.revision >= previous.revision) byId.set(item.id, item);
   }
-  return [...byId.values()].sort((left, right) => left.seq - right.seq || left.id.localeCompare(right.id));
+  // Snapshot/reset array order is the server's canonical timeline. `seq` is a
+  // stream cursor and can be reassigned during transcript reconciliation, so
+  // sorting by it here made every reset rebuild the conversation in a new
+  // order even when the provider order itself had not changed.
+  return [...byId.values()];
 }
 
 function appendText(current: string | null, frame: ActivityAppendFrame): string | null {

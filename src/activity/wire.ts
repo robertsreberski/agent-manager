@@ -178,6 +178,27 @@ function validateTodoSteps(value: unknown, label: string): void {
   }
 }
 
+function validateMemoryCitation(value: unknown, label: string): void {
+  if (value === null) return;
+  const citation = record(value, label);
+  exactKeys(citation, ["entries", "rolloutIds"], label);
+  for (const [index, raw] of array(citation.entries, `${label}.entries`, 128).entries()) {
+    const entry = record(raw, `${label}.entries[${String(index)}]`);
+    exactKeys(entry, ["path", "lineStart", "lineEnd", "note"], `${label}.entries[${String(index)}]`);
+    string(entry.path, `${label}.entries[${String(index)}].path`, false);
+    const lineStart = integer(entry.lineStart, `${label}.entries[${String(index)}].lineStart`, 1);
+    const lineEnd = integer(entry.lineEnd, `${label}.entries[${String(index)}].lineEnd`, 1);
+    if (lineEnd < lineStart) fail(`${label}.entries[${String(index)}].lineEnd precedes lineStart`);
+    string(entry.note, `${label}.entries[${String(index)}].note`, false);
+  }
+  for (const [index, rolloutId] of array(citation.rolloutIds, `${label}.rolloutIds`, 128).entries()) {
+    const id = string(rolloutId, `${label}.rolloutIds[${String(index)}]`, false);
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(id)) {
+      fail(`${label}.rolloutIds[${String(index)}] must be a UUID`);
+    }
+  }
+}
+
 function validateQuestions(value: unknown, label: string): void {
   for (const [index, raw] of array(value, label, 32).entries()) {
     const question = record(raw, `${label}[${String(index)}]`);
@@ -231,7 +252,7 @@ export function parseActivityItem(value: unknown, label = "activity item"): Acti
   const specific: string[] = [];
   switch (kind) {
     case "message":
-      specific.push("role", "phase", "text", "label");
+      specific.push("role", "phase", "text", "label", "memoryCitation");
       break;
     case "reasoning":
       specific.push("reasoningKind", "label", "text");
@@ -273,6 +294,7 @@ export function parseActivityItem(value: unknown, label = "activity item"): Acti
       if (item.phase !== null) enumeration(item.phase, ["commentary", "final"], `${label}.phase`);
       string(item.text, `${label}.text`);
       nullableString(item.label, `${label}.label`);
+      validateMemoryCitation(item.memoryCitation, `${label}.memoryCitation`);
       break;
     case "reasoning":
       enumeration(item.reasoningKind, ["summary", "raw"], `${label}.reasoningKind`);

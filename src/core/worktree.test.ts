@@ -99,6 +99,22 @@ test("negative results and expensive facts are cached, while selection forces re
   assert.equal(await resolver.resolve(outside), null);
 });
 
+test("does not count registered worktrees nested under the selected checkout as file changes", async (t) => {
+  const fixture = repositoryFixture(t);
+  const nestedRoot = join(fixture.main, ".claude", "worktrees");
+  const nestedWorktree = join(nestedRoot, "managed-session");
+  mkdirSync(nestedRoot, { recursive: true });
+  git(fixture.main, ["worktree", "add", "-b", "feature/nested-managed", nestedWorktree]);
+  const resolver = new WorkspaceIdentityResolver();
+
+  const clean = await resolver.resolve(fixture.main, { selected: true });
+  assert.equal(clean?.dirtyCount, 0, "the registered nested checkout is not a repo change");
+
+  writeFileSync(join(fixture.main, ".claude", "settings.json"), "{}\n");
+  const ordinaryFile = await resolver.resolve(fixture.main, { selected: true });
+  assert.equal(ordinaryFile?.dirtyCount, 1, "ordinary untracked files beside it still count");
+});
+
 test("timeouts and oversized output degrade facts without escaping the pass budget", async () => {
   let now = 0;
   let calls = 0;

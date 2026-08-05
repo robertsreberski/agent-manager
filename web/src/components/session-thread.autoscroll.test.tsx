@@ -35,6 +35,7 @@ const common = {
   confidence: "exact" as const,
   exposure: "provider-exposed" as const,
   truncated: false,
+  memoryCitation: null,
 };
 
 const session = {

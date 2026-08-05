@@ -2433,6 +2433,8 @@ test("streams retained transcript history when managed Codex detail acquisition 
           createdAt: "2026-08-03T00:00:01.000Z",
           status: "complete",
           correlationId: null,
+          turnId: null,
+          memoryCitation: null,
         }],
       };
     },

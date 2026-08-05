@@ -38,6 +38,7 @@ function message(overrides: Partial<ActivityMessageItem> = {}): ActivityMessageI
     phase: "commentary",
     text: "Hi",
     label: null,
+    memoryCitation: null,
     ...overrides,
   };
 }

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -254,6 +254,7 @@ test("production observe scan attaches an exact official-CLI tmux match and make
 test("marks transcript-only request_user_input as heuristic and non-respondable", () => {
   const analysis = analyzeCodexEvents([
     { type: "event_msg", payload: { type: "task_started" } },
+    { type: "event_msg", payload: { type: "token_count", info: { total: 42 } } },
     {
       type: "response_item",
       payload: {
@@ -264,6 +265,7 @@ test("marks transcript-only request_user_input as heuristic and non-respondable"
     },
   ], true);
   assert.equal(analysis.status, "waiting");
+  assert.equal(analysis.providerStatus, "task_started");
   assert.equal(analysis.attention[0]?.id, null);
   assert.equal(analysis.attention[0]?.confidence, "heuristic");
   assert.equal(analysis.attention[0]?.details?.respondable, false);
@@ -288,6 +290,74 @@ test("marks transcript-only request_user_input as heuristic and non-respondable"
   ], false);
   assert.equal(resolved.status, "completed");
   assert.deepEqual(resolved.attention, []);
+});
+
+test("Codex status retains a task start after a long active turn outgrows the tail window", () => {
+  const root = mkdtempSync(join(tmpdir(), "agent-manager-codex-lifecycle-"));
+  const sqliteDirectory = join(root, "sqlite");
+  mkdirSync(sqliteDirectory);
+  const database = new DatabaseSync(join(sqliteDirectory, "state_5.sqlite"));
+  const now = Date.parse("2026-08-05T12:00:00.000Z");
+  const threadId = "019fccc8-833f-75e3-bfcc-1c00ea3be4cf";
+  const rollout = join(root, `rollout-${threadId}.jsonl`);
+  writeFileSync(rollout, [
+    JSON.stringify({ type: "event_msg", payload: { type: "task_started", turn_id: "turn-long" } }),
+    JSON.stringify({ type: "response_item", payload: { type: "custom_tool_call_output", output: "x".repeat(600 * 1024) } }),
+    JSON.stringify({ type: "event_msg", payload: { type: "token_count", info: { total: 123 } } }),
+    "",
+  ].join("\n"));
+  try {
+    database.exec(`
+      CREATE TABLE threads (
+        id TEXT PRIMARY KEY,
+        rollout_path TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        cwd TEXT NOT NULL
+      )
+    `);
+    database.prepare(
+      "INSERT INTO threads (id, rollout_path, created_at, updated_at, cwd) VALUES (?, ?, ?, ?, '/workspace')",
+    ).run(threadId, rollout, now / 1_000, now / 1_000);
+  } finally {
+    database.close();
+  }
+
+  try {
+    const listing = scanObservedSessions({
+      recentWindowSeconds: 60,
+      providers: new Set(["codex"]),
+    }, {
+      now: () => now,
+      homeDir: root,
+      env: { CODEX_HOME: root },
+      run: () => ({ stdout: "", stderr: "", status: 0, error: null }),
+    });
+    const session = listing.sessions.find((candidate) => candidate.providerThreadId === threadId);
+    assert.equal(session?.status, "running");
+    assert.equal(session?.providerStatus, "task_started");
+
+    appendFileSync(rollout, [
+      JSON.stringify({ type: "event_msg", payload: { type: "task_complete", turn_id: "turn-long" } }),
+      JSON.stringify({ type: "response_item", payload: { type: "custom_tool_call_output", output: "y".repeat(600 * 1024) } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "token_count", info: { total: 456 } } }),
+      "",
+    ].join("\n"));
+    const completedListing = scanObservedSessions({
+      recentWindowSeconds: 60,
+      providers: new Set(["codex"]),
+    }, {
+      now: () => now,
+      homeDir: root,
+      env: { CODEX_HOME: root },
+      run: () => ({ stdout: "", stderr: "", status: 0, error: null }),
+    });
+    const completed = completedListing.sessions.find((candidate) => candidate.providerThreadId === threadId);
+    assert.equal(completed?.status, "completed");
+    assert.equal(completed?.providerStatus, "task_complete");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("Codex profile follows approval and the sandbox is evidenced on its own axis", () => {

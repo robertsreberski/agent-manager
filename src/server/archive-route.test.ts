@@ -76,6 +76,8 @@ test("archive routes stay separate from active state while exposing history and 
           createdAt: "2026-08-05T09:00:00.000Z",
           status: "complete",
           correlationId: null,
+          turnId: null,
+          memoryCitation: null,
         }],
       };
     },
@@ -348,6 +350,8 @@ test("archived transcript polling retains its selected identity when catalog rea
           createdAt: `2026-08-05T09:00:0${transcriptReads}.000Z`,
           status: "complete",
           correlationId: null,
+          turnId: null,
+          memoryCitation: null,
         }],
       };
     },

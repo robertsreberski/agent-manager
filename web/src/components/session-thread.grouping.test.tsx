@@ -27,6 +27,7 @@ const common = {
   confidence: "inferred" as const,
   exposure: "transcript-derived" as const,
   truncated: false,
+  memoryCitation: null,
 };
 
 const session = {
@@ -140,6 +141,32 @@ describe("thread-level transport and archive states", () => {
     resume.click();
     expect(onResumeInWeb).toHaveBeenCalledOnce();
     expect(screen.queryByRole("button", { name: /Claude Code resume|handoff/iu })).not.toBeInTheDocument();
+  });
+});
+
+describe("memory citations in a rendered thread", () => {
+  it("renders a compact expandable source list beside the cited answer", () => {
+    const { container } = renderThread([{
+      ...common,
+      id: "m-cited",
+      seq: 1,
+      turnId: "turn-1",
+      kind: "message",
+      role: "assistant",
+      phase: "final",
+      text: "From prior project context.",
+      label: null,
+      memoryCitation: {
+        entries: [{ path: "MEMORY.md", lineStart: 1, lineEnd: 3, note: "prior project context" }],
+        rolloutIds: [],
+      },
+    }]);
+
+    expect(screen.getByText("From prior project context.")).toBeInTheDocument();
+    expect(screen.getByText("Memory sources")).toBeInTheDocument();
+    expect(screen.getByText("MEMORY.md:1-3")).toBeInTheDocument();
+    expect(container.querySelector("[data-memory-citation]")).toBeInTheDocument();
+    expect(container.textContent).not.toContain("<oai-mem-citation>");
   });
 });
 

@@ -942,6 +942,47 @@ test("atomically reconciles transcript history with exact correlated activity", 
   );
 });
 
+test("transcript reconciliation preserves an uncorrelated warning between its exact neighbours", () => {
+  const hub = new ActivityHub({ streamEpoch: "transcript-warning-order" });
+  const exactTool = (id: string, callId: string) => ({
+    id,
+    kind: "tool" as const,
+    toolCallId: callId,
+    name: "Bash",
+    state: "complete" as const,
+    correlationId: `tool:${callId}`,
+    source: "provider-api" as const,
+    confidence: "exact" as const,
+    exposure: "provider-exposed" as const,
+  });
+  hub.ingest("session-1", "codex", { type: "upsert", item: exactTool("api:first", "call-1") });
+  hub.ingest("session-1", "codex", {
+    type: "upsert",
+    item: {
+      id: "api:warning",
+      kind: "lifecycle",
+      event: "warning",
+      level: "warning",
+      title: "Codex warning",
+      details: "Keep me where I happened",
+      source: "provider-api",
+      confidence: "exact",
+      exposure: "provider-exposed",
+    },
+  });
+  hub.ingest("session-1", "codex", { type: "upsert", item: exactTool("api:second", "call-2") });
+
+  hub.reconcileTranscript("session-1", "codex", [
+    { ...exactTool("transcript:first", "call-1"), source: "transcript", confidence: "inferred", exposure: "transcript-derived" },
+    { ...exactTool("transcript:second", "call-2"), source: "transcript", confidence: "inferred", exposure: "transcript-derived" },
+  ], false);
+
+  assert.deepEqual(
+    hub.snapshot("session-1")?.items.map((item) => item.id),
+    ["api:first", "api:warning", "api:second"],
+  );
+});
+
 test("transcript reset listeners see preserved exact raw append cursors and source state atomically", () => {
   const hub = new ActivityHub({
     streamEpoch: "transcript-append-state",

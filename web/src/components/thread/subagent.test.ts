@@ -21,6 +21,7 @@ function common(id: string, seq: number, parentId: string | null) {
     confidence: "exact" as const,
     exposure: "provider-exposed" as const,
     truncated: false,
+    memoryCitation: null,
   };
 }
 

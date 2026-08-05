@@ -94,6 +94,18 @@ export interface ActivityQueuedMessage {
   turnId: string | null;
 }
 
+export interface ActivityMemoryCitationEntry {
+  path: string;
+  lineStart: number;
+  lineEnd: number;
+  note: string;
+}
+
+export interface ActivityMemoryCitation {
+  entries: ActivityMemoryCitationEntry[];
+  rolloutIds: string[];
+}
+
 export interface ActivityItemBase {
   schemaVersion: typeof ACTIVITY_SCHEMA_VERSION;
   id: string;
@@ -122,6 +134,7 @@ export interface ActivityMessageItem extends ActivityItemBase {
   phase: "commentary" | "final" | null;
   text: string;
   label: string | null;
+  memoryCitation: ActivityMemoryCitation | null;
 }
 
 export interface ActivityReasoningItem extends ActivityItemBase {
@@ -280,6 +293,7 @@ export type ActivityItemDraft =
       phase?: ActivityMessageItem["phase"];
       text?: string;
       label?: string | null;
+      memoryCitation?: ActivityMemoryCitation | null;
     })
   | (ActivityItemDraftBase & {
       kind: "reasoning";

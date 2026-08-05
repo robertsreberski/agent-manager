@@ -18,6 +18,7 @@ const common = {
   confidence: "exact" as const,
   exposure: "provider-exposed" as const,
   truncated: false,
+  memoryCitation: null,
 };
 
 /**
@@ -76,8 +77,8 @@ describe("turn timeline ordering", () => {
 
     expect(messages.map((message) => message.role)).toEqual(["user", "assistant"]);
     expect(partLabels(messages[1]!)).toEqual([
-      "data:agent-manager.lifecycle",
       "text",
+      "data:agent-manager.lifecycle",
       "reasoning",
       "tool-call",
       "data:agent-manager.turn-marker",
@@ -152,8 +153,8 @@ describe("turn timeline ordering", () => {
     const parts = activityToThreadMessages(items)[1]!.content as ReadonlyArray<{ type: string; name?: string }>;
 
     expect(partLabels({ content: parts })).toEqual([
-      "data:agent-manager.lifecycle",
       "text",
+      "data:agent-manager.lifecycle",
       "reasoning",
       "tool-call",
       "tool-call",
@@ -168,10 +169,10 @@ describe("turn timeline ordering", () => {
     ));
     const parts = activityToThreadMessages(items)[1]!.content as ReadonlyArray<{ type: string }>;
 
-    // lifecycle · answer · tool · reasoning · turn marker. The assistant
-    // message keeps its recorded boundary while body activity retains seq order.
+    // answer · lifecycle · tool · reasoning · turn marker: the canonical
+    // provider order is not rewritten around a message boundary.
     expect(parts.map((part) => part.type)).toEqual([
-      "data", "text", "tool-call", "reasoning", "data",
+      "text", "data", "tool-call", "reasoning", "data",
     ]);
   });
 });
@@ -205,6 +206,38 @@ describe("turns a provider never stated", () => {
 
     expect(messages.map((message) => message.role)).toEqual(["user", "assistant"]);
     expect(partLabels(messages[1]!)).toEqual(["tool-call", "tool-call", "tool-call", "text"]);
+    expect(messages[1]!.id).toMatch(/^assistant:/u);
+    expect(messages[1]!.id).not.toContain("turn:unassociated");
+    expect(activityToThreadMessages([
+      { ...unassociated, id: "m-user", seq: 1, kind: "message", role: "user", phase: null, text: "Go", label: null },
+      tool("t-1", 2),
+      tool("t-2", 3),
+      tool("t-3", 4),
+      { ...unassociated, id: "m-final", seq: 5, kind: "message", role: "assistant", phase: "final", text: "Done", label: null },
+    ])[1]!.id).toBe(messages[1]!.id);
+  });
+
+  it("projects a parsed memory citation directly after its assistant text", () => {
+    const messages = activityToThreadMessages([{
+      ...unassociated,
+      id: "m-cited",
+      seq: 1,
+      kind: "message",
+      role: "assistant",
+      phase: "final",
+      text: "From prior project context.",
+      label: null,
+      memoryCitation: {
+        entries: [{ path: "MEMORY.md", lineStart: 1, lineEnd: 3, note: "prior project context" }],
+        rolloutIds: [],
+      },
+    }]);
+    const parts = messages[0]!.content as ReadonlyArray<{ type: string; name?: string; data?: unknown }>;
+    expect(partLabels(messages[0]!)).toEqual(["text", "data:agent-manager.memory-citation"]);
+    expect(parts[1]?.data).toEqual({
+      entries: [{ path: "MEMORY.md", lineStart: 1, lineEnd: 3, note: "prior project context" }],
+      rolloutIds: [],
+    });
   });
 
   it("keeps an assistant message between two tool runs in the same stated turn", () => {
@@ -269,18 +302,17 @@ describe("provider status lines", () => {
     };
   }
 
-  it("bands an info status with the turn facts instead of interrupting the work", () => {
+  it("keeps an info status at its recorded position", () => {
     const parts = activityToThreadMessages([
       tool("t-1", 1),
       status("hook-1", 2, "info"),
       tool("t-2", 3),
     ])[0]!.content as ReadonlyArray<{ type: string; name?: string }>;
 
-    // Both tool calls adjacent, so the group survives; the status follows.
     expect(partLabels({ content: parts })).toEqual([
       "tool-call",
-      "tool-call",
       "data:agent-manager.lifecycle",
+      "tool-call",
     ]);
   });
 
@@ -307,14 +339,14 @@ describe("provider status lines", () => {
       status("hook-1", 3, "info"),
     ])[0]!.content as ReadonlyArray<{ type: string; name?: string }>;
 
-    // The marker still closes the turn; the status sits just above it.
+    // The marker still closes the turn; both lifecycle rows retain provider order.
     expect(partLabels({ content: parts }).at(-1)).toBe("data:agent-manager.turn-marker");
     const lifecycleTitles = parts.flatMap((part) => (
       part.type === "data" && part.name === "agent-manager.lifecycle"
         ? [(part as unknown as { data: { title: string } }).data.title]
         : []
     ));
-    expect(lifecycleTitles).toEqual(["PostToolUse · Bash", "Turn failed"]);
+    expect(lifecycleTitles).toEqual(["Turn failed", "PostToolUse · Bash"]);
   });
 });
 

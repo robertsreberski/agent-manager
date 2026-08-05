@@ -168,6 +168,99 @@ test("launches only a fresh private 0.146 App Server socket with argv", async ()
   }
 });
 
+test("adopts a validated live private Codex App Server instead of launching over it", async () => {
+  const runtimeDir = await mkdtemp(join(tmpdir(), "am-codex-adopt-live-"));
+  const socketPath = join(runtimeDir, "codex-private.sock");
+  const liveServer = createServer((socket) => socket.end());
+  await new Promise<void>((resolve, reject) => {
+    liveServer.once("error", reject);
+    liveServer.listen(socketPath, () => resolve());
+  });
+  let launches = 0;
+  let inspections = 0;
+  const supervisor = new CodexAppServerSupervisor({
+    runtimeDir,
+    probeVersion: async () => "0.146.0",
+    inspectLiveListener: async (candidate) => {
+      inspections += 1;
+      assert.equal(candidate, socketPath);
+      return {
+        pid: 65_788,
+        command: `codex app-server --listen unix://${socketPath}`,
+      };
+    },
+    launch: () => {
+      launches += 1;
+      return new FakeChild();
+    },
+    connect: async (candidate) => {
+      assert.equal(candidate, socketPath);
+      return new InitializingTransport();
+    },
+  });
+
+  try {
+    const adapter = await supervisor.start();
+    assert.equal(adapter.capabilities.compatible, true);
+    assert.equal(inspections, 1);
+    assert.equal(launches, 0);
+    assert.equal(supervisor.state.status, "running");
+    assert.equal(supervisor.state.pid, 65_788);
+    await supervisor.stop();
+    assert.equal((await lstat(socketPath)).isSocket(), true);
+  } finally {
+    await supervisor.stop();
+    await new Promise<void>((resolve) => liveServer.close(() => resolve()));
+    await rm(runtimeDir, { recursive: true, force: true });
+  }
+});
+
+test("reconnects to an adopted listener when its WebSocket closes", async () => {
+  const runtimeDir = await mkdtemp(join(tmpdir(), "am-codex-adopt-reconnect-"));
+  const socketPath = join(runtimeDir, "codex-private.sock");
+  const liveServer = createServer((socket) => socket.end());
+  await new Promise<void>((resolve, reject) => {
+    liveServer.once("error", reject);
+    liveServer.listen(socketPath, () => resolve());
+  });
+  const transports: InitializingTransport[] = [];
+  let launches = 0;
+  const supervisor = new CodexAppServerSupervisor({
+    runtimeDir,
+    probeVersion: async () => "0.146.0",
+    inspectLiveListener: async () => ({
+      pid: 65_788,
+      command: `codex app-server --listen unix://${socketPath}`,
+    }),
+    connect: async () => {
+      const transport = new InitializingTransport();
+      transports.push(transport);
+      return transport;
+    },
+    launch: () => {
+      launches += 1;
+      return new FakeChild();
+    },
+    restartInitialDelayMs: 0,
+    restartMaxDelayMs: 0,
+  });
+
+  try {
+    await supervisor.start();
+    await transports[0]!.close();
+    await eventually(() => {
+      assert.equal(supervisor.state.status, "running");
+      assert.equal(transports.length, 2);
+    });
+    assert.equal(launches, 0);
+    assert.equal(supervisor.state.pid, 65_788);
+  } finally {
+    await supervisor.stop();
+    await new Promise<void>((resolve) => liveServer.close(() => resolve()));
+    await rm(runtimeDir, { recursive: true, force: true });
+  }
+});
+
 test("rejects incompatible CLI versions before spawning", async () => {
   const runtimeDir = await mkdtemp(join(tmpdir(), "am-codex-version-"));
   let launches = 0;

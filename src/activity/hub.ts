@@ -491,7 +491,7 @@ export class ActivityHub {
 
     const correlationOccurrences = new Map<string, number>();
     const retainedExactIds = new Set<string>();
-    const merged: ActivityItemDraft[] = drafts.map((draft) => {
+    const transcriptMerged: ActivityItemDraft[] = drafts.map((draft) => {
       const candidates = draft.correlationId
         ? exactByCorrelation.get(draft.correlationId) ?? []
         : [];
@@ -510,9 +510,48 @@ export class ActivityHub {
       retainedExactIds.add(exact.id);
       return clone(exact);
     });
+
+    // Uncorrelated exact diagnostics (warnings, hook notices, connection
+    // state) have no transcript twin. Appending them after the transcript made
+    // every warning jump to the bottom on each poll. Anchor each one to the
+    // nearest retained neighbour from the preceding canonical view instead.
+    const retainedIds = new Set(transcriptMerged.map((item) => item.id));
+    const unmatchedExact = new Set(ordered.flatMap((item) => (
+      item.source !== "transcript" && !retainedExactIds.has(item.id) ? [item.id] : []
+    )));
+    const before = new Map<string, ActivityItemDraft[]>();
+    const after = new Map<string, ActivityItemDraft[]>();
+    const trailing: ActivityItemDraft[] = [];
+    ordered.forEach((item, index) => {
+      if (!unmatchedExact.has(item.id)) return;
+      retainedExactIds.add(item.id);
+      const previous = ordered.slice(0, index).reverse().find((candidate) => retainedIds.has(candidate.id));
+      if (previous) {
+        const bucket = after.get(previous.id) ?? [];
+        bucket.push(clone(item));
+        after.set(previous.id, bucket);
+        return;
+      }
+      const next = ordered.slice(index + 1).find((candidate) => retainedIds.has(candidate.id));
+      if (next) {
+        const bucket = before.get(next.id) ?? [];
+        bucket.push(clone(item));
+        before.set(next.id, bucket);
+        return;
+      }
+      trailing.push(clone(item));
+    });
+    const merged: ActivityItemDraft[] = transcriptMerged.flatMap((item) => [
+      ...(before.get(item.id) ?? []),
+      item,
+      ...(after.get(item.id) ?? []),
+    ]);
+    merged.push(...trailing);
+
+    // Exact items can precede the first successful transcript hydration, so
+    // there may be no retained transcript anchor at all.
     for (const item of ordered) {
-      if (item.source === "transcript") continue;
-      if (retainedExactIds.has(item.id)) continue;
+      if (item.source === "transcript" || retainedExactIds.has(item.id)) continue;
       retainedExactIds.add(item.id);
       merged.push(clone(item));
     }
@@ -888,7 +927,23 @@ export class ActivityHub {
     switch (draft.kind) {
       case "message": {
         const old = previous?.kind === "message" ? previous : undefined;
-        return { ...common, kind: "message", role: draft.role, phase: draft.phase ?? old?.phase ?? null, text: text(draft.text ?? old?.text ?? ""), label: draft.label === undefined ? old?.label ?? null : draft.label === null ? null : text(draft.label), truncated };
+        const citation = draft.memoryCitation === undefined
+          ? old?.memoryCitation ?? null
+          : draft.memoryCitation === null
+            ? null
+            : {
+                entries: draft.memoryCitation.entries.map((entry) => {
+                  const lineStart = Math.max(1, nonnegativeInteger(entry.lineStart, 1));
+                  return {
+                    path: text(entry.path),
+                    lineStart,
+                    lineEnd: Math.max(lineStart, nonnegativeInteger(entry.lineEnd, lineStart)),
+                    note: text(entry.note),
+                  };
+                }),
+                rolloutIds: draft.memoryCitation.rolloutIds.map(text),
+              };
+        return { ...common, kind: "message", role: draft.role, phase: draft.phase ?? old?.phase ?? null, text: text(draft.text ?? old?.text ?? ""), label: draft.label === undefined ? old?.label ?? null : draft.label === null ? null : text(draft.label), memoryCitation: citation, truncated };
       }
       case "reasoning": {
         const old = previous?.kind === "reasoning" ? previous : undefined;

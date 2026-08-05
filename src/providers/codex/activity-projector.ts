@@ -10,7 +10,11 @@ import type {
   ActivityTodoInputStep,
   ActivityTodoRewriteState,
 } from "../../activity/index.ts";
-import { reconcileTodoRewrite } from "../../activity/index.ts";
+import {
+  extractTrailingMemoryCitation,
+  parseMemoryCitation,
+  reconcileTodoRewrite,
+} from "../../activity/index.ts";
 import { resolveProviderPath } from "../approval-facts.ts";
 import {
   jsonRpcIdKey,
@@ -542,7 +546,10 @@ function projectThreadItem(
     }
     case "agentMessage":
       {
-        const text = stringValue(item.text) ?? "";
+        const extracted = extractTrailingMemoryCitation(stringValue(item.text) ?? "");
+        const text = extracted.text;
+        const memoryCitation = parseMemoryCitation(item.memory_citation ?? item.memoryCitation)
+          ?? extracted.memoryCitation;
         const final = item.phase === "final_answer";
         mutations.push(upsert({
           ...baseItem(id, "message", turnId, state, times.startedAt, times.updatedAt, times.completedAt),
@@ -557,6 +564,7 @@ function projectThreadItem(
             : null,
           text,
           label: null,
+          memoryCitation,
         }));
       }
       break;

@@ -21,7 +21,12 @@ import {
   sep,
 } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { ActivityJsonValue } from "../activity/types.ts";
+import {
+  extractTrailingMemoryCitation,
+  parseMemoryCitation,
+  type ActivityJsonValue,
+  type ActivityMemoryCitation,
+} from "../activity/index.ts";
 import { redactActivityText } from "../activity/redaction.ts";
 import { codexMessageCorrelationId } from "../providers/codex/activity-projector.ts";
 import type {
@@ -80,6 +85,8 @@ interface TranscriptItemBase {
   id: string;
   /** Exact provider identity shared with hook/API activity when one exists. */
   correlationId?: string | null;
+  /** Exact provider prompt/turn identity when the transcript exposes it. */
+  turnId: string | null;
   createdAt: string | null;
   status: TranscriptItemStatus;
 }
@@ -90,6 +97,7 @@ export interface TranscriptMessage extends TranscriptItemBase {
   role: "user" | "assistant" | "system" | "tool";
   text: string;
   label: string | null;
+  memoryCitation: ActivityMemoryCitation | null;
 }
 
 /**
@@ -719,6 +727,8 @@ function codexItems(
   let previousKey: string | null = null;
   let truncated = tail.truncated;
   let activeTurnId: string | null = null;
+  const turnByProviderId = new Map<string, string>();
+  const citationByProviderId = new Map<string, ActivityMemoryCitation>();
   const assistantCandidates = new Map<string, number[]>();
   const canonicalAssistantTurns = new Set<string>();
 
@@ -739,6 +749,8 @@ function codexItems(
   for (const record of tail.records) {
     if (record.gapBefore) {
       activeTurnId = null;
+      turnByProviderId.clear();
+      citationByProviderId.clear();
       previousKey = null;
       seenAdjacent.clear();
       toolIndex.clear();
@@ -756,6 +768,21 @@ function codexItems(
         if (activeTurnId === turnId) activeTurnId = null;
       } else if (payload.type === "turn_aborted" && turnId && activeTurnId === turnId) {
         activeTurnId = null;
+      }
+      const providerItem = objectValue(payload.item);
+      if (turnId && providerItem) {
+        for (const providerId of [
+          stringValue(providerItem.id),
+          stringValue(providerItem.call_id),
+          stringValue(providerItem.tool_call_id),
+        ]) {
+          if (providerId) turnByProviderId.set(providerId, turnId);
+        }
+        const citation = parseMemoryCitation(
+          providerItem.memory_citation ?? providerItem.memoryCitation,
+        );
+        const providerId = stringValue(providerItem.id);
+        if (citation && providerId) citationByProviderId.set(providerId, citation);
       }
       continue;
     }
@@ -780,6 +807,7 @@ function codexItems(
         kind: "reasoning",
         id,
         correlationId: providerId ? `reasoning:${providerId}:summary:0` : null,
+        turnId: (providerId ? turnByProviderId.get(providerId) : null) ?? activeTurnId,
         text,
         createdAt,
         status: "complete",
@@ -797,6 +825,9 @@ function codexItems(
         kind: "tool",
         id: stableItemId("codex", callId, fileIdentity, record.offset, "tool"),
         correlationId: correlationId("tool", callId),
+        turnId: turnByProviderId.get(callId)
+          ?? (stringValue(payload.id) ? turnByProviderId.get(stringValue(payload.id)!) : undefined)
+          ?? activeTurnId,
         toolCallId: callId,
         name,
         arguments: codexArguments(payload),
@@ -833,7 +864,8 @@ function codexItems(
     if (role === "user") {
       parts = parts.filter((part) => !syntheticCodexUserContext(part));
     }
-    const text = parts.join("\n\n").trim();
+    const extracted = extractTrailingMemoryCitation(parts.join("\n\n").trim());
+    const text = extracted.text;
     if (!text) continue;
     const providerId = stringValue(payload.id) ?? stringValue(outer.id);
     const id = stableItemId("codex", providerId, fileIdentity, record.offset);
@@ -852,7 +884,10 @@ function codexItems(
     seenAdjacent.clear();
     if (adjacentKey !== null) seenAdjacent.add(adjacentKey);
     previousKey = adjacentKey;
-    const messageTurnId = activeTurnId;
+    const passthrough = objectValue(payload.internal_chat_message_metadata_passthrough);
+    const messageTurnId = (providerId ? turnByProviderId.get(providerId) : null)
+      ?? stringValue(passthrough?.turn_id)
+      ?? activeTurnId;
     const finalAssistant = messageTurnId !== null && role === "assistant" &&
       (payload.phase === "final_answer" || payload.phase === "final");
     items.push({
@@ -863,11 +898,14 @@ function codexItems(
         : finalAssistant
         ? codexMessageCorrelationId(sessionId, messageTurnId, "assistant", text)
         : correlationId("message", providerId),
+      turnId: messageTurnId,
       role,
       text,
       createdAt,
       status: "complete",
       label: null,
+      memoryCitation: (providerId ? citationByProviderId.get(providerId) : null)
+        ?? extracted.memoryCitation,
     });
     if (messageTurnId && role === "assistant") {
       const candidates = assistantCandidates.get(messageTurnId) ?? [];
@@ -1040,16 +1078,20 @@ function machineClaudeUser(object: Record<string, unknown>, text: string): boole
 /**
  * Walks one Claude assistant record's content blocks in the order the provider
  * wrote them, so a `thinking` block, a tool call and the answer keep their
- * recorded sequence. Streaming rewrites the same `message.id` repeatedly, so
- * text fragments merge and tool calls de-duplicate on their own `tool_use` id.
+ * recorded sequence. Claude streams one provider message through multiple JSONL
+ * records; each visible text block keeps its record identity so text emitted
+ * after a tool can never be merged back into a message above that tool.
  */
 function claudeAssistantBlocks(
   outer: Record<string, unknown>,
   message: Record<string, unknown>,
   messageKey: string,
   providerMessageId: string | null,
+  turnId: string | null,
   items: TranscriptItem[],
-  byId: Map<string, { index: number; fragments: Set<string> }>,
+  seenItemIds: Set<string>,
+  seenTextFragments: Map<string, Set<string>>,
+  textItemsByProviderMessage: Map<string, number[]>,
   toolIndex: Map<string, number>,
 ): void {
   const createdAt = timestamp(outer.timestamp);
@@ -1058,13 +1100,15 @@ function claudeAssistantBlocks(
     if (block.type === "thinking" && typeof block.thinking === "string") {
       const text = block.thinking.trim();
       const id = `${messageKey}:thinking:${String(index)}`;
-      if (!text || items.some((item) => item.id === id)) return;
+      if (!text || seenItemIds.has(id)) return;
+      seenItemIds.add(id);
       items.push({
         kind: "reasoning",
         id,
         correlationId: providerMessageId
           ? `reasoning:${providerMessageId}:thinking:${String(index)}`
           : null,
+        turnId,
         text,
         createdAt,
         status: "complete",
@@ -1082,6 +1126,7 @@ function claudeAssistantBlocks(
         kind: "tool",
         id: `claude:tool:${callId}`,
         correlationId: correlationId("tool", callId),
+        turnId,
         toolCallId: callId,
         name,
         arguments: (block.input ?? null) as ActivityJsonValue | null,
@@ -1095,25 +1140,32 @@ function claudeAssistantBlocks(
     if (block.type !== "text" || typeof block.text !== "string") return;
     const text = block.text.trim();
     if (!text) return;
-    const existing = byId.get(messageKey);
-    if (existing) {
-      const target = items[existing.index];
-      if (target?.kind !== "message" || existing.fragments.has(text)) return;
-      existing.fragments.add(text);
-      target.text = `${target.text}\n\n${text}`;
-      return;
-    }
-    byId.set(messageKey, { index: items.length, fragments: new Set([text]) });
+    const fragmentKey = providerMessageId ?? messageKey;
+    const fragments = seenTextFragments.get(fragmentKey) ?? new Set<string>();
+    if (fragments.has(text)) return;
+    fragments.add(text);
+    seenTextFragments.set(fragmentKey, fragments);
+    const id = `${messageKey}:text:${String(index)}`;
+    if (seenItemIds.has(id)) return;
+    seenItemIds.add(id);
+    const itemIndex = items.length;
     items.push({
       kind: "message",
-      id: messageKey,
-      correlationId: correlationId("message", providerMessageId),
+      id,
+      correlationId: null,
+      turnId,
       role: "assistant",
       text,
       createdAt,
       status,
       label: null,
+      memoryCitation: null,
     });
+    if (providerMessageId) {
+      const indexes = textItemsByProviderMessage.get(providerMessageId) ?? [];
+      indexes.push(itemIndex);
+      textItemsByProviderMessage.set(providerMessageId, indexes);
+    }
   });
 }
 
@@ -1125,19 +1177,27 @@ function claudeItems(
 ): ParsedItems {
   const chain = claudeChain(tail, session, isChild);
   const items: TranscriptItem[] = [];
-  const byId = new Map<string, { index: number; fragments: Set<string> }>();
+  const seenItemIds = new Set<string>();
+  const seenTextFragments = new Map<string, Set<string>>();
+  const textItemsByProviderMessage = new Map<string, number[]>();
   const toolIndex = new Map<string, number>();
+  let activeTurnId: string | null = null;
   let truncated = chain.truncated;
 
   for (const record of chain.records) {
     // A result can only complete a tool call when both records belong to one
     // observed parent chain. Never infer that relationship across skipped
     // source bytes, even when an identifier happens to match.
-    if (record.gapBefore) toolIndex.clear();
+    if (record.gapBefore) {
+      toolIndex.clear();
+      activeTurnId = null;
+    }
     const outer = record.object;
     if (!matchesClaudeIdentity(outer, session, isChild) || outer.isMeta === true) continue;
     const message = objectValue(outer.message);
     if (!message) continue;
+    const rowPromptId = stringValue(outer.promptId) ?? stringValue(outer.prompt_id);
+    if (rowPromptId) activeTurnId = rowPromptId;
     if (outer.type === "user" && message.role === "user") {
       if (hasToolResult(message.content)) {
         for (const block of contentBlocks(message.content)) {
@@ -1154,34 +1214,46 @@ function claudeItems(
       const text = textBlocks(message.content).join("\n\n").trim();
       if (!text || machineClaudeUser(outer, text)) continue;
       const providerId = stringValue(outer.uuid);
-      const promptId = stringValue(outer.promptId) ?? stringValue(outer.prompt_id);
+      const promptId = rowPromptId;
       const id = stableItemId("claude", providerId, fileIdentity, record.offset);
-      if (byId.has(id)) continue;
-      byId.set(id, { index: items.length, fragments: new Set([text]) });
+      if (seenItemIds.has(id)) continue;
+      seenItemIds.add(id);
+      activeTurnId = promptId ?? providerId ?? activeTurnId;
       items.push({
         kind: "message",
         id,
         correlationId: correlationId("message", promptId ?? providerId),
+        turnId: activeTurnId,
         role: "user",
         text,
         createdAt: timestamp(outer.timestamp),
         status: "complete",
         label: null,
+        memoryCitation: null,
       });
       continue;
     }
     if (outer.type !== "assistant" || message.role !== "assistant") continue;
     const providerId = stringValue(message.id) ?? stringValue(outer.uuid);
-    const messageKey = stableItemId("claude", providerId, fileIdentity, record.offset);
+    const recordId = stringValue(outer.uuid);
+    const messageKey = stableItemId("claude", recordId, fileIdentity, record.offset);
     claudeAssistantBlocks(
       outer,
       message,
       messageKey,
       providerId,
+      activeTurnId,
       items,
-      byId,
+      seenItemIds,
+      seenTextFragments,
+      textItemsByProviderMessage,
       toolIndex,
     );
+  }
+  for (const [providerMessageId, indexes] of textItemsByProviderMessage) {
+    const last = indexes.at(-1);
+    const item = last === undefined ? undefined : items[last];
+    if (item?.kind === "message") item.correlationId = correlationId("message", providerMessageId);
   }
   const capped = capItems(settleToolCalls(items));
   truncated ||= capped.truncated;

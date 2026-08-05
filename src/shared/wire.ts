@@ -14,7 +14,7 @@ import {
   sessionRecordId,
 } from "./session.ts";
 
-export const WIRE_SCHEMA_VERSION = 6 as const;
+export const WIRE_SCHEMA_VERSION = 7 as const;
 
 export interface WireIdentity {
   schemaVersion: number | null;

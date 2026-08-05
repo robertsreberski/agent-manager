@@ -34,6 +34,21 @@ test("accepts and clones an exact activity frame", () => {
   );
 });
 
+test("strictly validates structured message memory citations", () => {
+  const frame = validFrame();
+  if (frame.type !== "activity.upsert" || frame.item.kind !== "message") return;
+  frame.item.memoryCitation = {
+    entries: [{ path: "MEMORY.md", lineStart: 1, lineEnd: 3, note: "prior context" }],
+    rolloutIds: ["019fcbd5-7a38-7c31-a5f7-e199f5b06f4e"],
+  };
+  assert.doesNotThrow(() => parseActivityFrame(frame));
+
+  const invalid = structuredClone(frame);
+  if (invalid.type !== "activity.upsert" || invalid.item.kind !== "message" || !invalid.item.memoryCitation) return;
+  invalid.item.memoryCitation.rolloutIds = ["not-a-rollout-id"];
+  assert.throws(() => parseActivityFrame(invalid), /rolloutIds/u);
+});
+
 test("rejects unknown, incomplete, and unsafe nested wire data", () => {
   const unknown = { ...validFrame(), compatibilityAlias: true };
   assert.throws(() => parseActivityFrame(unknown), ActivityWireError);

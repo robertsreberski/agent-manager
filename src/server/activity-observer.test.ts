@@ -92,6 +92,8 @@ function transcript(id: string, text: string, truncated = false): TranscriptRead
     createdAt: "2026-08-03T00:00:01.000Z",
     status: "running",
     label: null,
+    turnId: null,
+    memoryCitation: null,
   }], truncated);
 }
 
@@ -150,6 +152,32 @@ test("observes a selected transcript live and stops polling after release", asyn
   assert.equal(settled?.kind === "message" ? settled.text : null, "replacement branch");
 
   unsubscribe();
+  observer.dispose();
+  hub.dispose();
+});
+
+test("keeps a selected idle session on the active transcript cadence", async () => {
+  const hub = new ActivityHub({ streamEpoch: "observer-selected-idle" });
+  const session = { ...externalSession(), status: "idle" as const, providerStatus: "task_complete" };
+  hub.ensureSession(session.id, session.provider);
+  let current = transcript("message-1", "before CLI input");
+  const observer = new SelectedTranscriptActivityObserver({
+    hub,
+    reader: { read: () => structuredClone(current) },
+    runningPollMs: 100,
+    idlePollMs: 2_000,
+  });
+
+  const release = observer.acquire(session);
+  current = transcript("message-2", "CLI user message observed");
+  await delay(140);
+  const observed = hub.snapshot(session.id)?.items[0];
+  assert.equal(
+    observed?.kind === "message" ? observed.text : null,
+    "CLI user message observed",
+  );
+
+  release();
   observer.dispose();
   hub.dispose();
 });
@@ -330,6 +358,7 @@ test("projects transcript tool and reasoning items with transcript-derived prove
           createdAt: "2026-08-03T00:00:01.000Z",
           status: "complete",
           label: null,
+          turnId: null,
         },
         {
           kind: "tool",
@@ -341,6 +370,7 @@ test("projects transcript tool and reasoning items with transcript-derived prove
           isError: false,
           createdAt: "2026-08-03T00:00:02.000Z",
           status: "complete",
+          turnId: null,
         },
         {
           kind: "tool",
@@ -352,6 +382,7 @@ test("projects transcript tool and reasoning items with transcript-derived prove
           isError: true,
           createdAt: "2026-08-03T00:00:03.000Z",
           status: "complete",
+          turnId: null,
         },
       ]),
     },
@@ -402,6 +433,8 @@ test("does not invent a final phase for a complete transcript assistant message"
         createdAt: "2026-08-03T00:00:02.000Z",
         status: "complete",
         label: null,
+        turnId: null,
+        memoryCitation: null,
       }]),
     },
   });
@@ -430,6 +463,7 @@ test("re-observes a tool call when only its result arrives", async () => {
     isError: false,
     createdAt: "2026-08-03T00:00:01.000Z",
     status: "running",
+    turnId: null,
   };
   let current = available([pending]);
   const frames: ActivityFrame[] = [];

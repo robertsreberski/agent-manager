@@ -1411,6 +1411,13 @@ function providerCommand(command: string): ProviderCommand | null {
   return null;
 }
 
+function codexServiceProcess(row: ProcessRow): boolean {
+  return row.providerCommand?.provider === "codex"
+    && row.providerCommand.args.some((argument) => (
+      argument === "app-server" || argument === "mcp-server" || argument === "completion"
+    ));
+}
+
 function executablePath(path: string, env: NodeJS.ProcessEnv): string {
   const candidates = path.includes("/")
     ? [resolve(path)]
@@ -1877,7 +1884,9 @@ export class SystemLocalCliProcessInspector implements LocalCliProcessInspector 
       return { state: "mismatch", reason: "Codex owner discovery could not revalidate process identities" };
     }
     const candidates = processRows(result.stdout).filter((row) =>
-      row.uid === this.#uid && row.providerCommand?.provider === "codex"
+      row.uid === this.#uid
+      && row.providerCommand?.provider === "codex"
+      && !codexServiceProcess(row)
     );
     if (candidates.length > 64) {
       return { state: "mismatch", reason: "Too many Codex processes are present to fence safely" };

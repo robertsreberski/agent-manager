@@ -5,7 +5,7 @@ import type {
   MessageTiming,
   ThreadMessageLike,
 } from "@assistant-ui/react";
-import { AlertTriangle, CircleAlert, Gauge, Radio } from "lucide-react";
+import { AlertTriangle, BookOpen, CircleAlert, Gauge, Radio } from "lucide-react";
 import { DiffViewer, diffIdentityKey, fileChangeIsUpserting, relativeEditorPath, type FileChangeView } from "./diffs";
 import { PlanArtifact, TodoList, type PlanArtifactView, type TodoListView } from "./plans";
 import { ApprovalRequest, QuestionRequest, type ExactQuestionRequest } from "./requests";
@@ -18,6 +18,7 @@ import type {
   ActivityFileChangeItem,
   ActivityItem,
   ActivityJsonValue,
+  ActivityMemoryCitation,
   ActivityState,
   ActivityTodoItem,
   RequestResponse,
@@ -126,30 +127,35 @@ function itemTiming(item: ActivityItem): { startedAt: number; completedAt?: numb
     : { startedAt };
 }
 
-function activityPart(
+function activityParts(
   item: ActivityItem,
   subagents: ReadonlyMap<string, SubagentFrameData>,
   groupItems: readonly ActivityItem[],
-): ThreadContentPart {
+): ThreadContentPart[] {
   if (item.kind === "message") {
-    return { type: "text", text: item.text, status: partStatus(item.state) };
+    return [
+      ...(item.text ? [{ type: "text" as const, text: item.text, status: partStatus(item.state) }] : []),
+      ...(item.memoryCitation
+        ? [{ type: "data" as const, name: `${DATA_PREFIX}memory-citation`, data: item.memoryCitation }]
+        : []),
+    ];
   }
   if (item.kind === "reasoning") {
     // Codex projects one thought twice — a `summary-N` labelled "Thinking" and a
     // `raw-N` labelled "Provider reasoning". Dropping the label rendered them as
     // two identical "Reasoning" rows, which reads as a duplicated event. The
     // label is the provider's own, so it travels in `providerMetadata`.
-    return {
+    return [{
       type: "reasoning",
       text: item.text,
       status: partStatus(item.state),
       ...(item.label ? { providerMetadata: { [PART_METADATA_KEY]: { label: item.label } } } : {}),
-    };
+    }];
   }
   if (item.kind === "tool") {
     const hasResult = item.result !== null || item.output.length > 0 || !["pending", "running", "waiting"].includes(item.state);
     const timing = itemTiming(item);
-    return {
+    return [{
       type: "tool-call",
       toolCallId: item.toolCallId,
       toolName: item.name,
@@ -158,21 +164,21 @@ function activityPart(
       ...(hasResult ? { result: item.result ?? item.output } : {}),
       ...(item.state === "failed" ? { isError: true } : {}),
       ...(timing ? { timing } : {}),
-    };
+    }];
   }
   if (item.kind === "subagent") {
     const frame = subagents.get(item.id);
     if (!frame) throw new Error(`Missing subagent frame for ${item.id}`);
-    return { type: "data", name: `${DATA_PREFIX}${item.kind}`, data: frame };
+    return [{ type: "data", name: `${DATA_PREFIX}${item.kind}`, data: frame }];
   }
   if (item.kind === "file-change") {
-    return {
+    return [{
       type: "data",
       name: `${DATA_PREFIX}${item.kind}`,
       data: { ...item, upserting: fileChangeIsUpserting(item, groupItems) },
-    };
+    }];
   }
-  return { type: "data", name: `${DATA_PREFIX}${item.kind}`, data: item };
+  return [{ type: "data", name: `${DATA_PREFIX}${item.kind}`, data: item }];
 }
 
 export function preferredFileChangeItems(items: readonly ActivityItem[]): ActivityFileChangeItem[] {
@@ -244,7 +250,7 @@ function turnFacts(items: readonly ActivityItem[]): TurnFacts | null {
   if (!terminal) return null;
   const startedAt = items.map((item) => item.startedAt).filter((value): value is string => value !== null).sort()[0] ?? null;
   const endedAt = terminal.completedAt ?? terminal.updatedAt;
-  const usage = [...items].reverse().find((item) => item.kind === "usage");
+  const usage = [...items].reverse().find((item) => item.kind === "usage" && item.scope === "turn");
   const counts = diffCounts(items);
   return {
     endedAt,
@@ -302,7 +308,7 @@ function turnTiming(items: readonly ActivityItem[]): MessageTiming | undefined {
   const end = Date.parse(endedAt);
   if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return undefined;
   const elapsed = end - start;
-  const usage = [...items].reverse().find((item) => item.kind === "usage");
+  const usage = [...items].reverse().find((item) => item.kind === "usage" && item.scope === "turn");
   const tokens = usage?.kind === "usage" ? usage.totalTokens : null;
   const outputTokens = usage?.kind === "usage" ? usage.outputTokens : null;
   return {
@@ -335,7 +341,7 @@ function assistantMessage(
     role: "assistant",
     status: messageStatus(state),
     content: [
-      ...rendered.map((item) => activityPart(item, subagents, items)),
+      ...rendered.flatMap((item) => activityParts(item, subagents, items)),
       ...(facts ? [{ type: "data" as const, name: `${DATA_PREFIX}turn-marker`, data: facts }] : []),
     ] satisfies ThreadContent,
     ...(timing ? { metadata: { custom: {}, timing } } : {}),
@@ -343,44 +349,43 @@ function assistantMessage(
   };
 }
 
-/**
- * Deterministic intra-turn bands. Turn lifecycle and aggregate facts move to
- * their semantic edges, but messages, reasoning, and tools share the body band
- * so a recorded message can never be moved across tool calls. That boundary is
- * what keeps separate tool runs from collapsing into one per-turn group.
- *
- * The todo list and the turn diff are turn *artifacts*, not steps: a provider
- * emits one of each per turn (`todoKey = turnId`, and `preferredFileChangeItems`
- * reduces the rest to a single aggregate), and `ActivityHub` pins them to the
- * seq of their first upsert — which is wherever the first `TodoWrite` or patch
- * landed, in the middle of a tool run. Left inline they split that run on every
- * edit, because adjacent-prefix grouping closes a group at the first part that
- * is not a tool call. Banding them with the other turn facts is what lets a
- * run of tool calls stay one group.
- */
-function turnRank(
-  item: ActivityItem,
-  initialUserId: string | null,
-): number {
-  if (initialUserId !== null && item.id === initialUserId) return 0;
-  if (item.kind === "lifecycle") {
-    if (item.event === "turn-started") return 1;
-    // The event list directly, not `isTurnEnd`: its guard narrows to the whole
-    // lifecycle type, so the negative branch would leave nothing behind it.
-    if (TURN_END_EVENTS.includes(item.event)) return 5;
-    /*
-      A provider status line — a hook firing, a compaction, the session going
-      idle — is a fact about the turn, not a step in it. Left in the body band
-      it read as work and, because adjacent-prefix grouping closes a group at
-      the first part that is not a tool call, one hook notification mid-run
-      split the run in two. `warning` and `error` stay in the body: those are
-      about the work and belong where the work is.
-    */
-    return item.level === "info" ? 4 : 2;
+/** Keep provider chronology intact, moving only aggregate turn artifacts. */
+function semanticTurnOrder(items: readonly ActivityItem[]): ActivityItem[] {
+  const ordered = [...items];
+  const userIndex = ordered.findIndex((item) => item.kind === "message" && item.role === "user");
+  if (userIndex > 0) {
+    const leadingStart = ordered.slice(0, userIndex).findIndex((item) => (
+      item.kind === "lifecycle" && item.event === "turn-started"
+    ));
+    if (leadingStart >= 0) {
+      const [user] = ordered.splice(userIndex, 1);
+      if (user) ordered.splice(leadingStart, 0, user);
+    }
   }
-  if (item.kind === "todo" || item.kind === "file-change") return 4;
-  if (item.kind === "usage") return 5;
-  return 2;
+
+  const latestTurnUsage = [...ordered].reverse().find((item) => (
+    item.kind === "usage" && item.scope === "turn"
+  ));
+  const artifacts = ordered.filter((item) => (
+    item.kind === "todo"
+    || item.kind === "file-change"
+    || (item.kind === "usage" && item.id === latestTurnUsage?.id)
+  ));
+  const body = ordered.filter((item) => (
+    item.kind !== "todo"
+    && item.kind !== "file-change"
+    && item.kind !== "usage"
+  ));
+  return [...body, ...artifacts];
+}
+
+function stableAssistantMessageId(turnKey: string, boundaryId: string): string {
+  let hash = 2_166_136_261;
+  for (const character of `${turnKey}\u0000${boundaryId}`) {
+    hash ^= character.codePointAt(0) ?? 0;
+    hash = Math.imul(hash, 16_777_619);
+  }
+  return `assistant:${(hash >>> 0).toString(36)}`;
 }
 
 /**
@@ -419,21 +424,16 @@ function messagesForTurn(turnKey: string, source: readonly ActivityItem[]): Thre
   const turnFactItems = source.filter((item) => item.kind !== "file-change" || turnFactFileIds.has(item.id));
   const preferredFileIds = new Set(preferredFileChangeItems(hierarchy.topLevelItems).map((item) => item.id));
   const ordered = hierarchy.topLevelItems
-    .filter((item) => item.kind !== "file-change" || preferredFileIds.has(item.id))
-    .sort((left, right) => left.seq - right.seq || left.id.localeCompare(right.id));
-  const initialUser = ordered.find((item) => item.kind === "message" && item.role === "user");
-  const semantic = placeUnderParent([...ordered].sort((left, right) =>
-    turnRank(left, initialUser?.id ?? null) - turnRank(right, initialUser?.id ?? null)
-    || left.seq - right.seq
-    || left.id.localeCompare(right.id)));
+    .filter((item) => item.kind !== "file-change" || preferredFileIds.has(item.id));
+  const semantic = placeUnderParent(semanticTurnOrder(ordered));
   const result: ThreadMessageLike[] = [];
   let assistantItems: ActivityItem[] = [];
-  let segment = 0;
+  let boundaryId = semantic[0]?.id ?? turnKey;
   const flush = () => {
     const includesTurnEnd = assistantItems.some((item) => item.kind === "lifecycle"
       && ["turn-completed", "turn-failed", "turn-interrupted"].includes(item.event));
     const message = assistantMessage(
-      `turn:${encodeURIComponent(turnKey)}:assistant:${segment++}`,
+      stableAssistantMessageId(turnKey, boundaryId),
       assistantItems,
       hierarchy.frames,
       includesTurnEnd ? turnFactItems : assistantItems,
@@ -444,6 +444,7 @@ function messagesForTurn(turnKey: string, source: readonly ActivityItem[]): Thre
   for (const item of semantic) {
     if (item.kind === "message" && item.role === "user") {
       flush();
+      boundaryId = item.id;
       result.push({
         id: item.id,
         role: "user",
@@ -452,6 +453,7 @@ function messagesForTurn(turnKey: string, source: readonly ActivityItem[]): Thre
       });
     } else if (item.kind === "message" && item.role === "system") {
       flush();
+      boundaryId = item.id;
       result.push({
         id: item.id,
         role: "system",
@@ -474,29 +476,22 @@ function messagesForTurn(turnKey: string, source: readonly ActivityItem[]): Thre
  * A turn key per item, in stream order. A stated `turnId` always wins; nothing
  * here invents one.
  *
- * Not every source states a turn. The transcript reader has no turn concept at
- * all (`TranscriptItem` carries none, so every draft materializes with
- * `turnId: null`), and keying those items individually put each one in a turn
- * of its own — one assistant message per item, which left the grouping
- * primitive nothing adjacent to coalesce and rendered every tool call as its
- * own "1 tool call" shell. Adjacent unassociated items share a synthetic turn
- * instead, broken only where a boundary is actually observable: an operator
- * message opens the next turn, and a turn-end lifecycle event closes the
- * current one.
+ * Older transcripts and provider-level diagnostics can still lack a turn id.
+ * Adjacent unassociated items share one stable synthetic turn, broken only at
+ * an observable operator-message or turn-end boundary.
  */
 function turnKeys(ordered: readonly ActivityItem[]): readonly string[] {
   const keys: string[] = [];
   let open: string | null = null;
-  let run = 0;
   for (const item of ordered) {
     if (item.turnId !== null) {
       keys.push(item.turnId);
-      open = null;
+      open = item.turnId;
+      if (isTurnEnd(item)) open = null;
       continue;
     }
     if (open === null || (item.kind === "message" && item.role === "user")) {
-      run += 1;
-      open = `unassociated:${run}`;
+      open = `synthetic:${item.id}`;
     }
     keys.push(open);
     if (isTurnEnd(item)) open = null;
@@ -506,10 +501,10 @@ function turnKeys(ordered: readonly ActivityItem[]): readonly string[] {
 
 /** Projects only the canonical selected-session activity stream. */
 export function activityToThreadMessages(items: readonly ActivityItem[]): ThreadMessageLike[] {
-  const ordered = [...items].sort((left, right) => left.seq - right.seq || left.id.localeCompare(right.id));
+  const ordered = [...items];
   const keys = turnKeys(ordered);
   const turns = new Map<string, ActivityItem[]>();
-  const entries: Array<{ seq: number; order: number; key: string; items: ActivityItem[] }> = [];
+  const entries: Array<{ order: number; key: string; items: ActivityItem[] }> = [];
   ordered.forEach((item, order) => {
     const key = keys[order]!;
     const previous = turns.get(key);
@@ -517,12 +512,10 @@ export function activityToThreadMessages(items: readonly ActivityItem[]): Thread
     else {
       const grouped = [item];
       turns.set(key, grouped);
-      entries.push({ seq: item.seq, order, key, items: grouped });
+      entries.push({ order, key, items: grouped });
     }
   });
-  return entries
-    .sort((left, right) => left.seq - right.seq || left.order - right.order)
-    .flatMap((entry) => messagesForTurn(entry.key, entry.items));
+  return entries.flatMap((entry) => messagesForTurn(entry.key, entry.items));
 }
 
 export function exactCurrentActivityRequestIds(items: readonly ActivityItem[]): ReadonlySet<string> {
@@ -770,8 +763,35 @@ function Plan({ item, controls }: { item: Extract<ActivityItem, { kind: "plan" }
   } : {})} />{item.truncated && <p className="mt-1 text-code-sm text-[var(--warning)]">The plan is truncated.</p>}</div>;
 }
 
+function MemoryCitationSources({ citation }: { citation: ActivityMemoryCitation }) {
+  const count = citation.entries.length;
+  return (
+    <details className="my-2 text-code-xs text-[var(--text-muted)]" data-memory-citation>
+      <summary className="flex cursor-pointer list-none items-center gap-2 rounded px-1 py-1 hover:bg-[var(--surface-raised)]">
+        <BookOpen size={13} aria-hidden="true" />
+        <span>Memory sources</span>
+        <span aria-label={`${count} ${count === 1 ? "source" : "sources"}`}>· {count}</span>
+      </summary>
+      <div className="ml-5 mt-1 grid gap-1 border-l border-[var(--border)] pl-3">
+        {citation.entries.map((entry) => (
+          <p key={`${entry.path}:${entry.lineStart}:${entry.lineEnd}:${entry.note}`}>
+            <span className="break-all text-[var(--text)]">{entry.path}:{entry.lineStart}-{entry.lineEnd}</span>
+            {entry.note && <span className="ml-2">{entry.note}</span>}
+          </p>
+        ))}
+        {citation.rolloutIds.length > 0 && (
+          <p className="break-all">Rollouts: {citation.rolloutIds.join(", ")}</p>
+        )}
+      </div>
+    </details>
+  );
+}
+
 export function renderActivityData(name: string, data: unknown, controls: ActivityDataControls): ReactNode {
   if (name === `${DATA_PREFIX}turn-marker`) return <TurnMarker facts={data as TurnFacts} />;
+  if (name === `${DATA_PREFIX}memory-citation`) {
+    return <MemoryCitationSources citation={data as ActivityMemoryCitation} />;
+  }
   const item = data as ActivityItem;
   if (!item || typeof item !== "object" || !("kind" in item)) return null;
   switch (item.kind) {

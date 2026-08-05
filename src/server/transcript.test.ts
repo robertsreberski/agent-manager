@@ -183,6 +183,30 @@ test("Codex reads ordered user/assistant response items and ignores provider int
   assert.equal(result.items[0]?.correlationId, "message:user-provider-id");
 });
 
+test("Codex transcript separates a trailing memory citation from visible assistant text", () => {
+  const fixture = codexFixture([
+    codexMeta(),
+    codexMessage("assistant", `Remembered answer.
+<oai-mem-citation>
+<citation_entries>
+MEMORY.md:10-12|note=[workspace decision]
+</citation_entries>
+<rollout_ids>
+019fcbd5-7a38-7c31-a5f7-e199f5b06f4e
+</rollout_ids>
+</oai-mem-citation>`, { id: "cited-message" }),
+  ]);
+  const result = new LocalSessionTranscriptReader({ codexHome: fixture.home }).read(codexSession());
+  const message = result.items[0];
+  assert.equal(message?.kind, "message");
+  if (message?.kind !== "message") return;
+  assert.equal(message.text, "Remembered answer.");
+  assert.deepEqual(message.memoryCitation, {
+    entries: [{ path: "MEMORY.md", lineStart: 10, lineEnd: 12, note: "workspace decision" }],
+    rolloutIds: ["019fcbd5-7a38-7c31-a5f7-e199f5b06f4e"],
+  });
+});
+
 test("Codex derives the same turn-scoped message identity as hooks without merging repeated prompts", () => {
   const firstTurn = "turn-11111111-1111-4111-8111-111111111111";
   const secondTurn = "turn-22222222-2222-4222-8222-222222222222";
@@ -541,9 +565,9 @@ test("Claude follows the latest parentUuid branch and renders only human-visible
     result.items.flatMap((item) => (item.kind === "message" ? [{ id: item.id, role: item.role, text: item.text }] : [])),
     [
       { id: "claude:u1", role: "user", text: "Hello" },
-      { id: "claude:msg-one", role: "assistant", text: "Visible answer" },
+      { id: "claude:a1:text:0", role: "assistant", text: "Visible answer" },
       { id: "claude:u2", role: "user", text: "Continue" },
-      { id: "claude:msg-two", role: "assistant", text: "Done" },
+      { id: "claude:a2:text:0", role: "assistant", text: "Done" },
     ],
   );
 });
@@ -620,11 +644,11 @@ test("Claude exposes thinking blocks and paired tool_use/tool_result as transcri
   assert.equal(result.transcript.state, "available");
   assert.deepEqual(result.items.map((item) => [item.kind, item.id]), [
     ["message", "claude:u1"],
-    ["reasoning", "claude:msg-one:thinking:0"],
-    ["message", "claude:msg-one"],
+    ["reasoning", "claude:a1:thinking:0"],
+    ["message", "claude:a1:text:1"],
     ["tool", "claude:tool:toolu_01"],
     ["tool", "claude:tool:toolu_02"],
-    ["message", "claude:msg-three"],
+    ["message", "claude:a3:text:0"],
   ]);
 
   const reasoning = result.items[1];

@@ -35,6 +35,7 @@ function message(overrides: Partial<ActivityMessageItem> = {}): ActivityMessageI
     phase: "commentary",
     text: "Streaming",
     label: null,
+    memoryCitation: null,
     ...overrides,
   };
 }

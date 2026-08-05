@@ -99,7 +99,7 @@ function snapshot(): unknown {
 
 test("parses the exact current wire epoch", () => {
   const parsed = parseStateSnapshot(snapshot());
-  assert.equal(parsed.schemaVersion, 6);
+  assert.equal(parsed.schemaVersion, 7);
   assert.equal(parsed.buildId, AGENT_MANAGER_BUILD_ID);
   assert.equal(parsed.sessions[0]?.providerThreadId, "thread-1");
   assert.equal(parsed.sessions[0]?.id, sessionRecordId("local", "codex", "thread-1"));

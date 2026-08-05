@@ -1,7 +1,8 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { chmod, lstat, mkdir, unlink } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { promisify } from "node:util";
 
 import { CodexManagedAdapter } from "./adapter.ts";
 import type { MessageTransport } from "./rpc.ts";
@@ -41,6 +42,7 @@ export interface CodexAppServerSupervisorOptions {
     env: NodeJS.ProcessEnv,
   ) => ManagedChildProcess;
   connect?: (socketPath: string) => Promise<MessageTransport>;
+  inspectLiveListener?: (socketPath: string) => Promise<CodexLiveListener | null>;
   probeVersion?: (executable: string) => Promise<string | null>;
   now?: () => Date;
   /** Maximum automatic restart attempts after a previously-running child exits. */
@@ -54,6 +56,11 @@ export interface CodexAppServerSupervisorOptions {
     attempt: number,
   ) => CodexRecoveryPublication | void | Promise<CodexRecoveryPublication | void>;
   onRecoveryFailed?: (event: CodexRecoveryFailure) => void;
+}
+
+export interface CodexLiveListener {
+  pid: number;
+  command: string;
 }
 
 export interface CodexUnexpectedExit {
@@ -174,6 +181,49 @@ function withAbort<T>(
 
 type UnixSocketProbe = "live" | "dead" | "missing";
 
+const execFileAsync = promisify(execFile);
+
+async function inspectCodexListener(socketPath: string): Promise<CodexLiveListener | null> {
+  let lsofOutput: string;
+  try {
+    ({ stdout: lsofOutput } = await execFileAsync(
+      "/usr/sbin/lsof",
+      ["-nP", "-a", "-U", "-Fpcn", "--", socketPath],
+      { encoding: "utf8", maxBuffer: 64 * 1024 },
+    ));
+  } catch {
+    return null;
+  }
+  const lines = lsofOutput.split(/\r?\n/u);
+  const pid = Number(lines.find((line) => /^p\d+$/u.test(line))?.slice(1));
+  const commandName = lines.find((line) => line.startsWith("c"))?.slice(1) ?? "";
+  if (!Number.isSafeInteger(pid) || pid <= 0 || commandName !== "codex") return null;
+
+  let processOutput: string;
+  try {
+    ({ stdout: processOutput } = await execFileAsync(
+      "/bin/ps",
+      ["-ww", "-p", String(pid), "-o", "uid=", "-o", "command="],
+      { encoding: "utf8", maxBuffer: 64 * 1024 },
+    ));
+  } catch {
+    return null;
+  }
+  const match = processOutput.trim().match(/^(\d+)\s+([\s\S]+)$/u);
+  if (!match) return null;
+  const uid = Number(match[1]);
+  const command = match[2]!.trim();
+  if (typeof process.getuid === "function" && uid !== process.getuid()) return null;
+  const escapedSocket = `unix://${socketPath}`;
+  const executable = command.split(/\s+/u, 1)[0] ?? "";
+  if (
+    !(executable === "codex" || executable.endsWith("/codex"))
+    || !command.includes(" app-server ")
+    || !command.includes(` --listen ${escapedSocket}`)
+  ) return null;
+  return { pid, command };
+}
+
 /**
  * Probe the exact Unix-domain socket directly. A successful connection is
  * authoritative evidence of a live listener. Only ECONNREFUSED proves that a
@@ -270,6 +320,9 @@ export class CodexAppServerSupervisor {
   #terminalFailure: CodexRecoveryFailure | null = null;
   #stopping = false;
   #ownsSocket = false;
+  #adoptedListener = false;
+  #adoptedPid: number | null = null;
+  #removeAdoptedCloseListener: (() => void) | null = null;
   #attemptAbort: AbortController | null = null;
   #startTask: Promise<CodexManagedAdapter> | null = null;
   #recoveryTask: Promise<void> | null = null;
@@ -336,7 +389,7 @@ export class CodexAppServerSupervisor {
   get state(): CodexSupervisorState {
     return {
       status: this.#status,
-      pid: this.#child?.pid ?? null,
+      pid: this.#child?.pid ?? this.#adoptedPid,
       socketPath: this.socketPath,
       stderrTail: this.#stderrTail,
       exitCode: this.#exitCode,
@@ -420,6 +473,9 @@ export class CodexAppServerSupervisor {
       try {
         const adapter = await this.#launchInitialized(controller.signal);
         controller.signal.throwIfAborted();
+        if (this.#initializingAdapter !== adapter || (!this.#child && !this.#adoptedListener)) {
+          throw new Error("Codex App Server exited before startup publication");
+        }
         this.#initializingAdapter = null;
         this.#adapter = adapter;
         this.#status = "running";
@@ -492,6 +548,10 @@ export class CodexAppServerSupervisor {
 
       const adapter = this.#adapter;
       this.#adapter = null;
+      this.#removeAdoptedCloseListener?.();
+      this.#removeAdoptedCloseListener = null;
+      this.#adoptedListener = false;
+      this.#adoptedPid = null;
       if (adapter) await adapter.dispose().catch(() => undefined);
       await this.#terminateChild(this.#child);
       await this.#removeOwnedSocket();
@@ -521,7 +581,8 @@ export class CodexAppServerSupervisor {
   async #launchInitialized(signal: AbortSignal): Promise<CodexManagedAdapter> {
     await this.#prepareRuntimeDirectory();
     signal.throwIfAborted();
-    await this.#reclaimStaleSocket(signal);
+    const liveSocket = await this.#liveSocketInfo(signal);
+    if (!liveSocket) await this.#reclaimStaleSocket(signal);
     signal.throwIfAborted();
 
     const probe = this.#options.probeVersion ?? probeCodexVersion;
@@ -532,6 +593,38 @@ export class CodexAppServerSupervisor {
       );
     }
     signal.throwIfAborted();
+
+    if (liveSocket) {
+      this.#ownsSocket = false;
+      const inspect = this.#options.inspectLiveListener ?? inspectCodexListener;
+      const listener = await withAbort(inspect(this.socketPath), signal);
+      if (!listener) {
+        throw new Error(
+          `Refusing to connect to or replace an existing Codex socket with a live listener: ${this.socketPath}; the listener process is not the expected same-user Codex App Server`,
+        );
+      }
+      const connect = this.#options.connect ?? ((socketPath: string) =>
+        UnixWebSocketTransport.connect({ socketPath })
+      );
+      let transport: MessageTransport;
+      try {
+        transport = await withAbort(
+          connect(this.socketPath),
+          signal,
+          (lateTransport) => void lateTransport.close().catch(() => undefined),
+        );
+      } catch (error) {
+        throw new Error(
+          `Refusing to connect to or replace an existing Codex socket with a live listener: ${this.socketPath}; the listener did not accept the Codex App Server transport: ${errorMessage(error)}`,
+          { cause: error },
+        );
+      }
+      const adapter = await this.#initializeTransport(transport, signal);
+      this.#adoptedListener = true;
+      this.#adoptedPid = listener.pid;
+      this.#observeAdoptedAdapter(adapter);
+      return adapter;
+    }
 
     this.#stderrTail = "";
     this.#exitCode = null;
@@ -548,6 +641,20 @@ export class CodexAppServerSupervisor {
 
     const transport = await this.#connectUntilReady(child, signal);
     signal.throwIfAborted();
+    const adapter = await this.#initializeTransport(transport, signal);
+    if (this.#child !== child || this.#reportedUnexpectedChildren.has(child)) {
+      throw new Error(
+        this.#startupFailureMessage() ??
+          "Codex App Server exited while the adapter was initializing",
+      );
+    }
+    return adapter;
+  }
+
+  async #initializeTransport(
+    transport: MessageTransport,
+    signal: AbortSignal,
+  ): Promise<CodexManagedAdapter> {
     const adapter = new CodexManagedAdapter({
       transport,
       socketPath: this.socketPath,
@@ -559,13 +666,42 @@ export class CodexAppServerSupervisor {
     if ((this.#options.strictVersion ?? true) && !capabilities.compatible) {
       throw new Error(capabilities.reason ?? "Codex App Server is incompatible");
     }
-    if (this.#child !== child || this.#reportedUnexpectedChildren.has(child)) {
-      throw new Error(
-        this.#startupFailureMessage() ??
-          "Codex App Server exited while the adapter was initializing",
-      );
-    }
     return adapter;
+  }
+
+  #observeAdoptedAdapter(adapter: CodexManagedAdapter): void {
+    this.#removeAdoptedCloseListener?.();
+    this.#removeAdoptedCloseListener = adapter.rpc.onClose((error) => {
+      if (this.#stopping || (!this.#adoptedListener && this.#adapter !== adapter)) return;
+      this.#adoptedListener = false;
+      this.#adoptedPid = null;
+      this.#removeAdoptedCloseListener?.();
+      this.#removeAdoptedCloseListener = null;
+      const message = error?.message || "Codex App Server connection closed";
+      const wasRunning = this.#status === "running";
+      if (this.#adapter === adapter) this.#adapter = null;
+      if (this.#initializingAdapter === adapter) this.#initializingAdapter = null;
+      this.#status = wasRunning || this.#recoveryTask ? "recovering" : "failed";
+      const event: CodexUnexpectedExit = {
+        occurredAt: this.#now().toISOString(),
+        code: null,
+        signal: null,
+        message,
+        stderrTail: this.#stderrTail,
+        wasRunning,
+      };
+      this.#lastUnexpectedExit = event;
+      for (const listener of this.#unexpectedExitListeners) {
+        try {
+          listener({ ...event });
+        } catch {
+          // A diagnostic consumer cannot compromise listener recovery.
+        }
+      }
+      adapter.markRuntimeUnavailable(new Error(message));
+      void adapter.dispose().catch(() => undefined);
+      if (wasRunning) this.#scheduleRecovery();
+    });
   }
 
   #observeChild(child: ManagedChildProcess): void {
@@ -608,6 +744,24 @@ export class CodexAppServerSupervisor {
       if (errorCode(error) === "ENOENT") return null;
       throw error;
     }
+  }
+
+  async #liveSocketInfo(signal?: AbortSignal): Promise<boolean> {
+    const original = await this.#socketInfo();
+    if (!original) return false;
+    this.#validateSocketForCleanup(original);
+    if (await probeUnixSocket(this.socketPath, signal) !== "live") return false;
+
+    // Do not adopt a listener that swapped the pathname while it was probed.
+    const current = await this.#socketInfo();
+    if (!current) return false;
+    this.#validateSocketForCleanup(current);
+    if (current.dev !== original.dev || current.ino !== original.ino) {
+      throw new Error(
+        `Refusing to connect to a Codex socket that changed during validation: ${this.socketPath}`,
+      );
+    }
+    return true;
   }
 
   async #reclaimStaleSocket(signal?: AbortSignal): Promise<void> {
@@ -702,6 +856,10 @@ export class CodexAppServerSupervisor {
   }
 
   async #cleanupFailedAttempt(): Promise<void> {
+    this.#removeAdoptedCloseListener?.();
+    this.#removeAdoptedCloseListener = null;
+    this.#adoptedListener = false;
+    this.#adoptedPid = null;
     const adapter = this.#initializingAdapter;
     this.#initializingAdapter = null;
     if (adapter) await adapter.dispose().catch(() => undefined);
@@ -834,7 +992,7 @@ export class CodexAppServerSupervisor {
             signal.throwIfAborted();
           }
         }
-        if (this.#initializingAdapter !== adapter || !this.#child) {
+        if (this.#initializingAdapter !== adapter || (!this.#child && !this.#adoptedListener)) {
           throw new Error("Codex recovery was superseded before publication");
         }
         this.#initializingAdapter = null;
