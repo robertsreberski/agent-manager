@@ -163,6 +163,51 @@ export function displayDuration(timing: { startedAt: number; completedAt?: numbe
   return elapsed < 1_000 ? `${Math.round(elapsed)}ms` : `${(elapsed / 1_000).toFixed(elapsed < 10_000 ? 1 : 0)}s`;
 }
 
+interface GroupedPart {
+  type: string;
+}
+
+/**
+ * True when no tool call in the message comes after this group.
+ *
+ * All tool calls sit in the same intra-turn band, and `turnRank` sorts the
+ * turn's artifacts — the todo list, the turn diff, usage, the lifecycle events —
+ * behind them, so "no `tool-call` part at a higher index" identifies the run the
+ * provider is still adding to. A `TodoWrite` landing mid-run does not disturb it.
+ */
+export function isTrailingToolRun(
+  parts: readonly GroupedPart[],
+  indices: readonly number[],
+): boolean {
+  const last = indices.at(-1) ?? -1;
+  return !parts.some((part, index) => part.type === "tool-call" && index > last);
+}
+
+/**
+ * Whether a run is still in motion, which is not the same question as whether
+ * any of its calls is running right now.
+ *
+ * A provider goes quiet between calls: the moment the last call reports its
+ * result every part in the group reads `complete`, and deriving the group's
+ * open state from that alone collapsed the panel in every gap and reopened it
+ * on the next call — once per tool, for the length of the turn. A run whose
+ * turn is still going and which nothing has been appended after is a run the
+ * next call is about to join, so it stays active.
+ *
+ * Only the trailing run: a run that a message or a thought already closed is
+ * genuinely finished, and holding every group of a long turn open would bury
+ * the turn in its own detail.
+ */
+export function toolRunActive(
+  status: { type: string },
+  parts: readonly GroupedPart[],
+  indices: readonly number[],
+  turnInMotion: boolean,
+): boolean {
+  if (status.type !== "complete") return true;
+  return turnInMotion && isTrailingToolRun(parts, indices);
+}
+
 interface TimedGroupPart {
   type: string;
   timing?: { startedAt: number; completedAt?: number } | undefined;

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { displayDuration, groupActivityPart, toolCallDetail, toolGroupTiming } from "./grouping";
+import { displayDuration, groupActivityPart, isTrailingToolRun, toolCallDetail, toolGroupTiming, toolRunActive } from "./grouping";
 
 describe("activity grouping", () => {
   it("groups only adjacent thought/tool and one-level subagent parts", () => {
@@ -25,6 +25,46 @@ describe("activity grouping", () => {
       { type: "tool-call", timing: { startedAt: 1_600 } },
     ], [1, 2])).toBeUndefined();
     expect(toolGroupTiming(parts, [0])).toBeUndefined();
+  });
+});
+
+/*
+  A run goes quiet between calls: the moment the last call reports its result
+  every part in the group reads `complete`, which is indistinguishable from the
+  run having finished. Taking the group's hold from that alone collapsed the
+  panel in every gap and reopened it on the next call — once per tool, for the
+  length of the turn. The turn's own status is what tells the two apart.
+*/
+describe("tool run activity", () => {
+  const settledRun = [
+    { type: "reasoning" },
+    { type: "tool-call" },
+    { type: "tool-call" },
+  ];
+
+  it("treats a run as trailing until a later tool call joins the message", () => {
+    expect(isTrailingToolRun(settledRun, [1, 2])).toBe(true);
+    // The turn's artifacts — the todo list, the diff, usage, lifecycle — are
+    // banded behind every tool call, so they never close the trailing run.
+    expect(isTrailingToolRun([...settledRun, { type: "data" }], [1, 2])).toBe(true);
+    expect(isTrailingToolRun([...settledRun, { type: "text" }, { type: "tool-call" }], [1, 2])).toBe(false);
+    expect(isTrailingToolRun(settledRun, [])).toBe(false);
+  });
+
+  it("holds a settled trailing run while the turn is still in motion", () => {
+    expect(toolRunActive({ type: "complete" }, settledRun, [1, 2], true)).toBe(true);
+    expect(toolRunActive({ type: "complete" }, settledRun, [1, 2], false)).toBe(false);
+  });
+
+  it("releases a run that a later part already closed, even mid-turn", () => {
+    const parts = [...settledRun, { type: "text" }, { type: "tool-call" }];
+    expect(toolRunActive({ type: "complete" }, parts, [1, 2], true)).toBe(false);
+    expect(toolRunActive({ type: "complete" }, parts, [4], true)).toBe(true);
+  });
+
+  it("holds a run whose own calls are running whatever the turn reports", () => {
+    expect(toolRunActive({ type: "running" }, settledRun, [1, 2], false)).toBe(true);
+    expect(toolRunActive({ type: "requires-action" }, settledRun, [1, 2], false)).toBe(true);
   });
 });
 
