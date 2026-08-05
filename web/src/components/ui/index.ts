@@ -76,3 +76,4 @@ export {
   type SheetContentProps,
 } from "./sheet";
 export { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./tooltip";
+export { Popover, PopoverAnchor, PopoverContent, PopoverTrigger } from "./popover";

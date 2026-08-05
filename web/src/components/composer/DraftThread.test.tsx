@@ -74,13 +74,14 @@ describe("DraftThread", () => {
       onFirstSend={vi.fn()}
     />);
 
-    // The runtime menu is a Radix dropdown: it opens on pointerdown.
-    const trigger = screen.getByRole("button", { name: /codex/i });
+    const trigger = screen.getByRole("combobox", { name: /codex/i });
     fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false, pointerId: 1 });
     fireEvent.click(trigger);
-    expect(screen.getByRole("menuitemradio", { name: "ultra effort" })).toBeInTheDocument();
-    expect(screen.queryByRole("menuitemradio", { name: "medium effort" })).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("menuitemradio", { name: /GPT Live/u }));
+    // Effort is a radiogroup beside the model list, and only the levels the
+    // provider's catalog declared for the selected model are offered.
+    expect(screen.getByRole("radio", { name: /ultra/i })).toBeInTheDocument();
+    expect(screen.queryByRole("radio", { name: /medium/i })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("option", { name: /GPT Live/u }));
     expect(dispatch).toHaveBeenCalledWith({ type: "set-model", model: "gpt-live" });
     expect(screen.queryByText("default-model")).not.toBeInTheDocument();
   });

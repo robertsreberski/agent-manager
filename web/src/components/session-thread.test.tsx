@@ -49,8 +49,8 @@ describe("SessionThreadComposer", () => {
 
     expect(screen.getByLabelText("1 queued message")).toHaveTextContent("1 queued");
     expect(screen.queryByText("Do not duplicate this bubble")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /codex/i })).toBeDisabled();
-    expect(screen.getByRole("button", { name: /codex/i })).toHaveAttribute("title", "The hook can observe the model but cannot change it.");
+    expect(screen.getByRole("combobox", { name: /codex/i })).toBeDisabled();
+    expect(screen.getByRole("combobox", { name: /codex/i })).toHaveAttribute("title", "The hook can observe the model but cannot change it.");
     expect(screen.getByRole("button", { name: /execute/i })).toBeDisabled();
     expect(screen.getByRole("button", { name: /execute/i })).toHaveAttribute("title", "The hook exposes no profile control.");
     expect(document.querySelector("[data-withheld-reasons]"))
@@ -121,7 +121,7 @@ describe("SessionThreadComposer", () => {
       modelOptionsStatus={null}
     />);
 
-    const trigger = screen.getByRole("button", { name: /codex/i });
+    const trigger = screen.getByRole("combobox", { name: /codex/i });
     expect(trigger).toBeEnabled();
     // The composer's menus are Radix dropdowns now: they open on pointerdown,
     // and a withheld choice is an `aria-disabled` menu item rather than a
@@ -129,8 +129,8 @@ describe("SessionThreadComposer", () => {
     // readable and every row in it is unwritable.
     fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false, pointerId: 1 });
     fireEvent.click(trigger);
-    const menu = screen.getByRole("menu", { name: "Harness, model, and effort" });
-    expect(within(menu).getByRole("menuitemradio", { name: /Live/u })).toHaveAttribute("aria-disabled", "true");
+    const menu = document.querySelector<HTMLElement>('[data-slot="model-selector-content"]')!;
+    expect(within(menu).getByRole("option", { name: /Live/u })).toHaveAttribute("aria-disabled", "true");
     expect(menu).toHaveTextContent("The hook can observe the model but cannot change it.");
   });
 });

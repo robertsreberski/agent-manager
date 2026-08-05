@@ -4,6 +4,14 @@ import type { ReasoningEffort } from "@shared/session";
 import type { CockpitProvider, ExecutionProfile } from "../../lib/cockpit-view";
 import { isTypingTarget } from "../../lib/shortcuts";
 import {
+  ModelSelectorContent,
+  ModelSelectorEffort,
+  ModelSelectorList,
+  ModelSelectorRoot,
+  ModelSelectorTrigger,
+  type ModelOption as ModelSelectorOption,
+} from "../assistant-ui/model-selector";
+import {
   applyCompletion,
   completionTrigger,
   composerPlaceholder,
@@ -14,12 +22,12 @@ import {
   Button,
   DropdownMenu,
   DropdownMenuContent,
-  DropdownMenuItem,
   DropdownMenuRadioGroup,
   DropdownMenuRadioItem,
-  DropdownMenuSeparator,
   DropdownMenuShortcut,
   DropdownMenuTrigger,
+  RadioGroup,
+  RadioGroupItem,
 } from "../ui";
 
 /*
@@ -132,6 +140,25 @@ export function SessionComposer(props: SessionComposerProps) {
     runtimeDisabled ? runtimeDisabledReason : null,
     profileDisabled ? profileDisabledReason : null,
   ].flatMap((reason) => reason && reason !== readOnlyReason ? [reason] : []))];
+  /*
+    The provider's catalog in the selector's shape. Efforts hang off the model
+    because that is where the component looks for them, and a model the harness
+    will not let this cockpit write is still worth reading — it appears
+    disabled, with the reason stated below the list.
+  */
+  const selectorModels: ModelSelectorOption[] = modelOptions.map((option) => ({
+    id: option.value,
+    name: option.label,
+    // The id disambiguates two models with the same friendly name, so it stays
+    // visible — the menu this replaced printed it on its own line — and it is
+    // searchable alongside the label.
+    description: option.description ? `${option.value} · ${option.description}` : option.value,
+    keywords: [option.value],
+    ...(onModelChange ? {} : { disabled: true }),
+    ...(effortOptions.length > 0
+      ? { efforts: effortOptions.map((level) => ({ id: level, name: level })) }
+      : {}),
+  }));
   const sendDisabled = busy || value.trim().length === 0 || !canQueue;
   useEffect(() => {
     const element = textareaRef.current;
@@ -307,77 +334,70 @@ export function SessionComposer(props: SessionComposerProps) {
         placeholder={readOnlyReason ? "This session is read-only" : isRunning ? "Queue a message…" : composerPlaceholder(provider, Boolean(onSearchFiles))}
       />
       <div className="flex min-w-0 items-center gap-2.5 sm:gap-3.5">
-        <DropdownMenu open={openMenu === "runtime"} onOpenChange={(next) => setOpenMenu(next ? "runtime" : null)}>
-          <DropdownMenuTrigger asChild disabled={runtimeDisabled}>
-            <Button
-              variant="ghost"
-              size="sm"
-              data-compact-control
-              className={`h-auto min-h-8 min-w-0 justify-start rounded-full px-1.5 text-left text-meta data-[state=open]:bg-[var(--surface-selected)] sm:px-2 ${KEEPS_ITS_TOOLTIP}`}
-              title={runtimeDisabled ? runtimeDisabledReason : undefined}
-            >
-              {/* Frames 5a, 9a-2 and 9b fill this tile lime, with the CodeXml glyph. */}
-              <span className="grid size-[17px] shrink-0 place-items-center bg-[var(--accent)] text-[var(--accent-ink)]" data-provider-mark>
-                <CodeXml size={11} strokeWidth={2} />
-              </span>
-              <span className="shrink-0 font-medium capitalize">{provider}</span>
-              {model && <span className="hidden min-w-0 max-w-28 truncate text-[var(--text-muted)] sm:inline">{model}</span>}
-            </Button>
-          </DropdownMenuTrigger>
-          {/* Radix names a menu after its trigger; "codex gpt-5" is a worse
-              label for this menu than what it actually contains. */}
-          <DropdownMenuContent side="top" align="start" aria-labelledby={undefined} aria-label="Harness, model, and effort" className="max-w-[22rem] min-w-64">
+        {/*
+          assistant-ui's ModelSelector, composed rather than taken whole: its
+          default export registers the selection into `ModelContext`, where it
+          would ride on `config.modelName` in every chat request. A model change
+          here is an explicit, capability-gated action against the harness, so
+          that registration must not happen.
+
+          The component has no notion of a withheld capability, so the gate
+          stays outside it — the trigger is disabled with the harness's own
+          reason, and that reason is also stated as text above, because a native
+          tooltip is invisible on touch and to screen readers.
+        */}
+        <ModelSelectorRoot
+          models={selectorModels}
+          {...(model ? { value: model } : {})}
+          onValueChange={(next) => onModelChange?.(next)}
+          {...(effort ? { effort } : {})}
+          onEffortChange={(next) => onEffortChange?.(next as NonNullable<SessionComposerProps["effort"]>)}
+          open={openMenu === "runtime"}
+          onOpenChange={(next) => { if (!runtimeDisabled || !next) setOpenMenu(next ? "runtime" : null); }}
+        >
+          <ModelSelectorTrigger
+            data-compact-control
+            disabled={runtimeDisabled}
+            // A combobox does not take its name from its contents, so the
+            // harness and model have to be stated for anyone not reading the
+            // tile. The dropdown this replaced was a button, which did.
+            aria-label={model ? `${provider}, model ${model}` : provider}
+            className={`inline-flex h-auto min-h-8 min-w-0 items-center gap-2 rounded-full px-1.5 text-left text-meta text-[var(--text)] hover:bg-[var(--surface-selected-hover)] disabled:pointer-events-none disabled:opacity-45 data-[state=open]:bg-[var(--surface-selected)] sm:px-2 ${KEEPS_ITS_TOOLTIP}`}
+            {...(runtimeDisabled ? { title: runtimeDisabledReason } : {})}
+          >
+            {/* Frames 5a, 9a-2 and 9b fill this tile lime, with the CodeXml glyph. */}
+            <span className="grid size-[17px] shrink-0 place-items-center bg-[var(--accent)] text-[var(--accent-ink)]" data-provider-mark>
+              <CodeXml size={11} strokeWidth={2} />
+            </span>
+            <span className="shrink-0 font-medium capitalize">{provider}</span>
+            {model && <span className="hidden min-w-0 max-w-28 truncate text-[var(--text-muted)] sm:inline">{model}</span>}
+          </ModelSelectorTrigger>
+          <ModelSelectorContent side="top" align="start" aria-label="Harness, model, and effort" className="w-[22rem] max-w-[calc(100vw-2rem)]">
             {draft && providerOptions.length > 0 && (
-              <>
-                <DropdownMenuRadioGroup value={provider} onValueChange={(next) => onProviderChange?.(next as CockpitProvider)}>
+              <div className="border-b border-[var(--rule)] p-1">
+                <RadioGroup className="flex gap-1" value={provider} onValueChange={(next: string) => onProviderChange?.(next as CockpitProvider)} aria-label="Harness">
                   {providerOptions.map((option) => (
-                    <DropdownMenuRadioItem key={option} value={option} disabled={!onProviderChange} className="capitalize">{option}</DropdownMenuRadioItem>
+                    <label key={option} className="flex min-h-8 flex-1 cursor-pointer items-center gap-2 rounded-sm px-2 text-meta-sm capitalize hover:bg-[var(--surface-selected)]">
+                      <RadioGroupItem value={option} disabled={!onProviderChange} />{option}
+                    </label>
                   ))}
-                </DropdownMenuRadioGroup>
-                <DropdownMenuSeparator />
-              </>
+                </RadioGroup>
+              </div>
             )}
-            <DropdownMenuRadioGroup value={model ?? ""} onValueChange={(next) => onModelChange?.(next)}>
-              {modelOptions.map((option) => (
-                <DropdownMenuRadioItem
-                  key={option.value}
-                  value={option.value}
-                  disabled={settingsDisabled || !onModelChange}
-                  title={!onModelChange ? modelChangeUnavailableReason ?? undefined : undefined}
-                  className="flex-col items-start gap-0.5 py-2"
-                >
-                  <span className="font-medium">{option.label}</span>
-                  <span className="font-mono text-code-xs text-[var(--text-muted)]">{option.value}</span>
-                  {option.description && <span className="text-code-xs text-[var(--text-muted)]">{option.description}</span>}
-                </DropdownMenuRadioItem>
-              ))}
-            </DropdownMenuRadioGroup>
+            <ModelSelectorList />
+            <ModelSelectorEffort />
             {modelOptions.length === 0 && modelOptionsStatus && <p className="px-2.5 py-1.5 text-code-sm text-[var(--text-muted)]" role="status">{modelOptionsStatus}</p>}
             {!onModelChange && modelChangeUnavailableReason && <p className="px-2.5 py-1.5 text-code-sm text-[var(--text-muted)]">{modelChangeUnavailableReason}</p>}
-            {/* No rule unless the model section actually said something. */}
-            {(modelOptions.length > 0 || modelOptionsStatus || (!onModelChange && modelChangeUnavailableReason)) && <DropdownMenuSeparator />}
-            <DropdownMenuRadioGroup value={effort ?? ""} onValueChange={(next) => onEffortChange?.(next as NonNullable<SessionComposerProps["effort"]>)}>
-              {effortOptions.map((option) => (
-                <DropdownMenuRadioItem
-                  key={option}
-                  value={option}
-                  disabled={settingsDisabled || !onEffortChange}
-                  title={!onEffortChange ? effortChangeUnavailableReason ?? undefined : undefined}
-                  className="capitalize"
-                >{option} effort</DropdownMenuRadioItem>
-              ))}
-            </DropdownMenuRadioGroup>
             {!onEffortChange && effortChangeUnavailableReason && <p className="px-2.5 py-1.5 text-code-sm text-[var(--text-muted)]">{effortChangeUnavailableReason}</p>}
             {onResetSettings && (
-              <>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem disabled={settingsDisabled} className="text-[var(--text-muted)]" onSelect={() => onResetSettings()}>
+              <div className="border-t border-[var(--rule)] p-1">
+                <Button variant="ghost" size="sm" data-compact-control="height" disabled={settingsDisabled} className="w-full justify-start gap-2 text-meta-sm text-[var(--text-muted)]" onClick={() => onResetSettings()}>
                   <RotateCcw size={12} aria-hidden="true" />Reset to configured defaults
-                </DropdownMenuItem>
-              </>
+                </Button>
+              </div>
             )}
-          </DropdownMenuContent>
-        </DropdownMenu>
+          </ModelSelectorContent>
+        </ModelSelectorRoot>
         <span className="flex shrink-0 items-end gap-0.5" role="img" aria-label={`${effort ?? "unknown"} effort`}>
           {/* Frames 5a and 9a-2 fill the reached bars lime. */}
           {[1, 2, 3].map((bar) => <span key={bar} data-effort-bar={bar <= effortBars(effort) ? "active" : "inactive"} className={`w-[3px] ${bar <= effortBars(effort) ? "h-[11px] bg-[var(--accent)]" : "h-[7px] bg-[var(--border-strong)]"}`} />)}

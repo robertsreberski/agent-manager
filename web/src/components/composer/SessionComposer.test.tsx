@@ -50,11 +50,11 @@ describe("SessionComposer", () => {
       onModelChange,
     });
 
-    click(screen.getByRole("button", { name: /claude/i }));
-    const sonnet = await screen.findByRole("menuitemradio", { name: /Sonnet/ });
+    click(screen.getByRole("combobox", { name: /claude/i }));
+    const sonnet = await screen.findByRole("option", { name: /Sonnet/ });
     expect(sonnet).toHaveTextContent("live-sonnet");
     expect(sonnet).toHaveTextContent("Balanced");
-    expect(screen.queryByRole("menuitemradio", { name: /current-model/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: /current-model/ })).not.toBeInTheDocument();
 
     fireEvent.click(sonnet);
     expect(onModelChange).toHaveBeenCalledWith("live-sonnet");
@@ -75,14 +75,16 @@ describe("SessionComposer", () => {
       onProfileChange: vi.fn(),
     });
 
-    click(screen.getByRole("button", { name: /codex/i }));
-    expect(await screen.findByRole("menuitemradio", { name: /Sonnet/ })).toHaveAttribute("aria-checked", "true");
-    expect(screen.getByRole("menuitemradio", { name: /Opus/ })).toHaveAttribute("aria-checked", "false");
-    expect(screen.getByRole("menuitemradio", { name: "high effort" })).toHaveAttribute("aria-checked", "true");
-    expect(screen.getByRole("menuitemradio", { name: "low effort" })).toHaveAttribute("aria-checked", "false");
+    click(screen.getByRole("combobox", { name: /codex/i }));
+    // A cmdk option reports selection as aria-selected; the effort picker
+    // beside it is a real radiogroup and reports aria-checked.
+    expect(await screen.findByRole("option", { name: /Sonnet/ })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("option", { name: /Opus/ })).toHaveAttribute("aria-selected", "false");
+    expect(screen.getByRole("radio", { name: /high/i })).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByRole("radio", { name: /low/i })).toHaveAttribute("aria-checked", "false");
 
     fireEvent.keyDown(document, { key: "Escape" });
-    await waitFor(() => expect(screen.queryByRole("menu")).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByRole("option", { name: /Sonnet/ })).not.toBeInTheDocument());
 
     click(screen.getByRole("button", { name: /execute/i }));
     expect(await screen.findByRole("menuitemradio", { name: /Execute/ })).toHaveAttribute("aria-checked", "true");
@@ -105,16 +107,16 @@ describe("SessionComposer", () => {
   it("explains when the selected harness exposes no model catalog", async () => {
     renderComposer({ canQueue: true, modelOptionsStatus: "This provider does not expose a live model catalog.", onModelChange: vi.fn() });
 
-    click(screen.getByRole("button", { name: /codex/i }));
-    const menu = await screen.findByRole("menu", { name: "Harness, model, and effort" });
+    click(screen.getByRole("combobox", { name: /codex/i }));
+    const menu = await screen.findByRole("dialog", { name: "Harness, model, and effort" });
     expect(within(menu).getByRole("status")).toHaveTextContent("does not expose a live model catalog");
   });
 
   it("offers one explicit reset to configured defaults when supported", async () => {
     const onResetSettings = vi.fn();
     renderComposer({ canQueue: true, draft: true, onResetSettings });
-    click(screen.getByRole("button", { name: /codex/i }));
-    fireEvent.click(await screen.findByRole("menuitem", { name: "Reset to configured defaults" }));
+    click(screen.getByRole("combobox", { name: /codex/i }));
+    fireEvent.click(await screen.findByRole("button", { name: "Reset to configured defaults" }));
     expect(onResetSettings).toHaveBeenCalledOnce();
     await waitFor(() => expect(screen.queryByRole("menu", { name: "Harness, model, and effort" })).not.toBeInTheDocument());
   });
@@ -133,7 +135,7 @@ describe("SessionComposer", () => {
     await waitFor(() => expect(screen.queryByRole("menu", { name: "Execution profile" })).not.toBeInTheDocument());
 
     fireEvent.keyDown(window, { key: "m", metaKey: true, shiftKey: true });
-    expect(await screen.findByRole("menu", { name: "Harness, model, and effort" })).toBeInTheDocument();
+    expect(await screen.findByRole("dialog", { name: "Harness, model, and effort" })).toBeInTheDocument();
     fireEvent.keyDown(window, { key: ".", metaKey: true });
     expect(onStop).toHaveBeenCalledOnce();
   });
@@ -145,8 +147,8 @@ describe("SessionComposer", () => {
       profileChangeUnavailableReason: "The hook exposes no profile control.",
     });
 
-    expect(screen.getByRole("button", { name: /codex/i })).toBeDisabled();
-    expect(screen.getByRole("button", { name: /codex/i })).toHaveAttribute("title", "The hook can observe the model but cannot change it.");
+    expect(screen.getByRole("combobox", { name: /codex/i })).toBeDisabled();
+    expect(screen.getByRole("combobox", { name: /codex/i })).toHaveAttribute("title", "The hook can observe the model but cannot change it.");
     expect(screen.getByRole("button", { name: /execute/i })).toBeDisabled();
     expect(screen.getByRole("button", { name: /execute/i })).toHaveAttribute("title", "The hook exposes no profile control.");
   });
@@ -182,31 +184,34 @@ describe("SessionComposer", () => {
       modelChangeUnavailableReason: "Model choices stay in the CLI that owns this session.",
     });
 
-    const trigger = screen.getByRole("button", { name: /codex/i });
+    const trigger = screen.getByRole("combobox", { name: /codex/i });
     expect(trigger).toBeEnabled();
     click(trigger);
-    const menu = await screen.findByRole("menu", { name: "Harness, model, and effort" });
-    expect(within(menu).getByRole("menuitemradio", { name: /Live/u })).toHaveAttribute("aria-disabled", "true");
+    const menu = await screen.findByRole("dialog", { name: "Harness, model, and effort" });
+    expect(within(menu).getByRole("option", { name: /Live/u })).toHaveAttribute("aria-disabled", "true");
     expect(menu).toHaveTextContent("Model choices stay in the CLI that owns this session.");
   });
 
   it("still disables the runtime menu when there is nothing to read or change", () => {
     renderComposer({ modelChangeUnavailableReason: "This harness does not expose live model changes." });
-    expect(screen.getByRole("button", { name: /codex/i })).toBeDisabled();
+    expect(screen.getByRole("combobox", { name: /codex/i })).toBeDisabled();
   });
 
-  it("opens the runtime menu from the keyboard and hands focus back to the trigger on Escape", async () => {
+  it("opens the runtime picker from the keyboard and hands focus back to the trigger on Escape", async () => {
     renderComposer({ canQueue: true, onModelChange: vi.fn(), modelOptions: [{ value: "gpt-live", label: "Live", description: null }] });
-    const trigger = screen.getByRole("button", { name: /codex/i });
+    const trigger = screen.getByRole("combobox", { name: /codex/i });
     trigger.focus();
 
-    fireEvent.keyDown(trigger, { key: "Enter" });
-    const menu = await screen.findByRole("menu", { name: "Harness, model, and effort" });
+    // A combobox opens on the arrows, which is what the trigger binds; Enter
+    // reaches it as a click, and jsdom does not synthesize that from a keydown.
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    await screen.findByRole("option", { name: /Live/u });
+    const menu = document.querySelector<HTMLElement>('[data-slot="model-selector-content"]')!;
     expect(trigger).toHaveAttribute("aria-expanded", "true");
     await waitFor(() => expect(menu.contains(document.activeElement)).toBe(true));
 
     fireEvent.keyDown(document, { key: "Escape" });
-    await waitFor(() => expect(screen.queryByRole("menu")).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByRole("option", { name: /Live/u })).not.toBeInTheDocument());
     expect(trigger).toHaveAttribute("aria-expanded", "false");
     expect(document.activeElement).toBe(trigger);
   });
@@ -233,7 +238,7 @@ describe("SessionComposer", () => {
   it("marks every compact primary composer control for coarse-pointer expansion", () => {
     const { unmount } = render(<SessionComposer value="Send this" onChange={vi.fn()} onSend={vi.fn()} isRunning={false} canQueue canSteer={false} canStop={false} provider="codex" model="gpt" effort="medium" profile="execute" onModelChange={vi.fn()} onProfileChange={vi.fn()} />);
     for (const control of [
-      screen.getByRole("button", { name: /codex/i }),
+      screen.getByRole("combobox", { name: /codex/i }),
       screen.getByRole("button", { name: /execute/i }),
       screen.getByRole("button", { name: "Send message" }),
     ]) expect(control).toHaveAttribute("data-compact-control");
