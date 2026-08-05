@@ -340,3 +340,120 @@ test("re-observes a tool call when only its result arrives", async () => {
   observer.dispose();
   hub.dispose();
 });
+
+/*
+  The activity window is volatile and nothing rehydrates it, so after a restart
+  a manager-owned session has no history and neither provider replays one —
+  Codex resumes with `excludeTurns`, and Claude's SDK child died with the
+  process. The operator was shown "Waiting for provider activity", which is not
+  what happened.
+*/
+test("fills an empty view from the transcript, once, without taking the session over", () => {
+  const hub = new ActivityHub({ streamEpoch: "observer-seed" });
+  const session = externalSession();
+  hub.ensureSession(session.id, session.provider);
+  let reads = 0;
+  const observer = new SelectedTranscriptActivityObserver({
+    hub,
+    reader: { read() { reads += 1; return transcript("message-1", "earlier turn"); } },
+    // The seed deliberately bypasses eligibility: that predicate keeps two
+    // *live* producers off one session, and here there is no producer at all.
+    eligible: () => false,
+  });
+
+  assert.equal(observer.seedIfEmpty(session), true);
+  assert.equal(reads, 1);
+  const items = hub.snapshot(session.id)?.items ?? [];
+  assert.equal(items.length, 1);
+  assert.equal(items[0]?.kind === "message" ? items[0].text : null, "earlier turn");
+  // Provenance stays honest: a transcript item is reconstructed, never exact.
+  assert.equal(items[0]?.source, "transcript");
+  assert.equal(items[0]?.confidence, "inferred");
+  assert.equal(items[0]?.exposure, "transcript-derived");
+
+  observer.dispose();
+  hub.dispose();
+});
+
+test("does not seed a view that already holds provider activity", () => {
+  const hub = new ActivityHub({ streamEpoch: "observer-seed-live" });
+  const session = externalSession();
+  hub.ingest(session.id, session.provider, {
+    type: "upsert",
+    item: { id: "codex/live", kind: "message", role: "assistant", text: "live", state: "complete" },
+  });
+  let reads = 0;
+  const observer = new SelectedTranscriptActivityObserver({
+    hub,
+    reader: { read() { reads += 1; return transcript("message-1", "earlier turn"); } },
+  });
+
+  assert.equal(hub.isEmpty(session.id), false);
+  // The caller gates on `isEmpty`, but the observer must not double up either.
+  observer.acquire(session);
+  assert.equal(observer.seedIfEmpty(session), false);
+  assert.equal(reads, 1, "the ongoing observation read; the seed did not");
+
+  observer.dispose();
+  hub.dispose();
+});
+
+test("reports an unreadable transcript rather than seeding silence", () => {
+  const hub = new ActivityHub({ streamEpoch: "observer-seed-missing" });
+  const session = externalSession();
+  hub.ensureSession(session.id, session.provider);
+  const observer = new SelectedTranscriptActivityObserver({
+    hub,
+    reader: {
+      read() {
+        return {
+          items: [],
+          transcript: { state: "unavailable", truncated: false, source: null, itemCount: 0, reason: "not-found" },
+        };
+      },
+    },
+  });
+
+  assert.equal(observer.seedIfEmpty(session), false);
+  assert.equal(hub.snapshot(session.id)?.items.length, 0);
+
+  // Which is what lets the caller state the boundary instead of claiming quiet.
+  hub.markRetentionBoundary(session.id);
+  assert.equal(hub.snapshot(session.id)?.truncated, true);
+
+  observer.dispose();
+  hub.dispose();
+});
+
+test("carries a provider truncation through the seed", () => {
+  const hub = new ActivityHub({ streamEpoch: "observer-seed-truncated" });
+  const session = externalSession();
+  hub.ensureSession(session.id, session.provider);
+  const observer = new SelectedTranscriptActivityObserver({
+    hub,
+    reader: { read() { return transcript("message-1", "earlier turn", true); } },
+  });
+
+  assert.equal(observer.seedIfEmpty(session), true);
+  assert.equal(hub.snapshot(session.id)?.truncated, true);
+
+  observer.dispose();
+  hub.dispose();
+});
+
+test("the retention boundary is stated once, and only when something is missing", () => {
+  const hub = new ActivityHub({ streamEpoch: "observer-boundary" });
+  const session = externalSession();
+  hub.ensureSession(session.id, session.provider);
+  const frames: ActivityFrame[] = [];
+  const unsubscribe = hub.subscribe(session.id, (frame) => frames.push(frame));
+
+  hub.markRetentionBoundary(session.id);
+  hub.markRetentionBoundary(session.id);
+
+  assert.equal(frames.filter((frame) => frame.type === "activity.reset").length, 1);
+  assert.equal(hub.snapshot(session.id)?.truncated, true);
+
+  unsubscribe();
+  hub.dispose();
+});

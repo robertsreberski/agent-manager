@@ -232,6 +232,45 @@ export class SelectedTranscriptActivityObserver {
     this.#refresh(temporary);
   }
 
+  /**
+   * Fills an empty activity view from the transcript, once, and then gets out
+   * of the way.
+   *
+   * The activity hub is volatile: it holds one bounded window per session and
+   * nothing rehydrates it, so every restart leaves a manager-owned session with
+   * no history — and neither provider replays one (Codex resumes with
+   * `excludeTurns`, Claude's SDK child died with the process). The operator was
+   * shown "Waiting for provider activity", which is not what happened.
+   *
+   * This deliberately does not go through `eligible`. That predicate governs an
+   * *ongoing* observation and exists to keep two live producers off one
+   * session; routing this through it would make the observer withdraw its own
+   * seed the moment the view stopped being empty. The rule it protects is about
+   * concurrent producers, and this runs only when there is no producer at all —
+   * the seeded turns ended before this process started, and the live stream
+   * carries only what comes after.
+   *
+   * Returns whether anything was seeded, so the caller can tell an empty
+   * history from an unreadable one.
+   */
+  seedIfEmpty(session: SessionView): boolean {
+    if (!this.#reader || this.#active.has(session.id)) return false;
+    let result: TranscriptReadResult;
+    try {
+      result = this.#reader.read(session);
+    } catch {
+      return false;
+    }
+    if (result.transcript.state !== "available" || result.items.length === 0) return false;
+    this.#hub.ingest(session.id, session.provider, {
+      type: "reset",
+      reason: result.transcript.truncated ? "truncation" : "transcript-reset",
+      items: result.items.map(activityDraft),
+      truncated: result.transcript.truncated,
+    });
+    return true;
+  }
+
   acquire(session: SessionView): () => void {
     if (!this.#reader) return () => undefined;
     let observation = this.#active.get(session.id);

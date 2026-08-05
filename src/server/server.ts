@@ -2020,6 +2020,23 @@ export async function createAgentManagerServer(
         ? transcriptActivity.acquire(session)
         : () => undefined;
 
+    /*
+      The activity window is volatile, and nothing rehydrates it: a restart
+      leaves a manager-owned session with no history, and neither provider
+      replays one. Fill it from the transcript once, here, where the operator
+      has just asked to look at the session — and if that is not possible, say
+      so rather than let the drawer claim the session has simply been quiet.
+
+      This runs only when the window holds nothing, so it cannot put a second
+      producer on a live session; the seeded turns ended before this process
+      started, and the stream below carries only what comes after.
+    */
+    if (!isRemoteSession(session) && activityHub.isEmpty(id)) {
+      if (!transcriptActivity.seedIfEmpty(session)) {
+        activityHub.markRetentionBoundary(id);
+      }
+    }
+
     reply
       .header("Content-Type", "text/event-stream; charset=utf-8")
       .header("Connection", "keep-alive")

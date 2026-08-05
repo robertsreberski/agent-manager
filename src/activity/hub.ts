@@ -141,6 +141,37 @@ export class ActivityHub {
     });
   }
 
+  /** True when this session's view holds nothing yet. */
+  isEmpty(sessionId: string): boolean {
+    const session = this.#sessions.get(sessionId);
+    return !session || session.items.size === 0;
+  }
+
+  /**
+   * Records that activity exists which this window does not hold.
+   *
+   * The window is volatile and bounded, so "empty" has two very different
+   * meanings: a session that has genuinely said nothing yet, and one whose
+   * history died with the previous process. Only the first is honestly
+   * described as waiting for provider activity. This marks the second, and the
+   * drawer states the retention boundary it already has a component for.
+   */
+  markRetentionBoundary(sessionId: string): void {
+    const session = this.#sessions.get(sessionId);
+    if (!session || session.truncated) return;
+    session.truncated = true;
+    const at = new Date(this.#now()).toISOString();
+    const frame = this.#resetFrame(sessionId, session, ++session.seq, at, "truncation");
+    this.#record(session, frame);
+    for (const listener of session.listeners) {
+      try {
+        listener(clone(frame));
+      } catch {
+        // Activity consumers cannot interrupt a provider pump.
+      }
+    }
+  }
+
   ingest(sessionId: string, provider: Provider, mutation: ActivityMutation): ActivityFrame {
     this.ensureSession(sessionId, provider);
     const session = this.#sessions.get(sessionId)!;
