@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { SessionView } from "../core/types.ts";
+import { observeOnlyControl } from "../shared/session.ts";
 import type {
   SessionTranscriptReader,
   TranscriptSearchResult,
@@ -67,11 +68,9 @@ function session(overrides: Partial<SessionView> = {}): SessionView {
     attention: [],
     terminal: null,
     control: {
+      ...observeOnlyControl(),
       plane: "codex-hook-bridge",
       authority: "foreign",
-      capabilities: [],
-      withheld: [],
-      takeover: null,
     },
     workspaceIdentity: null,
     generation: 0,

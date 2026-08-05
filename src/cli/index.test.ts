@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import { defaultConfig, type AttachSpec } from "../ops/index.ts";
@@ -101,8 +104,8 @@ test("attach executes only the validated provider argv spec", async () => {
   let executed: AttachSpec | null = null;
   const instruction: AttachInstruction = {
     kind: "codex-remote",
-    argv: ["/opt/homebrew/bin/codex", "resume", "thread-7", "--remote", "unix:///tmp/codex.sock"],
-    cwd: "/tmp/project",
+    argv: [SERVICE_EXECUTABLES.codex, "resume", "thread-7", "--remote", "unix:///tmp/codex.sock"],
+    cwd: process.cwd(),
     warning: "Native controller lease acquired.",
   };
   const exitCode = await runCli(["attach", "codex:thread-7"], {
@@ -123,10 +126,141 @@ test("attach executes only the validated provider argv spec", async () => {
   assert.deepEqual(executed, {
     executable: "/trusted/bin/codex",
     args: ["resume", "thread-7", "--remote", "unix:///tmp/codex.sock"],
-    cwd: "/tmp/project",
+    cwd: process.cwd(),
   });
   assert.equal(stdout.read(), "");
   assert.equal(stderr.read(), "Native controller lease acquired.\n");
+});
+
+test("Codex attach falls back to an existing absolute current directory when its worktree was deleted", async (t) => {
+  const stderr = output();
+  const fallback = mkdtempSync(join(tmpdir(), "agent-manager-codex-attach-"));
+  t.after(() => rmSync(fallback, { recursive: true, force: true }));
+  const deletedWorktree = join(fallback, "deleted-worktree");
+  let executed: AttachSpec | null = null;
+
+  const exitCode = await runCli(["attach", "codex:thread-7"], {
+    stderr: stderr.writer,
+    currentDirectory: fallback,
+    serviceExecutables: () => SERVICE_EXECUTABLES,
+    async requestAttach() {
+      return {
+        instruction: {
+          kind: "codex-remote",
+          argv: [SERVICE_EXECUTABLES.codex, "resume", "thread-7", "--remote", "unix:///tmp/codex.sock"],
+          cwd: deletedWorktree,
+          warning: null,
+        },
+      };
+    },
+    async executeAttach(spec) {
+      executed = spec;
+      return 0;
+    },
+  });
+
+  assert.equal(exitCode, 0);
+  assert.deepEqual(executed, {
+    executable: SERVICE_EXECUTABLES.codex,
+    args: ["resume", "thread-7", "--remote", "unix:///tmp/codex.sock"],
+    cwd: fallback,
+  });
+  assert.match(stderr.read(), /Codex session working directory .*deleted-worktree.* is unavailable/u);
+  assert.match(stderr.read(), /pinned executable, thread ID, and shared App Server socket are unchanged/u);
+});
+
+test("Codex attach fails before spawn when neither instructed nor current directory is usable", async (t) => {
+  const stderr = output();
+  const temporary = mkdtempSync(join(tmpdir(), "agent-manager-codex-attach-"));
+  t.after(() => rmSync(temporary, { recursive: true, force: true }));
+  const deletedWorktree = join(temporary, "deleted-worktree");
+  let executed = false;
+
+  const exitCode = await runCli(["attach", "codex:thread-7"], {
+    stderr: stderr.writer,
+    currentDirectory: ".",
+    serviceExecutables: () => SERVICE_EXECUTABLES,
+    async requestAttach() {
+      return {
+        instruction: {
+          kind: "codex-remote",
+          argv: [SERVICE_EXECUTABLES.codex, "resume", "thread-7", "--remote", "unix:///tmp/codex.sock"],
+          cwd: deletedWorktree,
+          warning: null,
+        },
+      };
+    },
+    async executeAttach() {
+      executed = true;
+      return 0;
+    },
+  });
+
+  assert.equal(exitCode, 1);
+  assert.equal(executed, false);
+  assert.match(stderr.read(), /current directory "\." is not an existing absolute directory/u);
+});
+
+test("deleted working-directory fallback is never applied to Claude or tmux", async (t) => {
+  const fallback = mkdtempSync(join(tmpdir(), "agent-manager-native-attach-"));
+  t.after(() => rmSync(fallback, { recursive: true, force: true }));
+  const deletedWorktree = join(fallback, "deleted-worktree");
+
+  await t.test("Claude keeps the exact provider working directory", async () => {
+    const executed: AttachSpec[] = [];
+    const exitCode = await runCli(["attach", "claude:session-7"], {
+      currentDirectory: fallback,
+      controlSocketPath: "/tmp/control.sock",
+      serviceExecutables: () => SERVICE_EXECUTABLES,
+      async requestAttach() {
+        return {
+          instruction: {
+            kind: "claude-resume",
+            argv: [SERVICE_EXECUTABLES.claude, "--resume", "session-7"],
+            cwd: deletedWorktree,
+            warning: null,
+            handoffId: "handoff-7",
+            spawnNonce: "spawn-nonce-00000007",
+          },
+        };
+      },
+      async requestAttachAuthorizeSpawn() {
+        return { ok: true };
+      },
+      async executeLifecycleAttach(spec) {
+        executed.push(spec);
+        return 0;
+      },
+    });
+
+    assert.equal(exitCode, 0);
+    assert.equal(executed[0]?.cwd, deletedWorktree);
+  });
+
+  await t.test("tmux keeps the exact terminal working directory", async () => {
+    const executed: AttachSpec[] = [];
+    const exitCode = await runCli(["attach", "external:tmux"], {
+      currentDirectory: fallback,
+      serviceExecutables: () => SERVICE_EXECUTABLES,
+      async requestAttach() {
+        return {
+          instruction: {
+            kind: "tmux",
+            argv: [SERVICE_EXECUTABLES.tmux, "attach-session", "-t", "agent-session"],
+            cwd: deletedWorktree,
+            warning: null,
+          },
+        };
+      },
+      async executeAttach(spec) {
+        executed.push(spec);
+        return 0;
+      },
+    });
+
+    assert.equal(exitCode, 0);
+    assert.equal(executed[0]?.cwd, deletedWorktree);
+  });
 });
 
 test("Claude attach reports actual child lifecycle through the owner socket", async () => {

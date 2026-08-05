@@ -12,7 +12,7 @@ import {
   sessionRecordId,
 } from "./session.ts";
 
-export const WIRE_SCHEMA_VERSION = 4 as const;
+export const WIRE_SCHEMA_VERSION = 5 as const;
 
 export interface WireIdentity {
   schemaVersion: number | null;
@@ -87,13 +87,21 @@ const controlCapabilitySchema = z.enum([
   "delete",
   "take-control",
   "cancel-take-control",
+  "retry-control",
   "open-editor",
 ]);
 
 const takeoverMethodSchema = z.enum(["guided-exit", "graceful-stop"]);
 const sessionTakeoverSchema = z.object({
   id: z.string().min(1).nullable(),
-  state: z.enum(["available", "waiting-for-exit", "stopping", "adopting", "failed"]),
+  state: z.enum([
+    "available",
+    "awaiting-confirmation",
+    "waiting-for-exit",
+    "stopping",
+    "adopting",
+    "failed",
+  ]),
   methods: z.array(takeoverMethodSchema).min(1).max(2),
   method: takeoverMethodSchema.nullable(),
   requestedAt: z.string().nullable(),
@@ -113,6 +121,111 @@ const sessionTakeoverSchema = z.object({
   }
   if (takeover.state === "failed" && !takeover.error) {
     context.addIssue({ code: "custom", message: "failed takeover requires an error", path: ["error"] });
+  }
+  if (
+    takeover.state === "awaiting-confirmation"
+    && (takeover.method !== "graceful-stop" || takeover.deadlineAt !== null)
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "graceful-stop confirmation requires its exact method and no signal deadline",
+      path: ["state"],
+    });
+  }
+});
+
+const sessionControlCoordinationSchema = z.object({
+  mode: z.enum(["shared", "exclusive", "observe-only"]),
+  nativeAttach: z.enum(["join", "handoff", "none"]),
+  responseResolution: z.enum(["first-response-wins", "single-controller"]),
+}).strict().superRefine((coordination, context) => {
+  if (coordination.nativeAttach === "join" && coordination.mode !== "shared") {
+    context.addIssue({
+      code: "custom",
+      message: "native join requires shared control coordination",
+      path: ["nativeAttach"],
+    });
+  }
+  if (coordination.nativeAttach === "handoff" && coordination.mode !== "exclusive") {
+    context.addIssue({
+      code: "custom",
+      message: "native handoff requires exclusive control coordination",
+      path: ["nativeAttach"],
+    });
+  }
+  if (
+    coordination.responseResolution === "first-response-wins"
+    && coordination.mode !== "shared"
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "first-response-wins requires shared control coordination",
+      path: ["responseResolution"],
+    });
+  }
+  if (coordination.mode === "observe-only" && coordination.nativeAttach !== "none") {
+    context.addIssue({
+      code: "custom",
+      message: "observe-only control cannot coordinate native attachment",
+      path: ["nativeAttach"],
+    });
+  }
+});
+
+const timestampSchema = z.string().refine(
+  (value) => Number.isFinite(Date.parse(value)),
+  "must be a timestamp",
+);
+
+const sessionControlRecoverySchema = z.object({
+  state: z.enum([
+    "reconnecting",
+    "waiting-for-native-exit",
+    "retrying",
+    "needs-attention",
+  ]),
+  attempt: z.number().int().positive(),
+  startedAt: timestampSchema,
+  deadlineAt: timestampSchema.nullable(),
+  nextRetryAt: timestampSchema.nullable(),
+  error: z.string().min(1).nullable(),
+}).strict().superRefine((recovery, context) => {
+  if (recovery.state === "waiting-for-native-exit") {
+    if (recovery.deadlineAt !== null) {
+      context.addIssue({
+        code: "custom",
+        message: "waiting for native exit cannot expose a recovery deadline",
+        path: ["deadlineAt"],
+      });
+    }
+    if (recovery.nextRetryAt !== null) {
+      context.addIssue({
+        code: "custom",
+        message: "waiting for native exit cannot expose an internal poll time",
+        path: ["nextRetryAt"],
+      });
+    }
+    if (recovery.error === null) {
+      context.addIssue({
+        code: "custom",
+        message: "waiting for native exit requires an ownership reason",
+        path: ["error"],
+      });
+    }
+  }
+  if (recovery.state === "retrying" && recovery.nextRetryAt === null) {
+    context.addIssue({
+      code: "custom",
+      message: "retrying control recovery requires its next retry time",
+      path: ["nextRetryAt"],
+    });
+  }
+  if (recovery.state === "needs-attention" && recovery.error === null) {
+    context.addIssue({
+      code: "custom",
+      message: "control recovery needing attention requires an error",
+      path: ["error"],
+    });
   }
 });
 
@@ -245,6 +358,8 @@ export const sessionRecordSchema: z.ZodType<SessionRecord> = z.object({
       "observe-only",
     ]),
     authority: z.enum(["manager", "foreign", "none"]),
+    coordination: sessionControlCoordinationSchema,
+    recovery: sessionControlRecoverySchema.nullable(),
     capabilities: z.array(controlCapabilitySchema),
     withheld: z.array(z.object({
       capability: controlCapabilitySchema,
@@ -309,6 +424,37 @@ export const sessionRecordSchema: z.ZodType<SessionRecord> = z.object({
       path: ["control", "capabilities"],
     });
   }
+  const coordination = session.control.coordination;
+  if (
+    session.control.plane === "codex-private"
+    && (
+      session.provider !== "codex"
+      || coordination.mode !== "shared"
+      || coordination.nativeAttach !== "join"
+      || coordination.responseResolution !== "first-response-wins"
+    )
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "the private Codex plane requires shared join and first-response-wins coordination",
+      path: ["control", "coordination"],
+    });
+  }
+  if (
+    session.control.plane === "claude-sdk"
+    && (
+      session.provider !== "claude"
+      || coordination.mode !== "exclusive"
+      || coordination.nativeAttach !== "handoff"
+      || coordination.responseResolution !== "single-controller"
+    )
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "the Claude SDK plane requires exclusive handoff and single-controller coordination",
+      path: ["control", "coordination"],
+    });
+  }
 });
 
 export function parseSessionRecord(value: unknown): SessionRecord {
@@ -357,8 +503,10 @@ export const sessionActionTypeSchema = z.enum([
   "end",
   "archive",
   "delete",
+  "resume",
   "take-control",
   "cancel-take-control",
+  "retry-control",
   "open-editor",
 ]);
 

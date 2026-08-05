@@ -3,6 +3,7 @@ import test from "node:test";
 
 import type { ActivityItemDraft, ActivityMutation } from "../../activity/index.ts";
 import {
+  codexMessageCorrelationId,
   codexActivityOffset,
   projectCodexNotification,
   projectCodexQueue,
@@ -95,6 +96,10 @@ test("assistant deltas use UTF-8 offsets and completed snapshots remain authorit
   if (completed.kind === "message") {
     assert.equal(completed.phase, "final");
     assert.equal(completed.text, "hé! canonical");
+    assert.equal(
+      completed.correlationId,
+      codexMessageCorrelationId("thread/one", "turn-1", "assistant", "hé! canonical"),
+    );
   }
 });
 

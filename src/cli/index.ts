@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import { statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -64,6 +65,7 @@ import {
   requestHooksReloadFromControlSocket,
   type BootstrapTokenReply,
 } from "../server/control-socket.ts";
+import { ConfigRemoteHostRegistry } from "../server/remote-host-registry.ts";
 import type { AttachInstruction } from "../server/contracts.ts";
 import { IncompatibleDatabaseError, ManagerDatabase } from "../server/persistence.ts";
 import { installRemoteNode, runNodeBridge } from "../remote/index.ts";
@@ -89,8 +91,21 @@ interface ServerModule {
     tailscaleHosts?: readonly string[];
     tailscaleAllowedLogins?: readonly string[];
     codexExecutable?: string;
+    claudeExecutable?: string;
     tmuxExecutable?: string;
     remoteHosts?: ReadonlyArray<{ id: string; label: string; target: string }>;
+    remoteHostRegistry?: {
+      list(): Array<{ id: string; label: string; target: string }>;
+      add(input: { label: string; target: string }): { id: string; label: string; target: string };
+      remove(id: string): boolean;
+    };
+    configuredHosts?: ReadonlyArray<{ id: string; label: string; target: string }>;
+    configuredWorkspaces?: ReadonlyArray<{
+      id: string;
+      label: string;
+      path: string;
+      hostId: string;
+    }>;
   }): Promise<{
     listen(): Promise<string>;
     close(): Promise<void>;
@@ -213,43 +228,12 @@ function syncConfiguredWorkspaces(config: AgentManagerConfig): void {
 async function defaultStartServer(
   options: { host: "127.0.0.1"; port: number },
 ): Promise<StartedServer> {
-  const moduleUrl = import.meta.url.endsWith(".ts")
-    ? new URL("../server/index.ts", import.meta.url).href
-    : new URL("../server/index.js", import.meta.url).href;
-  const serverModule = await import(moduleUrl) as ServerModule;
-  const config = loadConfig();
-  const executables = resolveServiceExecutables();
-  syncConfiguredWorkspaces(config);
-  const tailscaleDnsName = config.tailscale.dnsName;
-  const tailscaleAllowedLogin = config.tailscale.allowedLogin;
-  const tailscaleConfigured = tailscaleDnsName !== null
-    && tailscaleAllowedLogin !== null;
-  const backend = await serverModule.createAgentManagerServer({
-    ...options,
-    codexExecutable: executables.codex,
-    tmuxExecutable: executables.tmux,
-    remoteHosts: config.hosts.map((host) => ({
-      id: host.id,
-      label: host.name,
-      target: host.target,
-    })),
-    ...(tailscaleConfigured
-      ? {
-          tailscaleHosts: [`${tailscaleDnsName}:${config.tailscale.httpsPort}`],
-          tailscaleAllowedLogins: [tailscaleAllowedLogin],
-        }
-      : {}),
-  });
-  let address: string;
-  try {
-    address = await backend.listen();
-  } catch (error) {
-    await backend.close().catch(() => undefined);
-    throw error;
-  }
+  let backend: Awaited<ReturnType<ServerModule["createAgentManagerServer"]>> | null = null;
+  let shutdownRequested = false;
   let closing = false;
   const close = (): void => {
-    if (closing) return;
+    shutdownRequested = true;
+    if (!backend || closing) return;
     closing = true;
     process.off("SIGINT", close);
     process.off("SIGTERM", close);
@@ -258,9 +242,62 @@ async function defaultStartServer(
       process.exitCode = 1;
     });
   };
+  // Install lifecycle handling before provider composition so a deployment
+  // signal cannot strand a partially initialized Claude or Codex child.
   process.once("SIGINT", close);
   process.once("SIGTERM", close);
-  return { address };
+  const moduleUrl = import.meta.url.endsWith(".ts")
+    ? new URL("../server/index.ts", import.meta.url).href
+    : new URL("../server/index.js", import.meta.url).href;
+  const serverModule = await import(moduleUrl) as ServerModule;
+  const config = loadConfig();
+  const executables = resolveServiceExecutables();
+  const tailscaleDnsName = config.tailscale.dnsName;
+  const tailscaleAllowedLogin = config.tailscale.allowedLogin;
+  const tailscaleConfigured = tailscaleDnsName !== null
+    && tailscaleAllowedLogin !== null;
+  try {
+    backend = await serverModule.createAgentManagerServer({
+      ...options,
+      codexExecutable: executables.codex,
+      claudeExecutable: executables.claude,
+      tmuxExecutable: executables.tmux,
+      remoteHosts: config.hosts.map((host) => ({
+        id: host.id,
+        label: host.name,
+        target: host.target,
+      })),
+      remoteHostRegistry: new ConfigRemoteHostRegistry(defaultPaths()),
+      configuredHosts: config.hosts.map((host) => ({
+        id: host.id,
+        label: host.name,
+        target: host.target,
+      })),
+      configuredWorkspaces: config.workspaces.map((workspace) => ({
+        id: workspace.id,
+        label: workspace.name,
+        path: workspace.path,
+        hostId: workspace.hostId,
+      })),
+      ...(tailscaleConfigured
+        ? {
+            tailscaleHosts: [`${tailscaleDnsName}:${config.tailscale.httpsPort}`],
+            tailscaleAllowedLogins: [tailscaleAllowedLogin],
+          }
+        : {}),
+    });
+    if (shutdownRequested) {
+      await backend.close();
+      throw new Error("Agent Manager startup was cancelled by a termination signal");
+    }
+    const address = await backend.listen();
+    return { address };
+  } catch (error) {
+    process.off("SIGINT", close);
+    process.off("SIGTERM", close);
+    await backend?.close().catch(() => undefined);
+    throw error;
+  }
 }
 
 function defaultOpenBrowser(url: string): Promise<void> {
@@ -653,6 +690,39 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function isExistingAbsoluteDirectory(path: string): boolean {
+  if (!isAbsolute(path)) return false;
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function recoverCodexAttachWorkingDirectory(
+  instruction: AttachInstruction,
+  spec: AttachSpec,
+  currentDirectory: string,
+): { spec: AttachSpec; warning: string | null } {
+  if (instruction.kind !== "codex-remote") return { spec, warning: null };
+  const instructedDirectory = instruction.cwd;
+  if (!instructedDirectory || !isAbsolute(instructedDirectory)) {
+    throw new Error("Codex attach instruction must use an absolute working directory");
+  }
+  if (isExistingAbsoluteDirectory(instructedDirectory)) {
+    return { spec, warning: null };
+  }
+  if (!isExistingAbsoluteDirectory(currentDirectory)) {
+    throw new Error(
+      `Codex session working directory ${JSON.stringify(instructedDirectory)} is unavailable, and current directory ${JSON.stringify(currentDirectory)} is not an existing absolute directory`,
+    );
+  }
+  return {
+    spec: { ...spec, cwd: currentDirectory },
+    warning: `Codex session working directory ${JSON.stringify(instructedDirectory)} is unavailable; using current directory ${JSON.stringify(currentDirectory)} for this CLI join. The pinned executable, thread ID, and shared App Server socket are unchanged.`,
+  };
+}
+
 function printDoctor(report: DoctorReport, deps: CliDependencies): void {
   for (const check of report.checks) {
     const suffix = check.blocksControl ? " (controls blocked)" : "";
@@ -724,11 +794,19 @@ async function dispatch(argv: readonly string[], deps: CliDependencies): Promise
       const handoffId = reply.instruction.handoffId;
       const spawnNonce = reply.instruction.spawnNonce;
       let spec: AttachSpec;
+      let workingDirectoryWarning: string | null = null;
       try {
         if (reply.instruction.kind === "manager-cli") {
           throw new Error("Manager CLI attach instructions are browser-only");
         }
         spec = attachSpecFromInstruction(reply.instruction, deps.serviceExecutables());
+        const recovered = recoverCodexAttachWorkingDirectory(
+          reply.instruction,
+          spec,
+          deps.currentDirectory,
+        );
+        spec = recovered.spec;
+        workingDirectoryWarning = recovered.warning;
       } catch (error) {
         if (handoffId) {
           await deps.requestAttachFailed(
@@ -741,6 +819,7 @@ async function dispatch(argv: readonly string[], deps: CliDependencies): Promise
         throw error;
       }
       if (reply.instruction.warning) writeLine(deps.stderr, reply.instruction.warning);
+      if (workingDirectoryWarning) writeLine(deps.stderr, workingDirectoryWarning);
       if (reply.instruction.kind === "claude-resume" && !handoffId) {
         throw new Error("Claude attach instruction is missing its ownership handoff id");
       }

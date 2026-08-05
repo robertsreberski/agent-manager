@@ -11,7 +11,11 @@ import type { SessionRecord } from "../core/types.ts";
 import type { DiscoveryWorkerMessage, WorkerPort } from "../discovery/index.ts";
 import { digestCodexHookToken } from "../providers/codex/codex-hook-auth.ts";
 import { digestHookBearerToken } from "../providers/hooks/auth.ts";
-import { sessionRecordId } from "../shared/session.ts";
+import {
+  observeOnlyControl,
+  providerControlCoordination,
+  sessionRecordId,
+} from "../shared/session.ts";
 import { requestHooksReloadFromControlSocket } from "./control-socket.ts";
 import { ManagerDatabase } from "./persistence.ts";
 import { createAgentManagerServer } from "./server.ts";
@@ -61,13 +65,7 @@ function session(provider: "claude" | "codex", providerThreadId: string): Sessio
     todoProgress: null,
     attention: [],
     terminal: null,
-    control: {
-      plane: "observe-only",
-      authority: "none",
-      capabilities: [],
-      withheld: [],
-      takeover: null,
-    },
+    control: observeOnlyControl(),
     workspaceIdentity: null,
     generation: 0,
   };
@@ -91,6 +89,12 @@ function claudeTmuxSession(providerThreadId = "claude-external"): SessionRecord 
     control: {
       plane: "tmux-attach",
       authority: "foreign",
+      coordination: {
+        mode: "observe-only",
+        nativeAttach: "none",
+        responseResolution: "single-controller",
+      },
+      recovery: null,
       capabilities: ["preview", "attach"],
       withheld: [],
       takeover: null,
@@ -598,11 +602,9 @@ test("recent Codex hook evidence selects the foreign hook plane and expires to o
   assert.equal(reply.statusCode, 200, reply.body);
   assert.deepEqual(reply.json(), {});
   assert.deepEqual(backend.state.get(id)?.control, {
+    ...observeOnlyControl(),
     plane: "codex-hook-bridge",
     authority: "foreign",
-    capabilities: [],
-    withheld: [],
-    takeover: null,
   });
   assert.ok(backend.activityHub.snapshot(id)?.items.some(
     (item) => item.kind === "lifecycle" && item.title === "External Codex session started",
@@ -612,13 +614,7 @@ test("recent Codex hook evidence selects the foreign hook plane and expires to o
     () => backend.state.get(id)?.control.plane === "observe-only",
     "stale Codex hook evidence to expire",
   );
-  assert.deepEqual(backend.state.get(id)?.control, {
-    plane: "observe-only",
-    authority: "none",
-    capabilities: [],
-    withheld: [],
-    takeover: null,
-  });
+  assert.deepEqual(backend.state.get(id)?.control, observeOnlyControl());
 });
 
 test("Codex hook evidence never promotes a manager-owned private session", async (t) => {
@@ -630,6 +626,8 @@ test("Codex hook evidence never promotes a manager-owned private session", async
     control: {
       plane: "codex-private",
       authority: "manager",
+      coordination: providerControlCoordination("codex"),
+      recovery: null,
       capabilities: ["queue", "interrupt"],
       withheld: [],
       takeover: null,

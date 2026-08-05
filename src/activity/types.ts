@@ -390,6 +390,10 @@ export type ActivityMutation =
     }
   | { type: "remove"; id: string }
   | {
+      /** Marks an incomplete retained window without replacing any materialized item. */
+      type: "retention-boundary";
+    }
+  | {
       type: "reset";
       reason: ActivityResetReason;
       items?: readonly ActivityItemDraft[];

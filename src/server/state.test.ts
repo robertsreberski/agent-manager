@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import type { SessionRecord } from "../shared/session.ts";
+import { observeOnlyControl, type SessionRecord } from "../shared/session.ts";
 import { AGENT_MANAGER_BUILD_ID, WIRE_SCHEMA_VERSION } from "../shared/wire.ts";
 import { SessionStateStore } from "./state.ts";
 
@@ -36,7 +36,7 @@ function strictSession(overrides: Partial<SessionRecord> = {}): SessionRecord {
     todoProgress: null,
     attention: [],
     terminal: null,
-    control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [], takeover: null },
+    control: observeOnlyControl(),
     workspaceIdentity: null,
     generation: 0,
     ...overrides,

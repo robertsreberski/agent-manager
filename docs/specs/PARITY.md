@@ -20,7 +20,7 @@ actually checked — it is not a claim that every criterion in every spec has be
 | 10 | AC8/AC11 — mixed selections report per-action outcomes, bounded concurrency | pass | `SelectionBar` renders `Archived n · m not supported · k failed`; `selectionAction` in `App.tsx` uses a 3-worker cursor pool and counts every outcome |
 | 05 | R5 — heuristic attention is visually distinct and non-actionable | pass | `SessionCard.tsx` renders `border-l-2 border-dashed border-[var(--accent)]` and `data-attention-confidence="heuristic"` when `boardState === "wants-you" && !attentionExact` |
 | 12 | Responsive — board at 320px | pass, verified | at 320×844 `document.documentElement.scrollWidth === 320`; the only elements crossing the viewport edge live inside the header filter row, which is a deliberate `overflow-x: auto` scroller |
-| 01 | Wire epoch — a build/schema mismatch fails closed with a typed upgrade error | pass, verified | pointing a `development`-build client at the deployed `am-fb0945e6…` server produced the error screen "Agent Manager build mismatch; expected wire 3 / development, received 3 / am-fb0945e6…" instead of degrading into a partially-working cockpit |
+| 01 | Wire epoch mechanism — a build/schema mismatch fails closed with a typed upgrade error | historical pass at wire 3; wire 5 cutover pending below | pointing a `development`-build client at the deployed `am-fb0945e6…` server produced the error screen "Agent Manager build mismatch; expected wire 3 / development, received 3 / am-fb0945e6…" instead of degrading into a partially-working cockpit |
 | 13 | Removals — no global stop/sentinel, `set-mode`/`set-access`, sidebar, launch dialog, duplicate `session.messages` timeline, migration aliases | pass, verified | repository greps return no matches. `ClaudeManagedSession.setMode()` is the internal SDK permission-mode call reached through the atomic `set-profile` mapping (`profileMode(action.profile)`), which is what spec 01 requires — not the forbidden public action |
 
 ## Found and fixed during this pass
@@ -68,8 +68,24 @@ tinted lime would make "this session wants you" and "this session exists" the
 same glance, and that distinction is the board's only job.
 `web/src/theme-contrast.test.ts` guards the narrowed rule.
 
+## Current control contract — verification pending
+
+Specs 01 and 02 now define the wire 5 provider split. These rows are release gates, not claims of
+completed verification:
+
+| Spec | Contract to verify | Required evidence |
+| --- | --- | --- |
+| 01 | Every `SessionControl` carries a valid provider-specific `coordination` shape and nullable bounded `recovery`; old wire shapes fail closed | strict shared-schema tests across server/web/remote fixtures, plus a real mismatched wire 4 ↔ wire 5 connection |
+| 01 | Managed Codex is `shared / join / first-response-wins`; managed Claude is `exclusive / handoff / single-controller` | adapter projection tests and cockpit action-copy checks for both providers |
+| 01 | Manual provider recovery is advertised and accepted only through `retry-control`; exact native Claude ownership is a healthy stable wait; no recovery replays an action | failure-injection tests covering reconnecting, waiting-for-native-exit, retrying, needs-attention, explicit retry, and idempotency logs |
+| 02 | A native Codex `--remote` peer and cockpit client use one private-server thread concurrently; environment IDs remain observational | disposable two-client app-server probe covering send, steer, interrupt, request resolution, disconnect, and rejoin |
+| 02 | First exact Codex response wins without duplicate requests or replay | two-client request race plus `serverRequest/resolved` timeline assertion |
+| 02 | Standalone Codex migration is one-time and identity checked; Claude takeover remains exclusive | guided cancel, server-issued two-action graceful confirmation, one-SIGTERM, PID reuse, identity/workspace drift, timeout, restart recovery, and duplicate-owner rejection tests |
+| 02 | The mismatched user-global experimental daemon is neither trusted nor mutated | process/socket provenance assertions and deploy/runtime audit proving only the pinned private child is addressed |
+
 ## Not audited
 
-Specs 01–04 (control planes, Codex daemon adoption, hook bridge, workspace model), 06, 11, and the
-remaining criteria of 05 and 07–10 were not walked criterion by criterion in this pass. The defects
-that were found and fixed against them are recorded in the branch history rather than here.
+Specs 01–02 have an updated contract and the explicit pending gates above, but have not yet been
+re-audited against wire 5. Specs 03–04 (hook bridge, workspace model), 06, 11, and the remaining
+criteria of 05 and 07–10 were not walked criterion by criterion in this pass. The defects that
+were found and fixed against them are recorded in the branch history rather than here.

@@ -8,6 +8,7 @@ import {
   type SelectedSessionFactsResponse,
   type SelectedTodoDetailResponse,
   type SessionSettingsOptionsResponse,
+  type SetupHookApplyResponse,
   type SetupReadModel,
   type TranscriptSearchResponse,
 } from "../lib/api";
@@ -163,6 +164,64 @@ export async function acquireAutomaticLease(api: Pick<CockpitApi, "acquireLease"
   return api.acquireLease(session.id, clientId, currentToken, 60, takeover);
 }
 
+export function shouldRenewForegroundLease(
+  lease: ControlLease,
+  now = Date.now(),
+  renewalWindowMs = 20_000,
+): boolean {
+  const expiresAt = Date.parse(lease.expiresAt);
+  return Number.isFinite(expiresAt) && expiresAt <= now + renewalWindowMs;
+}
+
+export function renewForegroundLease(
+  api: Pick<CockpitApi, "acquireLease">,
+  session: Pick<SessionView, "id">,
+  clientId: string,
+  current: ControlLease,
+  now = Date.now(),
+): Promise<ControlLease> {
+  const currentToken = Date.parse(current.expiresAt) > now ? current.token : undefined;
+  return api.acquireLease(session.id, clientId, currentToken, 60, false);
+}
+
+export function sessionNeedsForegroundLease(
+  session: Pick<SessionView, "archived" | "control">,
+): boolean {
+  if (session.archived) return false;
+  return session.control.capabilities.some((capability) =>
+    capability === "queue"
+    || capability === "steer"
+    || capability === "interrupt"
+    || capability === "respond"
+    || capability === "take-control"
+    || capability === "cancel-take-control"
+    || capability === "retry-control"
+  );
+}
+
+/**
+ * A selection can change while its first lease request is still in flight.
+ * Settle that request before reading and releasing the token so a late result
+ * cannot strand a writer on a drawer the operator has already left.
+ */
+export async function releaseHeldSessionLease(
+  api: Pick<CockpitApi, "releaseLease"> | null,
+  sessionId: string,
+  pending: Promise<ControlLease> | undefined,
+  readLease: () => ControlLease | undefined,
+  forgetLease: () => void,
+  shouldRelease: () => boolean = () => true,
+): Promise<void> {
+  // Renewal rotates the token. When selection cleanup cancels the renewing
+  // effect, its result is intentionally no longer written into React state,
+  // but it is still the server's authoritative token and must be released.
+  const settled = await pending?.catch(() => undefined);
+  if (!shouldRelease()) return;
+  const writer = settled ?? readLease();
+  forgetLease();
+  if (api && writer) await api.releaseLease(sessionId, writer.token).catch(() => undefined);
+}
+
 /** Gives an active-to-archive transition a short provider-index propagation window. */
 export async function resolveArchivedSelection(
   api: Pick<CockpitApi, "archivedSession">,
@@ -270,6 +329,7 @@ export function useCockpit() {
   const leaseOperationsRef = useRef(new Map<string, Promise<ControlLease>>());
   const recoveryRef = useRef<Promise<boolean> | null>(null);
   const archivedRequestRef = useRef(0);
+  const previousSelectedLeaseSessionRef = useRef<string | null>(selectedId);
   const archivedCatalogRef = useRef(archivedCatalog); archivedCatalogRef.current = archivedCatalog;
 
   const commitSnapshot = useCallback((next: WireStateSnapshot) => { snapshotRef.current = next; setSnapshot(next); }, []);
@@ -467,6 +527,8 @@ export function useCockpit() {
   const selectedSession = activeSelectedSession
     ?? archivedPageSession
     ?? (resolvedArchivedSession?.id === selectedId ? resolvedArchivedSession : null);
+  const selectedSessionRef = useRef<string | null>(selectedSession?.id ?? null);
+  selectedSessionRef.current = selectedSession?.id ?? null;
   useEffect(() => {
     if (!selectedId) {
       setResolvedArchivedSession(null);
@@ -482,7 +544,10 @@ export function useCockpit() {
       if (scope !== "archived") setScope("archived");
       return;
     }
-    if (!hasSuccessfulSnapshot || !api) return;
+    // Discovery deliberately publishes a stale snapshot while its initial scan
+    // is still running. An empty snapshot at that point is not evidence that a
+    // deep-linked session vanished or moved to the archive.
+    if (!hasSuccessfulSnapshot || snapshot.stale || !api) return;
     let cancelled = false;
     void (async () => {
       let archived: SessionView | null;
@@ -504,7 +569,7 @@ export function useCockpit() {
       void loadArchived(archivedCatalogRef.current.query);
     })();
     return () => { cancelled = true; };
-  }, [activeSelectedSession, api, archivedPageSession, handleFailure, hasSuccessfulSnapshot, loadArchived, resolvedArchivedSession, scope, selectedId, setScope, setSelectedId]);
+  }, [activeSelectedSession, api, archivedPageSession, handleFailure, hasSuccessfulSnapshot, loadArchived, resolvedArchivedSession, scope, selectedId, setScope, setSelectedId, snapshot.stale]);
   const mutationsReady = mutationsAreReady(auth !== null, connection, snapshot.stale, availability);
 
   const withBusy = useCallback(async <T,>(key: string, operation: () => Promise<T>): Promise<T> => {
@@ -521,6 +586,14 @@ export function useCockpit() {
   const forgetLease = useCallback((sessionId: string) => {
     const next = { ...leasesRef.current }; delete next[sessionId]; leasesRef.current = next; setLeases(next);
   }, []);
+  const releaseSessionWriter = useCallback((sessionId: string, preserveIfReselected = false) => releaseHeldSessionLease(
+    api,
+    sessionId,
+    leaseOperationsRef.current.get(sessionId),
+    () => leasesRef.current[sessionId],
+    () => forgetLease(sessionId),
+    () => !preserveIfReselected || selectedSessionRef.current !== sessionId,
+  ), [api, forgetLease]);
   const ensureLease = useCallback(async (session: SessionView, takeover = false): Promise<ControlLease> => {
     if (!api || !mutationsReady) throw new Error("Reconnect before sending an action.");
     const pending = leaseOperationsRef.current.get(session.id); if (pending && !takeover) return pending;
@@ -571,11 +644,77 @@ export function useCockpit() {
   const setModel = useCallback((session: SessionView, model: string) => perform(session, { type: "set-model", model, ...expectedState(session) }), [perform]);
   const setEffort = useCallback((session: SessionView, effort: ReasoningEffort) => perform(session, { type: "set-effort", effort, ...expectedState(session) }), [perform]);
   const removeQueued = useCallback((session: SessionView, messageId: string) => perform(session, { type: "remove-queued", messageId, ...expectedState(session) }), [perform]);
+  const resumeInWeb = useCallback((session: SessionView) => perform(session, { type: "resume", ...expectedState(session) }), [perform]);
   const lifecycleAction = useCallback((session: SessionView, type: "archive" | "end" | "delete") => perform(session, { type, ...expectedState(session) }), [perform]);
   const openEditor = useCallback((session: SessionView, relativePath: string) => perform(session, { type: "open-editor", relativePath, ...expectedState(session) }), [perform]);
-  const takeCliControl = useCallback((session: SessionView, method: "guided-exit" | "graceful-stop") => perform(session, { type: "take-control", method, ...expectedState(session) }), [perform]);
+  const takeCliControl = useCallback((
+    session: SessionView,
+    method: "guided-exit" | "graceful-stop",
+    takeoverId?: string,
+  ) => perform(session, {
+    type: "take-control",
+    method,
+    ...(takeoverId === undefined ? {} : { takeoverId }),
+    ...expectedState(session),
+  }), [perform]);
   const cancelCliTakeover = useCallback((session: SessionView, takeoverId: string) => perform(session, { type: "cancel-take-control", takeoverId, ...expectedState(session) }), [perform]);
+  const retryControl = useCallback((session: SessionView) => perform(session, { type: "retry-control", ...expectedState(session) }), [perform]);
   const takeOverControl = useCallback(async (session: SessionView) => { await ensureLease(session, true); setNotice("This browser window can now steer the session."); }, [ensureLease]);
+
+  const selectedLeaseSessionId = selectedSession?.id ?? null;
+  const selectedLeaseEligible = Boolean(selectedSession && sessionNeedsForegroundLease(selectedSession));
+  useEffect(() => {
+    const previous = previousSelectedLeaseSessionRef.current;
+    previousSelectedLeaseSessionRef.current = selectedLeaseSessionId;
+    if (previous && previous !== selectedLeaseSessionId) {
+      void releaseSessionWriter(previous, true);
+    }
+  }, [releaseSessionWriter, selectedLeaseSessionId]);
+  useEffect(() => {
+    if (!api || !mutationsReady || !selectedLeaseSessionId || !selectedLeaseEligible) return;
+    const session = { id: selectedLeaseSessionId };
+    let cancelled = false;
+    const renew = (): void => {
+      if (cancelled || document.visibilityState !== "visible") return;
+      const current = leasesRef.current[session.id];
+      if (!current || !shouldRenewForegroundLease(current)) return;
+      const pending = leaseOperationsRef.current.get(session.id);
+      if (pending) return;
+      const operation = renewForegroundLease(api, session, BROWSER_CLIENT_ID, current)
+        .then((next) => {
+          if (!cancelled && leasesRef.current[session.id]?.token === current.token) {
+            rememberLease(session.id, next);
+          }
+          return next;
+        })
+        .catch((error: unknown) => {
+          if (cancelled || handleFailure(error)) throw error;
+          const expiry = conflictExpiry(error);
+          if (expiry !== undefined) {
+            setControlConflicts((value) => ({ ...value, [session.id]: expiry }));
+            setActionError("Another browser window is steering this session.");
+          }
+          throw error;
+        })
+        .finally(() => {
+          if (leaseOperationsRef.current.get(session.id) === operation) {
+            leaseOperationsRef.current.delete(session.id);
+          }
+        });
+      // The rejection is reflected in connectivity or conflict state above;
+      // the interval itself must never produce an unhandled rejection.
+      void operation.catch(() => undefined);
+      leaseOperationsRef.current.set(session.id, operation);
+    };
+    renew();
+    const timer = window.setInterval(renew, 5_000);
+    document.addEventListener("visibilitychange", renew);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", renew);
+    };
+  }, [api, handleFailure, mutationsReady, rememberLease, selectedLeaseEligible, selectedLeaseSessionId]);
 
   useEffect(() => {
     if (!mutationsReady || outbox.length === 0) return;
@@ -600,6 +739,48 @@ export function useCockpit() {
     return () => { cancelled = true; };
   }, [mutationsReady, outbox, perform]);
 
+  const refreshHostCollections = useCallback(async (): Promise<void> => {
+    if (!api) throw new Error("The cockpit is offline.");
+    const [nextHosts, nextWorkspaces] = await Promise.all([api.hosts(), api.workspaces()]);
+    setHosts(nextHosts);
+    setWorkspaces(nextWorkspaces);
+  }, [api]);
+
+  const addHost = useCallback(async (label: string, target: string): Promise<HostOption> => {
+    if (!api || !mutationsReady) throw new Error("Reconnect before adding a remote host.");
+    const normalizedLabel = label.trim();
+    const normalizedTarget = target.trim();
+    if (!normalizedLabel || !normalizedTarget) throw new Error("Enter both a host label and an SSH target.");
+    const host = await withBusy("host:add", async () => {
+      const registered = await api.addHost(normalizedLabel, normalizedTarget);
+      setHosts((current) => [registered, ...current.filter((item) => item.id !== registered.id)]);
+      await refreshHostCollections();
+      return registered;
+    });
+    setNotice(`${host.label} was added.`);
+    return host;
+  }, [api, mutationsReady, refreshHostCollections, withBusy]);
+
+  const removeHost = useCallback(async (hostId: string): Promise<void> => {
+    if (!api || !mutationsReady) throw new Error("Reconnect before removing a remote host.");
+    const host = hosts.find((item) => item.id === hostId);
+    if (hostId === "local" || host?.kind === "local") throw new Error("The local host cannot be removed.");
+    await withBusy(`host:remove:${hostId}`, async () => {
+      await api.removeHost(hostId);
+      setHosts((current) => current.filter((item) => item.id !== hostId));
+      setWorkspaces((current) => current.filter((item) => item.hostId !== hostId));
+      setHostFilterState((current) => {
+        if (!current.has(hostId)) return current;
+        const next = new Set(current);
+        next.delete(hostId);
+        replaceNavigationUrl(searchWithHostFilter(window.location.search, next));
+        return next;
+      });
+      await refreshHostCollections();
+    });
+    setNotice(`${host?.label ?? "Remote host"} was removed from Agent Manager.`);
+  }, [api, hosts, mutationsReady, refreshHostCollections, withBusy]);
+
   const createSession = useCallback(async (input: LaunchSessionInput) => {
     if (!api || !mutationsReady) throw new Error("Reconnect before creating a session.");
     const session = await withBusy("create", async () => {
@@ -611,10 +792,6 @@ export function useCockpit() {
     setSelectedId(session.id); setNotice("Session created."); return session;
   }, [api, commitSnapshot, mutationsReady, setSelectedId, withBusy]);
 
-  const releaseSessionWriter = useCallback(async (sessionId: string) => {
-    const writer = leasesRef.current[sessionId]; forgetLease(sessionId);
-    if (api && writer) await api.releaseLease(sessionId, writer.token).catch(() => undefined);
-  }, [api, forgetLease]);
   const closeSelected = useCallback(async () => { const id = selectedId; setSelectedId(null); if (id) await releaseSessionWriter(id); }, [releaseSessionWriter, selectedId, setSelectedId]);
   const completeWorkspacePath = useCallback((hostId: string, path: string) => api ? api.completeDirectories(hostId, path) : Promise.resolve([]), [api]);
   const loadPreview = useCallback((session: SessionView): Promise<PanePreview> => { if (!api) throw new Error("The cockpit is offline."); return api.preview(session.id); }, [api]);
@@ -661,6 +838,13 @@ export function useCockpit() {
     if (!api) throw new Error("The cockpit is offline.");
     return api.setup();
   }, [api]);
+  const applySetupHook = useCallback((
+    provider: "claude" | "codex",
+    previewId: string,
+  ): Promise<SetupHookApplyResponse> => {
+    if (!api) throw new Error("The cockpit is offline.");
+    return api.applySetupHook(provider, previewId);
+  }, [api]);
   return {
     ready: auth !== null, actor: auth?.actor ?? null, authError, availability, snapshot, sessions,
     displaySessions: scope === "archived" ? archivedCatalog.items : sessions,
@@ -672,8 +856,8 @@ export function useCockpit() {
     clearNotice: () => setNotice(null), actionError, clearActionError: () => setActionError(null),
     refresh, retryConnection: recoverBrowserSession, controlConflict: selectedSession ? controlConflicts[selectedSession.id] : undefined,
     takeOverControl, hasBusyAction: Object.values(busy).some(Boolean),
-    sendMessage, respond, interrupt, setProfile, setModel, setEffort, removeQueued, lifecycleAction, openEditor, takeCliControl, cancelCliTakeover,
-    createSession, completeWorkspacePath, loadPreview, loadAttach, loadAttentionDetails, loadTodoDetail, searchTranscript, loadWorkspaceFiles, loadSettingsOptions, loadProviderSettingsOptions, loadSessionFacts, loadPlanFile, loadSetup, outbox, offlineReview,
+    sendMessage, respond, interrupt, setProfile, setModel, setEffort, removeQueued, resumeInWeb, lifecycleAction, openEditor, takeCliControl, cancelCliTakeover, retryControl,
+    addHost, removeHost, createSession, completeWorkspacePath, loadPreview, loadAttach, loadAttentionDetails, loadTodoDetail, searchTranscript, loadWorkspaceFiles, loadSettingsOptions, loadProviderSettingsOptions, loadSessionFacts, loadPlanFile, loadSetup, applySetupHook, outbox, offlineReview,
     dismissOfflineReview: (id: string) => setOfflineReview((items) => items.filter((item) => item.id !== id)),
   };
 }

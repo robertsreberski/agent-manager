@@ -14,6 +14,7 @@ import {
   type ClaudeEffortLevel,
   type ClaudeInterruptResult,
   type ClaudeManagedResumeConfig,
+  type ClaudeManagedDormantConfig,
   type ClaudeManagedSessionConfig,
   type ClaudeManagedSessionSnapshot,
   type ClaudeMessageListener,
@@ -67,6 +68,28 @@ function deferred<T>(): Deferred<T> {
   return { promise, resolve, reject };
 }
 
+function waitWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(signal.reason ?? new Error("Operation was cancelled"));
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (complete: () => void): void => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", abort);
+      complete();
+    };
+    const abort = (): void => finish(() => reject(
+      signal.reason ?? new Error("Operation was cancelled"),
+    ));
+    signal.addEventListener("abort", abort, { once: true });
+    promise.then(
+      (value) => finish(() => resolve(value)),
+      (error) => finish(() => reject(error)),
+    );
+  });
+}
+
 function nonEmptyText(text: string, field: string): string {
   if (text.trim().length === 0) {
     throw new Error(`${field} must not be empty`);
@@ -107,11 +130,17 @@ export class ClaudeManagedSession {
   readonly #stillQueuedMessageIds = new Set<string>();
   readonly #backgroundTaskIds = new Set<string>();
   readonly #stagedMessages: ClaudeStagedMessage[] = [];
+  readonly #closedQueries = new WeakSet<ClaudeSdkQuery>();
 
   #query: ClaudeSdkQuery | null = null;
   #inbox: AsyncInbox<ClaudeSdkUserMessage> | null = null;
+  #queryAbortController: AbortController | null = null;
+  #consumerPromise: Promise<void> | null = null;
+  #cleanupQuery: ClaudeSdkQuery | null = null;
+  #disposePromise: Promise<void> | null = null;
   #ready = deferred<void>();
   #epoch = 0;
+  #initialized = false;
   #generation = 0;
   #sessionId: string | null = null;
   #resumedFrom: string | null = null;
@@ -127,6 +156,7 @@ export class ClaudeManagedSession {
   #canSteer = false;
   #queueKnowledge: "known" | "unknown" = "known";
   #handoff: ClaudeCliHandoff | null = null;
+  #handoffDisconnect: Promise<void> | null = null;
   #lastError: string | null = null;
   #updatedAt: string;
   #disposed = false;
@@ -146,6 +176,12 @@ export class ClaudeManagedSession {
         "bypassPermissions requires allowDangerouslySkipPermissions: true",
       );
     }
+    if (
+      config.claudeCodeExecutable !== undefined
+      && config.claudeCodeExecutable.trim().length === 0
+    ) {
+      throw new Error("claudeCodeExecutable must not be empty");
+    }
     this.#runtime = runtime;
     this.#config = { ...config };
     this.#localId = runtime.randomUUID();
@@ -160,21 +196,164 @@ export class ClaudeManagedSession {
   static async start(
     runtime: ClaudeSdkRuntime,
     config: ClaudeManagedSessionConfig,
+    signal?: AbortSignal,
   ): Promise<ClaudeManagedSession> {
     const session = new ClaudeManagedSession(runtime, config);
-    await session.#connect(null, config.initialMessage);
-    return session;
+    try {
+      await session.#connect(null, config.initialMessage, signal);
+      return session;
+    } catch (error) {
+      try {
+        await session.dispose();
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          "Claude session initialization and cleanup both failed",
+        );
+      }
+      throw error;
+    }
   }
 
   static async resume(
     runtime: ClaudeSdkRuntime,
     config: ClaudeManagedResumeConfig,
+    signal?: AbortSignal,
   ): Promise<ClaudeManagedSession> {
     nonEmptyText(config.sessionId, "sessionId");
     const session = new ClaudeManagedSession(runtime, config);
     session.#resumedFrom = config.sessionId;
-    await session.#connect(config.sessionId, config.initialMessage);
+    try {
+      await session.#connect(config.sessionId, config.initialMessage, signal);
+      return session;
+    } catch (error) {
+      try {
+        await session.dispose();
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          "Claude session resume and cleanup both failed",
+        );
+      }
+      throw error;
+    }
+  }
+
+  static dormant(
+    runtime: ClaudeSdkRuntime,
+    config: ClaudeManagedDormantConfig,
+  ): ClaudeManagedSession {
+    nonEmptyText(config.sessionId, "sessionId");
+    const session = new ClaudeManagedSession(runtime, config);
+    session.#sessionId = config.sessionId;
+    session.#resumedFrom = config.sessionId;
+    session.#model = config.model ?? null;
+    session.#providerActivity = "closed";
     return session;
+  }
+
+  /**
+   * Opens a new, still-unpublished SDK owner for this exact dormant
+   * conversation. The dormant object remains unchanged so the adapter can
+   * durably commit the ownership transition before swapping its public entry,
+   * or dispose the returned owner and keep this object on any failure.
+   *
+   * Concurrency is intentionally coordinated by the adapter: it reserves the
+   * provider session before calling this method and blocks native attach until
+   * commit/abort. The checks on both sides of the async SDK initialization make
+   * identity or workspace drift fail closed even if this dormant object changes
+   * while the provider is starting.
+   */
+  async resumeDormantExact(
+    expected: {
+      sessionId: string;
+      cwd: string;
+      mode: ClaudePermissionMode;
+      model?: string;
+      effort?: ClaudeEffortLevel;
+    },
+    signal?: AbortSignal,
+  ): Promise<ClaudeManagedSession> {
+    const sessionId = nonEmptyText(expected.sessionId, "sessionId");
+    const cwd = nonEmptyText(expected.cwd, "cwd");
+    signal?.throwIfAborted();
+    if (this.#disposed) throw new Error("Claude managed session is disposed");
+    if (this.#sessionId !== sessionId || this.#resumedFrom !== sessionId) {
+      throw new Error("Claude dormant resume identity does not match");
+    }
+    if (this.#config.cwd !== cwd) {
+      throw new Error("Claude dormant resume workspace does not match");
+    }
+    if (
+      this.#owner !== "manager"
+      || this.#providerActivity !== "closed"
+      || this.#query !== null
+      || this.#inbox !== null
+      || this.#queryAbortController !== null
+      || this.#handoff !== null
+      || this.#pending.size > 0
+      || this.#stagedMessages.length > 0
+      || this.#outstandingMessageIds.size > 0
+      || this.#stillQueuedMessageIds.size > 0
+      || this.#queueKnowledge !== "known"
+    ) {
+      throw new Error("Claude session is not an exact dormant resume target");
+    }
+
+    const generation = this.#generation;
+    const resumeConfig: ClaudeManagedResumeConfig = {
+      sessionId,
+      cwd,
+      mode: expected.mode,
+      ...(this.#config.claudeCodeExecutable
+        ? { claudeCodeExecutable: this.#config.claudeCodeExecutable }
+        : {}),
+      ...(this.#config.persistSession !== undefined
+        ? { persistSession: this.#config.persistSession }
+        : {}),
+      ...(expected.model !== undefined ? { model: expected.model } : {}),
+      ...(expected.effort !== undefined ? { effort: expected.effort } : {}),
+      ...(this.#config.environment
+        ? { environment: { ...this.#config.environment } }
+        : {}),
+      ...(this.#config.allowDangerouslySkipPermissions !== undefined
+        ? {
+            allowDangerouslySkipPermissions:
+              this.#config.allowDangerouslySkipPermissions,
+          }
+        : {}),
+    };
+    const resumed = await ClaudeManagedSession.resume(
+      this.#runtime,
+      resumeConfig,
+      signal,
+    );
+    try {
+      signal?.throwIfAborted();
+      if (
+        this.#disposed
+        || this.#generation !== generation
+        || this.#sessionId !== sessionId
+        || this.#config.cwd !== cwd
+        || this.#owner !== "manager"
+        || this.#providerActivity !== "closed"
+        || this.#query !== null
+        || this.#handoff !== null
+      ) {
+        throw new Error("Claude dormant ownership changed during resume");
+      }
+      if (
+        resumed.snapshot.sessionId !== sessionId
+        || resumed.snapshot.resumedFrom !== sessionId
+        || resumed.snapshot.cwd !== cwd
+      ) {
+        throw new Error("Claude dormant resume returned a different identity or workspace");
+      }
+      return resumed;
+    } catch (error) {
+      await resumed.dispose();
+      throw error;
+    }
   }
 
   get snapshot(): ClaudeManagedSessionSnapshot {
@@ -337,9 +516,23 @@ export class ClaudeManagedSession {
     return query.supportedModels();
   }
 
-  /** Ends only the manager-owned SDK query; external Claude processes are never targeted. */
-  end(): void {
-    this.dispose();
+  /**
+   * Stops only the manager-owned SDK query. The resumable conversation object
+   * deliberately remains alive so ending web control cannot erase the native
+   * resume path or turn a durable transcript into an unreachable orphan.
+   */
+  async end(): Promise<void> {
+    this.#assertManagerControl();
+    const settled = this.#disconnectQuery(new Error("Claude managed control was ended"));
+    this.#abortAllPending();
+    this.#stagedMessages.splice(0);
+    this.#outstandingMessageIds.clear();
+    this.#stillQueuedMessageIds.clear();
+    this.#backgroundTaskIds.clear();
+    this.#queueKnowledge = "known";
+    this.#providerActivity = "closed";
+    this.#touch();
+    await settled;
   }
 
   respondToRequest(id: string, response: ClaudeRequestResponse): void {
@@ -414,8 +607,12 @@ export class ClaudeManagedSession {
     throw new Error(`Response ${response.decision} cannot answer a permission`);
   }
 
-  prepareCliHandoff(): ClaudeCliHandoff {
+  async prepareCliHandoff(
+    handoffId = this.#runtime.randomUUID(),
+    signal?: AbortSignal,
+  ): Promise<ClaudeCliHandoff> {
     this.#assertManagerControl();
+    signal?.throwIfAborted();
     if (!this.#sessionId) throw new Error("Claude session has not initialized");
     const terminalConsumer =
       (this.#providerActivity === "closed" || this.#providerActivity === "failed")
@@ -438,14 +635,15 @@ export class ClaudeManagedSession {
     }
 
     const now = this.#runtime.now().toISOString();
-    const handoffId = this.#runtime.randomUUID();
     this.#handoff = {
       id: handoffId,
       state: "prepared",
       sessionId: this.#sessionId,
       cwd: this.#config.cwd,
       command: {
-        executable: "claude",
+        executable: this.#config.claudeCodeExecutable
+          ?? this.#runtime.claudeCodeExecutable
+          ?? "claude",
         args: ["--resume", this.#sessionId],
         cwd: this.#config.cwd,
       },
@@ -457,8 +655,15 @@ export class ClaudeManagedSession {
       error: null,
     };
     this.#owner = "native";
-    this.#disconnectQuery();
+    const disconnect = this.#disconnectQuery(new Error("Claude ownership transferred to the native CLI"));
+    this.#handoffDisconnect = disconnect;
+    // Publish foreign authority before waiting for provider cleanup. A timeout
+    // can now only initiate reclaim; it can never restore a stale writable
+    // manager projection while this disconnect completes in the background.
     this.#touch();
+    await waitWithSignal(disconnect, signal);
+    signal?.throwIfAborted();
+    if (this.#handoffDisconnect === disconnect) this.#handoffDisconnect = null;
     return cloneHandoff(this.#handoff) as ClaudeCliHandoff;
   }
 
@@ -495,16 +700,25 @@ export class ClaudeManagedSession {
     this.#touch();
   }
 
-  async reclaimFromCli(handoffId: string): Promise<void> {
+  async reclaimFromCli(handoffId: string, signal?: AbortSignal): Promise<void> {
     const handoff = this.#requireHandoff(handoffId, "exited");
     const sessionId = handoff.sessionId;
-    this.#handoff = null;
-    this.#owner = "manager";
+    // Keep native/foreign authority published until the resumed SDK stream has
+    // proven the exact provider identity and version through init.
     this.#providerActivity = "starting";
     this.#lastError = null;
     this.#touch();
     try {
-      await this.#connect(sessionId);
+      const disconnect = this.#handoffDisconnect;
+      if (disconnect) {
+        await waitWithSignal(disconnect, signal);
+        if (this.#handoffDisconnect === disconnect) this.#handoffDisconnect = null;
+      }
+      signal?.throwIfAborted();
+      await this.#connect(sessionId, undefined, signal);
+      this.#handoff = null;
+      this.#owner = "manager";
+      this.#touch();
     } catch (error) {
       this.#owner = "native";
       this.#handoff = handoff;
@@ -515,29 +729,51 @@ export class ClaudeManagedSession {
     }
   }
 
-  dispose(): void {
-    if (this.#disposed) return;
+  dispose(): Promise<void> {
+    if (this.#disposePromise) return this.#disposePromise;
     this.#disposed = true;
-    this.#disconnectQuery();
-    this.#abortAllPending();
-    this.#stagedMessages.splice(0);
-    this.#outstandingMessageIds.clear();
-    this.#stillQueuedMessageIds.clear();
-    this.#backgroundTaskIds.clear();
-    this.#queueKnowledge = "known";
-    this.#providerActivity = "closed";
-    this.#touch();
+    const operation = (async (): Promise<void> => {
+      const settled = this.#disconnectQuery(
+        new Error("Claude managed session was disposed"),
+      );
+      this.#abortAllPending();
+      this.#stagedMessages.splice(0);
+      this.#outstandingMessageIds.clear();
+      this.#stillQueuedMessageIds.clear();
+      this.#backgroundTaskIds.clear();
+      this.#queueKnowledge = "known";
+      this.#providerActivity = "closed";
+      this.#touch();
+      await settled;
+    })();
+    this.#disposePromise = operation;
+    void operation.catch(() => {
+      // A close that positively rejects may be retried. A hanging close keeps
+      // this promise installed so all concurrent callers share the same
+      // indeterminate cleanup instead of issuing another close.
+      if (this.#disposePromise === operation) this.#disposePromise = null;
+    });
+    return operation;
   }
 
   async #connect(
     resumeSessionId: string | null,
     initialMessage?: string,
+    signal?: AbortSignal,
   ): Promise<void> {
     if (this.#disposed) throw new Error("Claude managed session is disposed");
+    signal?.throwIfAborted();
     const epoch = ++this.#epoch;
     const inbox = new AsyncInbox<ClaudeSdkUserMessage>();
+    const abortController = new AbortController();
     this.#inbox = inbox;
+    this.#queryAbortController = abortController;
     this.#ready = deferred<void>();
+    // createQuery() can fail before #connect reaches the readiness await. Keep
+    // that synchronous construction failure from surfacing as an unhandled
+    // rejection while preserving the original promise for the normal await.
+    void this.#ready.promise.catch(() => undefined);
+    this.#initialized = false;
     this.#providerActivity = "starting";
     this.#sessionId = resumeSessionId;
     this.#resumedFrom = resumeSessionId;
@@ -561,10 +797,20 @@ export class ClaudeManagedSession {
       CLAUDE_AGENT_SDK_CLIENT_APP: "agent-manager",
       [CLAUDE_MANAGER_OWNER_ENV]: CLAUDE_MANAGER_OWNER_VALUE,
     };
+    let consumer: Promise<void> | null = null;
+    const abortFromSignal = (): void => {
+      const error = signal?.reason ?? new Error("Claude session initialization was cancelled");
+      if (!abortController.signal.aborted) abortController.abort(error);
+      if (epoch !== this.#epoch) return;
+      this.#ready.reject(error);
+      void this.#disconnectQuery(error);
+    };
+    signal?.addEventListener("abort", abortFromSignal, { once: true });
     try {
       const query = this.#runtime.createQuery({
         prompt: inbox,
         options: {
+          abortController,
           cwd: this.#config.cwd,
           persistSession: this.#config.persistSession ?? true,
           includePartialMessages: true,
@@ -577,27 +823,49 @@ export class ClaudeManagedSession {
           env: environment,
           ...(resumeSessionId ? { resume: resumeSessionId } : {}),
           ...(this.#config.model ? { model: this.#config.model } : {}),
+          ...((this.#config.claudeCodeExecutable ?? this.#runtime.claudeCodeExecutable)
+            ? {
+                pathToClaudeCodeExecutable:
+                  this.#config.claudeCodeExecutable ?? this.#runtime.claudeCodeExecutable,
+              }
+            : {}),
           canUseTool: (toolName, input, options) =>
             this.#handlePermission(epoch, toolName, input, options),
           onElicitation: (request, options) =>
             this.#handleElicitation(epoch, request, options.signal),
         },
       });
-      this.#query = query;
-      void this.#consume(query, epoch);
-      await this.#ready.promise;
-    } catch (error) {
-      inbox.close();
-      if (epoch === this.#epoch) {
-        this.#query?.close();
-        this.#query = null;
-        this.#inbox = null;
+      // An ownership conflict can abort synchronously from inside the runtime's
+      // process/bootstrap callback, before createQuery() returns and before the
+      // query is assigned to this object. Close that just-created handle
+      // explicitly; the earlier abort could not see it through #query yet.
+      if (signal?.aborted || epoch !== this.#epoch) {
+        this.#closeQuery(query);
+        throw signal?.reason ?? new Error(
+          "Claude SDK ownership changed during query construction",
+        );
       }
-      this.#providerActivity = "failed";
-      this.#lastError = error instanceof Error ? error.message : String(error);
+      this.#query = query;
+      consumer = this.#consume(query, epoch);
+      this.#consumerPromise = consumer;
+      await this.#ready.promise;
+      signal?.throwIfAborted();
+      if (epoch !== this.#epoch || this.#query !== query || !this.#initialized) {
+        throw new Error("Claude SDK ownership changed during initialization");
+      }
+    } catch (error) {
       this.#ready.reject(error);
-      this.#touch();
+      if (epoch === this.#epoch) {
+        await this.#disconnectQuery(error);
+        this.#providerActivity = "failed";
+        this.#lastError = error instanceof Error ? error.message : String(error);
+        this.#touch();
+      } else if (consumer) {
+        await consumer;
+      }
       throw error;
+    } finally {
+      signal?.removeEventListener("abort", abortFromSignal);
     }
   }
 
@@ -622,7 +890,7 @@ export class ClaudeManagedSession {
         }
       }
       if (epoch !== this.#epoch) return;
-      if (!this.#sessionId) {
+      if (!this.#initialized) {
         const error = new Error("Claude SDK ended before initialization");
         this.#ready.reject(error);
         throw error;
@@ -654,11 +922,17 @@ export class ClaudeManagedSession {
     if (message.type === "system" && message.subtype === "init") {
       const sessionId = message.session_id;
       const codeVersion = message.claude_code_version;
+      if (codeVersion !== CLAUDE_CODE_VERSION) {
+        throw new Error(
+          `Unsupported Claude Code ${codeVersion}; expected ${CLAUDE_CODE_VERSION}`,
+        );
+      }
       if (this.#resumedFrom && sessionId !== this.#resumedFrom) {
         throw new Error(
           `Claude resumed unexpected session ${sessionId}; expected ${this.#resumedFrom}`,
         );
       }
+      this.#initialized = true;
       this.#sessionId = sessionId;
       this.#claudeCodeVersion = codeVersion;
       this.#model = message.model;
@@ -1047,32 +1321,59 @@ export class ClaudeManagedSession {
     return handoff;
   }
 
-  #disconnectQuery(): void {
+  #disconnectQuery(reason: unknown): Promise<void> {
+    const consumer = this.#consumerPromise;
+    const query = this.#query ?? this.#cleanupQuery;
     this.#epoch += 1;
+    this.#initialized = false;
+    if (this.#queryAbortController && !this.#queryAbortController.signal.aborted) {
+      this.#queryAbortController.abort(reason);
+    }
+    this.#queryAbortController = null;
     this.#inbox?.close();
     this.#inbox = null;
-    this.#query?.close();
+    const closeError = query ? this.#closeQuery(query) : null;
     this.#query = null;
+    return (consumer ?? Promise.resolve()).then(() => {
+      if (closeError !== null) throw closeError;
+    });
   }
 
   #deactivateConsumer(query: ClaudeSdkQuery, epoch: number): void {
     if (epoch !== this.#epoch || this.#query !== query) return;
     this.#epoch += 1;
+    this.#initialized = false;
+    if (this.#queryAbortController && !this.#queryAbortController.signal.aborted) {
+      this.#queryAbortController.abort(new Error("Claude SDK query ended"));
+    }
+    this.#queryAbortController = null;
     this.#inbox?.close();
     this.#inbox = null;
     this.#query = null;
-    try {
-      query.close();
-    } catch {
-      // The consumer is already detached locally. A terminal provider close
-      // cannot be allowed to restore a stale writable path by interrupting
-      // cleanup.
-    }
+    this.#closeQuery(query);
     if (
       this.#outstandingMessageIds.size > 0
       || this.#stillQueuedMessageIds.size > 0
     ) {
       this.#queueKnowledge = "unknown";
+    }
+  }
+
+  #closeQuery(query: ClaudeSdkQuery): unknown | null {
+    if (this.#closedQueries.has(query)) {
+      if (this.#cleanupQuery === query) this.#cleanupQuery = null;
+      return null;
+    }
+    try {
+      query.close();
+      this.#closedQueries.add(query);
+      if (this.#cleanupQuery === query) this.#cleanupQuery = null;
+      return null;
+    } catch (error) {
+      // Local authority is already withdrawn, but the exact query handle stays
+      // quarantined so a later explicit cleanup retry can positively close it.
+      this.#cleanupQuery = query;
+      return error;
     }
   }
 

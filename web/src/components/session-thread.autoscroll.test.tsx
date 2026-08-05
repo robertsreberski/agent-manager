@@ -81,13 +81,14 @@ function renderDrawer() {
         <ThreadDrawer viewportRef={viewportRef} open title="Thread" onClose={() => undefined}>
           <SessionThread
             session={session}
-            activity={{ items, truncated: false, connection: "live" } as unknown as SessionActivityView}
+            activity={{ items, truncated: false, connection: "open" } as unknown as SessionActivityView}
             remote={false}
             busy={false}
             mutationsReady
             onRespond={vi.fn(async () => undefined)}
             onRemoveQueued={vi.fn(async () => undefined)}
             onOpenEditor={vi.fn(async () => undefined)}
+            onResumeInWeb={vi.fn(async () => undefined)}
             readKeys={new Set()}
             onReadChange={vi.fn()}
             loadAttach={vi.fn(async () => ({ available: false }) as never)}

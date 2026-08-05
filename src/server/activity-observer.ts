@@ -1,4 +1,4 @@
-import type { ActivityItemDraft, ActivityResetReason } from "../activity/index.ts";
+import type { ActivityItem, ActivityItemDraft, ActivityResetReason } from "../activity/index.ts";
 import { ActivityHub } from "../activity/index.ts";
 import type { SessionView } from "../core/types.ts";
 import type {
@@ -198,10 +198,24 @@ function unavailableActivity(reason: TranscriptUnavailableReason): ActivityItemD
   };
 }
 
+function sameUnavailableActivity(
+  item: ActivityItem,
+  draft: ActivityItemDraft,
+): boolean {
+  return item?.kind === "lifecycle"
+    && draft.kind === "lifecycle"
+    && item.id === draft.id
+    && item.event === draft.event
+    && item.level === draft.level
+    && item.title === draft.title
+    && item.state === draft.state;
+}
+
 /**
- * Projects only the currently selected provider transcript into the volatile
- * activity hub. Managed provider streams must remain the sole authority for
- * manager-owned sessions, so callers decide whether a session is eligible.
+ * Projects the currently selected provider transcript into the volatile
+ * activity hub. Exact managed/hook events remain authoritative through the
+ * hub's correlation reconciliation, while polling retains transcript-only
+ * history and event kinds the live provider surface does not expose.
  */
 export class SelectedTranscriptActivityObserver {
   readonly #hub: ActivityHub;
@@ -325,12 +339,42 @@ export class SelectedTranscriptActivityObserver {
         };
     const previous = observation.previous;
     if (next.state === "unavailable") {
-      this.#hub.reconcileTranscript(
-        observation.session.id,
-        observation.session.provider,
-        [unavailableActivity(next.reason)],
-        false,
+      const availability = unavailableActivity(next.reason);
+      const retained = this.#hub.snapshot(observation.session.id)?.items ?? [];
+      const existingAvailability = retained.find((item) => item.id === availability.id);
+      const availabilityUnchanged = existingAvailability !== undefined
+        && sameUnavailableActivity(existingAvailability, availability);
+      const hasRetainedTranscriptHistory = retained.some((item) =>
+        item.source === "transcript" && item.id !== availability.id
       );
+      if (
+        previous?.state === "unavailable"
+        && previous.reason === next.reason
+        && availabilityUnchanged
+      ) {
+        return false;
+      }
+      if (hasRetainedTranscriptHistory) {
+        // A provider file can rotate or be briefly locked while a live hook/API
+        // stream continues. The observer itself is also released when the
+        // drawer is deselected, so `previous` can be empty on a later reselect
+        // even though the hub still holds the transcript. Retain that history
+        // and keep exactly one availability fact beside it.
+        if (!availabilityUnchanged) {
+          this.#hub.ingest(
+            observation.session.id,
+            observation.session.provider,
+            { type: "upsert", item: availability },
+          );
+        }
+      } else {
+        this.#hub.reconcileTranscript(
+          observation.session.id,
+          observation.session.provider,
+          [availability],
+          false,
+        );
+      }
       observation.previous = next;
       return false;
     }

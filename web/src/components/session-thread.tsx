@@ -9,7 +9,7 @@ import {
   useThreadViewportAutoScroll,
   type ThreadMessageLike,
 } from "@assistant-ui/react";
-import { ArrowDown, Copy, LoaderCircle, Sparkles } from "lucide-react";
+import { Archive, ArrowDown, LoaderCircle, RefreshCw, RotateCcw, Sparkles, WifiOff } from "lucide-react";
 import { Button, Collapsible, CollapsibleContent, CollapsibleTrigger } from "./ui";
 import { DISCLOSURE_SCROLL_LOCK_MS, GroupedActivityParts } from "./thread";
 import { MarkdownText } from "./assistant-ui/markdown-text";
@@ -101,7 +101,27 @@ function AssistantMessage({ controls }: { controls: ActivityDataControls }) {
 export function emptyActivityCopy(
   connection: SessionActivityView["connection"],
   truncated: boolean,
+  archived = false,
 ): { title: string; description: string } {
+  // An empty archived drawer is not evidence that no transcript exists until
+  // the transport has completed a successful read. Keep transient and terminal
+  // connection facts ahead of the archive-empty conclusion.
+  if (archived && connection !== "open") {
+    switch (connection) {
+      case "connecting":
+        return { title: "Loading activity", description: "Loading this session's retained history." };
+      case "retrying":
+        return { title: "Reconnecting to activity", description: "The live stream was interrupted; history is preserved while it reconnects." };
+      case "offline":
+        return { title: "Activity stream unavailable", description: "The live activity connection could not be opened." };
+    }
+  }
+  if (archived) {
+    return {
+      title: "No archived activity",
+      description: "No retained transcript is available for this archived session.",
+    };
+  }
   if (truncated) {
     return {
       title: "No retained activity",
@@ -120,14 +140,36 @@ export function emptyActivityCopy(
   }
 }
 
-function EmptyActivity({ connection, truncated }: { connection: SessionActivityView["connection"]; truncated: boolean }) {
-  const copy = emptyActivityCopy(connection, truncated);
+function EmptyActivity({ connection, truncated, archived }: { connection: SessionActivityView["connection"]; truncated: boolean; archived: boolean }) {
+  const copy = emptyActivityCopy(connection, truncated, archived);
   return (
     <section className="grid min-h-56 place-content-center gap-3 text-center text-[var(--text-muted)]">
       {connection === "connecting" || connection === "retrying"
         ? <LoaderCircle size={20} className="mx-auto motion-safe:animate-spin" />
+        : connection === "offline"
+        ? <WifiOff size={20} className="mx-auto" />
+        : archived
+        ? <Archive size={20} className="mx-auto" />
         : <Sparkles size={20} className="mx-auto" />}
       <div><h3 className="text-title-sm text-[var(--text)]">{copy.title}</h3><p className="mt-1 text-meta-sm">{copy.description}</p></div>
+    </section>
+  );
+}
+
+function ActivityConnectionBanner({ connection, onRetry }: {
+  connection: SessionActivityView["connection"];
+  onRetry?: () => void;
+}) {
+  if (connection === "open") return null;
+  const copy = emptyActivityCopy(connection, false);
+  const terminal = connection === "offline";
+  return (
+    <section className="flex items-start gap-2 border-l-2 border-[var(--warning)] bg-[var(--warning-field)] px-3 py-2.5 text-code-sm text-[var(--text-muted)]" role="status" data-activity-connection>
+      {terminal
+        ? <WifiOff size={14} className="mt-0.5 shrink-0 text-[var(--warning)]" aria-hidden="true" />
+        : <LoaderCircle size={14} className="mt-0.5 shrink-0 motion-safe:animate-spin" aria-hidden="true" />}
+      <div className="min-w-0 flex-1"><strong className="text-[var(--text-secondary)]">{copy.title}.</strong> {copy.description}</div>
+      {terminal && onRetry && <Button variant="ghost" size="sm" data-compact-control className="shrink-0 gap-1 underline underline-offset-2" onClick={onRetry}><RefreshCw size={12} aria-hidden="true" />Retry activity</Button>}
     </section>
   );
 }
@@ -152,7 +194,18 @@ function SessionDetails({ session, remote, facts, factsStatus, attachInstruction
         {/* minmax(0,1fr): an implicit `auto` track sizes to max-content, which let
             long mono fact values push the panel past a 390px viewport and get clipped. */}
         <div className="grid grid-cols-[minmax(0,1fr)] gap-4 border-t border-[var(--rule)] p-3">
-          <SessionCapabilityPanel session={view} facts={facts} factsStatus={factsStatus} attachCommand={attachCommand} attachError={attachError} loadingAttach={loadingAttach} onRevealAttach={onRevealAttach} />
+          <SessionCapabilityPanel
+            session={view}
+            archived={session.archived}
+            facts={facts}
+            factsStatus={factsStatus}
+            attachCommand={attachCommand}
+            attachDescription={attachInstruction?.description ?? null}
+            attachRequiresHandoff={attachInstruction?.requiresHandoff ?? false}
+            attachError={attachError}
+            loadingAttach={loadingAttach}
+            onRevealAttach={onRevealAttach}
+          />
         </div>
       </CollapsibleContent>
     </Collapsible>
@@ -250,12 +303,14 @@ export function SessionThread({
   onRespond,
   onRemoveQueued,
   onOpenEditor,
+  onResumeInWeb,
   readKeys,
   onReadChange,
   loadAttach,
   loadSessionFacts,
   loadPlanFile,
   onContinueInWorkspace,
+  onRetryActivity,
   sessionsOnHost,
 }: {
   session: SessionView;
@@ -266,17 +321,31 @@ export function SessionThread({
   onRespond: (requestId: string, response: RequestResponse) => Promise<void>;
   onRemoveQueued: (messageId: string) => Promise<void>;
   onOpenEditor: (relativePath: string) => Promise<void>;
+  onResumeInWeb: () => Promise<void>;
   readKeys: ReadonlySet<string>;
   onReadChange: (readKey: string, read: boolean) => void;
   loadAttach: () => Promise<AttachInstruction>;
   loadSessionFacts: (sessionId: string, generation: number) => Promise<SelectedSessionFactsResponse>;
   loadPlanFile: (itemId: string) => Promise<PlanFileResponse>;
   onContinueInWorkspace: () => void;
+  onRetryActivity?: () => void;
   sessionsOnHost: number | null;
 }) {
   const [attachInstruction, setAttachInstruction] = useState<AttachInstruction | null>(null);
   const [attachError, setAttachError] = useState<string | null>(null);
   const [loadingAttach, setLoadingAttach] = useState(false);
+  const attachRequestRef = useRef(0);
+  const attachControlKey = [
+    session.generation,
+    session.control.plane,
+    session.control.authority,
+    session.control.coordination?.mode ?? "unknown",
+    session.control.coordination?.nativeAttach ?? "unknown",
+    session.control.takeover?.id ?? "none",
+    session.control.takeover?.state ?? "none",
+  ].join("\u0000");
+  const attachControlKeyRef = useRef(attachControlKey);
+  attachControlKeyRef.current = attachControlKey;
   const [facts, setFacts] = useState<SelectedSessionFactsResponse | null>(null);
   const [factsStatus, setFactsStatus] = useState<"loading" | "loaded" | "error">("loading");
   const exactRequestIds = useMemo(() => exactCurrentActivityRequestIds(activity.items), [activity.items]);
@@ -292,17 +361,27 @@ export function SessionThread({
     });
     return () => { cancelled = true; };
   }, [loadSessionFacts, session.generation, session.id]);
+  useEffect(() => {
+    setAttachInstruction(null);
+    setAttachError(null);
+    setLoadingAttach(false);
+    attachRequestRef.current += 1;
+  }, [attachControlKey]);
   async function revealAttach() {
+    const request = ++attachRequestRef.current;
+    const controlKey = attachControlKeyRef.current;
     setLoadingAttach(true);
     setAttachError(null);
     try {
       const instruction = await loadAttach();
+      if (attachRequestRef.current !== request || attachControlKeyRef.current !== controlKey) return;
       setAttachInstruction(instruction);
       if (!instruction.available) setAttachError("This harness did not return a guarded resume or attach wrapper.");
     } catch (error) {
+      if (attachRequestRef.current !== request) return;
       setAttachError(error instanceof Error ? error.message : "Attach details are unavailable.");
     } finally {
-      setLoadingAttach(false);
+      if (attachRequestRef.current === request) setLoadingAttach(false);
     }
   }
   const controls: ActivityDataControls = {
@@ -346,12 +425,14 @@ export function SessionThread({
       {/* Drawer body: 20px between turn parts (spec 05 R7, frame 4a). */}
       <div className="flex min-w-0 flex-col gap-5" role="log" aria-label="Provider activity" aria-live="polite" aria-relevant="additions text">
         <SessionDetails session={session} remote={remote} facts={facts} factsStatus={factsStatus} attachInstruction={attachInstruction} attachError={attachError} loadingAttach={loadingAttach} onRevealAttach={() => void revealAttach()} />
+        {session.archived && <section className="flex items-center gap-2 border border-[var(--border)] bg-[var(--surface-raised)] px-3 py-2 text-meta-sm text-[var(--text-muted)]" role="status" data-archived-read-only><Archive size={14} aria-hidden="true" /><strong className="text-[var(--text-secondary)]">Archived · read-only</strong><span>History and facts remain available; archived sessions cannot be changed.</span></section>}
+        {activity.items.length > 0 && <ActivityConnectionBanner connection={activity.connection} {...(onRetryActivity ? { onRetry: onRetryActivity } : {})} />}
         {activity.truncated && <ActivityRetentionBoundary />}
-        <AuiIf condition={(state) => state.thread.isEmpty}><EmptyActivity connection={activity.connection} truncated={activity.truncated} /></AuiIf>
+        <AuiIf condition={(state) => state.thread.isEmpty}><EmptyActivity connection={activity.connection} truncated={activity.truncated} archived={session.archived} /></AuiIf>
         <ThreadPrimitive.Messages>
           {({ message }) => message.role === "user" ? <UserMessage /> : message.role === "system" ? <SystemMessage label={systemMessageLabel(message)} /> : <AssistantMessage controls={controls} />}
         </ThreadPrimitive.Messages>
-        {!session.archived && ["completed", "failed", "interrupted"].includes(session.status) && <div><SessionEndedState canResume={session.control.capabilities.includes("resume")} resumeCommand={attachInstruction?.available ? attachInstruction.command : null} resumeDescription={attachInstruction?.description ?? null} resumeError={attachError} resumeUnavailableReason={session.control.withheld.find(({ capability }) => capability === "resume")?.reason ?? null} loadingResume={loadingAttach} onResume={() => void revealAttach()} canContinue={Boolean(session.workspaceIdentity?.worktreePath ?? session.cwd)} onContinue={onContinueInWorkspace} /></div>}
+        {!session.archived && ["completed", "failed", "interrupted"].includes(session.status) && <div><SessionEndedState canResume={session.control.capabilities.includes("resume")} resumeUnavailableReason={session.control.withheld.find(({ capability }) => capability === "resume")?.reason ?? null} resuming={busy} resumeDisabled={!mutationsReady} onResume={() => void onResumeInWeb().catch(() => undefined)} canContinue={Boolean(session.workspaceIdentity?.worktreePath ?? session.cwd)} onContinue={onContinueInWorkspace} /></div>}
         {/*
           Auto-scroll detaches the moment the operator scrolls up, so a long
           turn needs a way back. The primitive renders nothing while the view is
@@ -375,6 +456,33 @@ export function SessionThread({
 
 const PROFILES: readonly ExecutionProfile[] = ["ask-first", "plan", "execute", "full-access"];
 
+export function relativeDeadlineCopy(deadlineAt: string | null, now = Date.now()): string | null {
+  if (!deadlineAt) return null;
+  const remaining = Date.parse(deadlineAt) - now;
+  if (!Number.isFinite(remaining)) return null;
+  if (remaining <= 0) return "deadline reached";
+  const seconds = Math.ceil(remaining / 1_000);
+  if (seconds < 60) return `${seconds}s remaining`;
+  const minutes = Math.floor(seconds / 60);
+  const trailingSeconds = seconds % 60;
+  return `${minutes}m${trailingSeconds ? ` ${trailingSeconds}s` : ""} remaining`;
+}
+
+function useRelativeDeadline(deadlineAt: string | null): string | null {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    setNow(Date.now());
+    if (!deadlineAt) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [deadlineAt]);
+  return relativeDeadlineCopy(deadlineAt, now);
+}
+
+function providerLabel(session: SessionView): string {
+  return session.provider === "claude" ? "Claude Code" : "Codex";
+}
+
 export function SessionThreadComposer({
   session,
   activity,
@@ -392,7 +500,8 @@ export function SessionThreadComposer({
   onOpenSetup,
   onTakeControl,
   onCancelTakeControl,
-  onNativeContinue,
+  onRetryControl,
+  onResumeInWeb,
   onSearchFiles,
 }: {
   session: SessionView;
@@ -409,28 +518,32 @@ export function SessionThreadComposer({
   effortOptions?: readonly ReasoningEffort[];
   restoredDraft?: { key: string; text: string } | null;
   onOpenSetup?: () => void;
-  onTakeControl?: (method: TakeoverMethod) => Promise<void>;
+  onTakeControl?: (method: TakeoverMethod, takeoverId?: string) => Promise<void>;
   onCancelTakeControl?: (takeoverId: string) => Promise<void>;
-  onNativeContinue?: () => Promise<AttachInstruction>;
+  onRetryControl?: () => Promise<void>;
+  onResumeInWeb?: () => Promise<void>;
   /** Absent where the workspace is not readable from here, e.g. a remote host. */
   onSearchFiles?: (query: string) => Promise<readonly string[]>;
 }) {
   const [text, setText] = useState("");
   const [takeoverMenuOpen, setTakeoverMenuOpen] = useState(false);
-  const [confirmGraceful, setConfirmGraceful] = useState(false);
   const [takeoverBusy, setTakeoverBusy] = useState(false);
-  const [nativeBusy, setNativeBusy] = useState(false);
-  const [nativeInstruction, setNativeInstruction] = useState<AttachInstruction | null>(null);
-  const [nativeError, setNativeError] = useState<string | null>(null);
+  const [takeoverError, setTakeoverError] = useState<string | null>(null);
+  const [recoveryBusy, setRecoveryBusy] = useState(false);
+  const [recoveryError, setRecoveryError] = useState<string | null>(null);
+  const [resumeBusy, setResumeBusy] = useState(false);
+  const [resumeError, setResumeError] = useState<string | null>(null);
   useEffect(() => {
     if (restoredDraft) setText(restoredDraft.text);
   }, [restoredDraft]);
   useEffect(() => {
     setTakeoverMenuOpen(false);
-    setConfirmGraceful(false);
     setTakeoverBusy(false);
-    setNativeInstruction(null);
-    setNativeError(null);
+    setTakeoverError(null);
+    setRecoveryBusy(false);
+    setRecoveryError(null);
+    setResumeBusy(false);
+    setResumeError(null);
   }, [session.id]);
   const queued = currentQueue(activity);
   const todo = currentTodo(activity);
@@ -451,28 +564,74 @@ export function SessionThreadComposer({
     ? session.control.withheld.find((item) => item.capability === "queue")?.reason ?? "Replies are unavailable."
     : null;
   const takeover = session.control.takeover;
+  const recovery = session.control.recovery;
+  const waitingForNativeExit = recovery?.state === "waiting-for-native-exit";
+  const deadlineCopy = useRelativeDeadline(recovery
+    ? (waitingForNativeExit ? null : recovery.state === "retrying" ? recovery.nextRetryAt : recovery.deadlineAt)
+    : takeover?.deadlineAt ?? null);
+  const sharedCodex = session.provider === "codex" && session.control.coordination.mode === "shared";
+  const managedSharedCodex = sharedCodex
+    && session.control.authority === "manager"
+    && (canQueue || canSteer);
   const canTakeControl = session.control.capabilities.includes("take-control")
     && takeover !== null
+    && takeover.methods.length > 0
     && (takeover.state === "available" || takeover.state === "failed")
     && onTakeControl !== undefined;
   const canCancelTakeover = session.control.capabilities.includes("cancel-take-control")
-    && takeover?.state === "waiting-for-exit"
+    && (takeover?.state === "waiting-for-exit" || takeover?.state === "awaiting-confirmation")
     && takeover.id !== null
     && onCancelTakeControl !== undefined;
+  const canConfirmGraceful = session.control.capabilities.includes("take-control")
+    && takeover?.state === "awaiting-confirmation"
+    && takeover.method === "graceful-stop"
+    && takeover.id !== null
+    && onTakeControl !== undefined;
+  const canEscalateGuided = session.control.capabilities.includes("take-control")
+    && takeover?.state === "waiting-for-exit"
+    && takeover.method === "guided-exit"
+    && takeover.methods.includes("graceful-stop")
+    && takeover.id !== null
+    && onTakeControl !== undefined;
+  const activeTakeover = takeover !== null
+    && (takeover.state === "awaiting-confirmation"
+      || takeover.state === "waiting-for-exit"
+      || takeover.state === "stopping"
+      || takeover.state === "adopting");
+  // A discovered standalone Codex process describes its *current* surface as
+  // observe-only. The target of takeover is nevertheless the manager-owned,
+  // multi-client Codex server, so migration copy must follow the provider and
+  // offered action rather than misreading current coordination as exclusive.
+  const codexSharedTarget = managedSharedCodex
+    || (session.provider === "codex"
+      && session.control.authority === "foreign"
+      && (canTakeControl || activeTakeover || takeover?.state === "failed"));
   const hookSetupMissing = onOpenSetup !== undefined && (
     session.control.plane === "observe-only"
     || session.control.withheld.some((item) => /hook (?:bridge|setup)/iu.test(item.reason))
   );
-  const canContinueNatively = (!canTakeControl || takeover?.state === "failed")
-    && (session.control.capabilities.includes("attach") || session.control.capabilities.includes("resume"))
-    && onNativeContinue !== undefined;
-  async function beginTakeover(method: TakeoverMethod) {
+  const sessionEnded = ["completed", "failed", "interrupted"].includes(session.status);
+  const canResumeHere = !sessionEnded
+    && !canQueue
+    && !canSteer
+    && session.control.capabilities.includes("resume")
+    && !activeTakeover
+    && (!session.control.capabilities.includes("take-control") || takeover?.state === "failed")
+    && onResumeInWeb !== undefined;
+  const canRetryControl = session.control.capabilities.includes("retry-control")
+    && recovery !== null
+    && !waitingForNativeExit
+    && onRetryControl !== undefined;
+  const canShowTakeControl = canTakeControl && (!recovery || waitingForNativeExit);
+  async function beginTakeover(method: TakeoverMethod, takeoverId?: string) {
     if (!onTakeControl) return;
     setTakeoverBusy(true);
+    setTakeoverError(null);
     try {
-      await onTakeControl(method);
+      await onTakeControl(method, takeoverId);
       setTakeoverMenuOpen(false);
-      setConfirmGraceful(false);
+    } catch (error) {
+      setTakeoverError(error instanceof Error ? error.message : "Control migration could not start.");
     } finally {
       setTakeoverBusy(false);
     }
@@ -480,26 +639,37 @@ export function SessionThreadComposer({
   async function cancelTakeover() {
     if (!canCancelTakeover || !takeover?.id || !onCancelTakeControl) return;
     setTakeoverBusy(true);
+    setTakeoverError(null);
     try {
       await onCancelTakeControl(takeover.id);
+    } catch (error) {
+      setTakeoverError(error instanceof Error ? error.message : "Control migration could not be cancelled.");
     } finally {
       setTakeoverBusy(false);
     }
   }
-  async function revealNativeContinue() {
-    if (!onNativeContinue) return;
-    setNativeBusy(true);
-    setNativeError(null);
+  async function retryControl() {
+    if (!canRetryControl || !onRetryControl) return;
+    setRecoveryBusy(true);
+    setRecoveryError(null);
     try {
-      const instruction = await onNativeContinue();
-      setNativeInstruction(instruction);
-      if (!instruction.available) {
-        setNativeError("This session does not expose a guarded native continuation.");
-      }
+      await onRetryControl();
     } catch (error) {
-      setNativeError(error instanceof Error ? error.message : "Native continuation is unavailable.");
+      setRecoveryError(error instanceof Error ? error.message : "Control recovery could not restart.");
     } finally {
-      setNativeBusy(false);
+      setRecoveryBusy(false);
+    }
+  }
+  async function resumeHere() {
+    if (!canResumeHere || !onResumeInWeb) return;
+    setResumeBusy(true);
+    setResumeError(null);
+    try {
+      await onResumeInWeb();
+    } catch (error) {
+      setResumeError(error instanceof Error ? error.message : "This exact session could not resume in the web app.");
+    } finally {
+      setResumeBusy(false);
     }
   }
   const unavailableReason = (capability: "set-model" | "set-effort" | "set-profile", fallback: string) =>
@@ -516,6 +686,46 @@ export function SessionThreadComposer({
     : effortOptions.length > 0 || !canSetEffort
       ? effortOptions
       : reasoningEffortsForProvider(session.provider);
+  const takeoverFailed = takeover?.state === "failed";
+  const showControlStatus = Boolean(noWriteReason || recovery || managedSharedCodex || canTakeControl || canResumeHere || takeoverFailed || resumeError);
+  const statusTitle = recovery
+    ? recovery.state === "waiting-for-native-exit"
+      ? "Claude Code has control"
+      : recovery.state === "reconnecting"
+      ? `Reconnecting ${providerLabel(session)} control`
+      : recovery.state === "retrying"
+        ? `${providerLabel(session)} control will retry`
+        : `${providerLabel(session)} control needs attention`
+    : takeoverFailed
+      ? "Web control was not connected"
+    : managedSharedCodex
+      ? "CLI + web connected"
+      : canResumeHere
+        ? "Ready to resume here"
+      : session.provider === "codex" && session.control.authority === "foreign"
+        ? "Codex CLI is running"
+      : session.provider === "claude" && session.control.authority === "foreign"
+          ? "Claude Code has control"
+          : hookSetupMissing
+            ? "Live observation only"
+            : "Messages unavailable";
+  const statusDetail = recovery
+    ? recovery.state === "waiting-for-native-exit"
+      ? canShowTakeControl
+        ? "Web control reconnects automatically after this exact CLI exits, or you can transfer it safely here. History and exact live activity remain available."
+        : "Web control reconnects automatically after this exact CLI exits. History and exact live activity remain available here."
+      : recovery.state === "needs-attention"
+      ? "Agent Manager could not restore web control. Your conversation history is safe."
+      : recovery.state === "retrying"
+        ? "History remains available while Agent Manager waits for the next automatic attempt."
+        : "History remains available while Agent Manager restores exact provider control."
+    : takeoverFailed
+      ? "The conversation history is preserved. Retry the provider-specific migration here; optional CLI access remains under Advanced session facts."
+    : managedSharedCodex
+      ? "Use Codex CLI and web together. The first surface to answer a question or approval wins."
+      : canResumeHere
+        ? "Continue this exact provider conversation in Agent Manager. No terminal command is required."
+      : noWriteReason;
   return (
     <div className="grid gap-3">
       {todo && <TodoList list={todoView(todo, session.todoProgress)} canMessage={canQueue} canStop={canStop && mutationsReady} onAsk={() => setText("What is happening with the current todo?")} onStop={() => void onInterrupt()} />}
@@ -547,27 +757,65 @@ export function SessionThreadComposer({
         {...(canSetProfile ? { onProfileChange: (profile: ExecutionProfile) => void onSetProfile(profile) } : {})}
         {...(onSearchFiles ? { onSearchFiles } : {})}
       />
-      {noWriteReason && (
-        <div className="grid gap-2 px-0.5 text-code-sm text-[var(--text-muted)]" role="status" data-read-only-state>
+      {showControlStatus && (
+        <div className="grid gap-2 px-0.5 text-code-sm text-[var(--text-muted)]" role="status" data-control-state>
           <div className="flex min-h-7 flex-wrap items-center gap-1.5">
-            <span>Read only</span>
-            {hookSetupMissing && <><span aria-hidden="true">·</span><button type="button" data-read-only-explainer data-compact-control="height" className="underline underline-offset-2" onClick={onOpenSetup}>Enable live activity</button></>}
-            {canTakeControl && <><span aria-hidden="true">·</span><button type="button" data-compact-control="height" className="underline underline-offset-2" disabled={!mutationsReady || busy || takeoverBusy} onClick={() => { setTakeoverMenuOpen((open) => !open); setConfirmGraceful(false); }}>Take control</button></>}
-            {canContinueNatively && <><span aria-hidden="true">·</span><button type="button" data-compact-control="height" className="underline underline-offset-2" disabled={nativeBusy} onClick={() => void revealNativeContinue()}>{nativeBusy ? "Loading continuation…" : "Continue in CLI"}</button></>}
+            <strong className="font-medium text-[var(--text-secondary)]">{statusTitle}</strong>
+            {recovery && recovery.state !== "needs-attention" && recovery.state !== "waiting-for-native-exit" && <span aria-hidden="true">·</span>}
+            {recovery && recovery.state !== "needs-attention" && recovery.state !== "waiting-for-native-exit" && <span>attempt {recovery.attempt}</span>}
+            {deadlineCopy && <><span aria-hidden="true">·</span><span>{deadlineCopy}</span></>}
+            {canRetryControl && <><span aria-hidden="true">·</span><button type="button" data-compact-control="height" className="underline underline-offset-2" disabled={!mutationsReady || recoveryBusy} onClick={() => void retryControl()}>{recoveryBusy ? "Retrying web control…" : "Retry web control"}</button></>}
+            {canResumeHere && <Button variant="primary" size="sm" data-compact-control disabled={!mutationsReady || busy || resumeBusy} onClick={() => void resumeHere()}><RotateCcw size={12} aria-hidden="true" />{resumeBusy ? "Resuming…" : "Resume here"}</Button>}
+            {hookSetupMissing && !recovery && <><span aria-hidden="true">·</span><button type="button" data-read-only-explainer data-compact-control="height" className="underline underline-offset-2" onClick={onOpenSetup}>Enable live activity</button></>}
+            {canShowTakeControl && <><span aria-hidden="true">·</span><button type="button" data-compact-control="height" className="underline underline-offset-2" disabled={!mutationsReady || busy || takeoverBusy} onClick={() => setTakeoverMenuOpen((open) => !open)}>{takeoverFailed ? (codexSharedTarget ? "Retry shared-control migration" : "Retry moving Claude control") : codexSharedTarget ? "Migrate to shared web + CLI" : "Move Claude Code control here"}</button></>}
           </div>
-          {takeover?.state === "waiting-for-exit" && <div className="flex flex-wrap items-center gap-2" data-takeover-state><span>Exit the {session.provider === "claude" ? "Claude Code" : "Codex"} CLI to transfer this exact conversation.</span>{canCancelTakeover && <Button variant="ghost" size="sm" data-compact-control disabled={takeoverBusy} onClick={() => void cancelTakeover()}>Cancel takeover</Button>}</div>}
-          {takeover?.state === "stopping" && <p data-takeover-state>Stopping the validated CLI process gracefully…</p>}
-          {takeover?.state === "adopting" && <p data-takeover-state>Adopting the exact provider conversation…</p>}
-          {takeover?.state === "failed" && takeover.error && <p className="text-[var(--warning)]" data-takeover-error>{takeover.error} Retry takeover or continue in the native CLI.</p>}
-          {takeoverMenuOpen && canTakeControl && (
-            <div className="grid gap-2 border border-[var(--border)] bg-[var(--surface-raised)] p-3" data-takeover-menu>
-              <p>Takeover is exclusive. Agent Manager becomes writable only after the current CLI exits and the provider confirms the same conversation.</p>
-              {takeover.fallbackProfile && <p className="text-[var(--warning)]">The current profile could not be observed. Adoption will use the conservative <strong>{takeover.fallbackProfile}</strong> profile.</p>}
-              {!confirmGraceful ? <div className="flex flex-wrap gap-2"><Button variant="primary" size="sm" disabled={!mutationsReady || takeoverBusy} onClick={() => void beginTakeover("guided-exit")}>{takeoverBusy ? "Starting…" : "Wait for me to exit CLI"}</Button><Button variant="secondary" size="sm" disabled={!mutationsReady || takeoverBusy} onClick={() => setConfirmGraceful(true)}>Stop CLI gracefully…</Button></div> : <div className="grid gap-2"><p>Confirm sending exactly one SIGTERM to the revalidated provider process. Agent Manager waits 15 seconds and never sends SIGKILL.</p><div className="flex flex-wrap gap-2"><Button variant="primary" size="sm" disabled={!mutationsReady || takeoverBusy} onClick={() => void beginTakeover("graceful-stop")}>{takeoverBusy ? "Stopping…" : "Confirm graceful stop"}</Button><Button variant="ghost" size="sm" disabled={takeoverBusy} onClick={() => setConfirmGraceful(false)}>Back</Button></div></div>}
+          {statusDetail && <p data-control-detail>{statusDetail}</p>}
+          {recovery?.state === "retrying" && recovery.nextRetryAt && <p>Agent Manager will retry automatically; the transcript remains available now.</p>}
+          {recovery?.error && !waitingForNativeExit && <Collapsible><CollapsibleTrigger data-compact-control className="cursor-pointer underline underline-offset-2">Technical details</CollapsibleTrigger><CollapsibleContent><pre className="mt-1 whitespace-pre-wrap break-words bg-[var(--surface-raised)] p-2 font-mono text-code-xs text-[var(--text-muted)]" data-recovery-technical-details>{recovery.error}</pre></CollapsibleContent></Collapsible>}
+          {recoveryError && <p className="text-[var(--warning)]" data-recovery-error>{recoveryError}</p>}
+          {resumeError && <p className="text-[var(--warning)]" data-resume-error>{resumeError}</p>}
+
+          {takeover?.state === "waiting-for-exit" && (
+            <div className="flex flex-wrap items-center gap-2" data-takeover-state>
+              <span>{codexSharedTarget
+                ? "Agent Manager is waiting for exclusive access to migrate this exact conversation. Stop the validated Codex process safely here, or keep waiting."
+                : "Agent Manager is waiting for exclusive access to this exact conversation. Stop the validated Claude Code process safely here, or keep waiting."}</span>
+              {canEscalateGuided && <Button variant="primary" size="sm" data-compact-control disabled={!mutationsReady || takeoverBusy} onClick={() => void beginTakeover("graceful-stop", takeover.id ?? undefined)}>{takeoverBusy ? "Revalidating…" : "Stop safely here…"}</Button>}
+              {canCancelTakeover && <Button variant="secondary" size="sm" data-compact-control disabled={takeoverBusy} onClick={() => void cancelTakeover()}>Cancel</Button>}
             </div>
           )}
-          {nativeInstruction?.available && nativeInstruction.command && <div className="flex items-start gap-2" data-native-continuation><pre className="min-w-0 flex-1 overflow-x-auto bg-[var(--surface-raised)] p-2 font-mono text-code-xs text-[var(--text)]">{nativeInstruction.command}</pre><Button variant="secondary" size="sm" data-compact-control aria-label="Copy native continuation command" onClick={() => void navigator.clipboard?.writeText(nativeInstruction.command ?? "")}><Copy size={13} /></Button></div>}
-          {nativeError && <p className="text-[var(--warning)]" data-native-continuation-error>{nativeError}</p>}
+          {takeover?.state === "awaiting-confirmation" && takeover.id && (
+            <div className="grid gap-2 border border-[var(--border)] bg-[var(--surface-raised)] p-3" data-takeover-confirmation>
+              <p>Agent Manager pinned the exact {providerLabel(session)} process. No signal has been sent.</p>
+              <p>Confirm one identity-revalidated SIGTERM. Agent Manager then waits 15 seconds and never sends SIGKILL or a second signal.</p>
+              <div className="flex flex-wrap gap-2">
+                <Button variant="primary" size="sm" disabled={!mutationsReady || takeoverBusy || !canConfirmGraceful} onClick={() => void beginTakeover("graceful-stop", takeover.id ?? undefined)}>{takeoverBusy ? "Confirming…" : codexSharedTarget ? "Confirm stop and migrate" : "Confirm graceful stop"}</Button>
+                {canCancelTakeover && <Button variant="ghost" size="sm" disabled={takeoverBusy} onClick={() => void cancelTakeover()}>Cancel without signalling</Button>}
+              </div>
+            </div>
+          )}
+          {takeover?.state === "stopping" && <p data-takeover-state>Waiting for the validated {providerLabel(session)} process to stop gracefully…</p>}
+          {takeover?.state === "adopting" && <p data-takeover-state>{codexSharedTarget ? "Migrating the exact Codex conversation onto shared CLI + web control…" : "Connecting the exact Claude conversation to Agent Manager…"}</p>}
+          {takeover?.state === "failed" && takeover.error && (
+            <p className="text-[var(--warning)]" data-takeover-error>
+              {takeover.error}
+              {canTakeControl ? (codexSharedTarget ? " Retry the shared-control migration." : " Retry moving Claude control.") : ""}
+              {(session.control.capabilities.includes("attach") || session.control.capabilities.includes("resume")) ? " Optional CLI access is available under Advanced session facts." : ""}
+            </p>
+          )}
+          {takeoverError && <p className="text-[var(--warning)]" data-takeover-error>{takeoverError}</p>}
+          {takeoverMenuOpen && canTakeControl && (
+            <div className="grid gap-2 border border-[var(--border)] bg-[var(--surface-raised)] p-3" data-takeover-menu>
+              <p>{codexSharedTarget
+                ? "This is a one-time migration onto Agent Manager's Codex server. After it completes, Codex CLI and web remain writable together."
+                : "Claude Code supports one writer. Agent Manager becomes writable only after Claude Code exits and the same conversation is confirmed."}</p>
+              {takeover.fallbackProfile && <p className="text-[var(--warning)]">The current profile was not exposed. Web control will start in <strong>{takeover.fallbackProfile}</strong>; you can change it immediately after connection.</p>}
+              <div className="flex flex-wrap gap-2">
+                {takeover.methods.includes("graceful-stop") && <Button variant="primary" size="sm" disabled={!mutationsReady || takeoverBusy} onClick={() => void beginTakeover("graceful-stop")}>{takeoverBusy ? "Pinning exact process…" : codexSharedTarget ? "Prepare graceful Codex stop…" : "Prepare graceful Claude Code stop…"}</Button>}
+                {takeover.methods.includes("guided-exit") && <Button variant="secondary" size="sm" disabled={!mutationsReady || takeoverBusy} onClick={() => void beginTakeover("guided-exit")}>{takeoverBusy ? "Starting…" : codexSharedTarget ? "I’ll exit Codex myself" : "I’ll exit Claude Code myself"}</Button>}
+              </div>
+            </div>
+          )}
         </div>
       )}
       {!mutationsReady && (canQueue || canSteer) && <p className="text-center font-mono text-code-xs text-[var(--warning)]">Offline drafts stay on this device and are sent only if the session state is unchanged.</p>}

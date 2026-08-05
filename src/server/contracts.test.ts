@@ -74,6 +74,7 @@ test("maps every session action to its exact capability", () => {
     [{ type: "end", ...expectedState }, "end"],
     [{ type: "archive", ...expectedState }, "archive"],
     [{ type: "delete", ...expectedState }, "delete"],
+    [{ type: "resume", ...expectedState }, "resume"],
     [{ type: "open-editor", relativePath: "src/index.ts", line: 4, ...expectedState }, "open-editor"],
   ] as const;
 
@@ -108,6 +109,26 @@ test("accepts explicit persistent approval only on allow decisions", () => {
     response: { kind: "decision", decision: "deny", persist: true },
     ...expectedState,
   }), /persistence can only accompany an allow decision/);
+});
+
+test("binds graceful-stop confirmation to a server-issued takeover id", () => {
+  assert.deepEqual(sessionActionSchema.parse({
+    type: "take-control",
+    method: "graceful-stop",
+    takeoverId: "takeover-1",
+    ...expectedState,
+  }), {
+    type: "take-control",
+    method: "graceful-stop",
+    takeoverId: "takeover-1",
+    ...expectedState,
+  });
+  assert.throws(() => sessionActionSchema.parse({
+    type: "take-control",
+    method: "guided-exit",
+    takeoverId: "takeover-1",
+    ...expectedState,
+  }), /guided takeover does not accept/u);
 });
 
 test("open-editor accepts only a normalized file identity, never an executable", () => {

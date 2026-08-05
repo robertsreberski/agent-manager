@@ -70,6 +70,11 @@ export type ClaudeElicitationResult =
   | { action: "decline" | "cancel" };
 
 export interface ClaudeSdkQueryOptions {
+  /**
+   * Every SDK process is owned by an explicit controller. Aborting it is the
+   * provider-supported way to stop initialization and release the subprocess.
+   */
+  abortController: AbortController;
   cwd: string;
   /**
    * Managed sessions persist so they stay resumable. A bounded draft catalog
@@ -86,6 +91,7 @@ export interface ClaudeSdkQueryOptions {
   env: Record<string, string | undefined>;
   resume?: string;
   model?: string;
+  pathToClaudeCodeExecutable?: string;
   canUseTool: (
     toolName: string,
     input: Record<string, unknown>,
@@ -125,6 +131,8 @@ export interface ClaudeSdkQuery extends AsyncIterable<ClaudeSdkMessage> {
  */
 export interface ClaudeSdkRuntime {
   readonly sdkVersion: string;
+  /** Canonical executable selected by Agent Manager's production composition. */
+  readonly claudeCodeExecutable?: string;
   createQuery(params: ClaudeSdkQueryParams): ClaudeSdkQuery;
   randomUUID(): string;
   now(): Date;
@@ -133,6 +141,8 @@ export interface ClaudeSdkRuntime {
 export interface ClaudeManagedSessionConfig {
   cwd: string;
   mode: ClaudePermissionMode;
+  /** Exact executable to use for both SDK ownership and native handoff. */
+  claudeCodeExecutable?: string;
   /** Defaults to true; only a disposable read probe turns persistence off. */
   persistSession?: boolean;
   initialMessage?: string;
@@ -146,6 +156,13 @@ export interface ClaudeManagedResumeConfig
   extends ClaudeManagedSessionConfig {
   sessionId: string;
 }
+
+/**
+ * A persisted conversation whose manager-owned SDK consumer was deliberately
+ * stopped. Reconstructing this state must not open a provider process; it only
+ * retains the exact information needed for an explicit native resume.
+ */
+export type ClaudeManagedDormantConfig = ClaudeManagedResumeConfig;
 
 export interface ClaudePendingRequest {
   id: string;
@@ -171,7 +188,7 @@ export interface ClaudeCliHandoff {
   sessionId: string;
   cwd: string;
   command: {
-    executable: "claude";
+    executable: string;
     args: ["--resume", string];
     cwd: string;
   };

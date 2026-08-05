@@ -38,6 +38,31 @@ export const setupHookOfferSchema = z.object({
   changed: z.boolean(),
   diff: z.string().max(256 * 1_024),
   notice: z.string().max(1_024).nullable(),
+  previewId: z.string().uuid().nullable(),
+  expiresAt: z.iso.datetime({ offset: true }).nullable(),
+}).strict().superRefine((offer, context) => {
+  const hasPreview = offer.previewId !== null && offer.expiresAt !== null;
+  if (offer.changed !== hasPreview) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["previewId"],
+      message: offer.changed
+        ? "changed hook offers require a preview ID and expiry"
+        : "unchanged hook offers cannot expose a preview ID or expiry",
+    });
+  }
+});
+
+export const setupHookApplyRequestSchema = z.object({
+  provider: z.enum(["claude", "codex"]),
+  previewId: z.string().uuid(),
+  confirmed: z.literal(true),
+}).strict();
+
+export const setupHookApplyResponseSchema = z.object({
+  provider: z.enum(["claude", "codex"]),
+  outcome: z.enum(["applied", "already-applied"]),
+  hook: setupHookOfferSchema,
 }).strict();
 
 export const setupHostProbeSchema = z.object({
@@ -66,5 +91,7 @@ export type SetupHarnessAvailability = z.infer<typeof setupHarnessAvailabilitySc
 export type SetupHarnessProbe = z.infer<typeof setupHarnessProbeSchema>;
 export type SetupNearbyWorkspace = z.infer<typeof setupNearbyWorkspaceSchema>;
 export type SetupHookOffer = z.infer<typeof setupHookOfferSchema>;
+export type SetupHookApplyRequest = z.infer<typeof setupHookApplyRequestSchema>;
+export type SetupHookApplyResponse = z.infer<typeof setupHookApplyResponseSchema>;
 export type SetupHostProbe = z.infer<typeof setupHostProbeSchema>;
 export type SetupReadModel = z.infer<typeof setupReadModelSchema>;

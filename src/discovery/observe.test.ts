@@ -121,7 +121,7 @@ test("Codex discovery publishes ultra and quarantines unknown raw effort values"
   }
 });
 
-test("production observe scan attaches an exact official-CLI tmux match and leaves unmatched rows read-only", () => {
+test("production observe scan attaches an exact official-CLI tmux match and makes stopped roots resumable", () => {
   const root = mkdtempSync(join(tmpdir(), "agent-manager-tmux-observe-"));
   const sqliteDirectory = join(root, "sqlite");
   mkdirSync(sqliteDirectory);
@@ -224,13 +224,20 @@ test("production observe scan attaches an exact official-CLI tmux match and leav
     assert.deepEqual(sessions.get(liveThread)?.control, {
       plane: "tmux-attach",
       authority: "foreign",
+      coordination: {
+        mode: "observe-only",
+        nativeAttach: "none",
+        responseResolution: "single-controller",
+      },
+      recovery: null,
       capabilities: ["preview", "attach"],
       withheld: [],
       takeover: null,
     });
     assert.equal(sessions.get(recentThread)?.terminal, null);
-    assert.equal(sessions.get(recentThread)?.control.plane, "observe-only");
-    assert.deepEqual(sessions.get(recentThread)?.control.capabilities, []);
+    assert.equal(sessions.get(recentThread)?.control.plane, "resume-only");
+    assert.equal(sessions.get(recentThread)?.control.authority, "none");
+    assert.deepEqual(sessions.get(recentThread)?.control.capabilities, ["resume"]);
     assert.ok(tmuxCalls.some((call) =>
       call.command === "/trusted/bin/tmux"
       && call.args[0] === "-L"
@@ -401,6 +408,9 @@ test("Claude profile resolution falls back to the latest transcript permission m
       source: "transcript",
       confidence: "inferred",
     });
+    assert.equal(session?.control.plane, "resume-only");
+    assert.equal(session?.control.authority, "none");
+    assert.deepEqual(session?.control.capabilities, ["resume"]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

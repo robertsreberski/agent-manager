@@ -14,6 +14,8 @@ function hook(provider: "claude" | "codex", overrides: Partial<SetupHookOffer> =
     changed: true,
     diff: `--- before\n+++ after\n+Authorization: Bearer [REDACTED]`,
     notice: null,
+    previewId: provider === "claude" ? "11111111-1111-4111-8111-111111111111" : "22222222-2222-4222-8222-222222222222",
+    expiresAt: "2026-08-04T10:05:00.000Z",
     ...overrides,
   };
 }
@@ -44,6 +46,8 @@ function cockpitSession(overrides: Partial<CockpitSessionView> = {}): CockpitSes
     control: {
       plane: "codex-private",
       authority: "manager",
+      coordination: { mode: "shared", nativeAttach: "join", responseResolution: "first-response-wins" },
+      recovery: null,
       capabilities: ["queue", "set-profile", "attach"],
       withheld: [{ capability: "set-model", reason: "This provider cannot change models mid-session." }],
       takeover: null,
@@ -72,48 +76,57 @@ const facts: SelectedSessionFactsResponse = {
 };
 
 describe("SessionEndedState", () => {
-  it("loads the exact resume wrapper before offering a new worktree thread", () => {
+  it("resumes the exact session in the web app before offering a new worktree thread", () => {
     const onResume = vi.fn();
     const onContinue = vi.fn();
-    const { rerender } = render(<SessionEndedState canResume canContinue onResume={onResume} onContinue={onContinue} />);
-    fireEvent.click(screen.getByRole("button", { name: "Show resume command" }));
+    render(<SessionEndedState canResume canContinue onResume={onResume} onContinue={onContinue} />);
+    fireEvent.click(screen.getByRole("button", { name: "Resume here" }));
     expect(onResume).toHaveBeenCalledOnce();
+    expect(screen.getByText("Continue this exact provider conversation in Agent Manager.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Start a new thread in this worktree" })).toBeInTheDocument();
-
-    rerender(<SessionEndedState canResume canContinue resumeCommand="agent-manager attach guarded-token" resumeDescription="Resume the same provider session." onResume={onResume} onContinue={onContinue} />);
-    expect(screen.getByText("agent-manager attach guarded-token")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Show resume command" })).not.toBeInTheDocument();
   });
 
   it("does not imply resume when the harness withdrew it", () => {
     render(<SessionEndedState canResume={false} canContinue resumeUnavailableReason="Resume is unavailable because the provider queue did not drain." />);
 
-    expect(screen.queryByRole("button", { name: "Show resume command" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Resume here" })).not.toBeInTheDocument();
     expect(screen.getByText("Resume is unavailable because the provider queue did not drain.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Start a new thread in this worktree" })).toBeInTheDocument();
+  });
+
+  it("shows a busy semantic resume state without exposing a terminal command", () => {
+    render(<SessionEndedState canResume resuming canContinue={false} />);
+
+    expect(screen.getByRole("button", { name: "Resuming…" })).toBeDisabled();
+    expect(screen.queryByText(/agent-manager attach|codex resume/iu)).not.toBeInTheDocument();
   });
 });
 
 describe("SessionCapabilityPanel", () => {
-  it("renders the four ordered questions from truthful session and Codex facts", () => {
-    render(<SessionCapabilityPanel session={cockpitSession()} facts={facts} factsStatus="loaded" attachCommand={null} onRevealAttach={vi.fn()} />);
+  it("renders the ordered facts and describes resume as an exact web action", () => {
+    const { rerender } = render(<SessionCapabilityPanel session={cockpitSession()} facts={facts} factsStatus="loaded" attachCommand={null} onRevealAttach={vi.fn()} />);
 
     expect(screen.getAllByRole("heading", { level: 3 }).map((heading) => heading.textContent)).toEqual([
       "Where it runs",
       "What it may do",
       "What this turn cost",
-      "How to attach from a terminal",
     ]);
     const rendered = document.body.textContent ?? "";
     for (const text of ["This Mac", "project", "/workspace/project-worktree", "feature/session-facts", "3 files · +312 −87 uncommitted", "Codex managed app server", "Queue messages for the next turn", "This provider cannot change models mid-session.", "150", "$0.0123", "12.3K lifetime tokens", "25% used"]) expect(rendered).toContain(text);
     expect(screen.queryByText("codex-private")).not.toBeInTheDocument();
     expect(screen.queryByText("danger-full-access")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Show guarded attach command" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Advanced · CLI access" })).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByRole("button", { name: "Show Codex CLI join command" })).not.toBeInTheDocument();
+    expect(screen.getByText("Shared CLI + web")).toBeInTheDocument();
+
+    const resumable = cockpitSession({ activity: "completed", control: { ...cockpitSession().control, capabilities: ["resume", "attach"] } });
+    rerender(<SessionCapabilityPanel session={resumable} facts={facts} factsStatus="loaded" />);
+    expect(screen.getByText("Resume the exact session in the web app")).toBeInTheDocument();
   });
 
   it("keeps unknown facts unknown and never calls a zero-dirty worktree dirty", () => {
     const { rerender } = render(<SessionCapabilityPanel
-      session={cockpitSession({ workspaceIdentity: null, cwd: null, profile: null, model: null, effort: null, control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [], takeover: null } })}
+      session={cockpitSession({ workspaceIdentity: null, cwd: null, profile: null, model: null, effort: null, control: { plane: "observe-only", authority: "none", coordination: { mode: "observe-only", nativeAttach: "none", responseResolution: "single-controller" }, recovery: null, capabilities: [], withheld: [], takeover: null } })}
       facts={{ sessionId: "local:codex:managed-1", generation: 1, turnUsage: null, account: { available: false, reason: "unsupported-provider" } }}
       factsStatus="loaded"
     />);
@@ -127,33 +140,106 @@ describe("SessionCapabilityPanel", () => {
     expect(screen.queryByText("0 uncommitted")).not.toBeInTheDocument();
   });
 
-  it("reveals and copies only the guarded manager wrapper", () => {
+  it("reveals truthful shared Codex attach metadata", () => {
     const onRevealAttach = vi.fn();
     const { rerender } = render(<SessionCapabilityPanel session={cockpitSession()} facts={facts} factsStatus="loaded" onRevealAttach={onRevealAttach} />);
-    fireEvent.click(screen.getByRole("button", { name: "Show guarded attach command" }));
+    fireEvent.click(screen.getByRole("button", { name: "Advanced · CLI access" }));
+    fireEvent.click(screen.getByRole("button", { name: "Show Codex CLI join command" }));
     expect(onRevealAttach).toHaveBeenCalledOnce();
+    fireEvent.click(screen.getByRole("button", { name: "Advanced · CLI access" }));
 
-    rerender(<SessionCapabilityPanel session={cockpitSession()} facts={facts} factsStatus="loaded" attachCommand="agent-manager attach opaque-handoff" onRevealAttach={onRevealAttach} />);
-    expect(screen.getByText("agent-manager attach opaque-handoff")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Copy guarded attach command" })).toBeInTheDocument();
-    expect(screen.queryByText(/codex app-server|claude --resume/u)).not.toBeInTheDocument();
+    rerender(<SessionCapabilityPanel session={cockpitSession()} facts={facts} factsStatus="loaded" attachCommand="codex resume managed-1 --remote unix:///tmp/codex.sock" attachDescription="Join the managed Codex App Server." attachRequiresHandoff={false} onRevealAttach={onRevealAttach} />);
+    expect(screen.queryByText("codex resume managed-1 --remote unix:///tmp/codex.sock")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Advanced · CLI access" }));
+    expect(screen.getByText("codex resume managed-1 --remote unix:///tmp/codex.sock")).toBeInTheDocument();
+    expect(screen.getByText("Join the managed Codex App Server.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy Codex CLI join command" })).toBeInTheDocument();
+    expect(screen.getByText("CLI joins; web control stays active")).toBeInTheDocument();
+  });
+
+  it("describes takeover by provider target even while foreign sessions are observe-only", () => {
+    const foreign = {
+      plane: "observe-only",
+      authority: "foreign",
+      coordination: { mode: "observe-only", nativeAttach: "none", responseResolution: "single-controller" },
+      recovery: null,
+      capabilities: ["take-control"],
+      withheld: [],
+      takeover: null,
+    } as CockpitSessionView["control"];
+    const { rerender } = render(<SessionCapabilityPanel session={cockpitSession({ provider: "codex", control: foreign })} facts={facts} factsStatus="loaded" />);
+    expect(screen.getByText("Migrate once to shared CLI + web control")).toBeInTheDocument();
+
+    rerender(<SessionCapabilityPanel session={cockpitSession({ provider: "claude", control: foreign })} facts={facts} factsStatus="loaded" />);
+    expect(screen.getByText("Move exclusive Claude Code control to the web app")).toBeInTheDocument();
+  });
+
+  it("describes a dormant Claude wrapper as resume, not an active-writer handoff", () => {
+    const dormant = cockpitSession({
+      provider: "claude",
+      activity: "completed",
+      control: {
+        plane: "resume-only",
+        authority: "none",
+        coordination: { mode: "exclusive", nativeAttach: "handoff", responseResolution: "single-controller" },
+        recovery: null,
+        capabilities: ["resume"],
+        withheld: [],
+        takeover: null,
+      },
+    });
+    const { rerender } = render(<SessionCapabilityPanel session={dormant} facts={facts} factsStatus="loaded" onRevealAttach={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Advanced · CLI access" }));
+    expect(screen.getByRole("button", { name: "Show Claude Code resume command" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Advanced · CLI access" }));
+
+    rerender(<SessionCapabilityPanel session={dormant} facts={facts} factsStatus="loaded" attachCommand="agent-manager attach exact-claude" attachRequiresHandoff />);
+    fireEvent.click(screen.getByRole("button", { name: "Advanced · CLI access" }));
+    expect(screen.getByText("resumes the exact conversation in Claude Code; web replies stay unavailable while it runs")).toBeInTheDocument();
+    expect(screen.queryByText("running this moves provider control to the CLI")).not.toBeInTheDocument();
+  });
+
+  it("renders every archived capability as definitively unavailable", () => {
+    render(<SessionCapabilityPanel
+      session={cockpitSession()}
+      archived
+      facts={facts}
+      factsStatus="loaded"
+      onRevealAttach={vi.fn()}
+    />);
+
+    expect(screen.getByText("Archived · read-only")).toBeInTheDocument();
+    expect(screen.getAllByLabelText("Unavailable").length).toBeGreaterThan(0);
+    expect(screen.queryByLabelText("Available")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Unknown")).not.toBeInTheDocument();
+    expect(screen.getAllByText("Archived sessions are read-only.").length).toBeGreaterThan(1);
+    fireEvent.click(screen.getByRole("button", { name: "Advanced · CLI access" }));
+    expect(screen.queryByRole("button", { name: "Show Codex CLI join command" })).not.toBeInTheDocument();
   });
 });
 
 describe("first-run setup", () => {
-  it("shows absent hook status, exact CLI commands and redacted diffs without a browser apply action", () => {
+  it("installs an exact preview in the browser and keeps manual commands under Advanced", async () => {
     const onContinue = vi.fn();
+    const onApply = vi.fn(async () => undefined);
     render(<HookSetupStep
       hooks={{ claude: hook("claude"), codex: hook("codex") }}
+      onApply={onApply}
       onContinue={onContinue}
     />);
 
     expect(screen.getAllByText("Not installed")).toHaveLength(2);
-    expect(screen.getByText("agent-manager hooks install --provider claude --scope user")).toBeInTheDocument();
+    expect(screen.getByText(/Hooks add exact live activity and surface held approvals or questions/iu)).toHaveTextContent("Sending new messages still requires provider control");
+    expect(screen.queryByText(/see and answer sessions/iu)).not.toBeInTheDocument();
+    expect(screen.queryByText("agent-manager hooks install --provider claude --scope user")).not.toBeInTheDocument();
     expect(screen.getAllByText(/Bearer \[REDACTED\]/u)).toHaveLength(2);
-    expect(screen.getByText(/This browser never changes provider settings/u)).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /apply|install/u })).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Continue without changing settings" }));
+    expect(screen.getByText(/Web-native manager control does not depend on this optional CLI observation hook/u)).toBeInTheDocument();
+    expect(screen.getByText(/browser does not bypass Codex hook trust/u)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Install claude hook" }));
+    await waitFor(() => expect(onApply).toHaveBeenCalledWith("claude", "11111111-1111-4111-8111-111111111111"));
+    fireEvent.click(screen.getAllByRole("button", { name: "Advanced · manual installation" })[0]!);
+    expect(screen.getByText("agent-manager hooks install --provider claude --scope user")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Continue without installing hooks" }));
     expect(onContinue).toHaveBeenCalledOnce();
   });
 
@@ -173,31 +259,80 @@ describe("first-run setup", () => {
     expect(screen.getAllByText(/Bearer \[REDACTED\]/u)).toHaveLength(1);
   });
 
-  it("drops the wizard framing when reached outside first run, keeping the same read-only facts", () => {
-    render(<HookSetupStep hooks={{ claude: hook("claude"), codex: hook("codex") }} standalone />);
+  it("drops the wizard framing outside first run while retaining the in-app install action", () => {
+    const onApply = vi.fn(async () => undefined);
+    render(<HookSetupStep hooks={{ claude: hook("claude"), codex: hook("codex") }} onApply={onApply} standalone />);
 
     expect(screen.queryByText("Optional setup · 2 of 3")).not.toBeInTheDocument();
     expect(screen.getByText("Provider hooks")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Continue without changing settings" })).not.toBeInTheDocument();
-    expect(screen.getByText("agent-manager hooks install --provider claude --scope user")).toBeInTheDocument();
-    expect(screen.getByText(/This browser never changes provider settings/u)).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /apply|install/u })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Continue without installing hooks" })).not.toBeInTheDocument();
+    expect(screen.queryByText("agent-manager hooks install --provider claude --scope user")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Install claude hook" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Install codex hook" })).toBeEnabled();
+  });
+
+  it("keeps apply pending locally and reports a failed provider update", async () => {
+    let rejectApply!: (error: Error) => void;
+    const onApply = vi.fn(() => new Promise<void>((_resolve, reject) => { rejectApply = reject; }));
+    const onRefresh = vi.fn();
+    render(<HookSetupStep hooks={{ claude: hook("claude"), codex: hook("codex") }} onApply={onApply} onRefresh={onRefresh} standalone />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Install claude hook" }));
+    expect(await screen.findByRole("button", { name: "Installing…" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Install codex hook" })).toBeDisabled();
+    rejectApply(new Error("That preview expired. Refresh setup and try again."));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("That preview expired. Refresh setup and try again.");
+    expect(screen.getByRole("button", { name: "Install claude hook" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh preview" }));
+    expect(onRefresh).toHaveBeenCalledOnce();
   });
 
   it("drops the wizard framing on the standalone host step", () => {
-    render(<HostSetupStep hosts={[]} standalone />);
+    render(<HostSetupStep hosts={[]} onAddHost={vi.fn(async () => undefined)} onRemoveHost={vi.fn(async () => undefined)} standalone />);
 
     expect(screen.queryByText("Optional setup · 3 of 3")).not.toBeInTheDocument();
-    expect(screen.getByText("Remote hosts")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Remote hosts" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Continue to new thread" })).not.toBeInTheDocument();
     expect(screen.getByText(/No remote hosts are configured/u)).toBeInTheDocument();
+    expect(screen.queryByText(/agent-manager host add/u)).not.toBeInTheDocument();
+  });
+
+  it("adds a trimmed SSH target in-app while keeping first-run Continue available", async () => {
+    let finishAdd!: () => void;
+    const onAddHost = vi.fn(() => new Promise<void>((resolve) => { finishAdd = resolve; }));
+    const onContinue = vi.fn();
+    render(<HostSetupStep
+      hosts={[]}
+      onAddHost={onAddHost}
+      onRemoveHost={vi.fn(async () => undefined)}
+      onContinue={onContinue}
+    />);
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Host label" }), { target: { value: "  Build host  " } });
+    fireEvent.change(screen.getByRole("textbox", { name: "SSH target" }), { target: { value: "  dev@build.example  " } });
+    fireEvent.click(screen.getByRole("button", { name: "Add host" }));
+
+    expect(onAddHost).toHaveBeenCalledWith("Build host", "dev@build.example");
+    expect(await screen.findByRole("button", { name: "Adding…" })).toBeDisabled();
+    const continueButton = screen.getByRole("button", { name: "Continue to new thread" });
+    expect(continueButton).toBeEnabled();
+    fireEvent.click(continueButton);
+    expect(onContinue).toHaveBeenCalledOnce();
+    expect(screen.getByText(/does not delete remote files or stop remote processes/u)).toBeInTheDocument();
+    expect(screen.queryByText(/agent-manager host add/u)).not.toBeInTheDocument();
+
+    finishAdd();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Add host" })).toBeEnabled());
+    expect(screen.getByRole("textbox", { name: "Host label" })).toHaveValue("");
+    expect(screen.getByRole("textbox", { name: "SSH target" })).toHaveValue("");
   });
 
   it("reports current hooks without an install action", () => {
     render(<HookSetupStep
       hooks={{
-        claude: hook("claude", { state: "active", changed: false, diff: "" }),
-        codex: hook("codex", { state: "awaiting-trust", changed: false, diff: "" }),
+        claude: hook("claude", { state: "active", changed: false, diff: "", previewId: null, expiresAt: null }),
+        codex: hook("codex", { state: "awaiting-trust", changed: false, diff: "", previewId: null, expiresAt: null }),
       }}
       onContinue={vi.fn()}
     />);
@@ -255,9 +390,43 @@ describe("first-run setup", () => {
         claude: { state: "present", reason: null },
       },
     };
-    render(<HostSetupStep hosts={[host]} onContinue={vi.fn()} />);
+    render(<HostSetupStep hosts={[host]} onAddHost={vi.fn(async () => undefined)} onRemoveHost={vi.fn(async () => undefined)} onContinue={vi.fn()} />);
     expect(screen.getByText("codex missing")).toBeInTheDocument();
     expect(screen.getByText("claude present")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Continue to new thread" })).toBeEnabled();
+  });
+
+  it("removes a configured host in-app and reports removal failures locally", async () => {
+    const host: SetupHostProbe = {
+      id: "studio",
+      label: "Studio",
+      kind: "ssh",
+      status: "offline",
+      statusMessage: "SSH authentication failed.",
+      harnesses: {
+        codex: { state: "unavailable", reason: "Host is offline." },
+        claude: { state: "unavailable", reason: "Host is offline." },
+      },
+    };
+    let failRemoval!: (error: Error) => void;
+    const onRemoveHost = vi.fn(() => new Promise<void>((_resolve, reject) => { failRemoval = reject; }));
+    render(<HostSetupStep
+      hosts={[host]}
+      onAddHost={vi.fn(async () => undefined)}
+      onRemoveHost={onRemoveHost}
+      standalone
+    />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove Studio" }));
+    expect(onRemoveHost).not.toHaveBeenCalled();
+    expect(screen.getByText("Forget this host and its remembered workspaces?")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Cancel removal of Studio" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Confirm removal of Studio" }));
+    expect(onRemoveHost).toHaveBeenCalledWith("studio");
+    expect(await screen.findByRole("button", { name: "Removing Studio" })).toBeDisabled();
+    failRemoval(new Error("That host is still being removed elsewhere."));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("That host is still being removed elsewhere.");
+    expect(screen.getByRole("button", { name: "Confirm removal of Studio" })).toBeEnabled();
   });
 });

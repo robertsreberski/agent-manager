@@ -39,7 +39,11 @@ import type { SessionRecord } from "../src/core/types.ts";
 import type { AgentManagerBackend } from "../src/server/server.ts";
 import { createAgentManagerServer } from "../src/server/server.ts";
 import { ManagerDatabase } from "../src/server/persistence.ts";
-import { sessionRecordId, type Provider } from "../src/shared/session.ts";
+import {
+  observeOnlyControl,
+  sessionRecordId,
+  type Provider,
+} from "../src/shared/session.ts";
 
 const TEMP_PREFIX = "agent-manager-hooks-e2e-";
 const COMMAND_TIMEOUT_MS = 180_000;
@@ -567,13 +571,7 @@ function externalSession(provider: Provider, providerSessionId: string, cwd: str
     todoProgress: null,
     attention: [],
     terminal: null,
-    control: {
-      plane: "observe-only",
-      authority: "none",
-      capabilities: [],
-      withheld: [],
-      takeover: null,
-    },
+    control: observeOnlyControl(),
     workspaceIdentity: null,
     generation: 0,
   };

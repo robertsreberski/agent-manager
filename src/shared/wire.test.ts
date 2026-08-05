@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { sessionRecordId } from "./session.ts";
+import { providerControlCoordination, sessionRecordId } from "./session.ts";
 import {
   AGENT_MANAGER_BUILD_ID,
   parseStateEvent,
@@ -75,6 +75,12 @@ function snapshot(): unknown {
       control: {
         plane: "codex-private",
         authority: "manager",
+        coordination: {
+          mode: "shared",
+          nativeAttach: "join",
+          responseResolution: "first-response-wins",
+        },
+        recovery: null,
         capabilities: ["queue", "set-profile"],
         withheld: [],
         takeover: null,
@@ -87,11 +93,123 @@ function snapshot(): unknown {
 
 test("parses the exact current wire epoch", () => {
   const parsed = parseStateSnapshot(snapshot());
-  assert.equal(parsed.schemaVersion, 4);
+  assert.equal(parsed.schemaVersion, 5);
   assert.equal(parsed.buildId, AGENT_MANAGER_BUILD_ID);
   assert.equal(parsed.sessions[0]?.providerThreadId, "thread-1");
   assert.equal(parsed.sessions[0]?.id, sessionRecordId("local", "codex", "thread-1"));
   assert.equal(parsed.sessions[0]?.profile.value, null);
+  assert.deepEqual(providerControlCoordination("codex"), {
+    mode: "shared",
+    nativeAttach: "join",
+    responseResolution: "first-response-wins",
+  });
+  assert.deepEqual(providerControlCoordination("claude"), {
+    mode: "exclusive",
+    nativeAttach: "handoff",
+    responseResolution: "single-controller",
+  });
+});
+
+test("requires explicit control coordination and validates bounded recovery state", () => {
+  const missingCoordination = snapshot() as { sessions: Array<Record<string, unknown>> };
+  const missingControl = missingCoordination.sessions[0]!.control as Record<string, unknown>;
+  delete missingControl.coordination;
+  assert.throws(() => parseStateSnapshot(missingCoordination));
+
+  const retrying = snapshot() as { sessions: Array<Record<string, unknown>> };
+  const retryingControl = retrying.sessions[0]!.control as Record<string, unknown>;
+  retryingControl.recovery = {
+    state: "retrying",
+    attempt: 2,
+    startedAt: "2026-08-04T10:00:00.000Z",
+    deadlineAt: null,
+    nextRetryAt: "2026-08-04T10:00:30.000Z",
+    error: "App Server connection closed",
+  };
+  assert.equal(parseStateSnapshot(retrying).sessions[0]?.control.recovery?.attempt, 2);
+
+  const waiting = snapshot() as { sessions: Array<Record<string, unknown>> };
+  const waitingControl = waiting.sessions[0]!.control as Record<string, unknown>;
+  waitingControl.recovery = {
+    state: "waiting-for-native-exit",
+    attempt: 1,
+    startedAt: "2026-08-04T10:00:00.000Z",
+    deadlineAt: null,
+    nextRetryAt: null,
+    error: "Claude Code still owns this conversation",
+  };
+  assert.equal(
+    parseStateSnapshot(waiting).sessions[0]?.control.recovery?.state,
+    "waiting-for-native-exit",
+  );
+
+  for (const [field, value, expected] of [
+    ["deadlineAt", "2026-08-04T10:00:30.000Z", /recovery deadline/u],
+    ["nextRetryAt", "2026-08-04T10:00:30.000Z", /internal poll time/u],
+    ["error", null, /ownership reason/u],
+  ] as const) {
+    const invalidWaiting = structuredClone(waiting);
+    const invalidControl = invalidWaiting.sessions[0]!.control as Record<string, unknown>;
+    const invalidRecovery = invalidControl.recovery as Record<string, unknown>;
+    invalidRecovery[field] = value;
+    assert.throws(() => parseStateSnapshot(invalidWaiting), expected);
+  }
+
+  const missingRetryTime = snapshot() as { sessions: Array<Record<string, unknown>> };
+  const missingRetryControl = missingRetryTime.sessions[0]!.control as Record<string, unknown>;
+  missingRetryControl.recovery = {
+    state: "retrying",
+    attempt: 1,
+    startedAt: "2026-08-04T10:00:00.000Z",
+    deadlineAt: null,
+    nextRetryAt: null,
+    error: "temporarily unavailable",
+  };
+  assert.throws(() => parseStateSnapshot(missingRetryTime), /next retry time/u);
+
+  const attentionWithoutError = snapshot() as { sessions: Array<Record<string, unknown>> };
+  const attentionControl = attentionWithoutError.sessions[0]!.control as Record<string, unknown>;
+  attentionControl.recovery = {
+    state: "needs-attention",
+    attempt: 3,
+    startedAt: "2026-08-04T10:00:00.000Z",
+    deadlineAt: null,
+    nextRetryAt: null,
+    error: null,
+  };
+  assert.throws(() => parseStateSnapshot(attentionWithoutError), /requires an error/u);
+
+  const impossibleCoordination = snapshot() as { sessions: Array<Record<string, unknown>> };
+  const impossibleControl = impossibleCoordination.sessions[0]!.control as Record<string, unknown>;
+  impossibleControl.coordination = {
+    mode: "exclusive",
+    nativeAttach: "join",
+    responseResolution: "single-controller",
+  };
+  assert.throws(() => parseStateSnapshot(impossibleCoordination), /join requires shared/u);
+});
+
+test("parses the server-issued graceful-stop confirmation phase", () => {
+  const value = snapshot() as { sessions: Array<Record<string, unknown>> };
+  const control = value.sessions[0]!.control as Record<string, unknown>;
+  control.takeover = {
+    id: "takeover-1",
+    state: "awaiting-confirmation",
+    methods: ["guided-exit", "graceful-stop"],
+    method: "graceful-stop",
+    requestedAt: "2026-08-04T10:00:00.000Z",
+    deadlineAt: null,
+    fallbackProfile: null,
+    error: null,
+  };
+  assert.equal(
+    parseStateSnapshot(value).sessions[0]?.control.takeover?.state,
+    "awaiting-confirmation",
+  );
+  const invalid = structuredClone(value);
+  const invalidControl = invalid.sessions[0]!.control as Record<string, unknown>;
+  (invalidControl.takeover as Record<string, unknown>).method = "guided-exit";
+  assert.throws(() => parseStateSnapshot(invalid), /exact method/u);
 });
 
 test("accepts Codex ultra and preserves unknown provider effort outside the public value", () => {
@@ -269,6 +387,46 @@ test("state events carry the same epoch and exact typed payloads", () => {
       error: null,
     },
   }).type, "action.updated");
+
+  const retryEvent = parseStateEvent({
+    schemaVersion: WIRE_SCHEMA_VERSION,
+    buildId: AGENT_MANAGER_BUILD_ID,
+    seq: 3,
+    at: "2026-08-04T10:00:02.000Z",
+    type: "action.updated",
+    payload: {
+      id: "action-2",
+      sessionId: "local:codex:thread-1",
+      type: "retry-control",
+      status: "succeeded",
+      createdAt: "2026-08-04T10:00:01.000Z",
+      completedAt: "2026-08-04T10:00:02.000Z",
+      error: null,
+    },
+  });
+  assert.equal(retryEvent.type, "action.updated");
+  if (retryEvent.type !== "action.updated") assert.fail("retry event was not an action update");
+  assert.equal(retryEvent.payload.type, "retry-control");
+
+  const resumeEvent = parseStateEvent({
+    schemaVersion: WIRE_SCHEMA_VERSION,
+    buildId: AGENT_MANAGER_BUILD_ID,
+    seq: 4,
+    at: "2026-08-04T10:00:03.000Z",
+    type: "action.updated",
+    payload: {
+      id: "action-3",
+      sessionId: "local:codex:thread-1",
+      type: "resume",
+      status: "succeeded",
+      createdAt: "2026-08-04T10:00:02.000Z",
+      completedAt: "2026-08-04T10:00:03.000Z",
+      error: null,
+    },
+  });
+  assert.equal(resumeEvent.type, "action.updated");
+  if (resumeEvent.type !== "action.updated") assert.fail("resume event was not an action update");
+  assert.equal(resumeEvent.payload.type, "resume");
 
   assert.throws(() => parseStateEvent({
     schemaVersion: WIRE_SCHEMA_VERSION,

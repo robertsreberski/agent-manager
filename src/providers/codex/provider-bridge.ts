@@ -8,7 +8,11 @@ import {
   WorkspaceIdentityResolver,
   type WorkspaceIdentity,
 } from "../../core/worktree.ts";
-import { providerEffort, sessionRecordId } from "../../shared/session.ts";
+import {
+  providerControlCoordination,
+  providerEffort,
+  sessionRecordId,
+} from "../../shared/session.ts";
 import { sessionSettingsOptionsSchema } from "../../server/contracts.ts";
 import type {
   ActionDispatchResult,
@@ -47,10 +51,18 @@ interface ManagedMetadata {
   workspacePath: string;
 }
 
-interface SelectedThreadLease {
-  refs: number;
-  phase: "acquiring" | "active" | "releasing";
+interface ManagedThreadSubscription {
+  phase: "acquiring" | "active";
   settled: Promise<void>;
+}
+
+interface QuarantinedResume {
+  transaction: symbol;
+  phase: "releasing" | "needs-attention";
+  attempt: number;
+  startedAt: string;
+  error: string | null;
+  releasePromise: Promise<void> | null;
 }
 
 export interface CodexProviderBridgeOptions {
@@ -95,6 +107,19 @@ const UNLOADED_CAPABILITIES: SessionView["control"]["withheld"][number]["capabil
   "attach",
   "resume",
 ];
+const QUARANTINED_CAPABILITIES: SessionView["control"]["withheld"][number]["capability"][] = [
+  ...UNLOADED_CAPABILITIES,
+  "retry-control",
+];
+const QUARANTINE_REASON =
+  "Codex rollback is not confirmed; all controls remain quarantined";
+const STALE_REQUEST_FAILURE: ActionDispatchResult = {
+  status: "failed",
+  error: {
+    code: "REQUEST_STALE",
+    message: "the Codex request is no longer active; another provider peer may have responded first",
+  },
+};
 
 function recoveryError(error: unknown): string {
   if (error instanceof Error && error.message.trim()) return boundedText(error.message, 1_000);
@@ -234,7 +259,6 @@ function mappedCapabilities(
 ): SessionView["control"]["capabilities"] {
   const controls = new Set(adapter.capabilities.controls);
   const result: SessionView["control"]["capabilities"] = [];
-  if (state.writeBlockedReason) return result;
   if (creationIssue) {
     // Do not permit another prompt or mode mutation until a human has inspected
     // the provider thread. Exact pending-request responses and interruption are
@@ -270,15 +294,6 @@ function withheldCapabilities(
   adapter: CodexManagedAdapter,
   state: CodexThreadState,
 ): SessionView["control"]["withheld"] {
-  if (state.writeBlockedReason) {
-    return ["queue", "steer", "interrupt", "respond", "set-profile", "set-model",
-      "set-effort", "remove-queued", "end", "archive", "delete"].map(
-      (capability) => ({
-        capability: capability as SessionView["control"]["withheld"][number]["capability"],
-        reason: state.writeBlockedReason as string,
-      }),
-    );
-  }
   if (state.activeTurnId || state.status === "running") {
     return ["set-profile", "set-model", "set-effort", "archive", "delete"].map(
       (capability) => ({
@@ -489,11 +504,18 @@ export class CodexProviderBridge implements ProviderControlAdapter {
   #metadata = new Map<string, ManagedMetadata>();
   #knownStates = new Map<string, CodexThreadState>();
   #recovering = new Map<string, symbol>();
-  #selectedThreads = new Map<string, SelectedThreadLease>();
-  #creationHandoffs = new Set<string>();
+  /** One durable App Server subscription per managed provider thread. */
+  #managedThreads = new Map<string, ManagedThreadSubscription>();
+  /**
+   * Provider-side resume is a transaction, not a second manager connection.
+   * Reserve the exact thread before the first asynchronous read so concurrent
+   * web actions or startup recovery cannot both attach this bridge client to
+   * the same shared App Server thread and then tear each other down.
+   */
+  #resumeTransactions = new Map<string, symbol>();
   #provisionalAdoptions = new Set<string>();
+  #quarantinedResumes = new Map<string, QuarantinedResume>();
   #bufferedActivity = new Map<string, ActivityMutation[]>();
-  #overflowedActivity = new Set<string>();
   #unsubscribe: () => void;
 
   constructor(options: CodexProviderBridgeOptions) {
@@ -519,9 +541,12 @@ export class CodexProviderBridge implements ProviderControlAdapter {
         return;
       }
       if (event.type === "state.changed" && this.#metadata.has(event.threadId) &&
-          !this.#recovering.has(event.threadId) && this.#acceptsLiveEvents(event.threadId)) {
+          !this.#recovering.has(event.threadId)) {
+        // Keep the provider snapshot current while a takeover is waiting for
+        // its durable ownership commit, but never project that manager-owned
+        // state into the cockpit early. The commit returns this latest state.
         this.#knownStates.set(event.threadId, event.state);
-        this.#publishSession(event.state);
+        if (this.#acceptsLiveEvents(event.threadId)) this.#publishSession(event.state);
       }
     });
   }
@@ -572,16 +597,27 @@ export class CodexProviderBridge implements ProviderControlAdapter {
       workspacePath: cwd,
     });
     this.#knownStates.set(state.threadId, state);
-    // `thread/start` owns the initial native detail stream. Keep that stream
-    // alive until the first selected-session acquisition has adopted the exact
-    // thread, otherwise fast first-turn activity can be lost between create
-    // acknowledgement and the browser opening its activity EventSource.
-    this.#creationHandoffs.add(state.threadId);
+    // `thread/start` subscribes this App Server connection to the new thread.
+    // That subscription belongs to the managed session, not to whichever
+    // browser drawer happens to be open.
+    this.#managedThreads.set(state.threadId, {
+      phase: "active",
+      settled: Promise.resolve(),
+    });
     this.#flushBufferedActivity(state.threadId);
     return this.toSessionView(state);
   }
 
-  async adoptExternalSession(
+  /**
+   * Semantically resume one exact dormant Codex conversation in the web app.
+   *
+   * This uses the bridge's existing App Server connection: `thread/read` pins
+   * the provider identity without claiming it, `thread/resume` subscribes this
+   * client to that exact identity, and all resulting state/activity remains
+   * private until `commitExternalAdoption` confirms the durable manager record.
+   * Callers must invoke `abortExternalAdoption` if persistence fails.
+   */
+  async resumeSession(
     session: SessionView,
     profile: CreateSessionInput["profile"],
     context: RequestContext,
@@ -598,35 +634,46 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     if (!context.workspace || context.workspace.path !== session.cwd) {
       throw new Error("Codex adoption workspace does not match the discovered thread");
     }
-    if (this.#metadata.has(threadId) || this.#recovering.has(threadId)) {
+    if (this.#metadata.has(threadId) || this.#recovering.has(threadId) ||
+        this.#resumeTransactions.has(threadId)) {
       throw new Error("Codex thread is already managed by this bridge");
     }
 
-    const read = await this.adapter.readThread(threadId);
-    context.signal.throwIfAborted();
-    if (
-      read.threadId !== threadId
-      || read.cwd !== session.cwd
-      || (session.providerTreeId !== null && read.treeId !== session.providerTreeId)
-      || read.parentThreadId !== null
-    ) {
-      await this.adapter.releaseThread(threadId).catch(() => undefined);
-      throw new Error("Codex thread/read changed the validated thread, tree, or workspace identity");
-    }
-    await this.adapter.releaseThread(threadId);
-    context.signal.throwIfAborted();
+    const transaction = Symbol(threadId);
+    this.#resumeTransactions.set(threadId, transaction);
 
-    const metadata: ManagedMetadata = {
-      name: session.name,
-      requestedProfile: profile,
-      createdAt: session.startedAt ?? this.#now().toISOString(),
-      creationIssue: null,
-      workspaceId: context.workspace.id,
-      workspacePath: context.workspace.path,
-    };
-    this.#metadata.set(threadId, metadata);
-    this.#knownStates.set(threadId, read);
     try {
+      const read = await this.adapter.readThread(threadId);
+      context.signal.throwIfAborted();
+      if (
+        read.threadId !== threadId
+        || read.cwd !== session.cwd
+        || (session.providerTreeId !== null && read.treeId !== session.providerTreeId)
+        || read.parentThreadId !== null
+      ) {
+        throw new Error("Codex thread/read changed the validated thread, tree, or workspace identity");
+      }
+      // `thread/read` populates only this adapter's local identity cache. Drop
+      // that cache before `thread/resume`; there is still exactly one provider
+      // subscription owner for this bridge client, acquired below.
+      await this.adapter.releaseThread(threadId);
+      context.signal.throwIfAborted();
+
+      const metadata: ManagedMetadata = {
+        name: session.name,
+        requestedProfile: profile,
+        createdAt: session.startedAt ?? this.#now().toISOString(),
+        creationIssue: null,
+        workspaceId: context.workspace.id,
+        workspacePath: context.workspace.path,
+      };
+      this.#metadata.set(threadId, metadata);
+      this.#knownStates.set(threadId, read);
+      const subscription: ManagedThreadSubscription = {
+        phase: "acquiring",
+        settled: Promise.resolve(),
+      };
+      this.#managedThreads.set(threadId, subscription);
       const adopted = await this.adapter.adoptThread(threadId, {
         threadId: read.threadId,
         treeId: read.treeId,
@@ -657,25 +704,41 @@ export class CodexProviderBridge implements ProviderControlAdapter {
 
       await this.#resolveWorkspaceIdentity(confirmed.cwd);
       context.signal.throwIfAborted();
-      this.#knownStates.set(threadId, confirmed);
-      this.#selectedThreads.set(threadId, {
-        refs: 0,
-        phase: "active",
-        settled: Promise.resolve(),
-      });
       this.#provisionalAdoptions.add(threadId);
-      this.#flushBufferedActivity(threadId);
+      this.#knownStates.set(threadId, confirmed);
+      subscription.phase = "active";
       return this.toSessionView(confirmed);
     } catch (error) {
-      this.#metadata.delete(threadId);
-      this.#knownStates.delete(threadId);
-      this.#selectedThreads.delete(threadId);
-      this.#dropBufferedActivity(threadId);
-      if (this.adapter.getThreadState(threadId)) {
-        await this.adapter.releaseThread(threadId).catch(() => undefined);
+      if (this.#resumeTransactions.get(threadId) === transaction) {
+        try {
+          await this.#releaseResumeTransaction(
+            threadId,
+            transaction,
+            `Codex resume failed before commit: ${recoveryError(error)}`,
+          );
+        } catch (releaseError) {
+          throw new Error(
+            `${recoveryError(error)}; Codex rollback remains quarantined: ${recoveryError(releaseError)}`,
+            { cause: error },
+          );
+        }
       }
       throw error;
     }
+  }
+
+  /**
+   * CLI takeover and web-native resume share the same provider transaction.
+   * Claude needs exclusive ownership transfer; Codex does not, so the server
+   * may call `resumeSession` directly without waiting for a native client to
+   * exit. Keep this name as the takeover-compatible entrypoint.
+   */
+  async adoptExternalSession(
+    session: SessionView,
+    profile: CreateSessionInput["profile"],
+    context: RequestContext,
+  ): Promise<SessionView> {
+    return this.resumeSession(session, profile, context);
   }
 
   async restoreManagedSessions(
@@ -696,6 +759,10 @@ export class CodexProviderBridge implements ProviderControlAdapter {
       record: ManagedSessionRecoveryRecord;
     }> = [];
     for (const [index, record] of selected.entries()) {
+      if (record.provider !== "codex") {
+        failures[index] = "Codex recovery received another provider's durable identity";
+        continue;
+      }
       const expectedManagerId = sessionRecordId("local", "codex", record.providerThreadId);
       if (record.managerSessionId !== expectedManagerId) {
         failures[index] = "Persisted manager and provider thread identities do not match";
@@ -707,7 +774,8 @@ export class CodexProviderBridge implements ProviderControlAdapter {
       }
       seenThreadIds.add(record.providerThreadId);
       if (this.#metadata.has(record.providerThreadId) ||
-          this.#recovering.has(record.providerThreadId)) {
+          this.#recovering.has(record.providerThreadId) ||
+          this.#resumeTransactions.has(record.providerThreadId)) {
         failures[index] = "Codex thread is already managed by this bridge";
         continue;
       }
@@ -741,25 +809,36 @@ export class CodexProviderBridge implements ProviderControlAdapter {
           const read = await this.adapter.readThread(record.providerThreadId);
           assertActive();
           this.#assertRecoveredIdentity(read, record);
+          const subscription: ManagedThreadSubscription = {
+            phase: "acquiring",
+            settled: Promise.resolve(),
+          };
+          this.#managedThreads.set(record.providerThreadId, subscription);
+          const adopted = await this.adapter.adoptThread(record.providerThreadId, {
+            threadId: read.threadId,
+            treeId: read.treeId,
+            parentThreadId: read.parentThreadId,
+            cwd: read.cwd,
+          });
+          assertActive();
+          const metadata = this.#metadata.get(record.providerThreadId);
+          if (!metadata) throw new Error("Managed Codex recovery metadata disappeared");
+          this.#assertSelectedIdentity(adopted, read, metadata);
           await this.#resolveWorkspaceIdentity(read.cwd ?? record.workspacePath);
           assertActive();
-          this.#knownStates.set(record.providerThreadId, read);
-          // `thread/read` is an exact, bounded validation step, not adoption.
-          // Drop its local detail state immediately so startup cannot retain a
-          // writable/detailed plane for every persisted record. Selection will
-          // perform the one exact resume that owns future live events.
-          await this.adapter.releaseThread(record.providerThreadId);
-          assertActive();
+          this.#knownStates.set(record.providerThreadId, adopted);
+          subscription.phase = "active";
           this.#recovering.delete(record.providerThreadId);
           restored[index] = true;
-          this.#publishSession(read);
-          this.#dropBufferedActivity(record.providerThreadId);
+          this.#publishSession(adopted);
+          this.#flushBufferedActivity(record.providerThreadId);
         } catch (error) {
           failures[index] = recoveryError(error);
           if (this.#recovering.get(record.providerThreadId) === token) {
             this.#recovering.delete(record.providerThreadId);
             this.#metadata.delete(record.providerThreadId);
             this.#knownStates.delete(record.providerThreadId);
+            this.#managedThreads.delete(record.providerThreadId);
             this.#dropBufferedActivity(record.providerThreadId);
           }
           if (this.adapter.getThreadState(record.providerThreadId)) {
@@ -789,21 +868,35 @@ export class CodexProviderBridge implements ProviderControlAdapter {
   }
 
   commitExternalAdoption(threadId: string): SessionView {
-    if (!this.#provisionalAdoptions.delete(threadId)) {
+    if (this.#quarantinedResumes.has(threadId)) {
+      throw new Error("Codex adoption rollback is quarantined and cannot be committed");
+    }
+    if (!this.#provisionalAdoptions.has(threadId)) {
       throw new Error("Codex adoption is not awaiting durable commit");
     }
-    const session = this.getManagedSession(threadId);
-    if (!session) throw new Error("Codex adoption disappeared before commit");
+    const state = this.adapter.getThreadState(threadId) ?? this.#knownStates.get(threadId);
+    if (!state || !this.#metadata.has(threadId) ||
+        this.#managedThreads.get(threadId)?.phase !== "active") {
+      throw new Error("Codex adoption disappeared before commit");
+    }
+    this.#knownStates.set(threadId, state);
+    this.#provisionalAdoptions.delete(threadId);
+    this.#resumeTransactions.delete(threadId);
+    const session = this.toSessionView(state);
+    // Activity emitted by thread/resume or provider setting reconciliation is
+    // private to the provisional client until durable ownership has committed.
+    this.#flushBufferedActivity(threadId);
     return session;
   }
 
   async abortExternalAdoption(threadId: string): Promise<void> {
-    if (!this.#provisionalAdoptions.delete(threadId)) return;
-    this.#metadata.delete(threadId);
-    this.#knownStates.delete(threadId);
-    this.#selectedThreads.delete(threadId);
-    this.#dropBufferedActivity(threadId);
-    if (this.adapter.getThreadState(threadId)) await this.adapter.releaseThread(threadId);
+    const quarantine = this.#quarantinedResumes.get(threadId);
+    if (!this.#provisionalAdoptions.has(threadId) && !quarantine) return;
+    const transaction = quarantine?.transaction ?? this.#resumeTransactions.get(threadId);
+    if (!transaction) {
+      throw new Error("Codex rollback lost its exact resume transaction identity");
+    }
+    await this.#releaseResumeTransaction(threadId, transaction, null);
   }
 
   async acquireSelectedSession(
@@ -820,32 +913,23 @@ export class CodexProviderBridge implements ProviderControlAdapter {
       throw new Error("Codex detail acquisition requires a local manager-owned session");
     }
     const threadId = session.providerThreadId;
+    if (this.#quarantinedResumes.has(threadId)) {
+      throw new Error(QUARANTINE_REASON);
+    }
     if (session.id !== sessionRecordId("local", "codex", threadId) ||
         !this.#metadata.has(threadId) || !this.#knownStates.has(threadId)) {
       throw new Error("Codex detail acquisition received an unknown managed identity");
     }
 
-    let lease: SelectedThreadLease;
-    while (true) {
-      const existing = this.#selectedThreads.get(threadId);
-      if (existing?.phase === "releasing") {
-        await existing.settled.catch(() => undefined);
-        context.signal.throwIfAborted();
-        continue;
-      }
-      if (existing) {
-        existing.refs += 1;
-        lease = existing;
-        break;
-      }
-
-      lease = {
-        refs: 1,
+    let subscription = this.#managedThreads.get(threadId);
+    if (!subscription) {
+      subscription = {
         phase: "acquiring",
         settled: Promise.resolve(),
       };
-      this.#selectedThreads.set(threadId, lease);
-      lease.settled = (async () => {
+      this.#managedThreads.set(threadId, subscription);
+      const acquiring = subscription;
+      acquiring.settled = (async () => {
         const expected = this.#knownStates.get(threadId);
         const metadata = this.#metadata.get(threadId);
         if (!expected || !metadata) throw new Error("Managed Codex identity disappeared");
@@ -857,45 +941,36 @@ export class CodexProviderBridge implements ProviderControlAdapter {
         });
         this.#assertSelectedIdentity(adopted, expected, metadata);
         await this.#resolveWorkspaceIdentity(adopted.cwd ?? metadata.workspacePath);
-        if (this.#selectedThreads.get(threadId) !== lease) {
-          throw new Error("Codex selection was superseded");
+        if (this.#managedThreads.get(threadId) !== acquiring) {
+          throw new Error("Codex managed subscription was superseded");
         }
         this.#knownStates.set(threadId, adopted);
-        this.#creationHandoffs.delete(threadId);
-        lease.phase = "active";
+        acquiring.phase = "active";
         this.#publishSession(adopted);
         this.#flushBufferedActivity(threadId);
       })();
-      break;
     }
 
     try {
-      await lease.settled;
+      await subscription.settled;
       context.signal.throwIfAborted();
     } catch (error) {
-      if (lease.phase === "active") {
-        await this.#releaseSelectedSession(threadId, lease).catch(() => undefined);
-      } else if (this.#selectedThreads.get(threadId) === lease) {
-        lease.refs = Math.max(0, lease.refs - 1);
-        if (lease.refs === 0) this.#selectedThreads.delete(threadId);
-      }
-      if (lease.phase !== "active") {
+      if (this.#managedThreads.get(threadId) === subscription &&
+          subscription.phase !== "active") {
+        this.#managedThreads.delete(threadId);
         if (this.adapter.getThreadState(threadId)) {
           await this.adapter.releaseThread(threadId).catch(() => undefined);
         }
-        this.#creationHandoffs.delete(threadId);
       }
       const known = this.#knownStates.get(threadId);
       if (known && this.#metadata.has(threadId)) this.#publishSession(known);
       throw error;
     }
 
-    let released = false;
-    return async () => {
-      if (released) return;
-      released = true;
-      await this.#releaseSelectedSession(threadId, lease);
-    };
+    // Drawer/SSE lifetime is deliberately independent from the provider
+    // subscription. Closing this browser consumer must not turn a managed
+    // Codex thread read-only or disconnect its shared native clients.
+    return () => undefined;
   }
 
   async performAction(
@@ -907,12 +982,18 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     if (session.provider !== "codex" || session.control.authority !== "manager") {
       throw new Error("Codex controls apply only to manager-owned Codex sessions");
     }
-    if (action.expectedGeneration !== session.generation) {
+    if (action.type !== "respond" && action.expectedGeneration !== session.generation) {
       throw new Error("Codex session generation changed before dispatch");
     }
-    const selected = this.#selectedThreads.get(session.providerThreadId);
-    if (!selected || selected.phase !== "active" || selected.refs < 1) {
-      throw new Error("Manager-owned Codex thread is not selected or loaded");
+    if (this.#quarantinedResumes.has(session.providerThreadId)) {
+      throw new Error(QUARANTINE_REASON);
+    }
+    const subscription = this.#managedThreads.get(session.providerThreadId);
+    if (!subscription || subscription.phase !== "active") {
+      throw new Error("Manager-owned Codex thread is not subscribed or loaded");
+    }
+    if (this.#provisionalAdoptions.has(session.providerThreadId)) {
+      throw new Error("Manager-owned Codex thread is awaiting durable adoption commit");
     }
     const state = this.adapter.getThreadState(session.providerThreadId);
     if (!state) throw new Error("Manager-owned Codex thread is not loaded");
@@ -949,16 +1030,39 @@ export class CodexProviderBridge implements ProviderControlAdapter {
         const request = state.pendingRequests.find(
           (candidate) => encodeCodexRequestId(candidate.id) === action.requestId,
         );
-        if (!request) throw new Error("Codex request is stale or already resolved");
+        if (!request) return STALE_REQUEST_FAILURE;
+        const expectedTurnId = action.expectedProviderTurnId ?? null;
+        if (expectedTurnId !== request.turnId) {
+          return STALE_REQUEST_FAILURE;
+        }
         if (request.kind === "elicitation") {
           throw new Error("Codex MCP elicitation forms are not respondable in the cockpit");
         }
-        await this.adapter.respondToRequest(
-          session.providerThreadId,
-          decodeCodexRequestId(action.requestId),
-          codexRequestResponse(request, action.response),
-        );
-        return { status: "succeeded" };
+        if (request.kind === "unsupported") {
+          throw new Error(`Codex request method ${request.method} is not respondable`);
+        }
+        if (!request.respondable) return STALE_REQUEST_FAILURE;
+        try {
+          await this.adapter.respondToRequest(
+            session.providerThreadId,
+            decodeCodexRequestId(action.requestId),
+            codexRequestResponse(request, action.response),
+          );
+        } catch (error) {
+          const current = this.adapter.getThreadState(session.providerThreadId);
+          const currentRequest = current?.pendingRequests.find(
+            (candidate) => encodeCodexRequestId(candidate.id) === action.requestId,
+          );
+          if (!currentRequest?.respondable) return STALE_REQUEST_FAILURE;
+          throw error;
+        }
+        return {
+          status: "succeeded",
+          result: {
+            coordination: "first-response-wins",
+            resolution: "submitted",
+          },
+        };
       }
       case "interrupt":
         if (!action.expectedProviderTurnId) {
@@ -995,9 +1099,11 @@ export class CodexProviderBridge implements ProviderControlAdapter {
         return { status: "succeeded" };
       case "open-editor":
         throw new Error("Codex provider does not own editor launch operations");
+      case "resume":
       case "take-control":
       case "cancel-take-control":
-        throw new Error("Codex takeover is orchestrated by Agent Manager");
+      case "retry-control":
+        throw new Error("Codex resume and takeover are orchestrated by Agent Manager");
     }
   }
 
@@ -1007,16 +1113,23 @@ export class CodexProviderBridge implements ProviderControlAdapter {
   ): Promise<AttachInstruction | null> {
     context.signal.throwIfAborted();
     if (session.provider !== "codex" || session.control.authority !== "manager") return null;
-    const selected = this.#selectedThreads.get(session.providerThreadId);
-    if (!selected || selected.phase !== "active" || selected.refs < 1) {
-      throw new Error("Manager-owned Codex thread is not selected or loaded");
+    if (this.#quarantinedResumes.has(session.providerThreadId)) {
+      throw new Error(QUARANTINE_REASON);
+    }
+    if (this.#provisionalAdoptions.has(session.providerThreadId)) {
+      throw new Error("Manager-owned Codex thread is awaiting durable adoption commit");
+    }
+    const subscription = this.#managedThreads.get(session.providerThreadId);
+    if (!subscription || subscription.phase !== "active" ||
+        !this.adapter.getThreadState(session.providerThreadId)) {
+      throw new Error("Manager-owned Codex thread is not subscribed or loaded");
     }
     const command = this.adapter.buildAttachCommand(session.providerThreadId);
     return {
       kind: "codex-remote",
       argv: [command.executable, ...command.args],
       cwd: session.cwd,
-      warning: "Acquire the native-controller lease before attaching; the first client to answer a Codex request wins.",
+      warning: "Joins the shared Codex App Server thread. CLI and web stay active together; the first client to answer a Codex request wins.",
     };
   }
 
@@ -1068,14 +1181,12 @@ export class CodexProviderBridge implements ProviderControlAdapter {
   }
 
   toSessionView(state: CodexThreadState): SessionView {
-    const selected = this.#selectedThreads.get(state.threadId);
-    // A successful external takeover installs one validated, live detail plane
-    // before the replacement activity stream reconnects, so it is briefly
-    // active with zero browser references. The provider controls are already
-    // real in that handoff window and must be present in the post-commit view;
-    // ordinary drawer release changes the phase to `releasing` before publish.
-    const controlsLoaded = selected?.phase === "active";
-    const liveDetail = controlsLoaded || this.#creationHandoffs.has(state.threadId);
+    const subscription = this.#managedThreads.get(state.threadId);
+    const quarantine = this.#quarantinedResumes.get(state.threadId) ?? null;
+    const controlsLoaded = subscription?.phase === "active" &&
+      this.adapter.getThreadState(state.threadId) !== null && quarantine === null &&
+      !this.#provisionalAdoptions.has(state.threadId);
+    const liveDetail = controlsLoaded;
     const metadata = this.#metadata.get(state.threadId) ?? {
       name: null,
       requestedProfile: "plan" as const,
@@ -1166,11 +1277,27 @@ export class CodexProviderBridge implements ProviderControlAdapter {
       terminal: null,
       control: {
         plane: "codex-private",
-        authority: state.writeBlockedReason ? "foreign" : "manager",
+        authority: "manager",
+        coordination: providerControlCoordination("codex"),
+        recovery: quarantine
+          ? {
+              state: quarantine.phase === "releasing" ? "reconnecting" : "needs-attention",
+              attempt: quarantine.attempt,
+              startedAt: quarantine.startedAt,
+              deadlineAt: null,
+              nextRetryAt: null,
+              error: quarantine.error,
+            }
+          : null,
         capabilities: controlsLoaded
           ? mappedCapabilities(this.adapter, state, metadata.creationIssue)
           : [],
-        withheld: controlsLoaded
+        withheld: quarantine
+          ? QUARANTINED_CAPABILITIES.map((capability) => ({
+              capability,
+              reason: QUARANTINE_REASON,
+            }))
+          : controlsLoaded
           ? withheldCapabilities(this.adapter, state)
           : UNLOADED_CAPABILITIES.map((capability) => ({
               capability,
@@ -1200,12 +1327,101 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     this.#metadata.clear();
     this.#knownStates.clear();
     this.#recovering.clear();
-    this.#selectedThreads.clear();
-    this.#creationHandoffs.clear();
+    this.#managedThreads.clear();
+    this.#resumeTransactions.clear();
     this.#provisionalAdoptions.clear();
+    this.#quarantinedResumes.clear();
     this.#bufferedActivity.clear();
-    this.#overflowedActivity.clear();
     this.#workspaceIdentities.clear();
+  }
+
+  /**
+   * Fail-closed rollback for a provisional provider subscription. The exact
+   * transaction and all ownership maps remain reserved until the adapter has
+   * positively removed its thread state. A rejected unsubscribe is uncertain,
+   * so it becomes an explicit quarantine and may be retried idempotently; an
+   * in-flight unsubscribe is shared by every concurrent rollback caller.
+   */
+  async #releaseResumeTransaction(
+    threadId: string,
+    transaction: symbol,
+    contextError: string | null,
+  ): Promise<void> {
+    if (this.#resumeTransactions.get(threadId) !== transaction) {
+      throw new Error("Codex rollback no longer owns the exact resume transaction");
+    }
+
+    let quarantine = this.#quarantinedResumes.get(threadId);
+    if (quarantine && quarantine.transaction !== transaction) {
+      throw new Error("Codex rollback quarantine belongs to another resume transaction");
+    }
+    if (quarantine?.releasePromise) {
+      await quarantine.releasePromise;
+      return;
+    }
+    if (!quarantine) {
+      quarantine = {
+        transaction,
+        phase: "releasing",
+        attempt: 0,
+        startedAt: this.#now().toISOString(),
+        error: contextError,
+        releasePromise: null,
+      };
+      this.#quarantinedResumes.set(threadId, quarantine);
+    }
+
+    quarantine.phase = "releasing";
+    quarantine.attempt += 1;
+    if (contextError) quarantine.error = contextError;
+    // Keeping the provisional marker is what withholds state and activity from
+    // consumers while cleanup is uncertain or merely slow.
+    this.#provisionalAdoptions.add(threadId);
+    const activeQuarantine = quarantine;
+    const releasePromise = (async (): Promise<void> => {
+      try {
+        if (this.adapter.getThreadState(threadId)) {
+          await this.adapter.releaseThread(threadId);
+        }
+        if (this.adapter.getThreadState(threadId)) {
+          throw new Error("Codex App Server still reports the provider client as subscribed");
+        }
+
+        // A provider removal event may have completed cleanup while the RPC was
+        // in flight. That is also exact confirmation and needs no second pass.
+        const current = this.#resumeTransactions.get(threadId);
+        if (current !== undefined && current !== transaction) {
+          throw new Error("Codex rollback transaction changed during provider release");
+        }
+        this.#provisionalAdoptions.delete(threadId);
+        this.#metadata.delete(threadId);
+        this.#knownStates.delete(threadId);
+        this.#managedThreads.delete(threadId);
+        this.#dropBufferedActivity(threadId);
+        this.#quarantinedResumes.delete(threadId);
+        if (current === transaction) this.#resumeTransactions.delete(threadId);
+      } catch (error) {
+        // Exact provider removal wins over an RPC error racing its notification.
+        if (!this.#resumeTransactions.has(threadId) &&
+            !this.#quarantinedResumes.has(threadId) &&
+            !this.adapter.getThreadState(threadId)) {
+          return;
+        }
+        if (this.#quarantinedResumes.get(threadId) === activeQuarantine) {
+          activeQuarantine.phase = "needs-attention";
+          activeQuarantine.error = boundedText(
+            [contextError, `Provider release was not confirmed: ${recoveryError(error)}`]
+              .filter((part): part is string => Boolean(part))
+              .join("; "),
+            1_000,
+          );
+          activeQuarantine.releasePromise = null;
+        }
+        throw error;
+      }
+    })();
+    activeQuarantine.releasePromise = releasePromise;
+    await releasePromise;
   }
 
   /**
@@ -1226,49 +1442,18 @@ export class CodexProviderBridge implements ProviderControlAdapter {
   }
 
   #acceptsLiveEvents(threadId: string): boolean {
-    const selected = this.#selectedThreads.get(threadId);
-    return this.#creationHandoffs.has(threadId)
-      || selected?.phase === "active";
-  }
-
-  async #releaseSelectedSession(
-    threadId: string,
-    lease: SelectedThreadLease,
-  ): Promise<void> {
-    if (this.#selectedThreads.get(threadId) !== lease || lease.phase !== "active") return;
-    lease.refs = Math.max(0, lease.refs - 1);
-    if (lease.refs > 0) return;
-
-    lease.phase = "releasing";
-    const current = this.adapter.getThreadState(threadId) ?? this.#knownStates.get(threadId);
-    if (current) {
-      this.#knownStates.set(threadId, current);
-      if (this.#metadata.has(threadId)) this.#publishSession(current);
-    }
-    lease.settled = (async () => {
-      try {
-        if (this.adapter.getThreadState(threadId)) {
-          await this.adapter.releaseThread(threadId);
-        }
-      } finally {
-        if (this.#selectedThreads.get(threadId) === lease) {
-          this.#selectedThreads.delete(threadId);
-        }
-      }
-    })();
-    await lease.settled;
+    return this.#managedThreads.get(threadId)?.phase === "active" &&
+      !this.#provisionalAdoptions.has(threadId);
   }
 
   #forwardOrBufferActivity(threadId: string, mutation: ActivityMutation): void {
     if (!this.#onActivity) return;
     if (this.#metadata.has(threadId)) {
-      const phase = this.#selectedThreads.get(threadId)?.phase;
       if (!this.#recovering.has(threadId) && this.#acceptsLiveEvents(threadId)) {
         this.#publishActivity(threadId, mutation);
-      } else if (phase === "acquiring" || phase === "releasing") {
-        // Teardown still produces truthful state (an unresolved dispatch, for
-        // example). Dropping it here is what leaves a stale queue bubble on
-        // screen, so it is buffered for the next acquisition instead.
+      } else {
+        // Adoption/recovery can emit before identity validation completes.
+        // Retain that activity until the durable managed subscription is live.
         this.#bufferActivity(threadId, mutation);
       }
       return;
@@ -1283,37 +1468,57 @@ export class CodexProviderBridge implements ProviderControlAdapter {
       buffered = [];
       this.#bufferedActivity.set(threadId, buffered);
     }
-    if (buffered.length >= MAX_BUFFERED_ACTIVITY_MUTATIONS) {
-      buffered.length = 0;
-      buffered.push({ type: "reset", reason: "truncation" });
-      this.#overflowedActivity.add(threadId);
-    }
-    if (this.#overflowedActivity.has(threadId) && mutation.type === "append") return;
     buffered.push(mutation);
+    if (buffered.length <= MAX_BUFFERED_ACTIVITY_MUTATIONS) return;
+
+    // This buffer sits in front of an ActivityHub that may already contain
+    // transcript or hook history for the same manager session. A provider
+    // reset would erase that independently sourced history when adoption
+    // commits. Keep an amortized bounded tail and publish an internal boundary
+    // that marks the retained window incomplete without replacing its items.
+    const retained = buffered.slice(-(MAX_BUFFERED_ACTIVITY_MUTATIONS / 2));
+    buffered.length = 0;
+    buffered.push({ type: "retention-boundary" }, ...retained);
   }
 
   #flushBufferedActivity(threadId: string): void {
     const buffered = this.#bufferedActivity.get(threadId);
     this.#bufferedActivity.delete(threadId);
-    this.#overflowedActivity.delete(threadId);
     if (!buffered) return;
     for (const mutation of buffered) this.#publishActivity(threadId, mutation);
   }
 
   #dropBufferedActivity(threadId: string): void {
     this.#bufferedActivity.delete(threadId);
-    this.#overflowedActivity.delete(threadId);
   }
 
   #assertRecoveredIdentity(
     state: CodexThreadState,
     record: ManagedSessionRecoveryRecord,
   ): void {
+    if (
+      record.providerTreeId === undefined
+      || record.providerParentThreadId === undefined
+    ) {
+      throw new Error(
+        "Persisted Codex tree and parent identity baseline is missing or invalid; " +
+        "history is preserved, but automatic control recovery is fail-closed. " +
+        "Use Resume here to re-adopt this exact provider conversation.",
+      );
+    }
     if (state.threadId !== record.providerThreadId) {
       throw new Error("Native Codex recovery returned a different thread identity");
     }
     if (state.cwd !== record.workspacePath) {
       throw new Error("Native Codex recovery returned a different workspace");
+    }
+    if (
+      state.treeId !== record.providerTreeId
+      || state.parentThreadId !== record.providerParentThreadId
+    ) {
+      throw new Error(
+        "Native Codex recovery changed the persisted thread tree or parent identity",
+      );
     }
   }
 
@@ -1346,13 +1551,17 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     reason: "ended" | "archived" | "deleted",
   ): void {
     if (!this.#metadata.has(threadId)) return;
+    const provisional = this.#provisionalAdoptions.delete(threadId);
+    const resuming = this.#resumeTransactions.delete(threadId);
+    const quarantined = this.#quarantinedResumes.delete(threadId);
     this.#metadata.delete(threadId);
     this.#knownStates.delete(threadId);
     this.#recovering.delete(threadId);
-    this.#selectedThreads.delete(threadId);
-    this.#creationHandoffs.delete(threadId);
+    this.#managedThreads.delete(threadId);
     this.#dropBufferedActivity(threadId);
-    this.#publishRemoval(sessionRecordId("local", "codex", threadId), reason);
+    if (!provisional && !resuming && !quarantined) {
+      this.#publishRemoval(sessionRecordId("local", "codex", threadId), reason);
+    }
   }
 
   #publishRemoval(

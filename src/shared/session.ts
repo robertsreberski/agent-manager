@@ -58,13 +58,16 @@ export type SessionPresence = "live" | "recent";
 export type TakeoverMethod = "guided-exit" | "graceful-stop";
 export type TakeoverState =
   | "available"
+  | "awaiting-confirmation"
   | "waiting-for-exit"
   | "stopping"
   | "adopting"
   | "failed";
 
 /**
- * Public state for an exclusive foreign-CLI to manager ownership transfer.
+ * Public state for migrating a standalone foreign CLI onto Agent Manager's
+ * provider connection. Claude transfers exclusive ownership; Codex may use the
+ * same one-time migration before joining the shared App Server connection.
  * `id` is null only while takeover is merely available; an active or failed
  * attempt always carries the identity used to reject stale cancellation.
  */
@@ -221,7 +224,53 @@ export type ControlCapability =
   | "delete"
   | "take-control"
   | "cancel-take-control"
+  | "retry-control"
   | "open-editor";
+
+export type ControlCoordinationMode = "shared" | "exclusive" | "observe-only";
+export type NativeAttachCoordination = "join" | "handoff" | "none";
+export type ResponseResolution = "first-response-wins" | "single-controller";
+
+/** Provider concurrency semantics, independent of the current writer lease. */
+export interface SessionControlCoordination {
+  mode: ControlCoordinationMode;
+  nativeAttach: NativeAttachCoordination;
+  responseResolution: ResponseResolution;
+}
+
+/** Canonical live-control semantics for each provider. */
+export function providerControlCoordination(
+  provider: Provider,
+): SessionControlCoordination {
+  return provider === "codex"
+    ? {
+        mode: "shared",
+        nativeAttach: "join",
+        responseResolution: "first-response-wins",
+      }
+    : {
+        mode: "exclusive",
+        nativeAttach: "handoff",
+        responseResolution: "single-controller",
+      };
+}
+
+export type SessionControlRecoveryState =
+  | "reconnecting"
+  | "waiting-for-native-exit"
+  | "retrying"
+  | "needs-attention";
+
+/** Bounded provider-control recovery state; transcript reads remain independent. */
+export interface SessionControlRecovery {
+  state: SessionControlRecoveryState;
+  /** One-based attempt number for the current recovery series. */
+  attempt: number;
+  startedAt: string;
+  deadlineAt: string | null;
+  nextRetryAt: string | null;
+  error: string | null;
+}
 
 export interface WithheldCapability {
   capability: ControlCapability;
@@ -232,6 +281,10 @@ export interface SessionControl {
   plane: ControlPlane;
   /** Which controller currently has authority to write to the harness. */
   authority: "manager" | "foreign" | "none";
+  /** Whether provider clients may join or must hand exclusive ownership over. */
+  coordination: SessionControlCoordination;
+  /** Null while provider control is healthy or no recovery has been attempted. */
+  recovery: SessionControlRecovery | null;
   capabilities: ControlCapability[];
   /** Display-only explanations. Authorization reads capabilities, never this list. */
   withheld: WithheldCapability[];
@@ -381,6 +434,12 @@ export function observeOnlyControl(): SessionControl {
   return {
     plane: "observe-only",
     authority: "none",
+    coordination: {
+      mode: "observe-only",
+      nativeAttach: "none",
+      responseResolution: "single-controller",
+    },
+    recovery: null,
     capabilities: [],
     withheld: [],
     takeover: null,

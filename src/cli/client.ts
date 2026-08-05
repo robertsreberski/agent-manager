@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { basename, isAbsolute } from "node:path";
+import { isAbsolute } from "node:path";
 
 import { buildAttachSpec, type AttachSpec } from "../ops/attach.ts";
 import type { AttachExecutables } from "../ops/executables.ts";
@@ -14,8 +14,8 @@ export interface AttachLifecycle {
 export interface LifecycleAttachOptions {
   /** Test seam; production always uses node:child_process spawn. */
   spawnProcess?: typeof spawn;
+  /** Maximum time to wait after the single permitted SIGTERM. */
   terminationGraceMs?: number;
-  killGraceMs?: number;
 }
 
 interface ExitOutcome {
@@ -35,9 +35,13 @@ function assertSafeArgument(value: unknown, label: string): string {
   return value;
 }
 
-function assertCommandIdentity(value: unknown, expectedBasename: string): void {
+function assertCommandIdentity(
+  value: unknown,
+  expectedBasename: string,
+  pinnedExecutable: string,
+): void {
   const command = assertSafeArgument(value, `${expectedBasename} executable`);
-  if (basename(command) !== expectedBasename) {
+  if (command !== expectedBasename && command !== pinnedExecutable) {
     throw new Error(`Attach instruction expected the ${expectedBasename} executable`);
   }
 }
@@ -59,7 +63,7 @@ function tmuxAttachSpec(
   executables: AttachExecutables,
 ): AttachSpec {
   const argv = instruction.argv;
-  assertCommandIdentity(argv[0], "tmux");
+  assertCommandIdentity(argv[0], "tmux", executables.tmux);
   const args = argv.slice(1);
   const direct = args.length === 3
     && args[0] === "attach-session"
@@ -106,7 +110,7 @@ export function attachSpecFromInstruction(
       if (instruction.argv.length !== 5 || verb !== "resume" || remoteFlag !== "--remote") {
         throw new Error("Unsupported Codex attach instruction");
       }
-      assertCommandIdentity(rawExecutable, "codex");
+      assertCommandIdentity(rawExecutable, "codex", executables.codex);
       const remoteValue = assertSafeArgument(remote, "Codex remote socket");
       if (!remoteValue.startsWith("unix:///") || remoteValue.length <= "unix://".length) {
         throw new Error("Codex attach instruction must use an absolute Unix socket");
@@ -126,7 +130,7 @@ export function attachSpecFromInstruction(
       if (instruction.argv.length !== 3 || resumeFlag !== "--resume") {
         throw new Error("Unsupported Claude attach instruction");
       }
-      assertCommandIdentity(rawExecutable, "claude");
+      assertCommandIdentity(rawExecutable, "claude", executables.claude);
       const cwd = optionalCwd(instruction.cwd);
       if (!cwd) throw new Error("Claude attach instruction is missing its working directory");
       return buildAttachSpec({
@@ -154,24 +158,46 @@ async function awaitExitWithin(
   return await Promise.race([exitPromise, timer(timeoutMs)]);
 }
 
-async function terminateAndConfirm(
+function failureMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function uncertainCleanupError(primary: unknown, cleanup: unknown): AggregateError {
+  return new AggregateError(
+    [primary, cleanup],
+    `Attach process cleanup is uncertain after ${failureMessage(primary)}; the provider CLI may still be running, so ownership was not reclaimed`,
+  );
+}
+
+async function terminateOnceAndConfirm(
   child: ChildProcess,
   exitPromise: Promise<ExitOutcome>,
   getExit: () => ExitOutcome | null,
   terminationGraceMs: number,
-  killGraceMs: number,
 ): Promise<ExitOutcome> {
   const alreadyExited = getExit();
   if (alreadyExited) return alreadyExited;
 
-  child.kill("SIGTERM");
+  let signalFailure: unknown = null;
+  try {
+    // This is deliberately the only signal Agent Manager ever sends to a
+    // provider CLI it just spawned. A resumed provider conversation may
+    // already be live even when its owner acknowledgement is lost, so an
+    // escalation (or a repeated signal) could destroy valid user work.
+    child.kill("SIGTERM");
+  } catch (error) {
+    signalFailure = error;
+  }
   const terminated = await awaitExitWithin(exitPromise, terminationGraceMs);
   if (terminated) return terminated;
 
-  child.kill("SIGKILL");
-  const killed = await awaitExitWithin(exitPromise, killGraceMs);
-  if (killed) return killed;
-  throw new Error("Attach process did not exit after SIGTERM and SIGKILL");
+  const pid = child.pid === undefined ? "with an unknown PID" : `PID ${child.pid}`;
+  const signalDetail = signalFailure === null
+    ? "did not exit within the bounded wait"
+    : `could not be signalled (${failureMessage(signalFailure)})`;
+  throw new Error(
+    `Attach process ${pid} ${signalDetail} after the single permitted SIGTERM; cleanup is uncertain and ownership was not reclaimed`,
+  );
 }
 
 function waitForSpawn(child: ChildProcess): Promise<void> {
@@ -192,7 +218,9 @@ function waitForSpawn(child: ChildProcess): Promise<void> {
 /**
  * Run a provider attach handoff and settle its owner callback exactly once.
  * A failed `started` acknowledgement never reclaims the handoff until the
- * native child is confirmed dead (bounded SIGTERM followed by SIGKILL).
+ * native child is confirmed dead after at most one bounded SIGTERM. If that
+ * cannot be confirmed, the manager leaves ownership fail-closed and reports
+ * that the native process may still be live.
  */
 export async function executeLifecycleAttach(
   spec: AttachSpec,
@@ -206,10 +234,9 @@ export async function executeLifecycleAttach(
   ) {
     throw new Error("Attach executable must be a pinned absolute path");
   }
-  const terminationGraceMs = options.terminationGraceMs ?? 2_000;
-  const killGraceMs = options.killGraceMs ?? 2_000;
-  if (terminationGraceMs < 0 || killGraceMs < 0) {
-    throw new Error("Attach termination timeouts must not be negative");
+  const terminationGraceMs = options.terminationGraceMs ?? 15_000;
+  if (terminationGraceMs < 0) {
+    throw new Error("Attach termination timeout must not be negative");
   }
 
   let failedReported = false;
@@ -256,18 +283,14 @@ export async function executeLifecycleAttach(
   if (pid === undefined) {
     const error = new Error("Attach process started without a process id");
     try {
-      await terminateAndConfirm(
+      await terminateOnceAndConfirm(
         child,
         exitPromise,
         () => exitOutcome,
         terminationGraceMs,
-        killGraceMs,
       );
     } catch (terminationError) {
-      throw new AggregateError(
-        [error, terminationError],
-        "Attach process ownership could not be safely reclaimed",
-      );
+      throw uncertainCleanupError(error, terminationError);
     }
     await reportFailure(error);
     throw error;
@@ -277,18 +300,14 @@ export async function executeLifecycleAttach(
     await lifecycle.started(pid);
   } catch (error) {
     try {
-      await terminateAndConfirm(
+      await terminateOnceAndConfirm(
         child,
         exitPromise,
         () => exitOutcome,
         terminationGraceMs,
-        killGraceMs,
       );
     } catch (terminationError) {
-      throw new AggregateError(
-        [error, terminationError],
-        "Attach process ownership could not be safely reclaimed",
-      );
+      throw uncertainCleanupError(error, terminationError);
     }
     await reportFailure(error);
     throw error;

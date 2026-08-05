@@ -1,12 +1,16 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import type { ActivityAttentionItem, ActivityQueueItem } from "../types";
+import {
+  WIRE_SCHEMA_VERSION,
+  type ActivityAttentionItem,
+  type ActivityQueueItem,
+} from "../types";
 import { questionView, renderActivityData, type ActivityDataControls } from "./session-activity";
 import { SessionRuntimeProvider } from "./session-thread";
 
 const attention: ActivityAttentionItem = {
-  schemaVersion: 4,
+  schemaVersion: WIRE_SCHEMA_VERSION,
   id: "attention-1",
   sessionId: "local:codex:thread-1",
   provider: "codex",

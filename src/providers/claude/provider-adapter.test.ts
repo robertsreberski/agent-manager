@@ -5,10 +5,15 @@ import type { SessionView } from "../../core/types.ts";
 import type { ActivityMutation } from "../../activity/index.ts";
 import type { ManagedSessionRecoveryRecord, RequestContext } from "../../server/contracts.ts";
 import { AsyncInbox } from "./async-inbox.ts";
-import { ClaudeHookSourceArbiter } from "../hooks/claude-source.ts";
+import {
+  CLAUDE_MANAGER_OWNER_VALUE,
+  ClaudeHookSourceArbiter,
+} from "../hooks/claude-source.ts";
+import { parseClaudeHookInput } from "../hooks/claude-types.ts";
 import { ClaudeProviderControlAdapter } from "./provider-adapter.ts";
 import {
   CLAUDE_AGENT_SDK_VERSION,
+  CLAUDE_CODE_VERSION,
   type ClaudeEffortLevel,
   type ClaudeInterruptReceipt,
   type ClaudeModelInfo,
@@ -34,7 +39,11 @@ class BridgeQuery implements ClaudeSdkQuery, AsyncIterator<ClaudeSdkMessage> {
   }];
   supportedModelsCalls = 0;
   supportedModelsOverride: (() => Promise<ClaudeModelInfo[]>) | null = null;
+  setModelOverride: (() => Promise<void>) | null = null;
   closed = false;
+  closeCalls = 0;
+  closeEndsOutput = true;
+  readonly closeErrors: Error[] = [];
 
   constructor(params: ClaudeSdkQueryParams) {
     this.params = params;
@@ -56,6 +65,7 @@ class BridgeQuery implements ClaudeSdkQuery, AsyncIterator<ClaudeSdkMessage> {
 
   setModel(model?: string): Promise<void> {
     this.models.push(model);
+    if (this.setModelOverride) return this.setModelOverride();
     return Promise.resolve();
   }
 
@@ -71,8 +81,11 @@ class BridgeQuery implements ClaudeSdkQuery, AsyncIterator<ClaudeSdkMessage> {
   }
 
   close(): void {
+    this.closeCalls += 1;
     this.closed = true;
-    this.output.close();
+    if (this.closeEndsOutput) this.output.close();
+    const error = this.closeErrors.shift();
+    if (error) throw error;
   }
 
   next(): Promise<IteratorResult<ClaudeSdkMessage>> {
@@ -92,21 +105,26 @@ class BridgeRuntime implements ClaudeSdkRuntime {
   readonly sdkVersion = CLAUDE_AGENT_SDK_VERSION;
   readonly queries: BridgeQuery[] = [];
   nextQueryHook: ((query: BridgeQuery) => void) | null = null;
+  autoInitialize = true;
+  codeVersion = CLAUDE_CODE_VERSION;
+  initModelOverride: string | null = null;
   #id = 0;
 
   createQuery(params: ClaudeSdkQueryParams): ClaudeSdkQuery {
     const query = new BridgeQuery(params);
     this.queries.push(query);
     this.nextQueryHook?.(query);
-    query.emit({
-      type: "system",
-      subtype: "init",
-      session_id: params.options.resume ?? "managed-claude-1",
-      claude_code_version: "2.1.222",
-      model: params.options.model ?? "default-model",
-      permissionMode: params.options.permissionMode,
-      capabilities: ["interrupt_receipt_v1"],
-    });
+    if (this.autoInitialize) {
+      query.emit({
+        type: "system",
+        subtype: "init",
+        session_id: params.options.resume ?? "managed-claude-1",
+        claude_code_version: this.codeVersion,
+        model: this.initModelOverride ?? params.options.model ?? "default-model",
+        permissionMode: params.options.permissionMode,
+        capabilities: ["interrupt_receipt_v1"],
+      });
+    }
     return query;
   }
 
@@ -137,6 +155,38 @@ function context(): RequestContext {
   };
 }
 
+function stoppedRecoveryRecord(
+  overrides: Partial<ManagedSessionRecoveryRecord> = {},
+): ManagedSessionRecoveryRecord {
+  return {
+    managerSessionId: "local:claude:claude-stopped",
+    provider: "claude",
+    providerThreadId: "claude-stopped",
+    workspaceId: "workspace",
+    workspacePath: "/workspace",
+    name: "Stopped Claude",
+    profile: "plan",
+    model: "opus",
+    effort: "high",
+    createdAt: "2026-08-03T08:00:00.000Z",
+    ownership: "manager-exclusive",
+    managerControl: "stopped",
+    ...overrides,
+  };
+}
+
+function nativeStopHook(sessionId: string, promptId: string) {
+  return parseClaudeHookInput({
+    session_id: sessionId,
+    transcript_path: `/tmp/${sessionId}.jsonl`,
+    cwd: "/workspace",
+    prompt_id: promptId,
+    permission_mode: "default",
+    hook_event_name: "Stop",
+    stop_hook_active: false,
+  });
+}
+
 async function externalClaudeView(runtime: BridgeRuntime): Promise<SessionView> {
   const source = new ClaudeProviderControlAdapter({
     runtime,
@@ -151,19 +201,74 @@ async function externalClaudeView(runtime: BridgeRuntime): Promise<SessionView> 
     effort: "high",
     idempotencyKey: "external-claude-fixture",
   }, context());
-  source.dispose();
+  await source.dispose();
   return {
     ...view,
     source: "claude-hook",
     control: {
       plane: "claude-hook-bridge",
       authority: "foreign",
+      coordination: view.control.coordination,
+      recovery: null,
       capabilities: [],
       withheld: view.control.withheld,
       takeover: null,
     },
   };
 }
+
+test("never publishes manager control for an unexpected Claude Code version", async () => {
+  const runtime = new BridgeRuntime();
+  runtime.codeVersion = "2.1.219";
+  const changes: SessionView[] = [];
+  const adapter = new ClaudeProviderControlAdapter({
+    runtime,
+    resolveWorkspace: () => "/workspace",
+    onSessionChanged: (view) => changes.push(view),
+  });
+
+  await assert.rejects(adapter.createSession({
+    provider: "claude",
+    workspaceId: "workspace",
+    initialMessage: "Must not become writable",
+    profile: "ask-first",
+    model: null,
+    effort: null,
+    idempotencyKey: "reject-old-claude-code",
+  }, context()), /Unsupported Claude Code 2\.1\.219/);
+
+  assert.deepEqual(changes, []);
+  assert.equal(adapter.getManagedSession("managed-claude-1"), null);
+  assert.equal(runtime.queries[0]?.closeCalls, 1);
+  await adapter.dispose();
+});
+
+test("adapter disposal aborts and settles a hanging Claude creation", async () => {
+  const runtime = new BridgeRuntime();
+  runtime.autoInitialize = false;
+  const adapter = new ClaudeProviderControlAdapter({
+    runtime,
+    resolveWorkspace: () => "/workspace",
+  });
+  const creation = adapter.createSession({
+    provider: "claude",
+    workspaceId: "workspace",
+    initialMessage: "Hang before init",
+    profile: "ask-first",
+    model: null,
+    effort: null,
+    idempotencyKey: "dispose-hanging-create",
+  }, context());
+  const rejection = assert.rejects(creation, /disposed/);
+  await eventually(() => runtime.queries.length === 1);
+
+  await adapter.dispose();
+  await rejection;
+  const query = runtime.queries[0];
+  assert.ok(query);
+  assert.equal(query.params.options.abortController.signal.aborted, true);
+  assert.equal(query.closeCalls, 1);
+});
 
 test("returns only the live bounded Claude model catalog", async () => {
   const runtime = new BridgeRuntime();
@@ -703,14 +808,18 @@ test("maps the atomic full-access profile to Claude bypass permissions", async (
   adapter.dispose();
 });
 
-test("exposes live model, effort, removable staging, and manager-only end", async () => {
+test("ending manager control preserves the closed session and native resume path", async () => {
   const runtime = new BridgeRuntime();
   const hookSourceArbiter = new ClaudeHookSourceArbiter();
   const changes: SessionView[] = [];
+  const stoppedControl: string[] = [];
   const adapter = new ClaudeProviderControlAdapter({
     runtime,
     resolveWorkspace: () => "/workspace",
     onSessionChanged: (session) => changes.push(session),
+    onManagerControlStopped: (id) => {
+      stoppedControl.push(id);
+    },
     hookSourceArbiter,
   });
   const created = await adapter.createSession({
@@ -774,15 +883,84 @@ test("exposes live model, effort, removable staging, and manager-only end", asyn
   assert.deepEqual(query.efforts, ["xhigh"]);
 
   current = changes.at(-1)!;
-  assert.equal((await adapter.performAction(current, {
-    type: "end",
-    expectedGeneration: current.generation,
-    idempotencyKey: "end-managed-claude",
-  }, context())).status, "succeeded");
+  const [firstEnd, repeatedEnd] = await Promise.all([
+    adapter.performAction(current, {
+      type: "end",
+      expectedGeneration: current.generation,
+      idempotencyKey: "end-managed-claude",
+    }, context()),
+    adapter.performAction(current, {
+      type: "end",
+      expectedGeneration: current.generation,
+      idempotencyKey: "end-managed-claude-repeated",
+    }, context()),
+  ]);
+  assert.equal(firstEnd.status, "succeeded");
+  assert.equal(repeatedEnd.status, "succeeded");
   assert.equal(changes.at(-1)?.providerStatus, "closed");
   assert.equal(query.closed, true);
+  assert.equal(query.closeCalls, 1);
+  assert.deepEqual(stoppedControl, [created.id]);
+  const ended = adapter.getManagedSession(created.providerThreadId);
+  assert.ok(ended);
+  assert.equal(ended.status, "completed");
+  assert.equal(ended.control.plane, "resume-only");
+  assert.deepEqual(ended.control.capabilities, ["resume", "attach"]);
   assert.equal(hookSourceArbiter.shouldPollTranscript("managed-claude-1"), true);
-  adapter.dispose();
+  const instruction = await adapter.getAttachInstruction(ended, context());
+  assert.equal(instruction?.kind, "claude-resume");
+  assert.deepEqual(instruction?.argv, ["claude", "--resume", "managed-claude-1"]);
+  await adapter.dispose();
+});
+
+test("refuses to close Claude control until the durable stopped intent commits", async () => {
+  const runtime = new BridgeRuntime();
+  let persistenceAvailable = false;
+  let persistenceAttempts = 0;
+  const adapter = new ClaudeProviderControlAdapter({
+    runtime,
+    resolveWorkspace: () => "/workspace",
+    onManagerControlStopped: () => {
+      persistenceAttempts += 1;
+      if (!persistenceAvailable) throw new Error("stopped intent write failed");
+    },
+  });
+  const created = await adapter.createSession({
+    provider: "claude",
+    workspaceId: "workspace",
+    initialMessage: "Keep this query alive until the intent is durable",
+    profile: "ask-first",
+    model: null,
+    effort: null,
+    idempotencyKey: "create-durable-end-claude",
+  }, context());
+  const query = runtime.queries[0];
+  assert.ok(query);
+  const endAction = {
+    type: "end" as const,
+    expectedGeneration: created.generation,
+    idempotencyKey: "durable-end-claude",
+  };
+
+  const rejected = await adapter.performAction(created, endAction, context());
+  assert.equal(rejected.status, "failed");
+  assert.match(rejected.error?.message ?? "", /stopped intent write failed/);
+  assert.equal(query.closed, false, "failed persistence must leave manager control live");
+  assert.ok(adapter.getManagedSession(created.providerThreadId)?.control.capabilities.includes("queue"));
+
+  persistenceAvailable = true;
+  const retried = await adapter.performAction(created, {
+    ...endAction,
+    idempotencyKey: "durable-end-claude-retry",
+  }, context());
+  assert.equal(retried.status, "succeeded");
+  assert.equal(query.closed, true);
+  assert.equal(persistenceAttempts, 2);
+  assert.deepEqual(
+    adapter.getManagedSession(created.providerThreadId)?.control.capabilities,
+    ["resume", "attach"],
+  );
+  await adapter.dispose();
 });
 
 test("publishes exact multi-question and approval attention details", async () => {
@@ -983,6 +1161,7 @@ test("returns the provider handoff id with native Claude attach instructions", a
   const changes: SessionView[] = [];
   const adapter = new ClaudeProviderControlAdapter({
     runtime,
+    claudeExecutable: "/opt/agent-manager/bin/claude",
     resolveWorkspace: () => "/workspace",
     onSessionChanged: (session) => changes.push(session),
   });
@@ -1018,7 +1197,15 @@ test("returns the provider handoff id with native Claude attach instructions", a
   assert.ok(view);
   const instruction = await adapter.getAttachInstruction(view, context());
   assert.equal(instruction?.kind, "claude-resume");
-  assert.deepEqual(instruction?.argv, ["claude", "--resume", "managed-claude-1"]);
+  assert.deepEqual(instruction?.argv, [
+    "/opt/agent-manager/bin/claude",
+    "--resume",
+    "managed-claude-1",
+  ]);
+  assert.equal(
+    query.params.options.pathToClaudeCodeExecutable,
+    "/opt/agent-manager/bin/claude",
+  );
   assert.equal(typeof instruction?.handoffId, "string");
   assert.ok((instruction?.handoffId?.length ?? 0) > 0);
   const nativeOwned = changes.at(-1);
@@ -1029,7 +1216,31 @@ test("returns the provider handoff id with native Claude attach instructions", a
     nativeOwned.control.withheld.find(({ capability }) => capability === "resume")?.reason ?? "",
     /already owns this session/,
   );
-  adapter.dispose();
+  const handoffId = instruction?.handoffId;
+  assert.ok(handoffId);
+  adapter.markCliAttached("managed-claude-1", handoffId, 4242);
+  adapter.markCliExited("managed-claude-1", handoffId, 0);
+  runtime.autoInitialize = false;
+  const reclaim = adapter.reclaimFromCli("managed-claude-1", handoffId);
+  await eventually(() => runtime.queries.length === 2);
+  assert.equal(
+    changes.at(-1)?.control.authority,
+    "foreign",
+    "write authority stays withdrawn until exact provider init",
+  );
+  runtime.queries[1]?.emit({
+    type: "system",
+    subtype: "init",
+    session_id: "managed-claude-1",
+    claude_code_version: CLAUDE_CODE_VERSION,
+    model: "default-model",
+    permissionMode: "plan",
+    capabilities: ["interrupt_receipt_v1"],
+  });
+  const reclaimed = await reclaim;
+  assert.equal(reclaimed.control.authority, "manager");
+  assert.ok(reclaimed.control.capabilities.includes("queue"));
+  await adapter.dispose();
 });
 
 test("restores only exact persisted Claude identities with their profile, model, and effort", async () => {
@@ -1078,13 +1289,244 @@ test("restores only exact persisted Claude identities with their profile, model,
   adapter.dispose();
 });
 
-test("withdraws writable controls after stream close while preserving native resume", async () => {
+test("restores deliberately stopped Claude control without opening an SDK query", async () => {
+  const runtime = new BridgeRuntime();
+  const hookSourceArbiter = new ClaudeHookSourceArbiter();
+  const adapter = new ClaudeProviderControlAdapter({ runtime, hookSourceArbiter });
+  const record: ManagedSessionRecoveryRecord = {
+    managerSessionId: "local:claude:claude-stopped",
+    provider: "claude",
+    providerThreadId: "claude-stopped",
+    workspaceId: "workspace",
+    workspacePath: "/workspace",
+    name: "Stopped Claude",
+    profile: "plan",
+    model: "opus",
+    effort: "high",
+    createdAt: "2026-08-03T08:00:00.000Z",
+    ownership: "manager-exclusive",
+    managerControl: "stopped",
+  };
+
+  const report = await adapter.restoreManagedSessions(
+    [record],
+    new AbortController().signal,
+  );
+
+  assert.deepEqual(report, {
+    restoredSessionIds: [record.managerSessionId],
+    failures: [],
+    truncated: false,
+  });
+  assert.equal(runtime.queries.length, 0, "restart must not auto-resume ended control");
+  assert.equal(
+    hookSourceArbiter.shouldPollTranscript(record.providerThreadId),
+    true,
+    "dormant history must never be announced as a live manager-owned writer",
+  );
+  const restored = adapter.getManagedSession(record.providerThreadId);
+  assert.ok(restored);
+  assert.equal(restored.status, "completed");
+  assert.equal(restored.profile.value, "plan");
+  assert.equal(restored.model.value, "opus");
+  assert.equal(restored.effort.value, "high");
+  assert.deepEqual(restored.control.capabilities, ["resume", "attach"]);
+
+  const instruction = await adapter.getAttachInstruction(restored, context());
+  assert.equal(instruction?.kind, "claude-resume");
+  assert.deepEqual(instruction?.argv, ["claude", "--resume", "claude-stopped"]);
+  assert.equal(runtime.queries.length, 0, "native attach preparation stays query-free");
+  await adapter.dispose();
+});
+
+test("in-web resume stays dormant until commit, then atomically publishes one exact writer", async () => {
   const runtime = new BridgeRuntime();
   const changes: SessionView[] = [];
+  const hookSourceArbiter = new ClaudeHookSourceArbiter();
   const adapter = new ClaudeProviderControlAdapter({
+    runtime,
+    hookSourceArbiter,
+    onSessionChanged: (view) => changes.push(view),
+  });
+  const record = stoppedRecoveryRecord();
+  await adapter.restoreManagedSessions([record], new AbortController().signal);
+  const dormant = adapter.getManagedSession(record.providerThreadId);
+  assert.ok(dormant);
+  const publishedBeforeResume = changes.length;
+
+  const provisional = await adapter.resumeSession(dormant, "plan", context());
+  const query = runtime.queries[0];
+  assert.ok(query);
+  assert.equal(query.params.options.resume, record.providerThreadId);
+  assert.equal(query.params.options.cwd, record.workspacePath);
+  assert.equal(query.params.options.permissionMode, "plan");
+  assert.equal(query.params.options.model, "opus");
+  assert.equal(query.params.options.effort, "high");
+  assert.ok(provisional.control.capabilities.includes("queue"));
+  assert.equal(
+    adapter.getManagedSession(record.providerThreadId)?.status,
+    "completed",
+    "the public entry must remain dormant before durable commit",
+  );
+  assert.equal(changes.length, publishedBeforeResume);
+  assert.equal(hookSourceArbiter.shouldPollTranscript(record.providerThreadId), true);
+  assert.equal(
+    await adapter.getAttachInstruction(dormant, context()),
+    null,
+    "native resume must be blocked while an SDK owner awaits commit",
+  );
+  await assert.rejects(
+    adapter.resumeSession(dormant, "plan", context()),
+    /awaiting durable commit/u,
+  );
+  assert.equal(runtime.queries.length, 1, "only one SDK writer may exist");
+
+  const committed = adapter.commitExternalAdoption(record.providerThreadId);
+  assert.equal(committed.control.authority, "manager");
+  assert.ok(committed.control.capabilities.includes("queue"));
+  assert.equal(adapter.getManagedSession(record.providerThreadId)?.status, "idle");
+  assert.equal(hookSourceArbiter.shouldPollTranscript(record.providerThreadId), false);
+  assert.equal(runtime.queries.length, 1);
+  await adapter.dispose();
+});
+
+test("failed durable activation aborts only the provisional writer and preserves dormant retry", async () => {
+  const runtime = new BridgeRuntime();
+  const changes: SessionView[] = [];
+  const hookSourceArbiter = new ClaudeHookSourceArbiter();
+  const adapter = new ClaudeProviderControlAdapter({
+    runtime,
+    hookSourceArbiter,
+    onSessionChanged: (view) => changes.push(view),
+  });
+  const record = stoppedRecoveryRecord();
+  await adapter.restoreManagedSessions([record], new AbortController().signal);
+  const dormant = adapter.getManagedSession(record.providerThreadId);
+  assert.ok(dormant);
+  const publishedBeforeResume = changes.length;
+
+  await adapter.resumeSession(dormant, "plan", context());
+  await adapter.abortExternalAdoption(record.providerThreadId);
+  assert.equal(runtime.queries[0]?.closeCalls, 1);
+  const rolledBack = adapter.getManagedSession(record.providerThreadId);
+  assert.ok(rolledBack);
+  assert.equal(rolledBack.status, "completed");
+  assert.deepEqual(rolledBack.control.capabilities, ["resume", "attach"]);
+  assert.equal(changes.length, publishedBeforeResume);
+  assert.equal(hookSourceArbiter.shouldPollTranscript(record.providerThreadId), true);
+
+  await adapter.resumeSession(rolledBack, "plan", context());
+  assert.equal(runtime.queries.length, 2, "rollback must permit one clean retry");
+  await adapter.abortExternalAdoption(record.providerThreadId);
+  assert.equal(runtime.queries[1]?.closeCalls, 1);
+  await adapter.dispose();
+});
+
+test("in-web resume rejects identity drift and leaves the dormant manager record intact", async () => {
+  const runtime = new BridgeRuntime();
+  const adapter = new ClaudeProviderControlAdapter({ runtime });
+  const record = stoppedRecoveryRecord();
+  await adapter.restoreManagedSessions([record], new AbortController().signal);
+  const dormant = adapter.getManagedSession(record.providerThreadId);
+  assert.ok(dormant);
+  runtime.nextQueryHook = (query) => query.emit({
+    type: "system",
+    subtype: "init",
+    session_id: "substituted-session",
+    claude_code_version: CLAUDE_CODE_VERSION,
+    model: "opus",
+    permissionMode: "plan",
+    capabilities: ["interrupt_receipt_v1"],
+  });
+
+  await assert.rejects(
+    adapter.resumeSession(dormant, "plan", context()),
+    /resumed unexpected session/u,
+  );
+  assert.equal(runtime.queries[0]?.closeCalls, 1);
+  assert.equal(adapter.getManagedSession(record.providerThreadId)?.status, "completed");
+  assert.throws(
+    () => adapter.commitExternalAdoption(record.providerThreadId),
+    /no provisional adoption/u,
+  );
+  await adapter.dispose();
+});
+
+test("duplicate or aborted in-web resume never creates a second Claude writer", async () => {
+  const runtime = new BridgeRuntime();
+  runtime.autoInitialize = false;
+  const adapter = new ClaudeProviderControlAdapter({ runtime });
+  const record = stoppedRecoveryRecord();
+  await adapter.restoreManagedSessions([record], new AbortController().signal);
+  const dormant = adapter.getManagedSession(record.providerThreadId);
+  assert.ok(dormant);
+  const controller = new AbortController();
+  const resumeContext: RequestContext = { ...context(), signal: controller.signal };
+  const first = adapter.resumeSession(dormant, "plan", resumeContext);
+  await eventually(() => runtime.queries.length === 1);
+
+  await assert.rejects(
+    adapter.resumeSession(dormant, "plan", context()),
+    /already in progress/u,
+  );
+  assert.equal(runtime.queries.length, 1);
+  controller.abort(new Error("cancel web resume"));
+  await assert.rejects(first, /cancel web resume/u);
+  assert.equal(runtime.queries[0]?.closeCalls, 1);
+  assert.equal(runtime.queries[0]?.params.options.abortController.signal.aborted, true);
+  assert.equal(adapter.getManagedSession(record.providerThreadId)?.status, "completed");
+  await adapter.dispose();
+});
+
+test("cancels a hanging managed Claude recovery without leaking its query", async () => {
+  const runtime = new BridgeRuntime();
+  runtime.autoInitialize = false;
+  const adapter = new ClaudeProviderControlAdapter({ runtime });
+  const controller = new AbortController();
+  const record: ManagedSessionRecoveryRecord = {
+    managerSessionId: "local:claude:claude-recovery-hang",
+    provider: "claude",
+    providerThreadId: "claude-recovery-hang",
+    workspaceId: "workspace",
+    workspacePath: "/workspace",
+    name: "Hanging recovery",
+    profile: "ask-first",
+    model: null,
+    effort: null,
+    createdAt: "2026-08-03T08:00:00.000Z",
+  };
+
+  const recovery = adapter.restoreManagedSessions([record], controller.signal);
+  await eventually(() => runtime.queries.length === 1);
+  controller.abort(new Error("recovery deadline reached"));
+  const report = await recovery;
+
+  assert.deepEqual(report.restoredSessionIds, []);
+  assert.match(report.failures[0]?.reason ?? "", /recovery deadline reached/);
+  const query = runtime.queries[0];
+  assert.ok(query);
+  assert.equal(query.params.options.abortController.signal.aborted, true);
+  assert.equal(query.closeCalls, 1);
+  assert.equal(adapter.getManagedSession(record.providerThreadId), null);
+  await adapter.dispose();
+});
+
+test("unexpected stream close atomically retires the writer and reports managed loss", async () => {
+  const runtime = new BridgeRuntime();
+  const changes: SessionView[] = [];
+  const losses: Array<{ id: string; reason: string; registered: boolean }> = [];
+  let adapter!: ClaudeProviderControlAdapter;
+  adapter = new ClaudeProviderControlAdapter({
     runtime,
     resolveWorkspace: () => "/workspace",
     onSessionChanged: (session) => changes.push(session),
+    onSessionLost: (id, reason) => {
+      losses.push({
+        id,
+        reason,
+        registered: adapter.getManagedSession("managed-claude-1") !== null,
+      });
+    },
   });
   await adapter.createSession(
     {
@@ -1116,40 +1558,41 @@ test("withdraws writable controls after stream close while preserving native res
   await eventually(() => changes.at(-1)?.status === "idle");
 
   query.close();
-  await eventually(() => changes.at(-1)?.providerStatus === "closed");
-  const closed = changes.at(-1);
-  assert.ok(closed);
-  assert.equal(closed.control.plane, "resume-only");
-  assert.deepEqual(closed.control.capabilities, ["resume", "attach"]);
+  await eventually(() => losses.length === 1);
+  assert.deepEqual(losses, [{
+    id: "local:claude:managed-claude-1",
+    reason: "unexpected-close",
+    registered: false,
+  }]);
+  assert.equal(adapter.getManagedSession("managed-claude-1"), null);
 
   const rejected = await adapter.performAction(
-    closed,
+    changes.at(-1)!,
     {
       type: "send",
       delivery: "queue",
       text: "Do not queue this",
-      expectedGeneration: closed.generation,
+      expectedGeneration: changes.at(-1)!.generation,
       idempotencyKey: "terminal-send",
     },
     context(),
   );
   assert.equal(rejected.status, "failed");
-  assert.match(rejected.error?.message ?? "", /no live Agent SDK consumer/);
+  assert.match(rejected.error?.message ?? "", /does not own the Claude SDK query/);
 
-  const instruction = await adapter.getAttachInstruction(closed, context());
-  assert.equal(instruction?.kind, "claude-resume");
-  assert.deepEqual(instruction?.argv, ["claude", "--resume", "managed-claude-1"]);
-  assert.equal(typeof instruction?.handoffId, "string");
-  adapter.dispose();
+  assert.equal(await adapter.getAttachInstruction(changes.at(-1)!, context()), null);
+  await adapter.dispose();
 });
 
-test("withdraws writable controls after terminal provider failure", async () => {
+test("unexpected provider failure atomically retires the writer and reports managed loss", async () => {
   const runtime = new BridgeRuntime();
   const changes: SessionView[] = [];
+  const losses: string[] = [];
   const adapter = new ClaudeProviderControlAdapter({
     runtime,
     resolveWorkspace: () => "/workspace",
     onSessionChanged: (session) => changes.push(session),
+    onSessionLost: (_id, reason) => { losses.push(reason); },
   });
   await adapter.createSession(
     {
@@ -1171,18 +1614,89 @@ test("withdraws writable controls after terminal provider failure", async () => 
     errors: ["terminal provider failure"],
     session_id: "managed-claude-1",
   });
-  await eventually(() => changes.at(-1)?.providerStatus === "failed");
+  await eventually(() => losses.length === 1);
+  assert.deepEqual(losses, ["unexpected-failure"]);
+  assert.equal(adapter.getManagedSession("managed-claude-1"), null);
+  assert.equal(query.params.options.abortController.signal.aborted, true);
+  assert.equal(query.closeCalls, 1);
+  await adapter.dispose();
+});
 
-  const failed = changes.at(-1);
-  assert.ok(failed);
-  assert.equal(failed.control.plane, "resume-only");
-  assert.deepEqual(failed.control.capabilities, []);
-  assert.match(
-    failed.control.withheld.find(({ capability }) => capability === "resume")?.reason ?? "",
-    /provider-confirmed empty Claude input queue/,
-  );
-  assert.equal(await adapter.getAttachInstruction(failed, context()), null);
-  adapter.dispose();
+test("markerless hook conflict withdraws manager writes while manager-origin hooks stay ignored", async () => {
+  const runtime = new BridgeRuntime();
+  const arbiter = new ClaudeHookSourceArbiter();
+  const losses: string[] = [];
+  const adapter = new ClaudeProviderControlAdapter({
+    runtime,
+    resolveWorkspace: () => "/workspace",
+    hookSourceArbiter: arbiter,
+    onSessionLost: (_id, reason) => { losses.push(reason); },
+  });
+  await adapter.createSession({
+    provider: "claude",
+    workspaceId: "workspace",
+    initialMessage: "Own exactly one writer",
+    profile: "execute",
+    model: null,
+    effort: null,
+    idempotencyKey: "create-hook-conflict-claude",
+  }, context());
+  const hook = parseClaudeHookInput({
+    session_id: "managed-claude-1",
+    transcript_path: "/tmp/managed-claude-1.jsonl",
+    cwd: "/workspace",
+    prompt_id: "prompt-1",
+    permission_mode: "acceptEdits",
+    hook_event_name: "Stop",
+    stop_hook_active: false,
+  });
+
+  assert.deepEqual(arbiter.accept(hook, { ownerMarker: CLAUDE_MANAGER_OWNER_VALUE }), {
+    accepted: false,
+    reason: "manager-owned",
+  });
+  assert.deepEqual(losses, []);
+  assert.notEqual(adapter.getManagedSession("managed-claude-1"), null);
+
+  assert.deepEqual(arbiter.accept(hook), {
+    accepted: false,
+    reason: "ownership-conflict",
+  });
+  assert.deepEqual(losses, ["ownership-conflict"]);
+  assert.equal(adapter.getManagedSession("managed-claude-1"), null);
+  assert.equal(runtime.queries[0]?.params.options.abortController.signal.aborted, true);
+  assert.equal(runtime.queries[0]?.closeCalls, 1);
+  await adapter.dispose();
+});
+
+test("explicit end and adapter shutdown never report an unexpected managed loss", async () => {
+  const runtime = new BridgeRuntime();
+  const losses: string[] = [];
+  const adapter = new ClaudeProviderControlAdapter({
+    runtime,
+    resolveWorkspace: () => "/workspace",
+    onSessionLost: (_id, reason) => { losses.push(reason); },
+  });
+  const created = await adapter.createSession({
+    provider: "claude",
+    workspaceId: "workspace",
+    initialMessage: "Stop deliberately",
+    profile: "ask-first",
+    model: null,
+    effort: null,
+    idempotencyKey: "create-deliberate-end-claude",
+  }, context());
+
+  assert.equal((await adapter.performAction(created, {
+    type: "end",
+    expectedGeneration: created.generation,
+    idempotencyKey: "deliberate-end-claude",
+  }, context())).status, "succeeded");
+  assert.deepEqual(losses, []);
+  assert.equal(adapter.getManagedSession(created.providerThreadId)?.providerStatus, "closed");
+
+  await adapter.dispose();
+  assert.deepEqual(losses, []);
 });
 
 test("reads the draft model catalog before any manager-owned Claude thread exists", async () => {
@@ -1283,6 +1797,24 @@ test("a failing draft catalog read is surfaced rather than fabricated", async ()
   adapter.dispose();
 });
 
+test("adapter disposal aborts a hanging draft catalog query", async () => {
+  const runtime = new BridgeRuntime();
+  runtime.nextQueryHook = (query) => {
+    query.supportedModelsOverride = async () => await new Promise<never>(() => undefined);
+  };
+  const adapter = new ClaudeProviderControlAdapter({ runtime });
+  const lookup = adapter.getCreateSettingsOptions!(context());
+  const rejection = assert.rejects(lookup, /disposed/);
+  await eventually(() => runtime.queries.length === 1);
+
+  await adapter.dispose();
+  await rejection;
+  const query = runtime.queries[0];
+  assert.ok(query);
+  assert.equal(query.params.options.abortController.signal.aborted, true);
+  assert.equal(query.closeCalls, 1);
+});
+
 test("manager-owned Claude sessions publish resolved workspace identity", async () => {
   const runtime = new BridgeRuntime();
   const identity = {
@@ -1351,10 +1883,24 @@ test("external Claude adoption resumes the exact identity and stays unpublished 
   const runtime = new BridgeRuntime();
   const external = await externalClaudeView(runtime);
   const changes: SessionView[] = [];
+  const activity: Array<{ sessionId: string; mutation: ActivityMutation }> = [];
+  const hookSourceArbiter = new ClaudeHookSourceArbiter();
+  const nativeHook = parseClaudeHookInput({
+    session_id: external.providerThreadId,
+    transcript_path: `/tmp/${external.providerThreadId}.jsonl`,
+    cwd: "/workspace",
+    prompt_id: "native-before-adoption",
+    permission_mode: "default",
+    hook_event_name: "Stop",
+    stop_hook_active: false,
+  });
+  assert.equal(hookSourceArbiter.accept(nativeHook, { now: 10 }).accepted, true);
   const adapter = new ClaudeProviderControlAdapter({
     runtime,
     resolveWorkspace: () => "/workspace",
+    hookSourceArbiter,
     onSessionChanged: (session) => changes.push(session),
+    onActivity: (sessionId, mutation) => activity.push({ sessionId, mutation }),
   });
 
   const provisional = await adapter.adoptExternalSession(external, "ask-first", context());
@@ -1369,14 +1915,283 @@ test("external Claude adoption resumes the exact identity and stays unpublished 
   assert.equal(provisional.profile.value, "ask-first");
   assert.equal(provisional.model.value, "sonnet");
   assert.equal(provisional.effort.value, "high");
+  resumed.emit({
+    type: "system",
+    subtype: "informational",
+    content: "Buffered before durable commit",
+    level: "info",
+    uuid: "provisional-buffered-event",
+    session_id: external.providerThreadId,
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
   assert.deepEqual(changes, [], "a provisional adoption must not publish manager controls");
+  assert.equal(activity.length, 0, "provisional provider events must remain buffered");
+  assert.equal(adapter.getManagedSession(external.providerThreadId), null);
+  assert.equal(hookSourceArbiter.lastHookAt(external.providerThreadId), 10);
+  assert.equal(
+    hookSourceArbiter.shouldPollTranscript(external.providerThreadId),
+    false,
+    "hook/transcript authority stays external until durable commit",
+  );
 
   const committed = adapter.commitExternalAdoption(external.providerThreadId);
   assert.equal(committed.control.authority, "manager");
   assert.ok(committed.control.capabilities.includes("queue"));
+  assert.ok(activity.some(({ mutation }) =>
+    mutation.type === "upsert"
+    && mutation.item.kind === "lifecycle"
+    && mutation.item.title === "Claude session initialized"
+  ));
+  assert.ok(activity.some(({ mutation }) =>
+    mutation.type === "upsert"
+    && mutation.item.kind === "message"
+    && mutation.item.text === "Buffered before durable commit"
+  ));
+  assert.equal(hookSourceArbiter.lastHookAt(external.providerThreadId), null);
+  assert.equal(hookSourceArbiter.shouldPollTranscript(external.providerThreadId), false);
   adapter.abortExternalAdoption(external.providerThreadId);
   assert.ok(adapter.getManagedSession(external.providerThreadId));
-  adapter.dispose();
+  await adapter.dispose();
+});
+
+test("a native hook during first adoption aborts the reserved SDK writer without suppressing the hook", async () => {
+  const runtime = new BridgeRuntime();
+  const external = await externalClaudeView(runtime);
+  const changes: SessionView[] = [];
+  const activity: Array<{ sessionId: string; mutation: ActivityMutation }> = [];
+  const hookSourceArbiter = new ClaudeHookSourceArbiter();
+  const decisions: unknown[] = [];
+  runtime.nextQueryHook = () => {
+    decisions.push(hookSourceArbiter.accept(parseClaudeHookInput({
+      session_id: external.providerThreadId,
+      transcript_path: `/tmp/${external.providerThreadId}.jsonl`,
+      cwd: "/workspace",
+      prompt_id: "native-raced-adoption",
+      permission_mode: "default",
+      hook_event_name: "Stop",
+      stop_hook_active: false,
+    }), { now: 42 }));
+  };
+  const adapter = new ClaudeProviderControlAdapter({
+    runtime,
+    resolveWorkspace: () => "/workspace",
+    hookSourceArbiter,
+    onSessionChanged: (session) => changes.push(session),
+    onActivity: (sessionId, mutation) => activity.push({ sessionId, mutation }),
+  });
+
+  await assert.rejects(
+    adapter.adoptExternalSession(external, "ask-first", context()),
+    /native Claude owner appeared during web adoption/u,
+  );
+  assert.deepEqual(decisions, [{ accepted: true, suppressTranscriptPolling: true }]);
+  assert.equal(runtime.queries.at(-1)?.closeCalls, 1);
+  assert.equal(runtime.queries.at(-1)?.params.options.abortController.signal.aborted, true);
+  assert.equal(adapter.getManagedSession(external.providerThreadId), null);
+  assert.deepEqual(changes, []);
+  assert.deepEqual(activity, []);
+  assert.equal(hookSourceArbiter.lastHookAt(external.providerThreadId), 42);
+  assert.equal(hookSourceArbiter.shouldPollTranscript(external.providerThreadId), false);
+  assert.throws(
+    () => adapter.commitExternalAdoption(external.providerThreadId),
+    /Unknown managed Claude session/u,
+  );
+  await adapter.dispose();
+});
+
+test("rolling back first adoption preserves hook and transcript authority with no activity leak", async () => {
+  const runtime = new BridgeRuntime();
+  const external = await externalClaudeView(runtime);
+  const activity: Array<{ sessionId: string; mutation: ActivityMutation }> = [];
+  const hookSourceArbiter = new ClaudeHookSourceArbiter();
+  const hook = parseClaudeHookInput({
+    session_id: external.providerThreadId,
+    transcript_path: `/tmp/${external.providerThreadId}.jsonl`,
+    cwd: "/workspace",
+    prompt_id: "native-history",
+    permission_mode: "default",
+    hook_event_name: "Stop",
+    stop_hook_active: false,
+  });
+  hookSourceArbiter.accept(hook, { now: 77 });
+  const adapter = new ClaudeProviderControlAdapter({
+    runtime,
+    resolveWorkspace: () => "/workspace",
+    hookSourceArbiter,
+    onActivity: (sessionId, mutation) => activity.push({ sessionId, mutation }),
+  });
+
+  await adapter.adoptExternalSession(external, "ask-first", context());
+  await adapter.abortExternalAdoption(external.providerThreadId);
+  assert.equal(runtime.queries.at(-1)?.closeCalls, 1);
+  assert.deepEqual(activity, []);
+  assert.equal(adapter.getManagedSession(external.providerThreadId), null);
+  assert.equal(hookSourceArbiter.lastHookAt(external.providerThreadId), 77);
+  assert.equal(hookSourceArbiter.shouldPollTranscript(external.providerThreadId), false);
+  assert.equal(hookSourceArbiter.accept(hook, { now: 78 }).accepted, true);
+  await adapter.dispose();
+});
+
+test("external adoption retains one quarantined cleanup while provider close hangs", async () => {
+  const runtime = new BridgeRuntime();
+  const external = await externalClaudeView(runtime);
+  const hookSourceArbiter = new ClaudeHookSourceArbiter();
+  const adapter = new ClaudeProviderControlAdapter({
+    runtime,
+    resolveWorkspace: () => "/workspace",
+    hookSourceArbiter,
+  });
+  await adapter.adoptExternalSession(external, "ask-first", context());
+  const query = runtime.queries.at(-1);
+  assert.ok(query);
+  query.closeEndsOutput = false;
+
+  assert.equal(hookSourceArbiter.accept(
+    nativeStopHook(external.providerThreadId, "hang-external-close"),
+  ).accepted, true);
+  const first = adapter.abortExternalAdoption(external.providerThreadId);
+  const second = adapter.abortExternalAdoption(external.providerThreadId);
+  let settled = false;
+  void first.then(
+    () => { settled = true; },
+    () => { settled = true; },
+  );
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(query.closeCalls, 1, "concurrent aborts must share one close attempt");
+  assert.equal(settled, false);
+  await assert.rejects(
+    adapter.adoptExternalSession(external, "ask-first", context()),
+    /already in progress/u,
+  );
+  assert.throws(
+    () => adapter.commitExternalAdoption(external.providerThreadId),
+    /quarantined during cleanup/u,
+  );
+
+  query.output.close();
+  await Promise.all([first, second]);
+  const retry = await adapter.adoptExternalSession(external, "ask-first", context());
+  assert.equal(retry.providerThreadId, external.providerThreadId);
+  assert.equal(runtime.queries.length, 3);
+  await adapter.abortExternalAdoption(external.providerThreadId);
+  await adapter.dispose();
+});
+
+test("external adoption retains identity after rejected close and retries cleanup safely", async () => {
+  const runtime = new BridgeRuntime();
+  const external = await externalClaudeView(runtime);
+  const hookSourceArbiter = new ClaudeHookSourceArbiter();
+  const adapter = new ClaudeProviderControlAdapter({
+    runtime,
+    resolveWorkspace: () => "/workspace",
+    hookSourceArbiter,
+  });
+  await adapter.adoptExternalSession(external, "ask-first", context());
+  const query = runtime.queries.at(-1);
+  assert.ok(query);
+  query.closeErrors.push(new Error("external close rejected"));
+
+  assert.equal(hookSourceArbiter.accept(
+    nativeStopHook(external.providerThreadId, "reject-external-close"),
+  ).accepted, true);
+  await eventually(() => query.closeCalls === 1);
+  assert.equal(query.closeCalls, 1);
+  await assert.rejects(
+    adapter.adoptExternalSession(external, "ask-first", context()),
+    /already in progress/u,
+  );
+  assert.throws(
+    () => adapter.commitExternalAdoption(external.providerThreadId),
+    /quarantined during cleanup/u,
+  );
+
+  await adapter.abortExternalAdoption(external.providerThreadId);
+  assert.equal(query.closeCalls, 2);
+  const retry = await adapter.adoptExternalSession(external, "ask-first", context());
+  assert.equal(retry.providerThreadId, external.providerThreadId);
+  await adapter.abortExternalAdoption(external.providerThreadId);
+  await adapter.dispose();
+});
+
+test("dormant resume retains one quarantined cleanup while provider close hangs", async () => {
+  const runtime = new BridgeRuntime();
+  const hookSourceArbiter = new ClaudeHookSourceArbiter();
+  const adapter = new ClaudeProviderControlAdapter({ runtime, hookSourceArbiter });
+  const record = stoppedRecoveryRecord();
+  await adapter.restoreManagedSessions([record], new AbortController().signal);
+  const dormant = adapter.getManagedSession(record.providerThreadId);
+  assert.ok(dormant);
+  await adapter.resumeSession(dormant, "plan", context());
+  const query = runtime.queries[0];
+  assert.ok(query);
+  query.closeEndsOutput = false;
+
+  assert.equal(hookSourceArbiter.accept(
+    nativeStopHook(record.providerThreadId, "hang-dormant-close"),
+  ).accepted, true);
+  const first = adapter.abortExternalAdoption(record.providerThreadId);
+  const second = adapter.abortExternalAdoption(record.providerThreadId);
+  let settled = false;
+  void first.then(
+    () => { settled = true; },
+    () => { settled = true; },
+  );
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(query.closeCalls, 1);
+  assert.equal(settled, false);
+  await assert.rejects(
+    adapter.resumeSession(dormant, "plan", context()),
+    /awaiting durable commit/u,
+  );
+  assert.throws(
+    () => adapter.commitExternalAdoption(record.providerThreadId),
+    /quarantined during cleanup/u,
+  );
+  assert.equal(adapter.getManagedSession(record.providerThreadId)?.status, "completed");
+
+  query.output.close();
+  await Promise.all([first, second]);
+  const retry = await adapter.resumeSession(dormant, "plan", context());
+  assert.equal(retry.providerThreadId, record.providerThreadId);
+  assert.equal(runtime.queries.length, 2);
+  await adapter.abortExternalAdoption(record.providerThreadId);
+  await adapter.dispose();
+});
+
+test("dormant resume retains identity after rejected close and retries cleanup safely", async () => {
+  const runtime = new BridgeRuntime();
+  const hookSourceArbiter = new ClaudeHookSourceArbiter();
+  const adapter = new ClaudeProviderControlAdapter({ runtime, hookSourceArbiter });
+  const record = stoppedRecoveryRecord();
+  await adapter.restoreManagedSessions([record], new AbortController().signal);
+  const dormant = adapter.getManagedSession(record.providerThreadId);
+  assert.ok(dormant);
+  await adapter.resumeSession(dormant, "plan", context());
+  const query = runtime.queries[0];
+  assert.ok(query);
+  query.closeErrors.push(new Error("dormant close rejected"));
+
+  assert.equal(hookSourceArbiter.accept(
+    nativeStopHook(record.providerThreadId, "reject-dormant-close"),
+  ).accepted, true);
+  await eventually(() => query.closeCalls === 1);
+  assert.equal(query.closeCalls, 1);
+  await assert.rejects(
+    adapter.resumeSession(dormant, "plan", context()),
+    /awaiting durable commit/u,
+  );
+  assert.throws(
+    () => adapter.commitExternalAdoption(record.providerThreadId),
+    /quarantined during cleanup/u,
+  );
+  assert.equal(adapter.getManagedSession(record.providerThreadId)?.status, "completed");
+
+  await adapter.abortExternalAdoption(record.providerThreadId);
+  assert.equal(query.closeCalls, 2);
+  const retry = await adapter.resumeSession(dormant, "plan", context());
+  assert.equal(retry.providerThreadId, record.providerThreadId);
+  await adapter.abortExternalAdoption(record.providerThreadId);
+  await adapter.dispose();
 });
 
 test("external Claude adoption rejects provider identity drift without publishing controls", async () => {
@@ -1408,4 +2223,66 @@ test("external Claude adoption rejects provider identity drift without publishin
   assert.equal(adapter.getManagedSession(external.providerThreadId), null);
   assert.equal(runtime.queries.at(-1)?.closed, true);
   adapter.dispose();
+});
+
+test("external Claude adoption cancellation closes the provisional query", async () => {
+  const runtime = new BridgeRuntime();
+  const external = await externalClaudeView(runtime);
+  runtime.autoInitialize = false;
+  const changes: SessionView[] = [];
+  const adapter = new ClaudeProviderControlAdapter({
+    runtime,
+    resolveWorkspace: () => "/workspace",
+    onSessionChanged: (session) => changes.push(session),
+  });
+  const controller = new AbortController();
+  const adoptionContext: RequestContext = {
+    ...context(),
+    signal: controller.signal,
+  };
+
+  const adoption = adapter.adoptExternalSession(external, "ask-first", adoptionContext);
+  const rejection = assert.rejects(adoption, /cancel provisional adoption/);
+  await eventually(() => runtime.queries.length === 2);
+  controller.abort(new Error("cancel provisional adoption"));
+  await rejection;
+
+  const query = runtime.queries[1];
+  assert.ok(query);
+  assert.equal(query.params.options.abortController.signal.aborted, true);
+  assert.equal(query.closeCalls, 1);
+  assert.deepEqual(changes, []);
+  assert.equal(adapter.getManagedSession(external.providerThreadId), null);
+  await adapter.dispose();
+});
+
+test("adapter disposal owns adoption until provider settings finish", async () => {
+  const runtime = new BridgeRuntime();
+  const external = await externalClaudeView(runtime);
+  runtime.initModelOverride = "provider-default";
+  runtime.nextQueryHook = (query) => {
+    query.setModelOverride = () => new Promise<void>((_resolve, reject) => {
+      const signal = query.params.options.abortController.signal;
+      const abort = (): void => reject(
+        signal.reason ?? new Error("adoption query aborted"),
+      );
+      if (signal.aborted) abort();
+      else signal.addEventListener("abort", abort, { once: true });
+    });
+  };
+  const adapter = new ClaudeProviderControlAdapter({
+    runtime,
+    resolveWorkspace: () => "/workspace",
+  });
+  const adoption = adapter.adoptExternalSession(external, "ask-first", context());
+  const rejection = assert.rejects(adoption, /disposed/);
+  await eventually(() => runtime.queries[1]?.models.includes("sonnet") === true);
+
+  await adapter.dispose();
+  await rejection;
+  const query = runtime.queries[1];
+  assert.ok(query);
+  assert.equal(query.params.options.abortController.signal.aborted, true);
+  assert.equal(query.closeCalls, 1);
+  assert.equal(adapter.getManagedSession(external.providerThreadId), null);
 });

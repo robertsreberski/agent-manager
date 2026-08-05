@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { SessionRecord, WorkspaceIdentity } from "../core/types.ts";
-import { sessionRecordId } from "../shared/session.ts";
+import { observeOnlyControl, sessionRecordId } from "../shared/session.ts";
 import type { DiscoveryWorkerMessage } from "./protocol.ts";
 import {
   DiscoveryReconciler,
@@ -95,7 +95,7 @@ function session(
     todoProgress: null,
     attention: [],
     terminal: null,
-    control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [], takeover: null },
+    control: observeOnlyControl(),
     workspaceIdentity,
     generation: 0,
   };

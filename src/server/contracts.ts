@@ -130,13 +130,30 @@ export const sessionActionSchema = z.discriminatedUnion("type", [
     ...expectedState,
   }).strict(),
   z.object({
-    type: z.literal("take-control"),
-    method: z.enum(["guided-exit", "graceful-stop"]),
+    type: z.literal("resume"),
     ...expectedState,
   }).strict(),
   z.object({
+    type: z.literal("take-control"),
+    method: z.enum(["guided-exit", "graceful-stop"]),
+    takeoverId: z.string().min(1).max(256).optional(),
+    ...expectedState,
+  }).strict().superRefine((action, context) => {
+    if (action.method === "guided-exit" && action.takeoverId !== undefined) {
+      context.addIssue({
+        code: "custom",
+        message: "guided takeover does not accept a graceful-stop confirmation id",
+        path: ["takeoverId"],
+      });
+    }
+  }),
+  z.object({
     type: z.literal("cancel-take-control"),
     takeoverId: z.string().min(1).max(256),
+    ...expectedState,
+  }).strict(),
+  z.object({
+    type: z.literal("retry-control"),
     ...expectedState,
   }).strict(),
   z.object({
@@ -396,15 +413,25 @@ export interface ProviderControlAdapter {
     profile: CreateSessionInput["profile"],
     context: RequestContext,
   ): Promise<SessionView>;
+  /**
+   * Prepare provisional exact control for a deliberately stopped manager
+   * conversation. The server durably persists the identity and invokes the
+   * existing commit hook before publishing the returned capabilities.
+   */
+  resumeSession?(
+    session: SessionView,
+    profile: CreateSessionInput["profile"],
+    context: RequestContext,
+  ): Promise<SessionView>;
   /** Publish a provisionally adopted session only after durable identity commit. */
   commitExternalAdoption?(providerSessionId: string): SessionView | Promise<SessionView>;
   /** Release a provisional provider client when durable commit fails. */
   abortExternalAdoption?(providerSessionId: string): void | Promise<void>;
   /**
-   * Acquire the provider detail plane for one authenticated selected-session
-   * stream. Implementations may ref-count concurrent browser selections, but
-   * the returned release must detach the provider when the final selection
-   * closes. This lifecycle never replays prompts or actions.
+   * Acquire any provider detail needed by one authenticated selected-session
+   * stream. The returned release ends only that browser consumer; a managed
+   * provider may deliberately keep its session-owned subscription alive across
+   * drawer/task switches. This lifecycle never replays prompts or actions.
    */
   acquireSelectedSession?(
     session: SessionView,
@@ -445,6 +472,50 @@ export interface ManagedSessionRecoveryRecord {
   model?: string | null;
   effort?: CreateSessionInput["effort"];
   createdAt: string;
+  /**
+   * Canonical immutable Codex lineage captured at durable commit. Both keys are
+   * required for Codex recovery, including when the provider-confirmed value is
+   * null. They stay optional on this cross-provider interface so Claude records
+   * do not manufacture a Codex identity.
+   */
+  providerTreeId?: string | null;
+  providerParentThreadId?: string | null;
+  /** Durable provider-specific ownership state; absent records predate wire 5. */
+  ownership?: "shared" | "manager-exclusive" | "handoff-prepared" | "native-exclusive";
+  /**
+   * Claude-only control intent. `stopped` reconstructs a resumable closed view
+   * without automatically opening an Agent SDK query after service restart.
+   */
+  managerControl?: "active" | "stopped";
+  /** Exact native owner identity retained only for exclusive Claude handoff. */
+  nativeOwner?: {
+    pid: number;
+    uid: number;
+    executable: "claude";
+    startedAt: string;
+    providerSessionId: string;
+    cwd: string;
+    associationPath?: string | undefined;
+    executablePath?: string | undefined;
+    ppid?: number | undefined;
+    processGroupId?: number | undefined;
+    foregroundProcessGroupId?: number | undefined;
+    tty?: string | undefined;
+    providerStartedAtMs?: number | null | undefined;
+    interactive?: boolean | undefined;
+    members?: ReadonlyArray<{
+      pid: number;
+      ppid: number;
+      processGroupId: number;
+      foregroundProcessGroupId: number;
+      tty: string;
+      startedAt: string;
+      startedAtMs: number;
+      executablePath: string;
+      executableDevice: number;
+      executableInode: number;
+    }> | undefined;
+  } | null;
 }
 
 export interface ManagedSessionRecoveryFailure {
@@ -500,10 +571,14 @@ export function requiredCapability(action: SessionAction): ControlCapability {
       return "archive";
     case "delete":
       return "delete";
+    case "resume":
+      return "resume";
     case "take-control":
       return "take-control";
     case "cancel-take-control":
       return "cancel-take-control";
+    case "retry-control":
+      return "retry-control";
     case "open-editor":
       return "open-editor";
   }

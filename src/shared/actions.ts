@@ -52,8 +52,18 @@ export type SessionAction =
   | (ExpectedSessionState & { type: "end" })
   | (ExpectedSessionState & { type: "archive" })
   | (ExpectedSessionState & { type: "delete" })
-  | (ExpectedSessionState & { type: "take-control"; method: TakeoverMethod })
+  | (ExpectedSessionState & { type: "resume" })
+  | (ExpectedSessionState & {
+      type: "take-control";
+      method: TakeoverMethod;
+      /**
+       * Binds graceful-stop either to the guided attempt being replaced or to
+       * the separately confirmed graceful attempt that will send SIGTERM.
+       */
+      takeoverId?: string | undefined;
+    })
   | (ExpectedSessionState & { type: "cancel-take-control"; takeoverId: string })
+  | (ExpectedSessionState & { type: "retry-control" })
   | (ExpectedSessionState & {
       type: "open-editor";
       relativePath: string;

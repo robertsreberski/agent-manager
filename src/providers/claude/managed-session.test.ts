@@ -5,6 +5,7 @@ import { AsyncInbox } from "./async-inbox.ts";
 import { ClaudeManagedSession } from "./managed-session.ts";
 import {
   CLAUDE_AGENT_SDK_VERSION,
+  CLAUDE_CODE_VERSION,
   type ClaudeEffortLevel,
   type ClaudeInterruptReceipt,
   type ClaudeModelInfo,
@@ -28,6 +29,9 @@ class FakeQuery implements ClaudeSdkQuery, AsyncIterator<ClaudeSdkMessage> {
   };
   interruptCalls = 0;
   closed = false;
+  closeCalls = 0;
+  closeEndsOutput = true;
+  readonly closeErrors: Error[] = [];
 
   constructor(params: ClaudeSdkQueryParams) {
     this.params = params;
@@ -69,8 +73,11 @@ class FakeQuery implements ClaudeSdkQuery, AsyncIterator<ClaudeSdkMessage> {
   }
 
   close(): void {
+    this.closeCalls += 1;
     this.closed = true;
-    this.output.close();
+    if (this.closeEndsOutput) this.output.close();
+    const error = this.closeErrors.shift();
+    if (error) throw error;
   }
 
   next(): Promise<IteratorResult<ClaudeSdkMessage>> {
@@ -89,24 +96,30 @@ class FakeQuery implements ClaudeSdkQuery, AsyncIterator<ClaudeSdkMessage> {
 class FakeRuntime implements ClaudeSdkRuntime {
   readonly queries: FakeQuery[] = [];
   sdkVersion = CLAUDE_AGENT_SDK_VERSION;
-  codeVersion = "2.1.222";
+  codeVersion = CLAUDE_CODE_VERSION;
   initMode: ClaudePermissionMode | null = null;
+  autoInitialize = true;
+  claudeCodeExecutable = "claude";
+  createError: Error | null = null;
   #uuid = 0;
   #time = Date.parse("2026-08-03T12:00:00.000Z");
 
   createQuery(params: ClaudeSdkQueryParams): ClaudeSdkQuery {
+    if (this.createError) throw this.createError;
     const query = new FakeQuery(params);
     this.queries.push(query);
     const sessionId = params.options.resume ?? `session-${this.queries.length}`;
-    query.emit({
-      type: "system",
-      subtype: "init",
-      session_id: sessionId,
-      claude_code_version: this.codeVersion,
-      model: params.options.model ?? "default-model",
-      permissionMode: this.initMode ?? params.options.permissionMode,
-      capabilities: ["interrupt_receipt_v1"],
-    });
+    if (this.autoInitialize) {
+      query.emit({
+        type: "system",
+        subtype: "init",
+        session_id: sessionId,
+        claude_code_version: this.codeVersion,
+        model: params.options.model ?? "default-model",
+        permissionMode: this.initMode ?? params.options.permissionMode,
+        capabilities: ["interrupt_receipt_v1"],
+      });
+    }
     return query;
   }
 
@@ -149,6 +162,7 @@ test("keeps a streaming query, stages removable queue work, and maps steer and m
   assert.equal(query.params.options.includePartialMessages, true);
   assert.equal(query.params.options.includeHookEvents, true);
   assert.equal(query.params.options.forwardSubagentText, true);
+  assert.ok(query.params.options.abortController instanceof AbortController);
   assert.equal("agentProgressSummaries" in query.params.options, false);
   assert.equal(query.input[0]?.priority, "later");
   assert.deepEqual(query.input[0]?.origin, { kind: "human" });
@@ -175,7 +189,7 @@ test("keeps a streaming query, stages removable queue work, and maps steer and m
   assert.equal(session.snapshot.model, "sonnet");
   assert.equal(session.snapshot.effort, "high");
   assert.equal((await session.supportedModels())[0]?.value, "sonnet");
-  session.dispose();
+  await session.dispose();
 });
 
 test("end closes only the owned SDK query and discards manager-side staging", async () => {
@@ -190,12 +204,53 @@ test("end closes only the owned SDK query and discards manager-side staging", as
   session.send("later", "queue");
   assert.equal(session.snapshot.stagedMessages.length, 1);
 
-  session.end();
+  await session.end();
   assert.equal(query.closed, true);
   assert.equal(session.snapshot.activity, "closed");
   assert.deepEqual(session.snapshot.stagedMessages, []);
   assert.deepEqual(session.snapshot.outstandingMessageIds, []);
-  assert.throws(() => session.send("must not run"), /disposed/);
+  assert.throws(() => session.send("must not run"), /no live Agent SDK consumer/);
+  const handoff = await session.prepareCliHandoff("resume-after-end");
+  assert.deepEqual(handoff.command.args, ["--resume", "session-1"]);
+  assert.equal(session.snapshot.owner, "native");
+  await session.dispose();
+});
+
+test("dispose shares an indeterminate close and settles only after the consumer exits", async () => {
+  const runtime = new FakeRuntime();
+  const session = await ClaudeManagedSession.start(runtime, {
+    cwd: "/workspace",
+    mode: "default",
+  });
+  const query = runtime.queries[0];
+  assert.ok(query);
+  query.closeEndsOutput = false;
+
+  const first = session.dispose();
+  const second = session.dispose();
+  assert.equal(first, second);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(query.closeCalls, 1);
+
+  query.output.close();
+  await Promise.all([first, second]);
+  assert.equal(query.closeCalls, 1);
+});
+
+test("dispose retries a positively rejected close without overlapping attempts", async () => {
+  const runtime = new FakeRuntime();
+  const session = await ClaudeManagedSession.start(runtime, {
+    cwd: "/workspace",
+    mode: "default",
+  });
+  const query = runtime.queries[0];
+  assert.ok(query);
+  query.closeErrors.push(new Error("provider close rejected"));
+
+  await assert.rejects(session.dispose(), /provider close rejected/u);
+  assert.equal(query.closeCalls, 1);
+  await session.dispose();
+  assert.equal(query.closeCalls, 2);
 });
 
 test("replays messages emitted before the first observer can register", async () => {
@@ -227,10 +282,10 @@ test("replays messages emitted before the first observer can register", async ()
     && message.subtype === "informational"
     && message.content === "Early provider event"
   ));
-  session.dispose();
+  await session.dispose();
 });
 
-test("fails closed when SDK or Claude Code versions do not match the steer gate", async () => {
+test("fails closed before publishing control when SDK or Claude Code versions do not match", async () => {
   const badSdk = new FakeRuntime();
   badSdk.sdkVersion = "0.3.219";
   await assert.rejects(
@@ -243,13 +298,218 @@ test("fails closed when SDK or Claude Code versions do not match the steer gate"
 
   const oldClaude = new FakeRuntime();
   oldClaude.codeVersion = "2.1.219";
-  const session = await ClaudeManagedSession.start(oldClaude, {
+  await assert.rejects(
+    ClaudeManagedSession.start(oldClaude, {
+      cwd: "/workspace",
+      mode: "default",
+    }),
+    /Unsupported Claude Code 2\.1\.219/,
+  );
+  assert.equal(oldClaude.queries[0]?.closeCalls, 1);
+});
+
+test("surfaces synchronous SDK construction failure without leaving a query", async () => {
+  const runtime = new FakeRuntime();
+  runtime.createError = new Error("spawn failed before query construction");
+
+  await assert.rejects(ClaudeManagedSession.start(runtime, {
+    cwd: "/workspace",
+    mode: "default",
+  }), /spawn failed before query construction/);
+  assert.deepEqual(runtime.queries, []);
+});
+
+test("rejects readiness when a resumed stream ends before init", async () => {
+  const runtime = new FakeRuntime();
+  runtime.autoInitialize = false;
+  const pending = ClaudeManagedSession.resume(runtime, {
+    sessionId: "resume-me",
     cwd: "/workspace",
     mode: "default",
   });
-  assert.equal(session.snapshot.canSteer, false);
-  assert.throws(() => session.send("steer", "steer"), /unavailable/);
-  session.dispose();
+  await eventually(() => runtime.queries.length === 1);
+  const query = runtime.queries[0];
+  assert.ok(query);
+  query.output.close();
+
+  await assert.rejects(pending, /ended before initialization/);
+  assert.equal(query.closeCalls, 1);
+  assert.equal(query.params.options.abortController.signal.aborted, true);
+});
+
+test("aborts a hanging initialization and closes its query exactly once", async () => {
+  const runtime = new FakeRuntime();
+  runtime.autoInitialize = false;
+  const controller = new AbortController();
+  const pending = ClaudeManagedSession.start(runtime, {
+    cwd: "/workspace",
+    mode: "default",
+  }, controller.signal);
+  await eventually(() => runtime.queries.length === 1);
+  const query = runtime.queries[0];
+  assert.ok(query);
+
+  controller.abort(new Error("test cancelled initialization"));
+  await assert.rejects(pending, /test cancelled initialization/);
+  assert.equal(query.params.options.abortController.signal.aborted, true);
+  assert.equal(query.closeCalls, 1);
+});
+
+test("ignores a late init after cancellation and still settles the consumer", async () => {
+  const runtime = new FakeRuntime();
+  runtime.autoInitialize = false;
+  const controller = new AbortController();
+  const pending = ClaudeManagedSession.start(runtime, {
+    cwd: "/workspace",
+    mode: "default",
+  }, controller.signal);
+  await eventually(() => runtime.queries.length === 1);
+  const query = runtime.queries[0];
+  assert.ok(query);
+  query.closeEndsOutput = false;
+
+  controller.abort(new Error("cancel before init"));
+  query.emit({
+    type: "system",
+    subtype: "init",
+    session_id: "too-late",
+    claude_code_version: CLAUDE_CODE_VERSION,
+    model: "default-model",
+    permissionMode: "default",
+  });
+
+  await assert.rejects(pending, /cancel before init/);
+  assert.equal(query.closeCalls, 1);
+  query.output.close();
+});
+
+test("prepares an exact dormant resume without mutating or replaying the dormant session", async () => {
+  const runtime = new FakeRuntime();
+  const dormant = ClaudeManagedSession.dormant(runtime, {
+    sessionId: "dormant-session",
+    cwd: "/workspace",
+    mode: "plan",
+    initialMessage: "must never be replayed",
+    model: "sonnet",
+    effort: "high",
+    allowDangerouslySkipPermissions: true,
+  });
+
+  const resumed = await dormant.resumeDormantExact({
+    sessionId: "dormant-session",
+    cwd: "/workspace",
+    mode: "plan",
+    model: "sonnet",
+    effort: "high",
+  });
+  const query = runtime.queries[0];
+  assert.ok(query);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(dormant.snapshot.activity, "closed");
+  assert.equal(dormant.snapshot.owner, "manager");
+  assert.equal(resumed.snapshot.activity, "idle");
+  assert.equal(resumed.snapshot.sessionId, "dormant-session");
+  assert.equal(query.params.options.resume, "dormant-session");
+  assert.equal(query.params.options.cwd, "/workspace");
+  assert.equal(query.params.options.permissionMode, "plan");
+  assert.equal(query.params.options.model, "sonnet");
+  assert.equal(query.params.options.effort, "high");
+  assert.deepEqual(query.input, [], "resume must not replay the original prompt");
+  await resumed.dispose();
+  await dormant.dispose();
+});
+
+test("dormant resume rejects workspace and provider identity drift without changing history", async () => {
+  const runtime = new FakeRuntime();
+  const dormant = ClaudeManagedSession.dormant(runtime, {
+    sessionId: "exact-session",
+    cwd: "/workspace",
+    mode: "default",
+  });
+
+  await assert.rejects(dormant.resumeDormantExact({
+    sessionId: "exact-session",
+    cwd: "/different-workspace",
+    mode: "default",
+  }), /workspace does not match/u);
+  assert.equal(runtime.queries.length, 0);
+
+  runtime.autoInitialize = false;
+  const pending = dormant.resumeDormantExact({
+    sessionId: "exact-session",
+    cwd: "/workspace",
+    mode: "default",
+  });
+  await eventually(() => runtime.queries.length === 1);
+  runtime.queries[0]?.emit({
+    type: "system",
+    subtype: "init",
+    session_id: "substituted-session",
+    claude_code_version: CLAUDE_CODE_VERSION,
+    model: "default-model",
+    permissionMode: "default",
+  });
+  await assert.rejects(pending, /resumed unexpected session/u);
+  assert.equal(runtime.queries[0]?.closeCalls, 1);
+  assert.equal(dormant.snapshot.activity, "closed");
+  assert.equal(dormant.snapshot.sessionId, "exact-session");
+  await dormant.dispose();
+});
+
+test("aborting a dormant resume closes only the provisional writer", async () => {
+  const runtime = new FakeRuntime();
+  runtime.autoInitialize = false;
+  const dormant = ClaudeManagedSession.dormant(runtime, {
+    sessionId: "cancelled-resume",
+    cwd: "/workspace",
+    mode: "default",
+  });
+  const controller = new AbortController();
+  const pending = dormant.resumeDormantExact({
+    sessionId: "cancelled-resume",
+    cwd: "/workspace",
+    mode: "default",
+  }, controller.signal);
+  await eventually(() => runtime.queries.length === 1);
+
+  controller.abort(new Error("cancel in-web resume"));
+  await assert.rejects(pending, /cancel in-web resume/u);
+  assert.equal(runtime.queries[0]?.closeCalls, 1);
+  assert.equal(runtime.queries[0]?.params.options.abortController.signal.aborted, true);
+  assert.equal(dormant.snapshot.activity, "closed");
+  assert.equal(dormant.snapshot.owner, "manager");
+  await dormant.dispose();
+});
+
+test("dormant resume fails closed if ownership changes during provider initialization", async () => {
+  const runtime = new FakeRuntime();
+  runtime.autoInitialize = false;
+  const dormant = ClaudeManagedSession.dormant(runtime, {
+    sessionId: "ownership-race",
+    cwd: "/workspace",
+    mode: "default",
+  });
+  const pending = dormant.resumeDormantExact({
+    sessionId: "ownership-race",
+    cwd: "/workspace",
+    mode: "default",
+  });
+  await eventually(() => runtime.queries.length === 1);
+  await dormant.prepareCliHandoff("concurrent-native-resume");
+  runtime.queries[0]?.emit({
+    type: "system",
+    subtype: "init",
+    session_id: "ownership-race",
+    claude_code_version: CLAUDE_CODE_VERSION,
+    model: "default-model",
+    permissionMode: "default",
+  });
+
+  await assert.rejects(pending, /ownership changed during resume/u);
+  assert.equal(runtime.queries[0]?.closeCalls, 1);
+  assert.equal(dormant.snapshot.owner, "native");
+  await dormant.dispose();
 });
 
 test("withdraws the input consumer when the Agent SDK stream closes", async () => {
@@ -274,7 +534,7 @@ test("withdraws the input consumer when the Agent SDK stream closes", async () =
     session.setMode("plan"),
     /no live Agent SDK consumer/,
   );
-  session.dispose();
+  await session.dispose();
 });
 
 test("withdraws the input consumer when the Agent SDK reports terminal failure", async () => {
@@ -317,7 +577,7 @@ test("withdraws the input consumer when the Agent SDK reports terminal failure",
     () => session.send("must fail instead of queueing"),
     /no live Agent SDK consumer/,
   );
-  session.dispose();
+  await session.dispose();
 });
 
 test("preserves interrupt still_queued receipts and marks old receipts unknown", async () => {
@@ -351,7 +611,7 @@ test("preserves interrupt still_queued receipts and marks old receipts unknown",
     cancelledMessageIds: [],
   });
   assert.equal(session.snapshot.queueKnowledge, "unknown");
-  session.dispose();
+  await session.dispose();
 });
 
 test("retains exact tool requests, answers questions, and replays duplicate responses", async () => {
@@ -457,7 +717,7 @@ test("retains exact tool requests, answers questions, and replays duplicate resp
   );
   session.respondToRequest("request-4", { decision: "allow" });
   await temporaryOnly;
-  session.dispose();
+  await session.dispose();
 });
 
 test("retains elicitation requests and cancels them on abort", async () => {
@@ -506,10 +766,69 @@ test("retains elicitation requests and cancels them on abort", async () => {
   secondAbort.abort();
   assert.deepEqual(await cancelled, { action: "cancel" });
   assert.equal(session.snapshot.pendingRequests.length, 0);
-  session.dispose();
+  await session.dispose();
 });
 
-test("hands off only an idle, drained session and reclaims after wrapper exit", async () => {
+test("hands off with the configured executable only after the owned query settles", async () => {
+  const runtime = new FakeRuntime();
+  runtime.claudeCodeExecutable = "/opt/agent-manager/bin/claude";
+  const session = await ClaudeManagedSession.start(runtime, {
+    cwd: "/workspace",
+    mode: "default",
+  });
+  const firstQuery = runtime.queries[0];
+  assert.ok(firstQuery);
+  firstQuery.emit({
+    type: "system",
+    subtype: "session_state_changed",
+    state: "idle",
+    session_id: "session-1",
+  });
+  await eventually(() => session.snapshot.activity === "idle");
+
+  const handoff = await session.prepareCliHandoff();
+  assert.deepEqual(handoff.command, {
+    executable: "/opt/agent-manager/bin/claude",
+    args: ["--resume", "session-1"],
+    cwd: "/workspace",
+  });
+  assert.equal(firstQuery.closed, true);
+  assert.equal(firstQuery.closeCalls, 1);
+  assert.equal(
+    firstQuery.params.options.pathToClaudeCodeExecutable,
+    "/opt/agent-manager/bin/claude",
+  );
+  assert.equal(session.snapshot.owner, "native");
+  assert.throws(() => session.send("unsafe"), /native CLI/);
+
+  session.markCliAttached(handoff.id, 4242);
+  await assert.rejects(session.reclaimFromCli(handoff.id), /expected exited/);
+  session.markCliExited(handoff.id, 0);
+  runtime.autoInitialize = false;
+  const reclaim = session.reclaimFromCli(handoff.id);
+  await eventually(() => runtime.queries.length === 2);
+  assert.equal(session.snapshot.owner, "native");
+  assert.equal(session.snapshot.activity, "native");
+  runtime.queries[1]?.emit({
+    type: "system",
+    subtype: "init",
+    session_id: "session-1",
+    claude_code_version: CLAUDE_CODE_VERSION,
+    model: "default-model",
+    permissionMode: "default",
+    capabilities: ["interrupt_receipt_v1"],
+  });
+  await reclaim;
+
+  assert.equal(runtime.queries.length, 2);
+  assert.equal(runtime.queries[1]?.params.options.resume, "session-1");
+  assert.equal(session.snapshot.owner, "manager");
+  assert.equal(session.snapshot.sessionId, "session-1");
+  assert.equal(session.snapshot.handoff, null);
+  await session.dispose();
+});
+
+test("cancelled handoff cleanup cannot overlap the resumed manager writer", async () => {
   const runtime = new FakeRuntime();
   const session = await ClaudeManagedSession.start(runtime, {
     cwd: "/workspace",
@@ -525,27 +844,35 @@ test("hands off only an idle, drained session and reclaims after wrapper exit", 
   });
   await eventually(() => session.snapshot.activity === "idle");
 
-  const handoff = session.prepareCliHandoff();
-  assert.deepEqual(handoff.command, {
-    executable: "claude",
-    args: ["--resume", "session-1"],
-    cwd: "/workspace",
-  });
-  assert.equal(firstQuery.closed, true);
+  // Simulate an SDK query whose close request has been accepted but whose
+  // async iterator has not yet ended. The request timeout may cancel the
+  // handoff waiter, but that must not make the old writer safe to overlap.
+  firstQuery.closeEndsOutput = false;
+  const controller = new AbortController();
+  const preparing = session.prepareCliHandoff("delayed-close", controller.signal);
+  await eventually(() => firstQuery.closed && session.snapshot.owner === "native");
+  controller.abort(new Error("handoff request timed out"));
+  await assert.rejects(preparing, /handoff request timed out/u);
+  assert.equal(runtime.queries.length, 1);
+  assert.equal(session.snapshot.handoff?.state, "prepared");
+
+  session.markCliAttachFailed("delayed-close", "native launch was cancelled");
+  const reclaiming = session.reclaimFromCli("delayed-close");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(
+    runtime.queries.length,
+    1,
+    "reclaim must wait for the old SDK consumer instead of creating a second writer",
+  );
   assert.equal(session.snapshot.owner, "native");
-  assert.throws(() => session.send("unsafe"), /native CLI/);
 
-  session.markCliAttached(handoff.id, 4242);
-  await assert.rejects(session.reclaimFromCli(handoff.id), /expected exited/);
-  session.markCliExited(handoff.id, 0);
-  await session.reclaimFromCli(handoff.id);
-
+  firstQuery.output.close();
+  await reclaiming;
   assert.equal(runtime.queries.length, 2);
   assert.equal(runtime.queries[1]?.params.options.resume, "session-1");
   assert.equal(session.snapshot.owner, "manager");
-  assert.equal(session.snapshot.sessionId, "session-1");
   assert.equal(session.snapshot.handoff, null);
-  session.dispose();
+  await session.dispose();
 });
 
 test("settles idle from a terminal result only after all tracked work drains", async () => {
@@ -572,7 +899,7 @@ test("settles idle from a terminal result only after all tracked work drains", a
     session_id: "session-1",
   });
   await eventually(() => session.snapshot.activity === "running");
-  assert.throws(() => session.prepareCliHandoff(), /idle session/);
+  await assert.rejects(session.prepareCliHandoff(), /idle session/);
 
   query.emit({
     type: "result",
@@ -582,7 +909,7 @@ test("settles idle from a terminal result only after all tracked work drains", a
   });
   await eventually(() => session.snapshot.outstandingMessageIds.length === 1);
   assert.equal(session.snapshot.activity, "running");
-  assert.throws(() => session.prepareCliHandoff(), /idle session/);
+  await assert.rejects(session.prepareCliHandoff(), /idle session/);
 
   // The installed streaming SDK does not consistently emit a later idle
   // state. The terminal result is therefore the safe fallback once the final
@@ -594,8 +921,8 @@ test("settles idle from a terminal result only after all tracked work drains", a
     session_id: "session-1",
   });
   await eventually(() => session.snapshot.activity === "idle");
-  assert.doesNotThrow(() => session.prepareCliHandoff());
-  session.dispose();
+  await session.prepareCliHandoff();
+  await session.dispose();
 });
 
 test("correlates an id-less terminal result when exactly one message is outstanding", async () => {
@@ -616,7 +943,7 @@ test("correlates an id-less terminal result when exactly one message is outstand
   });
   await eventually(() => session.snapshot.activity === "idle");
   assert.deepEqual(session.snapshot.outstandingMessageIds, []);
-  session.dispose();
+  await session.dispose();
 });
 
 test("keeps a completed turn running until Claude background work drains", async () => {
@@ -652,5 +979,5 @@ test("keeps a completed turn running until Claude background work drains", async
     session_id: "session-1",
   });
   await eventually(() => session.snapshot.activity === "idle");
-  session.dispose();
+  await session.dispose();
 });

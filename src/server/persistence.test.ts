@@ -78,6 +78,11 @@ test("workspace persistence removes configured launch targets and previews omit 
   });
   assert.equal(preview, "send:queue;content-omitted");
   assert.doesNotMatch(preview, /hunter2|abcdefghijklmnop/);
+  assert.equal(redactedPreview({
+    type: "resume",
+    expectedGeneration: 2,
+    idempotencyKey: "idempotency-resume-preview",
+  }), "resume");
 });
 
 test("persists Claude hook authorization as a digest and tracks monotonic liveness", () => {
@@ -200,6 +205,84 @@ test("queued work stays durable until recovery marks it unknown and scrubs conte
   }
 });
 
+test("managed control intent evidence survives reopen and follows the latest provider intent", () => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-manager-control-intent-db-"));
+  const path = join(directory, "state.sqlite");
+  const recordReceipt = (
+    database: ManagerDatabase,
+    input: {
+      sessionId: string;
+      idempotencyKey: string;
+      actionType: SessionAction["type"];
+      status: "succeeded" | "unknown";
+      at: string;
+    },
+  ): void => {
+    database.recordActionReceipt({
+      ...input,
+      requestSha256: `sha256:${input.idempotencyKey}`,
+      actionId: `action:${input.idempotencyKey}`,
+      createdAt: input.at,
+      completedAt: input.at,
+    });
+  };
+
+  try {
+    let database = new ManagerDatabase(path);
+    assert.equal(database.getLatestManagedControlIntent("claude:no-evidence"), null);
+    recordReceipt(database, {
+      sessionId: "claude:ended-successfully",
+      idempotencyKey: "end-success",
+      actionType: "end",
+      status: "succeeded",
+      at: "2026-08-05T10:00:00.000Z",
+    });
+    recordReceipt(database, {
+      sessionId: "claude:end-outcome-unknown",
+      idempotencyKey: "end-unknown",
+      actionType: "end",
+      status: "unknown",
+      at: "2026-08-05T10:01:00.000Z",
+    });
+    recordReceipt(database, {
+      sessionId: "claude:resumed-after-end",
+      idempotencyKey: "end-before-send",
+      actionType: "end",
+      status: "succeeded",
+      at: "2026-08-05T10:02:00.000Z",
+    });
+    recordReceipt(database, {
+      sessionId: "claude:resumed-after-end",
+      idempotencyKey: "send-after-end",
+      actionType: "send",
+      status: "succeeded",
+      at: "2026-08-05T10:03:00.000Z",
+    });
+    database.close();
+
+    database = new ManagerDatabase(path);
+    assert.equal(database.getLatestManagedControlIntent("claude:no-evidence"), null);
+    assert.deepEqual(database.getLatestManagedControlIntent("claude:ended-successfully"), {
+      actionType: "end",
+      status: "succeeded",
+      at: "2026-08-05T10:00:00.000Z",
+    });
+    assert.deepEqual(database.getLatestManagedControlIntent("claude:end-outcome-unknown"), {
+      actionType: "end",
+      status: "unknown",
+      at: "2026-08-05T10:01:00.000Z",
+    });
+    assert.deepEqual(database.getLatestManagedControlIntent("claude:resumed-after-end"), {
+      actionType: "send",
+      status: "succeeded",
+      at: "2026-08-05T10:03:00.000Z",
+    });
+    database.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("session creation intent is durable without storing the initial message", () => {
   const directory = mkdtempSync(join(tmpdir(), "agent-manager-create-db-"));
   const path = join(directory, "state.sqlite");
@@ -262,6 +345,38 @@ test("workspace identity is scoped to its host and removing a host cascades only
   assert.equal(database.removeHost("host-studio"), true);
   assert.deepEqual(database.listWorkspaces().map((workspace) => workspace.id), ["workspace-local"]);
   database.close();
+});
+
+test("one-shot operational intents remain claimed across database reopen", () => {
+  const directory = mkdtempSync(join(tmpdir(), "agent-manager-intent-"));
+  const path = join(directory, "state.sqlite");
+  try {
+    let database = new ManagerDatabase(path);
+    assert.equal(database.claimOperationalIntent(
+      "takeover.signal-intent",
+      "sha256:identity-one",
+      { pid: 1234 },
+    ), true);
+    assert.equal(database.claimOperationalIntent(
+      "takeover.signal-intent",
+      "sha256:identity-one",
+      { pid: 1234 },
+    ), false);
+    database.close();
+
+    database = new ManagerDatabase(path);
+    assert.equal(database.claimOperationalIntent(
+      "takeover.signal-intent",
+      "sha256:identity-one",
+    ), false);
+    assert.equal(database.claimOperationalIntent(
+      "takeover.signal-intent",
+      "sha256:identity-two",
+    ), true);
+    database.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("rejects an incompatible database without migrating or deleting its records", () => {

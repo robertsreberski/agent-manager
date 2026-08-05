@@ -18,7 +18,9 @@ import {
   workspaceResolutionResponseSchema,
 } from "../../../src/shared/workspace.ts";
 import {
+  setupHookApplyResponseSchema,
   setupReadModelSchema,
+  type SetupHookApplyResponse,
   type SetupReadModel,
 } from "../../../src/shared/setup.ts";
 import { assertCurrentWireIdentity } from "../../../src/shared/wire.ts";
@@ -210,7 +212,7 @@ export interface ArchivedSessionsPage {
   total: number;
   query: string;
 }
-export type { SetupHookOffer, SetupReadModel } from "../../../src/shared/setup.ts";
+export type { SetupHookApplyResponse, SetupHookOffer, SetupReadModel } from "../../../src/shared/setup.ts";
 export type { SelectedAttentionDetailsResponse } from "../../../src/shared/attention-detail.ts";
 export type { SelectedSessionFactsResponse } from "../../../src/shared/session-facts.ts";
 export type { SelectedTodoDetailResponse } from "../../../src/shared/todo-detail.ts";
@@ -425,6 +427,20 @@ export class CockpitApi {
     );
   }
 
+  async applySetupHook(
+    provider: "claude" | "codex",
+    previewId: string,
+  ): Promise<SetupHookApplyResponse> {
+    return parseResponse(
+      setupHookApplyResponseSchema,
+      await this.request<unknown>("/api/v1/setup/hooks/apply", {
+        method: "POST",
+        body: JSON.stringify({ provider, previewId, confirmed: true }),
+      }),
+      "provider hook apply",
+    );
+  }
+
   async workspaces(): Promise<WorkspaceOption[]> {
     const result = await this.request<unknown>("/api/v1/workspaces");
     const { workspaces } = parseResponse(workspaceListResponseSchema, result, "workspaces");
@@ -451,6 +467,36 @@ export class CockpitApi {
       sshTarget: host.sshTarget ?? null,
       statusMessage: host.statusMessage ?? null,
     }));
+  }
+
+  async addHost(label: string, target: string): Promise<HostOption> {
+    const result = await this.request<unknown>("/api/v1/hosts", {
+      method: "POST",
+      body: JSON.stringify({ label, target }),
+    });
+    const { host } = parseResponse(
+      z.object({ host: hostRecordSchema }).strict(),
+      result,
+      "registered host",
+    );
+    if (host.kind !== "ssh") {
+      invalidResponse("registered host", result, new Error("registered hosts must use SSH"));
+    }
+    return {
+      ...host,
+      sshTarget: host.sshTarget ?? null,
+      statusMessage: host.statusMessage ?? null,
+    };
+  }
+
+  async removeHost(id: string): Promise<void> {
+    parseResponse(
+      z.object({ removed: z.literal(true) }).strict(),
+      await this.request<unknown>(`/api/v1/hosts/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+      }),
+      "removed host",
+    );
   }
 
   async completeDirectories(hostId: string, path: string): Promise<string[]> {
@@ -523,8 +569,11 @@ export class CockpitApi {
     const value = await this.request<unknown>(
       `/api/v1/sessions/${encodeURIComponent(id)}/attach`,
     );
-    const { instruction } = parseResponse(
-      z.object({ instruction: attachInstructionSchema.nullable() }).strict(),
+    const { instruction, requiresHandoff } = parseResponse(
+      z.object({
+        instruction: attachInstructionSchema.nullable(),
+        requiresHandoff: z.boolean(),
+      }).strict(),
       value,
       "attach",
     );
@@ -544,10 +593,7 @@ export class CockpitApi {
       kind: instruction.kind,
       command: shellDisplay(instruction.argv),
       description: instruction.warning,
-      requiresHandoff:
-        instruction.kind === "claude-resume"
-        || instruction.kind === "manager-cli"
-        || instruction.kind === "ssh",
+      requiresHandoff,
       argv: [...instruction.argv],
       cwd: instruction.cwd,
     };

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { providerControlCoordination } from "../../../src/shared/session.ts";
 import { AGENT_MANAGER_BUILD_ID, WireUpgradeRequiredError, WIRE_SCHEMA_VERSION } from "../../../src/shared/wire.ts";
 import { parseSessionRecord, parseSnapshot } from "./normalize";
 
@@ -61,6 +62,8 @@ function session() {
     control: {
       plane: "codex-private",
       authority: "manager",
+      coordination: providerControlCoordination("codex"),
+      recovery: null,
       capabilities: ["queue", "set-profile"],
       withheld: [],
       takeover: null,

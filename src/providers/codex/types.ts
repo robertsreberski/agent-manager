@@ -26,11 +26,6 @@ export type CodexSettingsDelivery =
   | "next-turn"
   | "unavailable";
 
-export type CodexControllerState =
-  | "available"
-  | "foreign-environment"
-  | "ambiguous-environment";
-
 export type CodexThreadStatus =
   | "not-loaded"
   | "idle"
@@ -116,9 +111,8 @@ export interface CodexThreadState {
   lastTurnStatus: CodexTurnStatus | null;
   pendingRequests: readonly CodexPendingRequest[];
   queue: readonly CodexQueuedMessage[];
-  environmentIds: readonly string[];
-  controller: CodexControllerState;
-  writeBlockedReason: string | null;
+  /** Remote exec-server environments currently available to this thread. */
+  executionEnvironmentIds: readonly string[];
   pendingSettings: CodexPendingSettings | null;
   generation: number;
 }

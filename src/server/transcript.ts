@@ -23,6 +23,7 @@ import {
 import { DatabaseSync } from "node:sqlite";
 import type { ActivityJsonValue } from "../activity/types.ts";
 import { redactActivityText } from "../activity/redaction.ts";
+import { codexMessageCorrelationId } from "../providers/codex/activity-projector.ts";
 import type {
   Provider,
   SessionView,
@@ -30,9 +31,12 @@ import type {
 
 export const TRANSCRIPT_LIMITS = Object.freeze({
   sourceBytes: 2 * 1024 * 1024,
+  sourceHeadBytes: 256 * 1024,
   messageBytes: 64 * 1024,
   totalBytes: 512 * 1024,
   messages: 120,
+  oldestMessageItems: 16,
+  oldestMessageBytes: 128 * 1024,
 });
 
 type SessionIdentity = Pick<
@@ -136,6 +140,8 @@ export interface LocalTranscriptReaderOptions {
 interface RootInfo {
   lexical: string;
   canonical: string;
+  stat: Stats;
+  parent?: RootInfo;
 }
 
 interface OpenTranscript {
@@ -147,6 +153,8 @@ interface OpenTranscript {
 interface JsonlRecord {
   object: Record<string, unknown>;
   offset: number;
+  /** True when bounded reading skipped an unknown physical middle window. */
+  gapBefore: boolean;
 }
 
 interface JsonlTail {
@@ -252,20 +260,61 @@ function isConfined(root: string, candidate: string): boolean {
 function rootInfo(path: string, uid: number): RootInfo {
   const lexical = resolve(path);
   let canonical: string;
+  let lexicalStat: Stats;
   let stat: Stats;
   try {
+    lexicalStat = lstatSync(lexical);
+    if (lexicalStat.isSymbolicLink()) failure("unreadable");
     canonical = realpathSync(lexical);
     stat = statSync(canonical);
-  } catch {
-    failure("not-found");
+  } catch (error) {
+    if (error instanceof TranscriptReadFailure) throw error;
+    const code = (error as NodeJS.ErrnoException).code;
+    failure(code === "ENOENT" || code === "ENOTDIR" ? "not-found" : "unreadable");
   }
-  if (!stat.isDirectory() || stat.uid !== uid) failure("unreadable");
-  return { lexical, canonical };
+  if (
+    !lexicalStat.isDirectory() ||
+    !stat.isDirectory() ||
+    lexicalStat.uid !== uid ||
+    stat.uid !== uid ||
+    lexicalStat.dev !== stat.dev ||
+    lexicalStat.ino !== stat.ino
+  ) failure("unreadable");
+  return { lexical, canonical, stat };
 }
 
-function optionalRootInfo(path: string, uid: number): RootInfo | null {
+function childRootInfo(parent: RootInfo, path: string, uid: number): RootInfo {
+  const child = rootInfo(path, uid);
+  if (
+    child.lexical === parent.lexical ||
+    child.canonical === parent.canonical ||
+    dirname(child.lexical) !== parent.lexical ||
+    dirname(child.canonical) !== parent.canonical ||
+    !isConfined(parent.lexical, child.lexical) ||
+    !isConfined(parent.canonical, child.canonical)
+  ) failure("unreadable");
+  return { ...child, parent };
+}
+
+function rootStillTrusted(root: RootInfo, uid: number): boolean {
   try {
-    return rootInfo(path, uid);
+    const lexical = lstatSync(root.lexical);
+    const canonical = realpathSync(root.lexical);
+    return !lexical.isSymbolicLink() &&
+      lexical.isDirectory() &&
+      lexical.uid === uid &&
+      lexical.dev === root.stat.dev &&
+      lexical.ino === root.stat.ino &&
+      canonical === root.canonical &&
+      (root.parent === undefined || rootStillTrusted(root.parent, uid));
+  } catch {
+    return false;
+  }
+}
+
+function optionalChildRootInfo(parent: RootInfo, path: string, uid: number): RootInfo | null {
+  try {
+    return childRootInfo(parent, path, uid);
   } catch (error) {
     if (error instanceof TranscriptReadFailure && error.reason === "not-found") return null;
     throw error;
@@ -296,6 +345,7 @@ function hasSymlinkBelowRoot(root: RootInfo, candidate: string): boolean {
 }
 
 function openTranscript(root: RootInfo, candidate: string, uid: number): OpenTranscript {
+  if (!rootStillTrusted(root, uid)) failure("unreadable");
   if (!isAbsolute(candidate)) failure("unreadable");
   const absolute = resolve(candidate);
   if (hasSymlinkBelowRoot(root, absolute)) failure("unreadable");
@@ -326,7 +376,8 @@ function openTranscript(root: RootInfo, candidate: string, uid: number): OpenTra
       !after.isFile() ||
       after.uid !== uid ||
       after.dev !== before.dev ||
-      after.ino !== before.ino
+      after.ino !== before.ino ||
+      !rootStillTrusted(root, uid)
     ) {
       failure("unreadable");
     }
@@ -363,21 +414,16 @@ function parseJsonObject(buffer: Buffer): Record<string, unknown> | null {
   }
 }
 
-/**
- * Reads complete physical JSONL records from the newest bounded file window.
- * Newline scanning happens on bytes, so the decoder never starts inside a
- * multi-byte UTF-8 code point. Absolute byte offsets remain stable identifiers.
- */
-function readJsonlTail(file: OpenTranscript): JsonlTail {
-  const requestedStart = Math.max(0, file.stat.size - TRANSCRIPT_LIMITS.sourceBytes);
-  const buffer = readAt(
-    file.descriptor,
-    requestedStart,
-    Math.min(TRANSCRIPT_LIMITS.sourceBytes, file.stat.size),
-  );
+function parseJsonlWindow(
+  buffer: Buffer,
+  requestedStart: number,
+  discardLeadingPartial: boolean,
+  reachesEnd: boolean,
+  gapBefore: boolean,
+): JsonlTail {
   let cursor = 0;
-  let truncated = requestedStart > 0;
-  if (requestedStart > 0) {
+  let truncated = discardLeadingPartial || !reachesEnd;
+  if (discardLeadingPartial) {
     const newline = buffer.indexOf(10);
     if (newline < 0) return { records: [], truncated: true };
     cursor = newline + 1;
@@ -386,17 +432,71 @@ function readJsonlTail(file: OpenTranscript): JsonlTail {
   const records: JsonlRecord[] = [];
   while (cursor < buffer.length) {
     const newline = buffer.indexOf(10, cursor);
+    if (newline < 0 && !reachesEnd) {
+      truncated = true;
+      break;
+    }
     const end = newline < 0 ? buffer.length : newline;
     const line = buffer.subarray(cursor, end);
     if (line.length > 0 && !(line.length === 1 && line[0] === 13)) {
       const object = parseJsonObject(line);
-      if (object) records.push({ object, offset: requestedStart + cursor });
-      else truncated = true;
+      if (object) {
+        records.push({
+          object,
+          offset: requestedStart + cursor,
+          gapBefore: gapBefore && records.length === 0,
+        });
+      } else truncated = true;
     }
     if (newline < 0) break;
     cursor = newline + 1;
   }
   return { records, truncated };
+}
+
+/**
+ * Reads complete physical JSONL records within one fixed byte budget. Large
+ * provider files reserve a small oldest window for the opening conversation
+ * and spend the remainder on newest activity. No skipped middle bytes are
+ * decoded or inferred, and the first tail record carries an explicit gap so a
+ * parser cannot accidentally extend a provider turn across unknown history.
+ * Absolute byte offsets remain stable item identities.
+ */
+function readJsonlTail(file: OpenTranscript): JsonlTail {
+  if (file.stat.size <= TRANSCRIPT_LIMITS.sourceBytes) {
+    return parseJsonlWindow(
+      readAt(file.descriptor, 0, file.stat.size),
+      0,
+      false,
+      true,
+      false,
+    );
+  }
+
+  const headBytes = Math.min(
+    TRANSCRIPT_LIMITS.sourceHeadBytes,
+    TRANSCRIPT_LIMITS.sourceBytes,
+  );
+  const tailBytes = TRANSCRIPT_LIMITS.sourceBytes - headBytes;
+  const tailStart = file.stat.size - tailBytes;
+  const head = parseJsonlWindow(
+    readAt(file.descriptor, 0, headBytes),
+    0,
+    false,
+    false,
+    false,
+  );
+  const tail = parseJsonlWindow(
+    readAt(file.descriptor, tailStart, tailBytes),
+    tailStart,
+    true,
+    true,
+    true,
+  );
+  return {
+    records: [...head.records, ...tail.records],
+    truncated: true,
+  };
 }
 
 function validHeaderSessionId(file: OpenTranscript, expectedId: string): boolean {
@@ -474,23 +574,49 @@ function capItems(input: TranscriptItem[]): ParsedItems {
       : { ...item, text: capped.text }];
   });
 
-  const retained: TranscriptItem[] = [];
+  // Reserve a small oldest-message lane before filling the remaining window
+  // from the newest activity. A tool-heavy turn must not evict the opening
+  // user/assistant exchange that identifies the conversation after restart.
+  const retainedIndexes = new Set<number>();
   let totalBytes = 0;
-  for (let index = perItem.length - 1; index >= 0; index -= 1) {
+  let oldestMessageBytes = 0;
+  let oldestMessageItems = 0;
+  for (let index = 0; index < perItem.length; index += 1) {
     const item = perItem[index];
-    if (!item) continue;
+    if (
+      !item ||
+      item.kind !== "message" ||
+      (item.role !== "user" && item.role !== "assistant")
+    ) continue;
     const bytes = itemBytes(item);
     if (
-      retained.length >= TRANSCRIPT_LIMITS.messages ||
+      oldestMessageItems >= TRANSCRIPT_LIMITS.oldestMessageItems ||
+      oldestMessageBytes + bytes > TRANSCRIPT_LIMITS.oldestMessageBytes ||
+      totalBytes + bytes > TRANSCRIPT_LIMITS.totalBytes
+    ) continue;
+    retainedIndexes.add(index);
+    oldestMessageItems += 1;
+    oldestMessageBytes += bytes;
+    totalBytes += bytes;
+  }
+
+  for (let index = perItem.length - 1; index >= 0; index -= 1) {
+    const item = perItem[index];
+    if (!item || retainedIndexes.has(index)) continue;
+    const bytes = itemBytes(item);
+    if (
+      retainedIndexes.size >= TRANSCRIPT_LIMITS.messages ||
       totalBytes + bytes > TRANSCRIPT_LIMITS.totalBytes
     ) {
       truncated = true;
       continue;
     }
     totalBytes += bytes;
-    retained.push(item);
+    retainedIndexes.add(index);
   }
-  retained.reverse();
+  const retained = [...retainedIndexes]
+    .sort((left, right) => left - right)
+    .flatMap((index) => perItem[index] ? [perItem[index]] : []);
   if (retained.length !== perItem.length) truncated = true;
   return { items: retained, truncated };
 }
@@ -581,19 +707,66 @@ function codexOutputText(output: unknown): string {
   return JSON.stringify(record) ?? "";
 }
 
-function codexItems(tail: JsonlTail, fileIdentity: string): ParsedItems {
+function codexItems(
+  tail: JsonlTail,
+  fileIdentity: string,
+  sessionId: string,
+): ParsedItems {
   const items: TranscriptItem[] = [];
   const seenIds = new Set<string>();
   const seenAdjacent = new Set<string>();
   const toolIndex = new Map<string, number>();
   let previousKey: string | null = null;
   let truncated = tail.truncated;
+  let activeTurnId: string | null = null;
+  const assistantCandidates = new Map<string, number[]>();
+  const canonicalAssistantTurns = new Set<string>();
+
+  const finalizeTurn = (turnId: string): void => {
+    const candidates = assistantCandidates.get(turnId) ?? [];
+    if (canonicalAssistantTurns.has(turnId)) return;
+    const index = candidates.at(-1);
+    const item = index === undefined ? undefined : items[index];
+    if (item?.kind !== "message" || item.role !== "assistant") return;
+    item.correlationId = codexMessageCorrelationId(
+      sessionId,
+      turnId,
+      "assistant",
+      item.text,
+    );
+  };
 
   for (const record of tail.records) {
+    if (record.gapBefore) {
+      activeTurnId = null;
+      previousKey = null;
+      seenAdjacent.clear();
+      toolIndex.clear();
+    }
     const outer = record.object;
-    if (outer.type !== "response_item") continue;
     const payload = objectValue(outer.payload);
     if (!payload) continue;
+
+    if (outer.type === "event_msg") {
+      const turnId = stringValue(payload.turn_id);
+      if (payload.type === "task_started" && turnId) {
+        activeTurnId = turnId;
+      } else if (payload.type === "task_complete" && turnId) {
+        finalizeTurn(turnId);
+        if (activeTurnId === turnId) activeTurnId = null;
+      } else if (payload.type === "turn_aborted" && turnId && activeTurnId === turnId) {
+        activeTurnId = null;
+      }
+      continue;
+    }
+
+    if (outer.type === "turn_context") {
+      const turnId = stringValue(payload.turn_id);
+      if (turnId) activeTurnId = turnId;
+      continue;
+    }
+
+    if (outer.type !== "response_item") continue;
     const createdAt = timestamp(outer.timestamp);
 
     if (payload.type === "reasoning") {
@@ -665,22 +838,43 @@ function codexItems(tail: JsonlTail, fileIdentity: string): ParsedItems {
     const providerId = stringValue(payload.id) ?? stringValue(outer.id);
     const id = stableItemId("codex", providerId, fileIdentity, record.offset);
     if (seenIds.has(id)) continue;
-    const adjacentKey = `${role}\u0000${createdAt ?? ""}\u0000${text}`;
-    if (previousKey === adjacentKey && seenAdjacent.has(adjacentKey)) continue;
+    // A provider message id is an occurrence identity. Identical adjacent text
+    // under two distinct ids is two real messages, even when Codex recorded the
+    // same coarse timestamp for both. The conservative adjacency fallback is
+    // reserved for legacy/id-less rollout rows only.
+    const adjacentKey = providerId === null
+      ? `${role}\u0000${createdAt ?? ""}\u0000${text}`
+      : null;
+    if (adjacentKey !== null && previousKey === adjacentKey && seenAdjacent.has(adjacentKey)) {
+      continue;
+    }
     seenIds.add(id);
     seenAdjacent.clear();
-    seenAdjacent.add(adjacentKey);
+    if (adjacentKey !== null) seenAdjacent.add(adjacentKey);
     previousKey = adjacentKey;
+    const messageTurnId = activeTurnId;
+    const finalAssistant = messageTurnId !== null && role === "assistant" &&
+      (payload.phase === "final_answer" || payload.phase === "final");
     items.push({
       kind: "message",
       id,
-      correlationId: correlationId("message", providerId),
+      correlationId: messageTurnId && role === "user"
+        ? codexMessageCorrelationId(sessionId, messageTurnId, "user", text)
+        : finalAssistant
+        ? codexMessageCorrelationId(sessionId, messageTurnId, "assistant", text)
+        : correlationId("message", providerId),
       role,
       text,
       createdAt,
       status: "complete",
       label: null,
     });
+    if (messageTurnId && role === "assistant") {
+      const candidates = assistantCandidates.get(messageTurnId) ?? [];
+      candidates.push(items.length - 1);
+      assistantCandidates.set(messageTurnId, candidates);
+      if (finalAssistant) canonicalAssistantTurns.add(messageTurnId);
+    }
   }
   const capped = capItems(settleToolCalls(items));
   truncated ||= capped.truncated;
@@ -711,45 +905,94 @@ function claudeChain(
   session: SessionIdentity,
   isChild: boolean,
 ): { records: JsonlRecord[]; truncated: boolean } {
-  const byUuid = new Map<string, JsonlRecord>();
   const agentIds = new Set<string>();
-  let latest: JsonlRecord | null = null;
   for (const record of tail.records) {
-    const uuid = stringValue(record.object.uuid);
-    if (uuid) byUuid.set(uuid, record);
     const agentId = stringValue(record.object.agentId);
     if (agentId) agentIds.add(agentId);
-    if (matchesClaudeIdentity(record.object, session, isChild)) latest = record;
   }
   if (isChild && agentIds.size > 1) failure("unsupported");
-  if (!latest) failure("unsupported");
+
+  const segments: Array<{ records: JsonlRecord[]; gapBefore: boolean }> = [];
+  for (const record of tail.records) {
+    if (segments.length === 0 || record.gapBefore) {
+      segments.push({ records: [], gapBefore: record.gapBefore });
+    }
+    segments.at(-1)?.records.push(record);
+  }
 
   const records: JsonlRecord[] = [];
-  const visited = new Set<string>();
-  let cursor: JsonlRecord | undefined = latest;
+  const includedUuids = new Set<string>();
+  let foundIdentity = false;
   let truncated = tail.truncated;
-  while (cursor) {
-    const uuid = stringValue(cursor.object.uuid);
-    if (!uuid || visited.has(uuid)) {
-      truncated = true;
-      break;
+
+  for (const segment of segments) {
+    const byUuid = new Map<string, JsonlRecord>();
+    let latest: JsonlRecord | null = null;
+    for (const record of segment.records) {
+      const uuid = stringValue(record.object.uuid);
+      if (uuid) {
+        if (byUuid.has(uuid)) truncated = true;
+        byUuid.set(uuid, record);
+      }
+      if (matchesClaudeIdentity(record.object, session, isChild)) latest = record;
     }
-    visited.add(uuid);
-    records.push(cursor);
-    if (records.length >= MAX_CHAIN_RECORDS) {
-      truncated = true;
-      break;
+    if (!latest) continue;
+    foundIdentity = true;
+
+    const segmentRecords: JsonlRecord[] = [];
+    const visited = new Set<string>();
+    let cursor: JsonlRecord | undefined = latest;
+    while (cursor) {
+      const uuid = stringValue(cursor.object.uuid);
+      if (!uuid || visited.has(uuid)) {
+        truncated = true;
+        break;
+      }
+      visited.add(uuid);
+      segmentRecords.push(cursor);
+      const parentUuid = stringValue(cursor.object.parentUuid);
+      if (!parentUuid) break;
+      const parent = byUuid.get(parentUuid);
+      if (!parent) {
+        truncated = true;
+        break;
+      }
+      cursor = parent;
     }
-    const parentUuid = stringValue(cursor.object.parentUuid);
-    if (!parentUuid) break;
-    const parent = byUuid.get(parentUuid);
-    if (!parent) {
-      truncated = true;
-      break;
+    segmentRecords.reverse();
+
+    let firstIncluded = true;
+    for (const record of segmentRecords) {
+      const uuid = stringValue(record.object.uuid);
+      if (!uuid || includedUuids.has(uuid)) {
+        truncated = true;
+        continue;
+      }
+      includedUuids.add(uuid);
+      records.push(segment.gapBefore && firstIncluded
+        ? { ...record, gapBefore: true }
+        : record);
+      firstIncluded = false;
     }
-    cursor = parent;
   }
-  records.reverse();
+
+  if (!foundIdentity) failure("unsupported");
+  if (records.length > MAX_CHAIN_RECORDS) {
+    const oldestCount = Math.max(
+      1,
+      Math.floor(
+        MAX_CHAIN_RECORDS *
+          (TRANSCRIPT_LIMITS.sourceHeadBytes / TRANSCRIPT_LIMITS.sourceBytes),
+      ),
+    );
+    const newestCount = MAX_CHAIN_RECORDS - oldestCount;
+    const oldest = records.slice(0, oldestCount);
+    const newest = records.slice(-newestCount);
+    const firstNewest = newest[0];
+    if (firstNewest) newest[0] = { ...firstNewest, gapBefore: true };
+    records.splice(0, records.length, ...oldest, ...newest);
+    truncated = true;
+  }
   return { records, truncated };
 }
 
@@ -887,6 +1130,10 @@ function claudeItems(
   let truncated = chain.truncated;
 
   for (const record of chain.records) {
+    // A result can only complete a tool call when both records belong to one
+    // observed parent chain. Never infer that relationship across skipped
+    // source bytes, even when an identifier happens to match.
+    if (record.gapBefore) toolIndex.clear();
     const outer = record.object;
     if (!matchesClaudeIdentity(outer, session, isChild) || outer.isMeta === true) continue;
     const message = objectValue(outer.message);
@@ -943,17 +1190,18 @@ function claudeItems(
 
 function stateDatabaseCandidates(codexHome: RootInfo, uid: number): string[] {
   const candidates: Array<{ path: string; root: boolean; version: number; mtimeMs: number }> = [];
-  for (const directory of [codexHome.lexical, join(codexHome.lexical, "sqlite")]) {
+  const sqlite = optionalChildRootInfo(codexHome, join(codexHome.lexical, "sqlite"), uid);
+  for (const directory of [codexHome, sqlite].filter((value): value is RootInfo => value !== null)) {
     let entries;
     try {
-      entries = readdirSync(directory, { withFileTypes: true });
+      entries = readdirSync(directory.canonical, { withFileTypes: true });
     } catch {
       continue;
     }
     for (const entry of entries) {
       const match = entry.name.match(/^state_(\d+)\.sqlite$/);
       if (!match || !entry.isFile()) continue;
-      const path = join(directory, entry.name);
+      const path = join(directory.canonical, entry.name);
       try {
         const lexical = lstatSync(path);
         const canonical = realpathSync(path);
@@ -961,12 +1209,16 @@ function stateDatabaseCandidates(codexHome: RootInfo, uid: number): string[] {
         if (
           lexical.isSymbolicLink() ||
           !stat.isFile() ||
+          lexical.uid !== uid ||
           stat.uid !== uid ||
+          lexical.dev !== stat.dev ||
+          lexical.ino !== stat.ino ||
+          dirname(canonical) !== directory.canonical ||
           !isConfined(codexHome.canonical, canonical)
         ) continue;
         candidates.push({
           path: canonical,
-          root: resolve(directory) === codexHome.lexical,
+          root: directory.canonical === codexHome.canonical,
           version: Number(match[1]),
           mtimeMs: stat.mtimeMs,
         });
@@ -1039,8 +1291,8 @@ function codexFile(
   if (!UUID_PATTERN.test(sessionId)) failure("unsupported");
   const codexHome = rootInfo(codexHomePath, uid);
   const roots = [
-    optionalRootInfo(join(codexHome.lexical, "sessions"), uid),
-    optionalRootInfo(join(codexHome.lexical, "archived_sessions"), uid),
+    optionalChildRootInfo(codexHome, join(codexHome.lexical, "sessions"), uid),
+    optionalChildRootInfo(codexHome, join(codexHome.lexical, "archived_sessions"), uid),
   ].filter((root): root is RootInfo => root !== null);
   if (roots.length === 0) failure("not-found");
   const databasePath = rolloutFromDatabase(codexHome, uid, sessionId);
@@ -1155,7 +1407,11 @@ export class LocalSessionTranscriptReader implements SessionTranscriptReader {
     try {
       if (session.provider === "codex") {
         file = codexFile(this.#codexHome, session.providerThreadId, this.#uid).file;
-        const parsed = codexItems(readJsonlTail(file), file.identity);
+        const parsed = codexItems(
+          readJsonlTail(file),
+          file.identity,
+          session.providerThreadId,
+        );
         return available("codex", parsed.items, parsed.truncated);
       }
       const claude = claudeFile(this.#claudeHome, session, this.#uid);

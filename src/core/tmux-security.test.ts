@@ -6,6 +6,7 @@ import test from "node:test";
 
 import { attachTmuxTerminals, discoverTmuxPanes } from "./tmux.ts";
 import type { Runtime, SessionRecord } from "./types.ts";
+import { observeOnlyControl } from "../shared/session.ts";
 
 test("tmux discovery never probes regular files or an unsafe shared directory", () => {
   const root = mkdtempSync(join(tmpdir(), "agent-manager-tmux-security-"));
@@ -133,7 +134,7 @@ test("local tmux evidence never attaches to a remote session with a colliding pi
     effort: { value: null, providerValue: null, source: "inferred", confidence: "heuristic" },
     attention: [],
     terminal: null,
-    control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [], takeover: null },
+    control: observeOnlyControl(),
     workspaceIdentity: null,
     generation: 0,
   };

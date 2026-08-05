@@ -26,6 +26,7 @@ import {
 } from "./server.ts";
 import { SessionStateStore } from "./state.ts";
 import { LocalSessionTranscriptReader } from "./transcript.ts";
+import { closeOwnerInstanceLease, startOwnerInstanceLease } from "./control-socket.ts";
 
 export * from "./auth.ts";
 export * from "./activity-observer.ts";
@@ -35,6 +36,7 @@ export * from "./controls.ts";
 export * from "./persistence.ts";
 export * from "./plan-file.ts";
 export * from "./preview.ts";
+export * from "./remote-host-registry.ts";
 export * from "./server.ts";
 export * from "./state.ts";
 export * from "./transcript.ts";
@@ -68,7 +70,32 @@ export interface ComposedAgentManagerServerOptions extends AgentManagerServerOpt
   /** Disable only in tests or when embedding custom provider adapters. */
   managedProviders?: boolean;
   codexExecutable?: string;
+  claudeExecutable?: string;
   runtimeDirectory?: string;
+  configuredHosts?: ReadonlyArray<{ id: string; label: string; target: string }>;
+  configuredWorkspaces?: ReadonlyArray<{
+    id: string;
+    label: string;
+    path: string;
+    hostId: string;
+  }>;
+}
+
+function boundedShutdown<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out`)), timeoutMs);
+    timer.unref();
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }
 
 function runtimeValidationPaths(
@@ -97,9 +124,16 @@ export async function createAgentManagerServer(
   const {
     managedProviders = true,
     codexExecutable,
+    claudeExecutable,
+    configuredHosts,
+    configuredWorkspaces,
     runtimeDirectory = paths.runtimeDirectory,
     ...serverOptions
   } = options;
+  const shutdownTimeoutMs = Math.max(250, serverOptions.shutdownTimeoutMs ?? 5_000);
+  // The raw server owns the enclosing shutdown deadline. Leave it enough time
+  // to observe this callback settling and finish its own resource finalizers.
+  const shutdownCallbackTimeoutMs = Math.max(100, shutdownTimeoutMs - 100);
   const controlSocketPath = serverOptions.controlSocketPath ?? join(runtimeDirectory, "control.sock");
   ensurePrivateRuntimeDirectory(runtimeValidationPaths(
     paths.stateDirectory,
@@ -121,89 +155,333 @@ export async function createAgentManagerServer(
       join(codexRuntimeDirectory, "codex-app-server.sock"),
     ));
   }
+  // This atomic kernel-owned bind is deliberately the first stateful runtime
+  // operation. A losing dev/service process must fail before opening the
+  // database or starting either provider.
+  const instanceLease = await startOwnerInstanceLease(join(runtimeDirectory, "instance.sock"));
+  let instanceLeaseRelease: Promise<void> | null = null;
+  const releaseInstanceLease = (): Promise<void> => {
+    instanceLeaseRelease ??= closeOwnerInstanceLease(instanceLease);
+    return instanceLeaseRelease;
+  };
+  const ownedAdapters = new Set<NonNullable<ProviderControlAdapters[keyof ProviderControlAdapters]>>();
+  let activityHubForCleanup: ActivityHub | null = null;
+  let databaseForCleanup: ManagerDatabase | null = null;
+  let codexSupervisor: CodexAppServerSupervisor | null = null;
+  try {
   const state = serverOptions.state ?? new SessionStateStore({
     replayCapacity: serverOptions.replayCapacity ?? 512,
   });
   const activityHub = serverOptions.activityHub ?? new ActivityHub();
+  activityHubForCleanup = activityHub;
   const database = serverOptions.database
     ?? new ManagerDatabase(serverOptions.databasePath ?? paths.databasePath);
+  databaseForCleanup = database;
+  if (configuredHosts || configuredWorkspaces) {
+    const hostIds = new Set((configuredHosts ?? []).map((host) => host.id));
+    for (const stored of database.listHosts()) {
+      if (stored.kind === "ssh" && !hostIds.has(stored.id)) database.removeHost(stored.id);
+    }
+    for (const host of configuredHosts ?? []) {
+      database.addHost({
+        id: host.id,
+        label: host.label,
+        kind: "ssh",
+        sshTarget: host.target,
+      });
+    }
+    for (const workspace of configuredWorkspaces ?? []) {
+      database.addWorkspace({
+        id: workspace.id,
+        label: workspace.label,
+        path: workspace.path,
+        hostId: workspace.hostId,
+      });
+    }
+  }
   const adapters: ProviderControlAdapters = { ...(serverOptions.adapters ?? {}) };
   const claudeHookSourceArbiter = serverOptions.claudeHookSourceArbiter
     ?? new ClaudeHookSourceArbiter();
   const planFileReader = serverOptions.planFileReader ?? new LocalPlanFileReader({ runtimeDirectory });
   const transcriptReader = serverOptions.transcriptReader ?? new LocalSessionTranscriptReader();
   const diagnostics: Diagnostic[] = [...(serverOptions.initialDiagnostics ?? [])];
-  let codexSupervisor: CodexAppServerSupervisor | null = null;
   let codexHookTrustStatus = serverOptions.codexHookTrustStatus;
+  let backendForRecovery: AgentManagerBackend | null = null;
+  let activeCodexBridge: CodexProviderBridge | null = null;
+  let retiredCodexBridge: CodexProviderBridge | null = null;
 
   if (managedProviders && !adapters.claude) {
-    adapters.claude = new ClaudeProviderControlAdapter({
+    const claudeAdapter = new ClaudeProviderControlAdapter({
       hookSourceArbiter: claudeHookSourceArbiter,
-      onSessionChanged: (session) => state.upsert(session),
+      ...(claudeExecutable === undefined ? {} : { claudeExecutable }),
+      onSessionChanged: (session) => {
+        state.upsert(session);
+        try {
+          const persisted = database.listManagedSessions().find(
+            (record) => record.id === session.id && record.provider === "claude",
+          );
+          if (!persisted) return;
+          const nextMetadata = {
+            ...persisted.metadata,
+            name: session.name,
+            profile: session.profile.value,
+            model: session.model.value,
+            effort: session.effort.value,
+            managerControl: session.providerStatus === "closed"
+              ? persisted.metadata.managerControl ?? "active"
+              : "active",
+            ...(session.control.authority === "manager"
+              ? {
+                  ownership: "manager-exclusive",
+                  nativeOwner: null,
+                  handoffId: null,
+                  recovery: null,
+                }
+              : {}),
+          };
+          if (JSON.stringify(nextMetadata) === JSON.stringify(persisted.metadata)) return;
+          database.upsertManagedSession({
+            ...persisted,
+            metadata: nextMetadata,
+            updatedAt: new Date().toISOString(),
+          });
+        } catch (error) {
+          state.addDiagnostic({
+            provider: "claude",
+            level: "error",
+            message: `Claude session ${session.id} changed, but its durable settings could not be updated: ${error instanceof Error ? error.message : String(error)}`,
+          });
+        }
+      },
+      onManagerControlStopped: (managerSessionId) => {
+        const persisted = database.listManagedSessions().find(
+          (record) => record.id === managerSessionId && record.provider === "claude",
+        );
+        if (!persisted) {
+          throw new Error("durable Claude identity is unavailable after manager control stopped");
+        }
+        database.upsertManagedSession({
+          ...persisted,
+          metadata: {
+            ...persisted.metadata,
+            managerControl: "stopped",
+            recovery: null,
+          },
+          updatedAt: new Date().toISOString(),
+        });
+      },
+      onSessionLost: (managerSessionId, reason) => {
+        try {
+          state.remove(managerSessionId);
+          backendForRecovery?.recoverManagedProvider("claude");
+        } catch (error) {
+          state.addDiagnostic({
+            provider: "claude",
+            level: "error",
+            message: `Claude session ${managerSessionId} lost manager control (${reason}), but recovery could not start: ${error instanceof Error ? error.message : String(error)}`,
+          });
+        }
+      },
       onActivity: (managerSessionId, mutation) => {
         activityHub.ingest(managerSessionId, "claude", mutation);
       },
     });
+    adapters.claude = claudeAdapter;
+    ownedAdapters.add(claudeAdapter);
   }
+
+  const createCodexBridge = (
+    managedAdapter: Awaited<ReturnType<CodexAppServerSupervisor["start"]>>,
+  ): CodexProviderBridge => {
+    const codexBridge = new CodexProviderBridge({
+      adapter: managedAdapter,
+      resolveWorkspace: (workspaceId, context) => {
+        if (context.workspace?.id === workspaceId) return context.workspace.path;
+        return database.getWorkspace(workspaceId)?.path ?? null;
+      },
+      onSessionChanged: (session) => {
+        if (activeCodexBridge !== codexBridge || adapters.codex !== codexBridge) return;
+        state.upsert(session);
+        try {
+          const persisted = database.listManagedSessions().find(
+            (record) => record.id === session.id && record.provider === "codex",
+          );
+          if (!persisted) return;
+          const nextMetadata = {
+            ...persisted.metadata,
+            name: session.name,
+            profile: session.profile.value,
+            model: session.model.value,
+            effort: session.effort.value,
+            ownership: "shared",
+            recovery: null,
+          };
+          if (JSON.stringify(nextMetadata) === JSON.stringify(persisted.metadata)) return;
+          database.upsertManagedSession({
+            ...persisted,
+            metadata: nextMetadata,
+            updatedAt: new Date().toISOString(),
+          });
+        } catch (error) {
+          state.addDiagnostic({
+            provider: "codex",
+            level: "error",
+            message: `Codex session ${session.id} changed, but its durable settings could not be updated: ${error instanceof Error ? error.message : String(error)}`,
+          });
+        }
+      },
+      onSessionRemoved: (managerSessionId, reason) => {
+        if (activeCodexBridge !== codexBridge || adapters.codex !== codexBridge) return;
+        backendForRecovery?.cancelManagedRecovery(managerSessionId);
+        state.remove(managerSessionId);
+        // Archiving moves the same conversation to a read-only catalog. Its
+        // selected drawer and transcript observer keep the existing bounded
+        // hub; end/delete are identity termination and still clear it.
+        if (reason !== "archived") activityHub.clearSession(managerSessionId);
+        try {
+          database.removeManagedSession(managerSessionId);
+        } catch (error) {
+          state.addDiagnostic({
+            provider: "codex",
+            level: "error",
+            message: `Codex session ${managerSessionId} reached lifecycle state ${reason}, but its durable manager identity could not be removed: ${error instanceof Error ? error.message : String(error)}`,
+          });
+        }
+      },
+      onActivity: (managerSessionId, mutation) => {
+        activityHub.ingest(managerSessionId, "codex", mutation);
+      },
+    });
+    return codexBridge;
+  };
+
+  const publishCodexBridge = (
+    managedAdapter: Awaited<ReturnType<CodexAppServerSupervisor["start"]>>,
+  ): CodexProviderBridge => {
+    // Construct while inactive: every callback above is fenced by the active
+    // slot, so a constructor/publication failure cannot leak provider events.
+    const replacement = createCodexBridge(managedAdapter);
+    const previous = activeCodexBridge ?? retiredCodexBridge;
+    try {
+      previous?.dispose();
+    } catch (error) {
+      replacement.dispose();
+      throw error;
+    }
+    if (previous) ownedAdapters.delete(previous);
+
+    // Initial startup and manual terminal-failure retry already have a
+    // supervisor-published adapter, so this pointer swap can commit directly.
+    adapters.codex = replacement;
+    activeCodexBridge = replacement;
+    retiredCodexBridge = null;
+    ownedAdapters.add(replacement);
+    return replacement;
+  };
 
   if (managedProviders && !adapters.codex) {
     codexSupervisor = new CodexAppServerSupervisor({
       runtimeDir: codexRuntimeDirectory,
       ...(codexExecutable === undefined ? {} : { codexExecutable }),
     });
-    codexSupervisor.onUnexpectedExit((event) => {
-      const exit = event.signal ?? (event.code === null ? "unknown status" : `code ${event.code}`);
-      state.addDiagnostic({
-        provider: "codex",
-        level: "error",
-        message: `Managed Codex runtime exited unexpectedly (${exit}); manager controls are unavailable.`,
-      });
+    codexSupervisor.onUnexpectedExit(() => {
+      const previous = activeCodexBridge;
+      activeCodexBridge = null;
+      if (previous) retiredCodexBridge = previous;
+      if (previous && adapters.codex === previous) delete adapters.codex;
+      backendForRecovery?.recoverManagedProvider("codex");
     });
-    try {
-      const managedAdapter = await codexSupervisor.start();
-      codexHookTrustStatus ??= (settingsPath, expectedCommand) => readCodexHookStatus(
-        managedAdapter.rpc,
-        [dirname(dirname(settingsPath))],
-        expectedCommand,
-      );
-      adapters.codex = new CodexProviderBridge({
-        adapter: managedAdapter,
-        resolveWorkspace: (workspaceId, context) => {
-          if (context.workspace?.id === workspaceId) return context.workspace.path;
-          return database.getWorkspace(workspaceId)?.path ?? null;
+    codexSupervisor.onRecovered((managedAdapter) => {
+      const replacement = createCodexBridge(managedAdapter);
+      let committed = false;
+      return {
+        rollback: () => {
+          if (committed) {
+            if (activeCodexBridge === replacement) activeCodexBridge = null;
+            if (adapters.codex === replacement) delete adapters.codex;
+            ownedAdapters.delete(replacement);
+          }
+          replacement.dispose();
         },
-        onSessionChanged: (session) => state.upsert(session),
-        onSessionRemoved: (managerSessionId, reason) => {
+        commit: () => {
+          const previous = activeCodexBridge ?? retiredCodexBridge;
+          adapters.codex = replacement;
+          activeCodexBridge = replacement;
+          retiredCodexBridge = null;
+          ownedAdapters.add(replacement);
+          committed = true;
+          if (previous) {
+            try {
+              previous.dispose();
+            } catch {
+              // The retired bridge is already runtime-dead; publication stays live.
+            }
+            ownedAdapters.delete(previous);
+          }
           try {
-            database.removeManagedSession(managerSessionId);
+            backendForRecovery?.recoverManagedProvider("codex");
           } catch (error) {
+            // Catalog/state recovery cannot roll back a live bridge publication.
+            try {
+              state.addDiagnostic({
+                provider: "codex",
+                level: "error",
+                message: `Managed Codex sessions could not begin recovery after runtime replacement: ${error instanceof Error ? error.message : String(error)}`,
+              });
+            } catch {
+              // Diagnostic publication is best effort at this already-live boundary.
+            }
+          }
+        },
+      };
+    });
+    codexSupervisor.onRecoveryFailed((event) => {
+      const retired = retiredCodexBridge;
+      retiredCodexBridge = null;
+      if (retired) {
+        try {
+          retired.dispose();
+        } catch (error) {
+          try {
             state.addDiagnostic({
               provider: "codex",
               level: "error",
-              message: `Codex session ${managerSessionId} reached lifecycle state ${reason}, but its durable manager identity could not be removed: ${error instanceof Error ? error.message : String(error)}`,
+              message: `The retired Codex bridge could not be fully disposed after terminal runtime failure: ${error instanceof Error ? error.message : String(error)}`,
             });
+          } catch {
+            // Terminal cleanup remains best effort even if diagnostics fail.
           }
-          state.remove(managerSessionId);
-          // Archiving moves the same conversation to a read-only catalog. Its
-          // selected drawer and transcript observer keep the existing bounded
-          // hub; end/delete are identity termination and still clear it.
-          if (reason !== "archived") activityHub.clearSession(managerSessionId);
-        },
-        onActivity: (managerSessionId, mutation) => {
-          activityHub.ingest(managerSessionId, "codex", mutation);
-        },
+        } finally {
+          ownedAdapters.delete(retired);
+        }
+      }
+      state.addDiagnostic({
+        provider: "codex",
+        level: "error",
+        message: `Managed Codex runtime could not reconnect after ${String(event.attempts)} attempts: ${event.lastError}`,
       });
+    });
+    codexHookTrustStatus ??= (settingsPath, expectedCommand) => {
+      const activeAdapter = codexSupervisor?.adapter;
+      if (!activeAdapter) throw new Error("Managed Codex runtime is reconnecting");
+      return readCodexHookStatus(
+        activeAdapter.rpc,
+        [dirname(dirname(settingsPath))],
+        expectedCommand,
+      );
+    };
+    try {
+      const managedAdapter = await codexSupervisor.start();
+      publishCodexBridge(managedAdapter);
     } catch (error) {
       diagnostics.push({
         provider: "codex",
         level: "warning",
         message: `Managed Codex controls are unavailable: ${error instanceof Error ? error.message : "startup failed"}`,
       });
-      codexSupervisor = null;
     }
   }
 
-  try {
     const discovery = serverOptions.discovery === false
       ? false
       : {
@@ -226,7 +504,7 @@ export async function createAgentManagerServer(
                 }),
           }) as WorkerPort),
         };
-    return await createRawServer({
+    const backend = await createRawServer({
       ...serverOptions,
       state,
       activityHub,
@@ -237,29 +515,117 @@ export async function createAgentManagerServer(
       transcriptReader,
       databasePath: serverOptions.databasePath ?? paths.databasePath,
       controlSocketPath,
+      ...(codexSupervisor
+        ? { codexSharedSocketPath: codexSupervisor.socketPath }
+        : {}),
       staticDir: serverOptions.staticDir ?? paths.staticDirectory,
       initialDiagnostics: diagnostics,
       discovery,
+      ensureManagedProvider: async (provider) => {
+        await serverOptions.ensureManagedProvider?.(provider);
+        if (provider !== "codex" || !codexSupervisor) return;
+        const managedAdapter = await codexSupervisor.ensureRunning();
+        if (activeCodexBridge && adapters.codex === activeCodexBridge) return;
+        publishCodexBridge(managedAdapter);
+      },
       ...(codexHookTrustStatus ? { codexHookTrustStatus } : {}),
       onShutdown: async () => {
-        await codexSupervisor?.stop();
-        await serverOptions.onShutdown?.();
+        const errors: unknown[] = [];
+        try {
+          const tasks: Promise<unknown>[] = [];
+          if (codexSupervisor) {
+            // This supervisor owns only the private app-server child. Codex
+            // threads remain shared and external Codex CLIs are never killed.
+            tasks.push(boundedShutdown(
+              Promise.resolve().then(() => codexSupervisor?.stop()),
+              shutdownCallbackTimeoutMs,
+              "managed Codex shutdown",
+            ));
+          }
+          if (serverOptions.onShutdown) {
+            tasks.push(boundedShutdown(
+              Promise.resolve().then(() => serverOptions.onShutdown?.()),
+              shutdownCallbackTimeoutMs,
+              "user shutdown callback",
+            ));
+          }
+          const results = await Promise.allSettled(tasks);
+          for (const result of results) {
+            if (result.status === "rejected") errors.push(result.reason);
+          }
+        } finally {
+          try {
+            await releaseInstanceLease();
+          } catch (error) {
+            errors.push(error);
+          }
+        }
+        if (errors.length > 0) {
+          throw new AggregateError(errors, "composed runtime shutdown was incomplete");
+        }
       },
     });
+    backendForRecovery = backend;
+    const rawListen = backend.listen.bind(backend);
+    backend.listen = async () => {
+      try {
+        return await rawListen();
+      } catch (error) {
+        await releaseInstanceLease().catch(() => undefined);
+        throw error;
+      }
+    };
+    const rawClose = backend.close.bind(backend);
+    backend.close = async () => {
+      try {
+        await rawClose();
+      } finally {
+        // The raw cleanup can fail before reaching onShutdown (for example, a
+        // synchronously throwing embedder adapter). Never strand the lease.
+        await releaseInstanceLease();
+      }
+    };
+    return backend;
   } catch (error) {
-    await codexSupervisor?.stop().catch(() => undefined);
-    activityHub.dispose();
-    database.close();
+    try {
+      const cleanupTasks = [...ownedAdapters].map((adapter) => boundedShutdown(
+        Promise.resolve().then(() => adapter.dispose?.()),
+        shutdownCallbackTimeoutMs,
+        "provider startup cleanup",
+      ));
+      if (codexSupervisor) {
+        cleanupTasks.push(boundedShutdown(
+          Promise.resolve().then(() => codexSupervisor?.stop()),
+          shutdownCallbackTimeoutMs,
+          "managed Codex startup cleanup",
+        ));
+      }
+      await Promise.allSettled(cleanupTasks);
+      try {
+        activityHubForCleanup?.dispose();
+      } catch {
+        // Preserve the startup failure while still releasing durable resources.
+      }
+      try {
+        databaseForCleanup?.close();
+      } catch {
+        // Preserve the startup failure while still releasing the owner lease.
+      }
+    } finally {
+      await releaseInstanceLease().catch(() => undefined);
+    }
     throw error;
   }
 }
 
 async function runStandalone(): Promise<void> {
-  const backend = await createAgentManagerServer();
-  const address = await backend.listen();
-  process.stdout.write(`Agent Manager listening at ${address}\n`);
-  process.stdout.write("Run `agent-manager open` to issue a one-time browser link.\n");
+  let backend: AgentManagerBackend | null = null;
+  let shutdownRequested = false;
+  let closing = false;
   const shutdown = (): void => {
+    shutdownRequested = true;
+    if (!backend || closing) return;
+    closing = true;
     void backend.close().then(
       () => process.exit(0),
       () => process.exit(1),
@@ -267,6 +633,21 @@ async function runStandalone(): Promise<void> {
   };
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
+  try {
+    backend = await createAgentManagerServer();
+    if (shutdownRequested) {
+      await backend.close();
+      return;
+    }
+    const address = await backend.listen();
+    process.stdout.write(`Agent Manager listening at ${address}\n`);
+    process.stdout.write("Run `agent-manager open` to issue a one-time browser link.\n");
+  } catch (error) {
+    process.off("SIGINT", shutdown);
+    process.off("SIGTERM", shutdown);
+    await backend?.close().catch(() => undefined);
+    throw error;
+  }
 }
 
 const entrypoint = process.argv[1]

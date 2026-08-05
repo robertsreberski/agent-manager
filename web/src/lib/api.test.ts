@@ -1,6 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { providerControlCoordination } from "../../../src/shared/session.ts";
 import { AGENT_MANAGER_BUILD_ID, WireUpgradeRequiredError, WIRE_SCHEMA_VERSION } from "../../../src/shared/wire.ts";
 import { ApiError, CockpitApi } from "./api";
+
+const observeOnlyCoordination = {
+  mode: "observe-only",
+  nativeAttach: "none",
+  responseResolution: "single-controller",
+} as const;
 
 function sessionRecord() {
   return {
@@ -60,6 +67,8 @@ function sessionRecord() {
     control: {
       plane: "codex-private",
       authority: "manager",
+      coordination: providerControlCoordination("codex"),
+      recovery: null,
       capabilities: ["queue", "set-profile"],
       withheld: [],
       takeover: null,
@@ -74,6 +83,40 @@ afterEach(() => {
 });
 
 describe("CockpitApi", () => {
+  it("applies a confirmed setup-hook preview with CSRF and validates the result", async () => {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => new Response(JSON.stringify({
+      provider: "claude",
+      outcome: "applied",
+      hook: {
+        provider: "claude",
+        state: "installed-unseen",
+        settingsPath: "/Users/me/.claude/settings.json",
+        command: "agent-manager hooks install --provider claude --scope user",
+        changed: false,
+        diff: "",
+        notice: null,
+        previewId: null,
+        expiresAt: null,
+      },
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    const api = new CockpitApi({ csrfToken: "csrf-token", actor: "Local" });
+
+    const result = await api.applySetupHook("claude", "11111111-1111-4111-8111-111111111111");
+
+    expect(result.outcome).toBe("applied");
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const [path, init] = fetchMock.mock.calls[0]!;
+    expect(String(path)).toBe("/api/v1/setup/hooks/apply");
+    expect(init?.method).toBe("POST");
+    expect(new Headers(init?.headers).get("x-csrf-token")).toBe("csrf-token");
+    expect(JSON.parse(String(init?.body))).toEqual({
+      provider: "claude",
+      previewId: "11111111-1111-4111-8111-111111111111",
+      confirmed: true,
+    });
+  });
+
   it("reads strict cursor-paginated archived sessions as read-only records", async () => {
     let requested = "";
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
@@ -88,7 +131,15 @@ describe("CockpitApi", () => {
           presence: "recent",
           status: "completed",
           providerStatus: "archived",
-          control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [], takeover: null },
+          control: {
+            plane: "observe-only",
+            authority: "none",
+            coordination: observeOnlyCoordination,
+            recovery: null,
+            capabilities: [],
+            withheld: [],
+            takeover: null,
+          },
         }],
         nextCursor: "next-page",
         total: 51,
@@ -118,7 +169,15 @@ describe("CockpitApi", () => {
           presence: "recent",
           status: "completed",
           providerStatus: "archived",
-          control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [], takeover: null },
+          control: {
+            plane: "observe-only",
+            authority: "none",
+            coordination: observeOnlyCoordination,
+            recovery: null,
+            capabilities: [],
+            withheld: [],
+            takeover: null,
+          },
         },
       }), { status: 200, headers: { "content-type": "application/json" } }),
       new Response(JSON.stringify({ error: { message: "missing" } }), { status: 404, headers: { "content-type": "application/json" } }),
@@ -138,6 +197,7 @@ describe("CockpitApi", () => {
         cwd: "/tmp/work tree",
         warning: null,
       },
+      requiresHandoff: false,
     }), { status: 200, headers: { "content-type": "application/json" } })));
     const api = new CockpitApi({ csrfToken: "csrf", actor: "Local" });
 
@@ -164,6 +224,7 @@ describe("CockpitApi", () => {
         cwd: null,
         warning: "Run from a terminal with SSH access to Build host.",
       },
+      requiresHandoff: true,
     }), { status: 200, headers: { "content-type": "application/json" } })));
     const api = new CockpitApi({ csrfToken: "csrf", actor: "Local" });
 
@@ -174,6 +235,24 @@ describe("CockpitApi", () => {
       requiresHandoff: true,
       cwd: null,
     }));
+  });
+
+  it("keeps a manager CLI wrapper shared when the server says it joins Codex", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+      instruction: {
+        kind: "manager-cli",
+        argv: ["agent-manager", "attach", "local:codex:thread-1"],
+        cwd: "/workspace",
+        warning: "Join the shared Codex server.",
+      },
+      requiresHandoff: false,
+    }), { status: 200, headers: { "content-type": "application/json" } })));
+    const api = new CockpitApi({ csrfToken: "csrf", actor: "Local" });
+
+    await expect(api.attach("local:codex:thread-1")).resolves.toMatchObject({
+      kind: "manager-cli",
+      requiresHandoff: false,
+    });
   });
 
   it("sends the CSRF and control-lease tokens on semantic actions", async () => {
@@ -663,6 +742,62 @@ describe("CockpitApi", () => {
     expect(captured?.body).toEqual(expect.objectContaining({ profile: "full-access" }));
     expect(captured?.body).not.toHaveProperty("mode");
     expect(captured?.body).not.toHaveProperty("accessMode");
+  });
+
+  it("registers and removes an SSH host through authenticated web mutations", async () => {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        return new Response(JSON.stringify({
+          host: {
+            id: "build/one",
+            label: "Build host",
+            kind: "ssh",
+            sshTarget: "dev@build.example",
+            status: "connecting",
+            statusMessage: "Checking SSH access…",
+          },
+        }), { status: 201, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ removed: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const api = new CockpitApi({ csrfToken: "csrf-host", actor: "Local" });
+
+    await expect(api.addHost("Build host", "dev@build.example")).resolves.toEqual({
+      id: "build/one",
+      label: "Build host",
+      kind: "ssh",
+      sshTarget: "dev@build.example",
+      status: "connecting",
+      statusMessage: "Checking SSH access…",
+    });
+    await expect(api.removeHost("build/one")).resolves.toBeUndefined();
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/v1/hosts", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({ label: "Build host", target: "dev@build.example" }),
+    }));
+    expect(new Headers(fetchMock.mock.calls[0]?.[1]?.headers).get("x-csrf-token")).toBe("csrf-host");
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/v1/hosts/build%2Fone", expect.objectContaining({
+      method: "DELETE",
+    }));
+    expect(new Headers(fetchMock.mock.calls[1]?.[1]?.headers).get("x-csrf-token")).toBe("csrf-host");
+  });
+
+  it("rejects a host removal response that does not confirm removal", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ removed: false }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    })));
+    const api = new CockpitApi({ csrfToken: "csrf", actor: "Local" });
+
+    await expect(api.removeHost("build-host")).rejects.toMatchObject({
+      message: "The server returned an invalid removed host response.",
+      status: 502,
+    });
   });
 
   it("accepts the exact resolved-workspace envelope and requests path completion on that host", async () => {

@@ -1,6 +1,10 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ActivityFrame, ActivityMessageItem } from "../types";
+import {
+  WIRE_SCHEMA_VERSION,
+  type ActivityFrame,
+  type ActivityMessageItem,
+} from "../types";
 import { encodeActivityCursor } from "../lib/session-activity";
 import { useSessionActivity } from "./use-session-activity";
 
@@ -9,7 +13,7 @@ const EPOCH = "epoch-1";
 
 function message(overrides: Partial<ActivityMessageItem> = {}): ActivityMessageItem {
   return {
-    schemaVersion: 4,
+    schemaVersion: WIRE_SCHEMA_VERSION,
     id: "message-1",
     sessionId: SESSION_ID,
     provider: "codex",
@@ -37,7 +41,7 @@ function message(overrides: Partial<ActivityMessageItem> = {}): ActivityMessageI
 
 function frame(value: { type: ActivityFrame["type"]; seq: number; [key: string]: unknown }): ActivityFrame {
   return {
-    schemaVersion: 4,
+    schemaVersion: WIRE_SCHEMA_VERSION,
     streamEpoch: EPOCH,
     sessionId: SESSION_ID,
     provider: "codex",
@@ -133,7 +137,7 @@ describe("useSessionActivity", () => {
     expect(result.current.updateCount).toBe(2);
   });
 
-  it("retains activity while the browser reconnects and clears on a terminal auth failure", () => {
+  it("retains confirmed history while reconnecting and after a terminal stream failure", () => {
     const { result } = renderHook(() => useSessionActivity(SESSION_ID));
     const source = TestEventSource.instances[0]!;
     act(() => {
@@ -161,7 +165,58 @@ describe("useSessionActivity", () => {
       source.readyState = TestEventSource.CLOSED;
       source.onerror?.(new Event("error"));
     });
-    expect(result.current).toMatchObject({ connection: "offline", streamEpoch: null, items: [] });
+    expect(result.current).toMatchObject({ connection: "offline", streamEpoch: EPOCH });
+    expect(result.current.items).toHaveLength(1);
+    expect(result.current.items[0]).toMatchObject({ text: "Streaming" });
+  });
+
+  it("explicitly retries a terminal stream without clearing confirmed history", () => {
+    const { result, rerender } = renderHook(
+      ({ retryGeneration }) => useSessionActivity(SESSION_ID, retryGeneration),
+      { initialProps: { retryGeneration: 0 } },
+    );
+    const first = TestEventSource.instances[0]!;
+    act(() => {
+      first.emit("activity.snapshot", frame({
+        type: "activity.snapshot",
+        seq: 1,
+        items: [message({ text: "Keep this transcript" })],
+        truncated: false,
+      }));
+      scheduled.values().next().value?.(16);
+      first.readyState = TestEventSource.CLOSED;
+      first.onerror?.(new Event("error"));
+    });
+    expect(result.current).toMatchObject({ connection: "offline" });
+    expect(result.current.items[0]).toMatchObject({ text: "Keep this transcript" });
+
+    rerender({ retryGeneration: 1 });
+
+    expect(first.close).toHaveBeenCalledOnce();
+    expect(TestEventSource.instances).toHaveLength(2);
+    expect(result.current).toMatchObject({ connection: "connecting", streamEpoch: EPOCH });
+    expect(result.current.items[0]).toMatchObject({ text: "Keep this transcript" });
+  });
+
+  it("stays in loading state after headers open until the initial snapshot is complete", () => {
+    const { result } = renderHook(() => useSessionActivity(SESSION_ID));
+    const source = TestEventSource.instances[0]!;
+    act(() => {
+      source.readyState = TestEventSource.OPEN;
+      source.onopen?.(new Event("open"));
+    });
+    expect(result.current.connection).toBe("connecting");
+
+    act(() => {
+      source.emit("activity.snapshot", frame({
+        type: "activity.snapshot",
+        seq: 1,
+        items: [],
+        truncated: false,
+      }));
+      scheduled.values().next().value?.(16);
+    });
+    expect(result.current.connection).toBe("open");
   });
 
   it("reconnects without a cursor when an append exposes a protocol gap", () => {
@@ -194,7 +249,8 @@ describe("useSessionActivity", () => {
 
     expect(source.close).toHaveBeenCalledOnce();
     expect(TestEventSource.instances).toHaveLength(2);
-    expect(result.current).toMatchObject({ connection: "connecting", streamEpoch: null, items: [] });
+    expect(result.current).toMatchObject({ connection: "connecting", streamEpoch: null });
+    expect(result.current.items[0]).toMatchObject({ text: "visible" });
   });
 
   it("closes and clears the old stream on deselect or session change", () => {

@@ -6,8 +6,8 @@ import test from "node:test";
 import { attachSpecFromInstruction, executeLifecycleAttach } from "./client.ts";
 
 const TRUSTED_EXECUTABLES = {
-  codex: "/trusted/bin/codex",
-  claude: "/trusted/bin/claude",
+  codex: "/trusted/lib/openai/codex.js",
+  claude: "/trusted/lib/anthropic/claude.exe",
   tmux: "/trusted/bin/tmux",
 } as const;
 
@@ -16,7 +16,7 @@ test("accepts only the closed Codex, Claude, and tmux attach grammars", () => {
     attachSpecFromInstruction({
       kind: "codex-remote",
       argv: [
-        "/opt/homebrew/bin/codex",
+        TRUSTED_EXECUTABLES.codex,
         "resume",
         "thread-1",
         "--remote",
@@ -26,7 +26,7 @@ test("accepts only the closed Codex, Claude, and tmux attach grammars", () => {
       warning: null,
     }, TRUSTED_EXECUTABLES),
     {
-      executable: "/trusted/bin/codex",
+      executable: TRUSTED_EXECUTABLES.codex,
       args: [
         "resume",
         "thread-1",
@@ -40,12 +40,12 @@ test("accepts only the closed Codex, Claude, and tmux attach grammars", () => {
   assert.deepEqual(
     attachSpecFromInstruction({
       kind: "claude-resume",
-      argv: ["/opt/homebrew/bin/claude", "--resume", "session-1"],
+      argv: [TRUSTED_EXECUTABLES.claude, "--resume", "session-1"],
       cwd: "/tmp/project",
       warning: "Manager ownership is handed off.",
     }, TRUSTED_EXECUTABLES),
     {
-      executable: "/trusted/bin/claude",
+      executable: TRUSTED_EXECUTABLES.claude,
       args: ["--resume", "session-1"],
       cwd: "/tmp/project",
     },
@@ -67,6 +67,15 @@ test("accepts only the closed Codex, Claude, and tmux attach grammars", () => {
 });
 
 test("refuses arbitrary executables, shell-shaped argv, and non-Unix Codex remotes", () => {
+  assert.throws(
+    () => attachSpecFromInstruction({
+      kind: "codex-remote",
+      argv: ["/untrusted/bin/codex", "resume", "thread-1", "--remote", "unix:///tmp/codex.sock"],
+      cwd: "/tmp/project",
+      warning: null,
+    }, TRUSTED_EXECUTABLES),
+    /codex executable/,
+  );
   assert.throws(
     () => attachSpecFromInstruction({
       kind: "manager-cli",
@@ -126,7 +135,7 @@ test("refuses arbitrary executables, shell-shaped argv, and non-Unix Codex remot
 class FakeChild extends EventEmitter {
   pid: number | undefined = 4_242;
   readonly signals: NodeJS.Signals[] = [];
-  exitOnKill: NodeJS.Signals | null = "SIGKILL";
+  exitOnKill: NodeJS.Signals | null = "SIGTERM";
 
   kill(signal: NodeJS.Signals = "SIGTERM"): boolean {
     this.signals.push(signal);
@@ -144,7 +153,7 @@ function fakeSpawner(child: FakeChild): typeof spawn {
   }) as typeof spawn;
 }
 
-test("kills and confirms the native child before reclaiming a failed started acknowledgement", async () => {
+test("sends one SIGTERM and confirms the native child before reclaiming a failed started acknowledgement", async () => {
   const child = new FakeChild();
   const events: string[] = [];
   child.once("exit", () => events.push("child-exited"));
@@ -166,14 +175,13 @@ test("kills and confirms the native child before reclaiming a failed started ack
       },
       {
         spawnProcess: fakeSpawner(child),
-        terminationGraceMs: 1,
-        killGraceMs: 10,
+        terminationGraceMs: 10,
       },
     ),
     /started acknowledgement failed/,
   );
 
-  assert.deepEqual(child.signals, ["SIGTERM", "SIGKILL"]);
+  assert.deepEqual(child.signals, ["SIGTERM"]);
   assert.deepEqual(events, ["started", "child-exited", "owner-failed"]);
 });
 
@@ -199,14 +207,71 @@ test("does not reclaim ownership when the child cannot be confirmed dead", async
       {
         spawnProcess: fakeSpawner(child),
         terminationGraceMs: 1,
-        killGraceMs: 1,
       },
     ),
-    /could not be safely reclaimed/,
+    (error: unknown) => {
+      assert.ok(error instanceof AggregateError);
+      assert.match(
+        error.message,
+        /cleanup is uncertain.*provider CLI may still be running.*ownership was not reclaimed/,
+      );
+      const cleanupError = error.errors.at(1);
+      assert.ok(cleanupError instanceof Error);
+      assert.match(
+        cleanupError.message,
+        /single permitted SIGTERM; cleanup is uncertain and ownership was not reclaimed/,
+      );
+      return true;
+    },
   );
 
-  assert.deepEqual(child.signals, ["SIGTERM", "SIGKILL"]);
+  assert.deepEqual(child.signals, ["SIGTERM"]);
   assert.equal(failedCalls, 0);
+});
+
+test("never retries or escalates when signalling the native child throws", async () => {
+  class ThrowingSignalChild extends FakeChild {
+    override kill(signal: NodeJS.Signals = "SIGTERM"): boolean {
+      this.signals.push(signal);
+      throw new Error("signal delivery failed");
+    }
+  }
+  const child = new ThrowingSignalChild();
+
+  await assert.rejects(
+    executeLifecycleAttach(
+      { executable: "/trusted/bin/claude", args: ["--resume", "session-1"] },
+      {
+        async started() {
+          throw new Error("owner socket dropped");
+        },
+        async exited() {
+          throw new Error("unexpected exited callback");
+        },
+        async failed() {
+          throw new Error("ownership must remain fail-closed");
+        },
+      },
+      {
+        spawnProcess: fakeSpawner(child),
+        terminationGraceMs: 1,
+      },
+    ),
+    (error: unknown) => {
+      assert.ok(error instanceof AggregateError);
+      assert.match(
+        error.message,
+        /cleanup is uncertain.*provider CLI may still be running.*ownership was not reclaimed/,
+      );
+      const cleanupError = error.errors.at(1);
+      assert.ok(cleanupError instanceof Error);
+      assert.match(cleanupError.message, /could not be signalled \(signal delivery failed\)/);
+      assert.match(cleanupError.message, /cleanup is uncertain/);
+      return true;
+    },
+  );
+
+  assert.deepEqual(child.signals, ["SIGTERM"]);
 });
 
 test("reports the native child lifecycle around an argv-only attach", async () => {

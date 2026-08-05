@@ -8,9 +8,9 @@ provider method is not a product capability until controller/security semantics 
 
 ## Codex 0.146
 
-### Shared app-server
+### Multi-client app-server
 
-Codex exposes a shared app-server daemon and multi-client protocol surfaces including bounded
+The pinned Codex app-server exposes multi-client protocol surfaces including bounded
 `thread/list`, `thread/read`, `thread/loaded/list`, subscription/unsubscription, turn start/steer/
 interrupt, server-to-client requests, and `serverRequest/resolved`. Thread metadata includes
 source kind, parent relationship, status, cwd, model/provider facts, and update time.
@@ -20,14 +20,29 @@ Important identity rule: `Thread.id` identifies one thread and is preserved as
 `parentThreadId` provides hierarchy. The app-stable distributed key is always
 `${hostId}:${provider}:${providerThreadId}` across local, remote, hook, and daemon discovery.
 
-The host inspected for this redesign has CLI `0.146.x` but a running daemon app-server
-`0.145.x`. That canonical daemon is unsupported and must remain untouched. Multi-client request
-routing and mid-life environment authority were not established by the isolated gate in spec
-02, so shared-daemon adoption is a NO-GO. “A second client can safely control an ordinary
-terminal session” is not a product fact.
+The pinned app-server supports more than one client on a thread. Agent Manager therefore treats
+its own `codex-private` server as a shared provider connection: its backend and native
+`codex resume <thread> --remote unix://<socket>` peers may remain active together. Execution
+environment notifications report peer presence; they do not identify a controlling writer and
+must not be used to revoke healthy thread capabilities.
 
-Agent Manager never connects to or manages the shared daemon lifecycle. The sole managed Codex
-plane is the isolated manager-owned private app-server runtime labeled `codex-private`.
+Server requests carry exact identities and publish `serverRequest/resolved`. That notification
+is the authoritative first-response-wins reconciliation surface when a cockpit client and a
+native peer see the same question or approval. A losing response becomes stale; it is not
+retried, converted, or shown as a second request.
+
+This result does not approve the user-global experimental daemon. The host inspected for this
+redesign has CLI `0.146.x` but a running global daemon app-server `0.145.x`. That endpoint is
+unsupported by the pinned integration and remains untouched. Agent Manager never connects to,
+trusts, upgrades, restarts, stops, repairs, mutates, or silently adopts it. The sole managed
+Codex plane remains the isolated manager-owned app-server labeled `codex-private`; multi-client
+support applies inside that trust boundary.
+
+A CLI already running on a different connection cannot be rebound in place. Exact
+process/provider/workspace identity plus one guided exit or separately confirmed single-SIGTERM
+stop is required before Agent Manager resumes that same thread on its private server. After that
+one-time migration, CLI and cockpit clients join as ordinary peers rather than transferring
+exclusive ownership back and forth.
 
 ### Settings and lifecycle
 
@@ -70,8 +85,11 @@ the manager owns. Steering remains gated by the exact SDK/CLI pins.
 
 An arbitrary interactive Claude terminal session has no local semantic queue/steer/control
 socket Agent Manager can join. Registry/Agent View, process/tmux facts, and transcripts provide
-discovery/observation; `--resume` would create another controller and is not adoption. Cloud
-Remote Control is not a local integration path.
+discovery/observation; running `--resume` while the original CLI remains alive would create a
+second controller and is not adoption. Cloud Remote Control is not a local integration path.
+Claude takeover is therefore exclusive: the original controller must exit first, the exact
+session/workspace identity must be revalidated, and only a successful SDK resume may enable
+manager writes. A native attach later is another handoff, not a concurrent peer join.
 
 A disposable probe verified that a `--bg` hook `session_id` matches the registry and
 `claude agents --json --all` session ID. That ID correlates hook events to discovery.
@@ -111,9 +129,19 @@ file.
 | Question | Contract |
 | --- | --- |
 | Can an ordinary Codex CLI session be seen? | Yes through a trusted command hook, otherwise bounded heuristic discovery. |
-| Can it be controlled through the shared daemon? | No. Spec 02 records the NO-GO; ordinary CLI sessions remain hook/observe-only. |
+| Can Codex CLI and web control the same conversation? | Yes after the thread is on Agent Manager's pinned private app-server. Native CLI joins it with the exact `--remote` command; first exact response wins. |
+| Can a standalone Codex process be adopted in place? | No. It exits once through the identity-checked guided or confirmed graceful migration, then the exact thread resumes on the private server. |
+| Does Agent Manager use the user-global experimental daemon? | No. The observed version-mismatched daemon and socket are never silently trusted or mutated. |
 | Can an ordinary Claude session be seen? | Yes through HTTP hooks plus bounded discovery/transcript fallback. |
-| Can external Claude be queued or steered? | No. Attach to the native interface. |
+| Can external Claude be queued or steered? | Only after an exclusive, identity-checked takeover succeeds; native and manager controllers never write concurrently. |
 | Can external Claude permissions be answered? | Only a live exact `PermissionRequest` held by the bridge. |
 | Can settings be changed? | Claude SDK methods where live; Codex next-turn overrides while idle. |
 | Does the cockpit own provider history? | No. It keeps one bounded volatile activity window and states the retention boundary. |
+
+Wire schema 5 makes the provider split explicit: managed Codex reports
+`shared / join / first-response-wins`, managed Claude reports
+`exclusive / handoff / single-controller`, and observation-only sessions report no native
+coordination. Bounded `reconnecting`, `waiting-for-native-exit`, `retrying`, and
+`needs-attention` states expose truthful ownership/timing/error facts. Native Claude ownership is
+a stable healthy wait without retry churn. `retry-control` appears only when a new safe attempt
+exists, and no recovery path replays a provider mutation.

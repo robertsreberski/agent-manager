@@ -1,10 +1,12 @@
 import {
   emptyChildSummary,
   observeOnlyControl,
+  providerControlCoordination,
   unknownEffort,
   unknownModel,
   unknownProfile,
   type Provider,
+  type SessionControl,
   type SessionRecord,
 } from "../core/types.ts";
 import { sessionRecordId } from "../shared/session.ts";
@@ -34,6 +36,24 @@ export function normalizedText(value: unknown): string | null {
 export function iso(value: number, fallback: number): string {
   const safe = Number.isFinite(value) && value > 0 ? value : fallback;
   return new Date(safe).toISOString();
+}
+
+/**
+ * An exact provider-indexed conversation may be resumed by Agent Manager even
+ * when no provider process is currently loaded. This is still a read-only
+ * projection: the server proves the provider-specific owner policy and commits
+ * adoption before publishing any manager write capabilities.
+ */
+export function observedResumeControl(provider: Provider): SessionControl {
+  return {
+    plane: "resume-only",
+    authority: "none",
+    coordination: providerControlCoordination(provider),
+    recovery: null,
+    capabilities: ["resume"],
+    withheld: [],
+    takeover: null,
+  };
 }
 
 export function baseRecord(

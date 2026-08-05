@@ -126,7 +126,7 @@ async function openActivityStream(
   return stream;
 }
 
-test("a full backend and provider restart re-adopts only the persisted private Codex identity", async () => {
+test("a full backend and provider restart restores exact Codex control and preserves failed history read-only", async () => {
   const root = mkdtempSync(join(tmpdir(), "agent-manager-codex-restart-"));
   const databasePath = join(root, "state.sqlite");
   const workspacePath = join(root, "workspace");
@@ -156,6 +156,8 @@ test("a full backend and provider restart re-adopts only the persisted private C
         model: null,
         effort: null,
         hostId: "local",
+        providerTreeId: "tree-restart",
+        providerParentThreadId: null,
       },
       createdAt: "2026-08-03T08:00:00.000Z",
       updatedAt: "2026-08-03T08:00:00.000Z",
@@ -172,9 +174,27 @@ test("a full backend and provider restart re-adopts only the persisted private C
         model: null,
         effort: null,
         hostId: "local",
+        providerTreeId: "tree-missing",
+        providerParentThreadId: null,
       },
       createdAt: "2026-08-03T08:05:00.000Z",
       updatedAt: "2026-08-03T08:05:00.000Z",
+    });
+    firstDatabase.upsertManagedSession({
+      id: "local:codex:legacy-without-baseline",
+      provider: "codex",
+      providerSessionId: "legacy-without-baseline",
+      workspaceId: "workspace-restart",
+      metadata: {
+        managerRequestId: "manager-request-legacy",
+        name: "Legacy managed conversation",
+        profile: "plan",
+        model: null,
+        effort: null,
+        hostId: "local",
+      },
+      createdAt: "2026-08-03T08:06:00.000Z",
+      updatedAt: "2026-08-03T08:06:00.000Z",
     });
     await firstBackend.close();
 
@@ -200,7 +220,23 @@ test("a full backend and provider restart re-adopts only the persisted private C
     transport.handlers.set("thread/list", () => {
       throw new Error("thread/list must not run during managed recovery");
     });
-    transport.handlers.set("thread/read", thread);
+    transport.handlers.set("thread/read", (params) => {
+      if (params.threadId === "missing-after-offline-delete") {
+        return thread();
+      }
+      if (params.threadId === "legacy-without-baseline") {
+        return {
+          ...thread(),
+          thread: {
+            ...(thread().thread as JsonObject),
+            id: "legacy-without-baseline",
+            sessionId: "legacy-provider-tree",
+            name: "Legacy provider conversation",
+          },
+        } satisfies JsonObject;
+      }
+      return thread();
+    });
     transport.handlers.set("thread/resume", thread);
     transport.handlers.set("turn/start", () => ({
       turn: { id: "turn-after-restart", status: "inProgress", items: [] },
@@ -228,6 +264,7 @@ test("a full backend and provider restart re-adopts only the persisted private C
         activityHub.ingest(managerSessionId, "codex", mutation);
       },
     });
+    let providerEnsureCalls = 0;
     const backend = await createAgentManagerServer({
       host: "127.0.0.1",
       port: 0,
@@ -237,6 +274,10 @@ test("a full backend and provider restart re-adopts only the persisted private C
       state,
       activityHub,
       adapters: { codex: bridge },
+      ensureManagedProvider: (provider) => {
+        assert.equal(provider, "codex");
+        providerEnsureCalls += 1;
+      },
       discovery: false,
       staticDir: false,
       editorLauncher: false,
@@ -244,6 +285,12 @@ test("a full backend and provider restart re-adopts only the persisted private C
     const streams = new Set<IncomingMessage>();
     try {
       const address = new URL(await backend.listen());
+      await waitFor(() => {
+        const session = backend.state.get("local:codex:thread-restart");
+        assert.ok(session);
+        assert.equal(session.control.recovery, null);
+        assert.equal(session.providerTreeId, "tree-restart");
+      }, "persisted Codex control to recover in the background");
       const recovered = backend.state.get("local:codex:thread-restart");
       assert.ok(recovered);
       assert.equal(recovered.name, "Restored manager name");
@@ -252,10 +299,24 @@ test("a full backend and provider restart re-adopts only the persisted private C
       assert.equal(recovered.control.plane, "codex-private");
       assert.equal(recovered.control.authority, "manager");
       assert.equal(backend.state.get("local:codex:official-cli-thread"), null);
-      assert.equal(backend.state.get("local:codex:missing-after-offline-delete"), null);
+      const unavailable = backend.state.get("local:codex:missing-after-offline-delete");
+      assert.ok(unavailable);
+      assert.equal(unavailable.source, "managed-recovery");
+      assert.equal(unavailable.control.recovery?.state, "retrying");
+      assert.deepEqual(unavailable.control.capabilities, ["retry-control"]);
+      await waitFor(() => {
+        const legacy = backend.state.get("local:codex:legacy-without-baseline");
+        assert.ok(legacy);
+        assert.notEqual(legacy.control.recovery?.state, "reconnecting");
+        assert.match(legacy.control.recovery?.error ?? "", /identity baseline is missing or invalid/u);
+        assert.match(legacy.control.recovery?.error ?? "", /Use Resume here/u);
+        assert.equal(legacy.control.plane, "resume-only");
+        assert.deepEqual(legacy.control.capabilities, ["resume"]);
+      }, "pre-cutover Codex identity to fail closed with re-adoption guidance");
       assert.deepEqual(
         database.listManagedSessions().map((record) => record.id).sort(),
         [
+          "local:codex:legacy-without-baseline",
           "local:codex:missing-after-offline-delete",
           "local:codex:thread-restart",
         ],
@@ -265,16 +326,50 @@ test("a full backend and provider restart re-adopts only the persisted private C
         "initialized",
         "thread/read",
         "thread/read",
+        "thread/read",
+        "thread/resume",
       ]);
 
       const headers = await authenticatedHeaders(backend);
-      const unloadedLease = await backend.app.inject({
+      const unavailableBeforeRetry = backend.state.get(
+        "local:codex:missing-after-offline-delete",
+      );
+      assert.ok(unavailableBeforeRetry);
+      const unavailableLeaseResponse = await backend.app.inject({
+        method: "POST",
+        url: "/api/v1/sessions/local:codex:missing-after-offline-delete/control-lease",
+        headers,
+        payload: { clientId: "restart-unavailable-browser" },
+      });
+      assert.equal(unavailableLeaseResponse.statusCode, 200, unavailableLeaseResponse.body);
+      const unavailableLease = unavailableLeaseResponse.json<{
+        lease: { token: string };
+      }>().lease;
+      const retryResponse = await backend.app.inject({
+        method: "POST",
+        url: "/api/v1/sessions/local:codex:missing-after-offline-delete/actions",
+        headers: { ...headers, "x-control-lease": unavailableLease.token },
+        payload: {
+          type: "retry-control",
+          expectedGeneration: unavailableBeforeRetry.generation,
+          idempotencyKey: "manual-runtime-before-session-retry",
+        },
+      });
+      assert.equal(retryResponse.statusCode, 200, retryResponse.body);
+      assert.equal(
+        retryResponse.json<{ action: { status: string } }>().action.status,
+        "succeeded",
+      );
+      assert.equal(providerEnsureCalls, 1);
+
+      const recoveredLease = await backend.app.inject({
         method: "POST",
         url: "/api/v1/sessions/local:codex:thread-restart/control-lease",
         headers,
         payload: { clientId: "restart-browser" },
       });
-      assert.equal(unloadedLease.statusCode, 409, unloadedLease.body);
+      assert.equal(recoveredLease.statusCode, 200, recoveredLease.body);
+      const lease = recoveredLease.json<{ lease: { token: string } }>().lease;
       assert.equal(transport.methods.includes("turn/start"), false);
 
       const firstSelection = await openActivityStream(address, headers.cookie, "restart-tab-one");
@@ -286,14 +381,6 @@ test("a full backend and provider restart re-adopts only the persisted private C
       const selected = backend.state.get("local:codex:thread-restart");
       assert.ok(selected);
       assert.ok(selected.control.capabilities.includes("queue"));
-      const leaseResponse = await backend.app.inject({
-        method: "POST",
-        url: "/api/v1/sessions/local:codex:thread-restart/control-lease",
-        headers,
-        payload: { clientId: "restart-browser" },
-      });
-      assert.equal(leaseResponse.statusCode, 200, leaseResponse.body);
-      const lease = leaseResponse.json<{ lease: { token: string } }>().lease;
       const actionHeaders = { ...headers, "x-control-lease": lease.token };
       const sendResponse = await backend.app.inject({
         method: "POST",
@@ -316,19 +403,18 @@ test("a full backend and provider restart re-adopts only the persisted private C
       assert.equal(transport.methods.filter((method) => method === "thread/unsubscribe").length, 0);
       secondSelection.destroy();
       streams.delete(secondSelection);
-      await waitFor(() => {
-        assert.equal(
-          transport.methods.filter((method) => method === "thread/unsubscribe").length,
-          1,
-        );
-      }, "last selected Codex client to release its native subscription");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(
+        transport.methods.filter((method) => method === "thread/unsubscribe").length,
+        0,
+      );
       const deselected = backend.state.get("local:codex:thread-restart");
       assert.ok(deselected);
-      assert.deepEqual(deselected.control.capabilities, []);
+      assert.ok(deselected.control.capabilities.includes("queue"));
 
       const thirdSelection = await openActivityStream(address, headers.cookie, "restart-tab-three");
       streams.add(thirdSelection);
-      assert.equal(transport.methods.filter((method) => method === "thread/resume").length, 2);
+      assert.equal(transport.methods.filter((method) => method === "thread/resume").length, 1);
 
       const active = backend.state.get("local:codex:thread-restart");
       assert.ok(active);
@@ -346,7 +432,10 @@ test("a full backend and provider restart re-adopts only the persisted private C
       assert.equal(backend.state.get("local:codex:thread-restart"), null);
       assert.deepEqual(
         database.listManagedSessions().map((record) => record.id),
-        ["local:codex:missing-after-offline-delete"],
+        [
+          "local:codex:missing-after-offline-delete",
+          "local:codex:legacy-without-baseline",
+        ],
       );
       thirdSelection.destroy();
       streams.delete(thirdSelection);
@@ -358,6 +447,108 @@ test("a full backend and provider restart re-adopts only the persisted private C
       await adapter.dispose();
     }
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("restart recovery rejects provider-consistent tree and parent drift from the durable baseline", async () => {
+  const root = mkdtempSync(join(tmpdir(), "agent-manager-codex-lineage-drift-"));
+  const databasePath = join(root, "state.sqlite");
+  const workspacePath = join(root, "workspace");
+  mkdirSync(workspacePath);
+  let backend: Awaited<ReturnType<typeof createAgentManagerServer>> | null = null;
+  let adapter: CodexManagedAdapter | null = null;
+  try {
+    let database = new ManagerDatabase(databasePath);
+    database.addWorkspace({
+      id: "workspace-lineage",
+      label: "Lineage workspace",
+      path: workspacePath,
+    });
+    database.upsertManagedSession({
+      id: "local:codex:thread-lineage",
+      provider: "codex",
+      providerSessionId: "thread-lineage",
+      workspaceId: "workspace-lineage",
+      metadata: {
+        name: "Persisted lineage",
+        profile: "execute",
+        model: null,
+        effort: null,
+        hostId: "local",
+        ownership: "shared",
+        providerTreeId: "tree-before-restart",
+        providerParentThreadId: "parent-before-restart",
+      },
+      createdAt: "2026-08-03T08:00:00.000Z",
+      updatedAt: "2026-08-03T08:00:00.000Z",
+    });
+    database.close();
+
+    database = new ManagerDatabase(databasePath);
+    const state = new SessionStateStore();
+    const transport = new RestartTransport();
+    const drifted = () => ({
+      cwd: workspacePath,
+      model: "gpt-5.6",
+      reasoningEffort: "high",
+      thread: {
+        id: "thread-lineage",
+        sessionId: "tree-after-restart",
+        parentThreadId: "parent-after-restart",
+        cwd: workspacePath,
+        name: "Provider lineage",
+        source: "agent-manager",
+        status: { type: "idle" },
+        turns: [],
+      },
+    }) satisfies JsonObject;
+    transport.handlers.set("thread/read", drifted);
+    transport.handlers.set("thread/resume", drifted);
+    transport.handlers.set("thread/unsubscribe", () => ({}));
+    adapter = new CodexManagedAdapter({
+      transport,
+      socketPath: join(root, "codex.sock"),
+    });
+    await adapter.initialize();
+    const bridge = new CodexProviderBridge({
+      adapter,
+      resolveWorkspace: (workspaceId) => database.getWorkspace(workspaceId)?.path ?? null,
+      onSessionChanged: (session) => state.upsert(session),
+    });
+    backend = await createAgentManagerServer({
+      host: "127.0.0.1",
+      port: 0,
+      database,
+      state,
+      adapters: { codex: bridge },
+      discovery: false,
+      staticDir: false,
+      editorLauncher: false,
+    });
+    await backend.listen();
+
+    await waitFor(() => {
+      const rejected = backend?.state.get("local:codex:thread-lineage");
+      assert.ok(rejected);
+      assert.notEqual(rejected.control.recovery?.state, "reconnecting");
+      assert.match(
+        rejected.control.recovery?.error ?? "",
+        /changed the persisted thread tree or parent identity/u,
+      );
+      assert.deepEqual(rejected.control.capabilities, ["retry-control"]);
+      assert.equal(rejected.control.capabilities.includes("queue"), false);
+    }, "persisted Codex lineage drift to fail closed");
+    assert.equal(transport.methods.includes("thread/resume"), false);
+    const retained = database.listManagedSessions().find(
+      (record) => record.id === "local:codex:thread-lineage",
+    );
+    assert.ok(retained, "the failed identity and its history pointer must remain durable");
+    assert.equal(retained.metadata.providerTreeId, "tree-before-restart");
+    assert.equal(retained.metadata.providerParentThreadId, "parent-before-restart");
+  } finally {
+    await backend?.close().catch(() => undefined);
+    await adapter?.dispose().catch(() => undefined);
     rmSync(root, { recursive: true, force: true });
   }
 });

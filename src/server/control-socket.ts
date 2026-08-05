@@ -1,5 +1,5 @@
 import { chmodSync, lstatSync, mkdirSync, unlinkSync, type Stats } from "node:fs";
-import { createConnection, createServer, type Server } from "node:net";
+import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname } from "node:path";
 
 import type { AuthManager } from "./auth.ts";
@@ -8,6 +8,30 @@ import type { AttachInstruction } from "./contracts.ts";
 const MAX_REQUEST_BYTES = 1_024;
 const DIRECTORY_MODE = 0o700;
 const SOCKET_MODE = 0o600;
+const ORDINARY_REQUEST_TIMEOUT_MS = 2_000;
+// Native attach preparation has its own 30-second provider deadline. Leave
+// enough transport margin for that deadline to settle and serialize a reply.
+const ATTACH_PREPARATION_TIMEOUT_MS = 35_000;
+// A started acknowledgement can perform two independent five-second identity
+// scans before it commits native ownership. Keep real transport margin around
+// both scans; timing out the wrapper while the owner is still validating would
+// create an avoidable uncertain-cleanup state. Pre-spawn authorization stays
+// on the ordinary short deadline.
+const ATTACH_LIFECYCLE_TIMEOUT_MS = 15_000;
+const instanceLeaseSockets = new WeakMap<Server, Set<Socket>>();
+const instanceLeaseClosures = new WeakMap<Server, Promise<void>>();
+
+function requestTimeoutMs(command: unknown): number {
+  if (command === "attach") return ATTACH_PREPARATION_TIMEOUT_MS;
+  if (
+    command === "attach-started"
+    || command === "attach-exited"
+    || command === "attach-failed"
+  ) {
+    return ATTACH_LIFECYCLE_TIMEOUT_MS;
+  }
+  return ORDINARY_REQUEST_TIMEOUT_MS;
+}
 
 export interface BootstrapTokenReply {
   secret: string;
@@ -116,24 +140,160 @@ function removeSocketIfPresent(path: string, expected: Stats, uid: number): void
   }
 }
 
-function socketIsActive(path: string): Promise<boolean> {
+export type OwnerSocketProbeResult = "live" | "dead" | "missing" | "inconclusive";
+
+function probeErrorResult(error: unknown): OwnerSocketProbeResult {
+  const code = (error as NodeJS.ErrnoException).code;
+  if (code === "ECONNREFUSED") return "dead";
+  if (code === "ENOENT") return "missing";
+  return "inconclusive";
+}
+
+export function probeOwnerSocket(
+  path: string,
+  connect: (socketPath: string) => Socket = createConnection,
+): Promise<OwnerSocketProbeResult> {
   return new Promise((resolve) => {
-    const socket = createConnection(path);
-    const timer = setTimeout(() => {
+    let socket: Socket;
+    try {
+      socket = connect(path);
+    } catch (error) {
+      resolve(probeErrorResult(error));
+      return;
+    }
+
+    let settled = false;
+    const finish = (result: OwnerSocketProbeResult): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.removeListener("connect", onConnect);
+      socket.removeListener("error", onError);
       socket.destroy();
-      resolve(false);
-    }, 250);
+      resolve(result);
+    };
+    const onConnect = (): void => finish("live");
+    const onError = (error: Error): void => finish(probeErrorResult(error));
+    const timer = setTimeout(() => finish("inconclusive"), 250);
     timer.unref();
-    socket.once("connect", () => {
-      clearTimeout(timer);
-      socket.end();
-      resolve(true);
-    });
-    socket.once("error", () => {
-      clearTimeout(timer);
-      resolve(false);
-    });
+    socket.once("connect", onConnect);
+    socket.once("error", onError);
   });
+}
+
+async function removeStaleOwnerSocket(
+  path: string,
+  existing: Stats,
+  uid: number,
+  activeMessage: string,
+): Promise<void> {
+  const result = await probeOwnerSocket(path);
+  if (result === "live") throw new Error(activeMessage);
+  if (result === "inconclusive") {
+    throw new Error(`could not safely determine owner socket liveness: ${path}`);
+  }
+  if (result === "dead") removeSocketIfPresent(path, existing, uid);
+}
+
+/**
+ * Atomically claims one runtime directory before any provider process is
+ * started. The listening socket itself is the lease: kernel bind arbitration
+ * chooses exactly one owner, and an active owner is never unlinked.
+ *
+ * This is deliberately separate from the authenticated control socket. The
+ * latter is assembled by the HTTP server and therefore cannot protect the
+ * provider-construction boundary.
+ */
+export async function startOwnerInstanceLease(path: string): Promise<Server> {
+  const uid = currentUid();
+  ensureOwnerRuntimeDirectory(dirname(path), uid);
+  try {
+    const existing = lstatSync(path);
+    if (!existing.isSocket() || existing.isSymbolicLink()) {
+      throw new Error(`refusing to replace non-socket owner lease path: ${path}`);
+    }
+    if (existing.uid !== uid || permissions(existing) !== SOCKET_MODE) {
+      throw new Error(`refusing unsafe existing owner lease socket: ${path}`);
+    }
+    await removeStaleOwnerSocket(
+      path,
+      existing,
+      uid,
+      `another Agent Manager already owns this runtime: ${path}`,
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+
+  const startedAt = new Date(Date.now() - Math.floor(process.uptime() * 1_000)).toISOString();
+  const identity = JSON.stringify({ pid: process.pid, uid, startedAt });
+  const sockets = new Set<Socket>();
+  const server = createServer((socket: Socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+    socket.setTimeout(1_000, () => socket.destroy());
+    socket.end(`${identity}\n`);
+  });
+  instanceLeaseSockets.set(server, sockets);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(path, () => {
+        server.off("error", reject);
+        resolve();
+      });
+    });
+    chmodSync(path, SOCKET_MODE);
+    const leaseIdentity = assertOwnerControlSocket(path, uid);
+    server.once("close", () => {
+      try {
+        const current = lstatSync(path);
+        if (current.isSocket() && current.uid === uid && sameFile(current, leaseIdentity)) {
+          unlinkSync(path);
+        }
+      } catch {
+        // A replaced or already-removed path must not make shutdown fail.
+      }
+    });
+    return server;
+  } catch (error) {
+    try {
+      server.close();
+    } catch {
+      // Binding may not have completed.
+    }
+    throw error;
+  }
+}
+
+/**
+ * Releases the kernel-owned instance lease and its short-lived identity probes.
+ * This never touches provider or attach processes: the tracked sockets belong
+ * only to the instance-ownership listener created above.
+ */
+export function closeOwnerInstanceLease(server: Server): Promise<void> {
+  const existing = instanceLeaseClosures.get(server);
+  if (existing) return existing;
+
+  const closing = new Promise<void>((resolve, reject) => {
+    try {
+      server.close((error) => {
+        if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") {
+          reject(error);
+          return;
+        }
+        resolve();
+      });
+      // A peer can stop reading after connecting. Destroy only lease-probe
+      // sockets so that such a peer cannot prolong manager shutdown.
+      for (const socket of instanceLeaseSockets.get(server) ?? []) socket.destroy();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ERR_SERVER_NOT_RUNNING") resolve();
+      else reject(error);
+    }
+  });
+  instanceLeaseClosures.set(server, closing);
+  return closing;
 }
 
 export async function startOwnerControlSocket(
@@ -150,14 +310,20 @@ export async function startOwnerControlSocket(
     if (existing.uid !== uid || permissions(existing) !== SOCKET_MODE) {
       throw new Error(`refusing unsafe existing owner control socket: ${path}`);
     }
-    if (await socketIsActive(path)) throw new Error(`owner control socket is already active: ${path}`);
-    removeSocketIfPresent(path, existing, uid);
+    await removeStaleOwnerSocket(
+      path,
+      existing,
+      uid,
+      `owner control socket is already active: ${path}`,
+    );
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
   const server = createServer((socket) => {
     let input = Buffer.alloc(0);
-    socket.setTimeout(2_000, () => socket.destroy());
+    // Keep unauthenticated request ingress short. Once a complete command is
+    // parsed, align the server-side deadline with that command's bounded work.
+    socket.setTimeout(ORDINARY_REQUEST_TIMEOUT_MS, () => socket.destroy());
     socket.on("data", (chunk: Buffer) => {
       input = Buffer.concat([input, chunk]);
       if (input.length > MAX_REQUEST_BYTES) {
@@ -168,6 +334,7 @@ export async function startOwnerControlSocket(
       if (newline < 0) return;
       try {
         const request = JSON.parse(input.subarray(0, newline).toString("utf8")) as Record<string, unknown>;
+        socket.setTimeout(requestTimeoutMs(request.command));
         if (request.command === "issue-bootstrap") {
           const issued = handlers.auth.issueBootstrapToken();
           socket.end(`${JSON.stringify({
@@ -402,7 +569,10 @@ function requestOwnerControlSocket<T>(path: string, request: Record<string, unkn
     const socket = createConnection(path);
     let response = Buffer.alloc(0);
     let replyIdentityValidated = false;
-    socket.setTimeout(2_000, () => socket.destroy(new Error("control socket timed out")));
+    socket.setTimeout(
+      requestTimeoutMs(request.command),
+      () => socket.destroy(new Error("control socket timed out")),
+    );
     socket.once("connect", () => {
       try {
         const current = assertOwnerControlSocket(path);

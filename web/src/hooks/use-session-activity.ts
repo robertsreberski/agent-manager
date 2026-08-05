@@ -46,7 +46,6 @@ export function connectSessionActivityEvents(options: {
   source.onopen = () => {
     if (closed) return;
     openedOnce = true;
-    options.onConnection("open");
   };
   source.onerror = () => {
     if (closed) return;
@@ -79,19 +78,28 @@ export function connectSessionActivityEvents(options: {
  * are coalesced to one React update per animation frame so token deltas do not
  * make the whole cockpit render at provider frequency.
  */
-export function useSessionActivity(selectedId: string | null): SessionActivityView {
+export function useSessionActivity(selectedId: string | null, retryGeneration = 0): SessionActivityView {
   const [view, setView] = useState<SessionActivityView>(() => emptySessionActivity(selectedId));
   const viewRef = useRef(view);
   viewRef.current = view;
 
   useEffect(() => {
-    const initial = emptySessionActivity(selectedId);
+    /*
+      An explicit retry recreates a terminally closed EventSource. Keep the
+      last internally consistent projection while that replacement loads; a
+      retry is a transport operation, not permission to erase transcript
+      history. A different selected session still starts from a clean view.
+    */
+    const initial = selectedId !== null && viewRef.current.sessionId === selectedId
+      ? { ...viewRef.current, connection: "connecting" as const }
+      : emptySessionActivity(selectedId);
     viewRef.current = initial;
     setView(initial);
     if (!selectedId) return;
     const sessionId = selectedId;
 
     let pending: ActivityFrame[] = [];
+    let receivedFrame = false;
     let animationFrame: number | null = null;
     let disconnectActivity = (): void => undefined;
     const scheduleFrame: ScheduleFrame = requestBrowserFrame;
@@ -109,6 +117,9 @@ export function useSessionActivity(selectedId: string | null): SessionActivityVi
         }
         next = reduction.state;
       }
+      if (receivedFrame && next.connection !== "open") {
+        next = { ...next, connection: "open" };
+      }
       pending = [];
       if (next !== viewRef.current) {
         viewRef.current = next;
@@ -120,8 +131,12 @@ export function useSessionActivity(selectedId: string | null): SessionActivityVi
       viewRef.current = next;
       setView(next);
     };
-    const clearAfterTerminalError = () => {
-      const next = { ...emptySessionActivity(sessionId), connection: "offline" as const };
+    const preserveAfterTerminalError = () => {
+      // A terminal EventSource failure says only that live delivery is
+      // unavailable. The last fully reconciled snapshot is still valid
+      // retained history and must remain visible while authentication, wire
+      // cutover, or the service connection is repaired.
+      const next = { ...viewRef.current, connection: "offline" as const };
       viewRef.current = next;
       pending = [];
       if (animationFrame !== null) {
@@ -136,16 +151,26 @@ export function useSessionActivity(selectedId: string | null): SessionActivityVi
         sessionId,
         clientId: BROWSER_CLIENT_ID,
         onFrame: (frame) => {
+          receivedFrame = true;
           pending.push(frame);
           if (animationFrame === null) animationFrame = scheduleFrame(commit);
         },
         onConnection: updateConnection,
-        onTerminalError: clearAfterTerminalError,
+        onTerminalError: preserveAfterTerminalError,
       });
     }
     function restartFromSnapshot(): void {
       disconnectActivity();
-      const next = { ...emptySessionActivity(sessionId), connection: "connecting" as const };
+      // Keep the last internally consistent projection on screen while a fresh
+      // baseline is fetched. Reset only the cursor identity so no subsequent
+      // delta can apply to that retained projection before the snapshot lands.
+      const next = {
+        ...viewRef.current,
+        streamEpoch: null,
+        cursor: null,
+        seq: null,
+        connection: "connecting" as const,
+      };
       viewRef.current = next;
       setView(next);
       startConnection();
@@ -156,9 +181,8 @@ export function useSessionActivity(selectedId: string | null): SessionActivityVi
       disconnectActivity();
       pending = [];
       if (animationFrame !== null) cancelFrame(animationFrame);
-      viewRef.current = emptySessionActivity(null);
     };
-  }, [selectedId]);
+  }, [retryGeneration, selectedId]);
 
   return useMemo(
     () => view.sessionId === selectedId ? view : emptySessionActivity(selectedId),

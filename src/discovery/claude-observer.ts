@@ -29,6 +29,7 @@ import {
   normalizedText,
   number,
   object,
+  observedResumeControl,
   string,
   type JsonObject,
 } from "./observe-values.ts";
@@ -250,6 +251,7 @@ export function discoverClaude(
           respondable: false,
         },
       }] : [],
+      ...(!live && cwd ? { control: observedResumeControl("claude") } : {}),
     });
   }
   for (const [id, value] of registry) {

@@ -66,7 +66,11 @@ export class OrderedSseWriter {
   }
 
   writeEvent(event: string | Uint8Array): boolean {
-    if (this.#closed || this.#target.destroyed || this.#target.writableEnded) return false;
+    if (this.#closed) return false;
+    if (this.#target.destroyed || this.#target.writableEnded) {
+      this.#fail("socket-failure");
+      return false;
+    }
     const bytes = typeof event === "string" ? Buffer.from(event) : Buffer.from(event);
 
     if (this.#active === null && this.#queue.length === 0) {
@@ -83,7 +87,13 @@ export class OrderedSseWriter {
       this.#queuedBytes += bytes.byteLength;
     }
 
-    void this.#pump();
+    // The pump normally absorbs transport failures and reports them through
+    // #fail. Keep a final rejection guard as well: a synchronous consumer
+    // callback or an unexpected stream implementation must never create an
+    // unhandled rejection in the server process.
+    void this.#pump().catch(() => {
+      if (!this.#closed) this.#fail("socket-failure");
+    });
     return !this.#closed;
   }
 
@@ -97,6 +107,7 @@ export class OrderedSseWriter {
 
   dispose(): void {
     this.#closed = true;
+    this.#blocked = false;
     this.#active = null;
     this.#activeOffset = 0;
     this.#queue.length = 0;
@@ -116,7 +127,7 @@ export class OrderedSseWriter {
           this.#activeOffset = 0;
         }
 
-        while (this.#activeOffset < this.#active.byteLength) {
+        while (this.#active !== null && this.#activeOffset < this.#active.byteLength) {
           if (this.#target.destroyed || this.#target.writableEnded) {
             this.#fail("socket-failure");
             return;
@@ -134,6 +145,10 @@ export class OrderedSseWriter {
             this.#blocked = true;
             const result = await this.#waitForDrain();
             this.#blocked = false;
+            // Backlog overflow or route teardown may dispose the writer while
+            // the pump is suspended. Do not dereference the cleared active
+            // frame if a late drain wins the race with socket close.
+            if (this.#closed || this.#active === null) return;
             if (result !== "drain") {
               this.#fail(result === "timeout" ? "drain-timeout" : "socket-failure");
               return;

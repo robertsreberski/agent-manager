@@ -25,6 +25,8 @@ const selectedSession = {
   control: {
     plane: "observe-only",
     authority: "none",
+    coordination: { mode: "observe-only", nativeAttach: "none", responseResolution: "single-controller" },
+    recovery: null,
     capabilities: ["open-editor"],
     withheld: [{ capability: "queue", reason: "This terminal-started session has no hook bridge." }],
     takeover: null,
@@ -51,6 +53,8 @@ function hookOffer(provider: "claude" | "codex"): SetupHookOffer {
     changed: true,
     diff: "--- before\n+++ after\n+Authorization: Bearer [REDACTED]",
     notice: null,
+    previewId: provider === "claude" ? "11111111-1111-4111-8111-111111111111" : "22222222-2222-4222-8222-222222222222",
+    expiresAt: "2026-08-04T10:05:00.000Z",
   };
 }
 
@@ -106,6 +110,7 @@ const cockpit = {
   openEditor: vi.fn(async () => undefined),
   takeCliControl: vi.fn(async () => undefined),
   cancelCliTakeover: vi.fn(async () => undefined),
+  retryControl: vi.fn(async () => undefined),
   createSession: vi.fn(async () => selectedSession),
   completeWorkspacePath: vi.fn(async () => []),
   loadPreview: vi.fn(async () => undefined),
@@ -123,6 +128,13 @@ const cockpit = {
   loadSessionFacts: vi.fn(async () => undefined),
   loadPlanFile: vi.fn(async () => undefined),
   loadSetup,
+  applySetupHook: vi.fn(async (provider: "claude" | "codex") => ({
+    provider,
+    outcome: "applied" as const,
+    hook: { ...hookOffer(provider), changed: false, diff: "", previewId: null, expiresAt: null },
+  })),
+  addHost: vi.fn(async () => ({ id: "studio", label: "Studio", kind: "ssh" as const, sshTarget: "studio", status: "connecting" as const, statusMessage: null })),
+  removeHost: vi.fn(async () => undefined),
   outbox: [],
   offlineReview: [],
   dismissOfflineReview: vi.fn(),
@@ -148,7 +160,13 @@ const { default: App } = await import("./App");
 describe("cockpit shell layout", () => {
   beforeEach(() => {
     loadSetup.mockClear();
+    cockpit.applySetupHook.mockClear();
+    cockpit.addHost.mockClear();
+    cockpit.removeHost.mockClear();
     cockpit.loadProviderSettingsOptions.mockClear();
+    cockpit.loadSettingsOptions.mockClear();
+    cockpit.closeSelected.mockClear();
+    cockpit.setScope.mockClear();
   });
 
   it("overlays the drawer on the board region instead of the whole page", () => {
@@ -188,7 +206,7 @@ describe("cockpit shell layout", () => {
       ...selectedSession,
       archived: true,
       status: "completed",
-      control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [], takeover: null },
+      control: { plane: "observe-only", authority: "none", coordination: { mode: "observe-only", nativeAttach: "none", responseResolution: "single-controller" }, recovery: null, capabilities: [], withheld: [], takeover: null },
     } as SessionView;
     cockpit.sessions = [];
     cockpit.displaySessions = [archived];
@@ -200,15 +218,103 @@ describe("cockpit shell layout", () => {
       expect(screen.getByRole("button", { name: "Archived, 51 sessions" })).toHaveAttribute("aria-current", "page");
       expect(screen.getByRole("searchbox", { name: "Search archived sessions" })).toBeInTheDocument();
       expect(screen.getAllByText("Observed thread").length).toBeGreaterThan(0);
+      expect(screen.getByText("Archived · read-only")).toBeInTheDocument();
       expect(screen.queryByRole("button", { name: "New thread here" })).not.toBeInTheDocument();
       fireEvent.click(screen.getByRole("button", { name: "Load more" }));
       expect(cockpit.loadMoreArchived).toHaveBeenCalledOnce();
+      fireEvent.click(screen.getByRole("button", { name: /^All,/u }));
+      expect(cockpit.closeSelected).toHaveBeenCalledOnce();
+      expect(cockpit.setScope).toHaveBeenCalledWith("all");
     } finally {
       cockpit.sessions = previous.sessions;
       cockpit.displaySessions = previous.displaySessions;
       cockpit.selectedSession = previous.selectedSession;
       cockpit.scope = previous.scope;
       cockpit.archivedCatalog = previous.archivedCatalog;
+    }
+  });
+
+  it("renders archive load failures as failures with an explicit retry", () => {
+    const previous = {
+      sessions: cockpit.sessions,
+      displaySessions: cockpit.displaySessions,
+      selectedSession: cockpit.selectedSession,
+      scope: cockpit.scope,
+      archivedCatalog: cockpit.archivedCatalog,
+    };
+    cockpit.sessions = [];
+    cockpit.displaySessions = [];
+    cockpit.selectedSession = null as unknown as SessionView;
+    cockpit.scope = "archived";
+    cockpit.archivedCatalog = { items: [], query: "needle", nextCursor: null, total: 0, status: "error", error: "Archive index is temporarily unavailable." };
+    try {
+      render(<App />);
+      expect(screen.getByRole("heading", { name: "Archived sessions unavailable" })).toBeInTheDocument();
+      expect(screen.queryByText("No archived sessions match")).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+      expect(cockpit.searchArchived).toHaveBeenCalledWith("needle");
+    } finally {
+      cockpit.sessions = previous.sessions;
+      cockpit.displaySessions = previous.displaySessions;
+      cockpit.selectedSession = previous.selectedSession;
+      cockpit.scope = previous.scope;
+      cockpit.archivedCatalog = previous.archivedCatalog;
+    }
+  });
+
+  it("closes and releases the active drawer before entering Archived", () => {
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: /^Archived,/u }));
+
+    expect(cockpit.closeSelected).toHaveBeenCalledOnce();
+    expect(cockpit.setScope).toHaveBeenCalledWith("archived");
+  });
+
+  it("reloads manager model settings when recovery completes", async () => {
+    const previous = {
+      sessions: cockpit.sessions,
+      displaySessions: cockpit.displaySessions,
+      selectedSession: cockpit.selectedSession,
+    };
+    const recovering = {
+      ...selectedSession,
+      control: {
+        ...selectedSession.control,
+        plane: "codex-private",
+        authority: "manager",
+        coordination: { mode: "shared", nativeAttach: "join", responseResolution: "first-response-wins" },
+        recovery: {
+          state: "reconnecting",
+          attempt: 1,
+          startedAt: "2026-08-05T10:00:00.000Z",
+          deadlineAt: "2026-08-05T10:00:30.000Z",
+          nextRetryAt: null,
+          error: null,
+        },
+      },
+    } as SessionView;
+    const recovered = {
+      ...recovering,
+      control: { ...recovering.control, recovery: null },
+    } as SessionView;
+    cockpit.sessions = [recovering];
+    cockpit.displaySessions = [recovering];
+    cockpit.selectedSession = recovering;
+    try {
+      const { rerender } = render(<App />);
+      await waitFor(() => expect(cockpit.loadSettingsOptions).toHaveBeenCalledTimes(1));
+
+      cockpit.sessions = [recovered];
+      cockpit.displaySessions = [recovered];
+      cockpit.selectedSession = recovered;
+      rerender(<App />);
+
+      await waitFor(() => expect(cockpit.loadSettingsOptions).toHaveBeenCalledTimes(2));
+    } finally {
+      cockpit.sessions = previous.sessions;
+      cockpit.displaySessions = previous.displaySessions;
+      cockpit.selectedSession = previous.selectedSession;
     }
   });
 
@@ -220,22 +326,73 @@ describe("cockpit shell layout", () => {
 
     const dialog = await screen.findByRole("dialog", { name: "Setup and integrations" });
     expect(loadSetup).toHaveBeenCalled();
-    await waitFor(() => expect(dialog).toHaveTextContent("agent-manager hooks install --provider claude --scope user"));
+    expect(dialog).toHaveTextContent(/Hooks add exact live activity and surface held approvals or questions/iu);
+    expect(dialog).toHaveTextContent(/Sending new messages still requires provider control/iu);
     expect(dialog).toHaveTextContent(/Bearer \[REDACTED\]/u);
-    expect(dialog).toHaveTextContent(/This browser never changes provider settings/u);
-    expect(screen.queryByRole("button", { name: /install|apply/iu })).not.toBeInTheDocument();
+    expect(dialog).toHaveTextContent(/install it directly from Agent Manager/u);
+    expect(screen.getByRole("button", { name: "Install claude hook" })).toBeEnabled();
+    expect(screen.queryByText("agent-manager hooks install --provider claude --scope user")).not.toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole("button", { name: "Advanced · manual installation" })[0]!);
+    expect(screen.getByText("agent-manager hooks install --provider claude --scope user")).toBeInTheDocument();
     expect(screen.queryByText(/Optional setup · 2 of 3/u)).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Continue without changing settings" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Continue without installing hooks" })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Close setup and integrations" }));
     expect(screen.queryByRole("dialog", { name: "Setup and integrations" })).not.toBeInTheDocument();
+  });
+
+  it("confirms remote-host removal before closing a drawer on that host", async () => {
+    const previous = {
+      sessions: cockpit.sessions,
+      displaySessions: cockpit.displaySessions,
+      selectedSession: cockpit.selectedSession,
+      hosts: cockpit.hosts,
+    };
+    const remoteSession = { ...selectedSession, id: "studio:codex:thread-1", hostId: "studio", hostLabel: "Studio" } as SessionView;
+    cockpit.sessions = [remoteSession];
+    cockpit.displaySessions = [remoteSession];
+    cockpit.selectedSession = remoteSession;
+    cockpit.hosts = [{ id: "studio", label: "Studio", kind: "ssh", status: "online" }];
+    loadSetup.mockResolvedValue({
+      ...setupModel,
+      hosts: [{
+        id: "studio",
+        label: "Studio",
+        kind: "ssh",
+        status: "online",
+        statusMessage: null,
+        harnesses: {
+          codex: { state: "present", reason: null },
+          claude: { state: "present", reason: null },
+        },
+      }],
+    });
+    try {
+      render(<App />);
+      fireEvent.click(screen.getByRole("button", { name: "Search sessions and commands" }));
+      fireEvent.click(await screen.findByRole("option", { name: /Setup and integrations/u }));
+      await screen.findByRole("dialog", { name: "Setup and integrations" });
+
+      fireEvent.click(screen.getByRole("button", { name: "Remove Studio" }));
+      expect(cockpit.removeHost).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: "Confirm removal of Studio" }));
+
+      await waitFor(() => expect(cockpit.removeHost).toHaveBeenCalledWith("studio"));
+      await waitFor(() => expect(cockpit.closeSelected).toHaveBeenCalledOnce());
+    } finally {
+      cockpit.sessions = previous.sessions;
+      cockpit.displaySessions = previous.displaySessions;
+      cockpit.selectedSession = previous.selectedSession;
+      cockpit.hosts = previous.hosts;
+      loadSetup.mockResolvedValue(setupModel);
+    }
   });
 });
 
 /*
   `cockpitContentMode` returns "board" as soon as one session exists, so an
   operator whose only sessions were started in a terminal never met the first-run
-  hook step and never learned that hooks are what make such a session answerable.
+  hook step and never learned that hooks add exact live activity to such a session.
   And because adding a hook edits a settings file — which emits no provider
   event — nothing tells this browser the state has changed.
 */
@@ -272,12 +429,22 @@ describe("reaching hooks from an observation-only board", () => {
     expect(loadSetup.mock.calls.length).toBeGreaterThan(afterOpen);
   });
 
+  it("applies the exact hook preview and refreshes setup facts in place", async () => {
+    render(<App />);
+    const afterOpen = await openSetupDialog();
+
+    fireEvent.click(screen.getByRole("button", { name: "Install claude hook" }));
+
+    await waitFor(() => expect(cockpit.applySetupHook).toHaveBeenCalledWith("claude", "11111111-1111-4111-8111-111111111111"));
+    await waitFor(() => expect(loadSetup.mock.calls.length).toBeGreaterThan(afterOpen));
+  });
+
   it("stops re-reading once every hook has settled", async () => {
     loadSetup.mockResolvedValue({
       ...setupModel,
       hooks: {
-        claude: { ...hookOffer("claude"), state: "active", changed: false, diff: "" },
-        codex: { ...hookOffer("codex"), state: "active", changed: false, diff: "" },
+        claude: { ...hookOffer("claude"), state: "active", changed: false, diff: "", previewId: null, expiresAt: null },
+        codex: { ...hookOffer("codex"), state: "active", changed: false, diff: "", previewId: null, expiresAt: null },
       },
     });
     vi.useFakeTimers({ shouldAdvanceTime: true });

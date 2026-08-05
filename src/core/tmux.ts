@@ -369,6 +369,12 @@ export function attachTmuxTerminals(
       ? {
           plane: "tmux-attach" as const,
           authority: "foreign" as const,
+          coordination: {
+            mode: "observe-only" as const,
+            nativeAttach: "none" as const,
+            responseResolution: "single-controller" as const,
+          },
+          recovery: null,
           capabilities: ["preview", "attach"] as const,
           withheld: record.control.withheld,
           takeover: record.control.takeover,

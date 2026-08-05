@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto";
 
 import type { ActivityItemDraft, ActivityMutation } from "../../activity/index.ts";
-import type { CodexActivityProjection } from "./activity-projector.ts";
+import {
+  codexMessageCorrelationId,
+  type CodexActivityProjection,
+} from "./activity-projector.ts";
 import type { CodexHookInput } from "./codex-hook.ts";
 import { toolApprovalFacts } from "../approval-facts.ts";
 
@@ -88,7 +91,9 @@ export function projectCodexHook(
       const prompt = text(input.raw.prompt);
       mutations.push(upsert({
         ...common(input, id(input, "prompt", `${turnIdentity}:${hash(prompt ?? input.raw)}`), "complete", receivedAt),
-        correlationId: input.turnId ? `message:${input.turnId}:user` : null,
+        correlationId: input.turnId && typeof input.raw.prompt === "string"
+          ? codexMessageCorrelationId(input.sessionId, input.turnId, "user", input.raw.prompt)
+          : null,
         kind: "message",
         role: "user",
         phase: null,
@@ -188,7 +193,14 @@ export function projectCodexHook(
       if (assistantMessage) {
         mutations.push(upsert({
           ...common(input, id(input, "message", `${turnIdentity}:assistant`), "complete", receivedAt),
-          correlationId: `message:${turnIdentity}:assistant`,
+          correlationId: input.turnId && typeof input.raw.last_assistant_message === "string"
+            ? codexMessageCorrelationId(
+                input.sessionId,
+                input.turnId,
+                "assistant",
+                input.raw.last_assistant_message,
+              )
+            : null,
           kind: "message",
           role: "assistant",
           phase: "final",

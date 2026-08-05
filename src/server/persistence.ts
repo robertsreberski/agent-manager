@@ -100,6 +100,12 @@ export interface ActionReceipt {
   completedAt: string;
 }
 
+export interface ManagedControlIntentEvidence {
+  actionType: SessionAction["type"];
+  status: "queued" | "succeeded" | "unknown";
+  at: string;
+}
+
 export interface CreateSessionIntent {
   actorId: string;
   idempotencyKey: string;
@@ -248,6 +254,8 @@ function actionText(action: SessionAction): string {
     case "open-editor": return action.relativePath;
     case "take-control": return action.method;
     case "cancel-take-control": return action.takeoverId;
+    case "retry-control": return action.type;
+    case "resume": return action.type;
     case "interrupt":
     case "end":
     case "archive":
@@ -271,6 +279,8 @@ export function redactedPreview(action: SessionAction): string {
     case "delete": return "delete";
     case "take-control": return `take-control:${action.method}`;
     case "cancel-take-control": return "cancel-take-control:id-omitted";
+    case "retry-control": return "retry-control";
+    case "resume": return "resume";
     case "open-editor": return "open-editor:path-omitted";
   }
 }
@@ -1012,6 +1022,57 @@ export class ManagerDatabase {
     } : null;
   }
 
+  /**
+   * Latest durable provider-control intent that can establish whether a
+   * pre-managerControl Claude record was explicitly ended. Failed actions and
+   * local-only coordination actions carry no provider ownership evidence.
+   */
+  getLatestManagedControlIntent(sessionId: string): ManagedControlIntentEvidence | null {
+    const actionTypes = [
+      "send",
+      "respond",
+      "interrupt",
+      "set-profile",
+      "set-model",
+      "set-effort",
+      "remove-queued",
+      "end",
+    ] as const satisfies readonly SessionAction["type"][];
+    const placeholders = actionTypes.map(() => "?").join(", ");
+    const receipt = this.#database.prepare(`
+      SELECT action_type, status, created_at AS at
+      FROM action_receipts
+      WHERE session_id = ?
+        AND action_type IN (${placeholders})
+        AND status IN ('succeeded', 'unknown')
+      ORDER BY created_at DESC, rowid DESC
+      LIMIT 1
+    `).get(sessionId, ...actionTypes) as Record<string, unknown> | undefined;
+    const audit = this.#database.prepare(`
+      SELECT outcome.action_type, outcome.outcome AS status,
+             COALESCE(intent.at, outcome.at) AS at
+      FROM audit_events AS outcome
+      LEFT JOIN audit_events AS intent
+        ON intent.action_id = outcome.action_id
+       AND intent.session_id = outcome.session_id
+       AND intent.outcome = 'dispatch-attempt'
+      WHERE outcome.session_id = ?
+        AND outcome.action_type IN (${placeholders})
+        AND outcome.outcome IN ('succeeded', 'unknown')
+      ORDER BY COALESCE(intent.at, outcome.at) DESC, outcome.rowid DESC
+      LIMIT 1
+    `).get(sessionId, ...actionTypes) as Record<string, unknown> | undefined;
+    const candidates = [receipt, audit]
+      .filter((row): row is Record<string, unknown> => row !== undefined)
+      .map((row) => ({
+        actionType: asString(row.action_type) as SessionAction["type"],
+        status: asString(row.status) as ManagedControlIntentEvidence["status"],
+        at: asString(row.at),
+      }));
+    candidates.sort((left, right) => right.at.localeCompare(left.at));
+    return candidates[0] ?? null;
+  }
+
   recordActionReceipt(receipt: ActionReceipt): void {
     this.#database.prepare(`
       INSERT INTO action_receipts (
@@ -1158,5 +1219,46 @@ export class ManagerDatabase {
       createHash("sha256").update(details).digest("hex"),
       `${input.operation}:${input.phase}`,
     );
+  }
+
+  /**
+   * Atomically records a one-shot operational intent. This reuses the durable
+   * append-only audit table so safety journals do not need an independently
+   * migrated schema. A claimed target remains claimed across service restarts.
+   */
+  claimOperationalIntent(
+    operation: string,
+    targetId: string,
+    details: Record<string, string | number | boolean | null> = {},
+  ): boolean {
+    this.#database.exec("BEGIN IMMEDIATE");
+    try {
+      const prior = this.#database.prepare(`
+        SELECT 1 AS claimed FROM audit_events
+        WHERE action_type = ? AND session_id = ? AND outcome = 'claimed'
+        LIMIT 1
+      `).get(operation, targetId);
+      if (prior) {
+        this.#database.exec("COMMIT");
+        return false;
+      }
+      this.auditOperation({
+        actor: { id: "agent-manager", kind: "local", displayName: "Agent Manager" },
+        operation,
+        targetId,
+        phase: "attempt",
+        outcome: "claimed",
+        details,
+      });
+      this.#database.exec("COMMIT");
+      return true;
+    } catch (error) {
+      try {
+        this.#database.exec("ROLLBACK");
+      } catch {
+        // Preserve the deciding persistence error.
+      }
+      throw error;
+    }
   }
 }

@@ -13,14 +13,24 @@ inferences remain visibly inferred.
 | Session origin | Observation | Semantic control |
 | --- | --- | --- |
 | Manager-owned Claude SDK | Exact SDK stream | Queue, pinned steer, interrupt, exact requests, model/effort/profile, close |
-| External Claude CLI | Exact installed HTTP-hook events plus bounded transcript fallback | Live held `PermissionRequest` only; no queue/steer/end |
-| Manager-owned Codex | Exact private app-server stream (`codex-private`) | Provider methods exposed by that isolated runtime |
-| Ordinary Codex CLI | Trusted Codex command-hook events plus bounded discovery fallback | Only a live hook request shape proved by the pinned integration |
+| External Claude CLI | Exact installed HTTP-hook events plus bounded transcript fallback | Live held `PermissionRequest` before takeover; exact SDK control only after an exclusive identity-checked handoff |
+| Managed Codex | Exact pinned private app-server stream (`codex-private`) | Shared provider methods; cockpit and native `--remote` CLI peers may use one conversation, with first exact response winning |
+| Standalone Codex CLI | Trusted command-hook events plus bounded discovery fallback | Read-only until one safe exit/adoption onto `codex-private`; then web and CLI may remain active together |
 | tmux/resume/observe-only | Bounded evidence with source/confidence | Native preview/attach/resume only when exact; otherwise read-only |
 
-The live capability list is authoritative. A provider/version failure, unknown foreign
-controller, or transport loss withdraws actions and explains why. Agent Manager never fakes a
-user turn through hook side channels, terminal keystrokes, or `thread/inject_items`.
+The live capability list is authoritative. Provider/version or transport failure withdraws the
+affected actions and explains why. Codex execution-environment IDs are peer-presence facts, not
+writer locks; a healthy manager-owned Codex thread stays writable when another native peer
+joins. Claude remains exclusive and withholds manager writes until handoff succeeds. Agent
+Manager never fakes a user turn through hook side channels, terminal keystrokes, or
+`thread/inject_items`.
+
+Agent Manager launches and owns its pinned private Codex app-server. It does not silently
+connect to, trust, upgrade, restart, stop, or mutate the user-global experimental daemon; the
+observed host daemon is version-mismatched with the pinned CLI. A standalone Codex process must
+exit once before its exact thread is resumed on the private server. After that adoption, a native
+CLI joins with `codex resume <thread> --remote unix://<agent-manager-socket>` and can be used
+alongside the web cockpit.
 
 There is one provider-neutral execution profile:
 
@@ -87,7 +97,10 @@ pnpm deploy
 That is the deployment process. The package is private: no npm publish, release branch, tag,
 changelog, GitHub release, version ceremony, or backup/rollback archive is required.
 
-Running `agent-manager` with no arguments opens the cockpit. Useful explicit commands are:
+Running `agent-manager` with no arguments opens the cockpit. Session creation, takeover,
+recovery, exact-session resume, messaging, approvals, and archives are all operated in the web
+app; they do not require copying or running a command. The explicit commands below are setup,
+diagnostic, or advanced native-access tools; ordinary cockpit operation does not depend on them:
 
 ```text
 agent-manager serve
@@ -110,7 +123,13 @@ worktrees.
 
 ## External-session hooks
 
-Hook installation is optional and explicit:
+Hook installation is optional and explicit. Open **Setup and integrations** in
+the cockpit, review the redacted exact-file preview, and choose **Install** or
+**Update**. Agent Manager applies that one preview under the authenticated
+browser session; stale previews are rejected and refreshed before anything is
+written.
+
+The equivalent commands are retained only for diagnostics and advanced setup:
 
 ```sh
 agent-manager hooks status
@@ -127,19 +146,42 @@ is machine-local.
 Held external Claude decisions are limited to exact `PermissionRequest` events. If Agent Manager
 times out or exits, the hook returns an empty successful response and the native Claude prompt
 continues. Hook installation never grants queue, steer, interrupt, settings, or process ownership.
+Codex hooks likewise grant observation, not shared-server membership; takeover is the separate
+identity-checked migration boundary.
 
-## Native attach and remote hosts
+## Advanced native attach and remote hosts
 
-`attach` is the verbose escape hatch. The browser receives only an owner-socket wrapper, never a
-raw provider command. Commands are a closed argv union, use pinned executables with `shell:
-false`, and fail closed when ownership/controller state is ambiguous. There is no browser
-terminal or tmux `send-keys` fallback.
+Normal continuation uses **Resume here** in the web app. It first proves that no standalone
+provider owner can race the resume, reopens the exact provider identity and workspace, persists
+manager ownership, and only then publishes write capabilities. A failure rolls the provisional
+provider client back while leaving history and the prior read-only session intact.
 
-Remote macOS hosts are explicitly installed:
+`attach` is an advanced escape hatch, collapsed under **Advanced · CLI access** in the web app.
+The browser receives only an owner-socket wrapper, never a
+raw provider command. Commands are a closed argv union, use pinned executables with
+`shell: false`, and preserve provider-specific coordination: Codex joins the manager-owned
+private server, while Claude performs an exclusive handoff. Codex environment IDs are not
+treated as controller ambiguity. There is no browser terminal or tmux `send-keys` fallback.
+
+For a CLI that began outside Agent Manager, guided takeover waits for the operator to exit and is
+cancellable. The graceful path first pins the exact process and returns a server-issued takeover
+ID; only a second action carrying that ID may signal. It then revalidates uid, executable, PID start
+identity, provider identity, transcript/registry association, and workspace before sending
+exactly one `SIGTERM`; it never uses `SIGKILL`, repeated signals, shell commands, or terminal key
+injection. Write capabilities appear only after exact provider adoption succeeds. Recovery is
+bounded, never replays mutations, reports an exact native Claude owner as healthy rather than
+failed, and exposes a manual retry only when it is safe.
+
+Remote hosts are registered and removed in **Setup and integrations**. The web
+form accepts a label and SSH target, refreshes host/workspace state immediately,
+and forgets the host without touching files or processes on the remote machine.
+
+Installing the Agent Manager service on a new remote Mac is a separate,
+explicit advanced operation because it crosses the remote machine's trust and
+authentication boundary:
 
 ```sh
 agent-manager host install user@remote-mac
-agent-manager host add "Remote Mac" user@remote-mac
 ```
 
 The controller communicates over a BatchMode SSH bridge; the remote HTTP service remains
@@ -154,7 +196,10 @@ Manager never binds directly to a LAN or tailnet address and never uses Funnel.
 
 - Treat browser-session or owner-socket access as access to the underlying agents.
 - Browser mutations are cookie + CSRF + generation + idempotency protected. Short writer leases
-  are automatic; only a real competing-window conflict/takeover appears in the product.
+  are automatic between cockpit windows. They do not turn a native Codex peer into a foreign
+  controller; provider request races use first-response-wins reconciliation.
+- Claude takeover is exclusive. Codex takeover is only the one-time migration of a standalone
+  process; after adoption, native CLI and web are supported concurrent peers.
 - Session creation and ambiguous dispatch are never blindly replayed.
 - Elicitation forms remain visible but non-respondable until all provider shapes can be encoded
   faithfully.

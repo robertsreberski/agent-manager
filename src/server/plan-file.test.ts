@@ -14,6 +14,7 @@ import test from "node:test";
 
 import { ActivityHub } from "../activity/index.ts";
 import type { SessionView } from "../core/types.ts";
+import { providerControlCoordination } from "../shared/session.ts";
 import { LocalPlanFileReader } from "./plan-file.ts";
 import { createAgentManagerServer } from "./server.ts";
 
@@ -78,6 +79,8 @@ function session(overrides: Partial<SessionView> = {}): SessionView {
     control: {
       plane: "claude-hook-bridge",
       authority: "foreign",
+      coordination: providerControlCoordination("claude"),
+      recovery: null,
       capabilities: [],
       withheld: [],
       takeover: null,

@@ -3,6 +3,7 @@ import test from "node:test";
 
 import { ActivityHub, type ActivityFrame } from "../activity/index.ts";
 import type { SessionView } from "../core/types.ts";
+import { observeOnlyControl } from "../shared/session.ts";
 import { SelectedTranscriptActivityObserver } from "./activity-observer.ts";
 import type { TranscriptItem, TranscriptReadResult } from "./transcript.ts";
 
@@ -61,13 +62,7 @@ function externalSession(): SessionView {
     todoProgress: null,
     attention: [],
     terminal: null,
-    control: {
-      plane: "observe-only",
-      authority: "none",
-      capabilities: [],
-      withheld: [],
-      takeover: null,
-    },
+    control: observeOnlyControl(),
     workspaceIdentity: null,
     generation: 1,
   };
@@ -226,6 +221,94 @@ test("replaces an unavailable lifecycle fact when transcript content appears", (
   assert.equal(items[0]?.kind === "message" ? items[0].text : null, "History is now available");
 
   release();
+  observer.dispose();
+  hub.dispose();
+});
+
+test("a transient transcript read failure preserves already reconciled history", () => {
+  const hub = new ActivityHub({ streamEpoch: "observer-transient-unavailable" });
+  const session = externalSession();
+  hub.ensureSession(session.id, session.provider);
+  let current: TranscriptReadResult = transcript("retained", "History stays visible");
+  const observer = new SelectedTranscriptActivityObserver({
+    hub,
+    reader: { read: () => structuredClone(current) },
+  });
+
+  const release = observer.acquire(session);
+  current = {
+    items: [],
+    transcript: {
+      state: "unavailable",
+      truncated: false,
+      source: null,
+      itemCount: 0,
+      reason: "unreadable",
+    },
+  };
+  observer.seedOnce(session);
+
+  const unavailable = hub.snapshot(session.id)?.items ?? [];
+  assert.deepEqual(
+    unavailable.map((item) => item.kind === "message" ? item.text : item.kind === "lifecycle" ? item.title : item.kind),
+    ["History stays visible", "Transcript unreadable"],
+  );
+  const sequence = hub.snapshot(session.id)?.seq;
+  observer.seedOnce(session);
+  assert.equal(hub.snapshot(session.id)?.seq, sequence, "the same unavailable fact is a no-op");
+
+  current = transcript("retained", "History stays visible");
+  observer.seedOnce(session);
+  const recovered = hub.snapshot(session.id)?.items ?? [];
+  assert.deepEqual(recovered.map((item) => item.kind), ["message"]);
+  assert.equal(recovered[0]?.kind === "message" ? recovered[0].text : null, "History stays visible");
+
+  release();
+  observer.dispose();
+  hub.dispose();
+});
+
+test("reselecting during a transient transcript failure retains history and one availability fact", () => {
+  const hub = new ActivityHub({ streamEpoch: "observer-reselect-unavailable" });
+  const session = externalSession();
+  hub.ensureSession(session.id, session.provider);
+  let current: TranscriptReadResult = transcript("retained", "History survives reselect");
+  const observer = new SelectedTranscriptActivityObserver({
+    hub,
+    reader: { read: () => structuredClone(current) },
+  });
+
+  observer.acquire(session)();
+  current = {
+    items: [],
+    transcript: {
+      state: "unavailable",
+      truncated: false,
+      source: null,
+      itemCount: 0,
+      reason: "unreadable",
+    },
+  };
+
+  observer.acquire(session)();
+  const firstReselect = hub.snapshot(session.id)!;
+  assert.deepEqual(
+    firstReselect.items.map((item) => item.id),
+    ["transcript:retained", "transcript:availability"],
+  );
+  assert.equal(
+    firstReselect.items.filter((item) => item.id === "transcript:availability").length,
+    1,
+  );
+
+  observer.acquire(session)();
+  const secondReselect = hub.snapshot(session.id)!;
+  assert.equal(secondReselect.seq, firstReselect.seq, "the bounded fact is not rewritten on every reselect");
+  assert.deepEqual(
+    secondReselect.items.map((item) => item.id),
+    ["transcript:retained", "transcript:availability"],
+  );
+
   observer.dispose();
   hub.dispose();
 });

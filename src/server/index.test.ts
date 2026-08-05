@@ -56,9 +56,98 @@ test("production composition creates and enforces its private runtime boundary",
     try {
       assert.equal(statSync(safeRuntime).mode & 0o777, 0o700);
       assert.equal(backend.controlSocketPath, join(safeRuntime, "control.sock"));
+      await assert.rejects(
+        createAgentManagerServer({
+          managedProviders: false,
+          discovery: false,
+          staticDir: false,
+          runtimeDirectory: safeRuntime,
+          databasePath: join(root, "contender.sqlite"),
+        }),
+        /another Agent Manager already owns this runtime/,
+      );
     } finally {
       await backend.close();
     }
+
+    const replacement = await createAgentManagerServer({
+      managedProviders: false,
+      discovery: false,
+      staticDir: false,
+      runtimeDirectory: safeRuntime,
+      databasePath: join(root, "replacement.sqlite"),
+    });
+    await replacement.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("production composition releases its instance lease when user shutdown hangs", async () => {
+  const root = mkdtempSync("/tmp/am-shutdown-hang-");
+  const runtimeDirectory = join(root, "runtime");
+  try {
+    const backend = await createAgentManagerServer({
+      managedProviders: false,
+      discovery: false,
+      staticDir: false,
+      runtimeDirectory,
+      databasePath: join(root, "owner.sqlite"),
+      shutdownTimeoutMs: 300,
+      onShutdown: () => new Promise<void>(() => undefined),
+    });
+
+    await assert.rejects(backend.close());
+
+    const replacement = await createAgentManagerServer({
+      managedProviders: false,
+      discovery: false,
+      staticDir: false,
+      runtimeDirectory,
+      databasePath: join(root, "replacement.sqlite"),
+    });
+    await replacement.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("production composition releases its instance lease after synchronous provider cleanup failure", async () => {
+  const root = mkdtempSync("/tmp/am-shutdown-fail-");
+  const runtimeDirectory = join(root, "runtime");
+  try {
+    const backend = await createAgentManagerServer({
+      managedProviders: false,
+      discovery: false,
+      staticDir: false,
+      runtimeDirectory,
+      databasePath: join(root, "owner.sqlite"),
+      shutdownTimeoutMs: 300,
+      adapters: {
+        codex: {
+          async createSession() {
+            throw new Error("not used by this shutdown test");
+          },
+          async performAction() {
+            return { status: "succeeded" };
+          },
+          dispose() {
+            throw new Error("provider cleanup failed synchronously");
+          },
+        },
+      },
+    });
+
+    await assert.rejects(backend.close());
+
+    const replacement = await createAgentManagerServer({
+      managedProviders: false,
+      discovery: false,
+      staticDir: false,
+      runtimeDirectory,
+      databasePath: join(root, "replacement.sqlite"),
+    });
+    await replacement.close();
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

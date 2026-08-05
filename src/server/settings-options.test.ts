@@ -2,6 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { SessionView } from "../core/types.ts";
+import {
+  observeOnlyControl,
+  providerControlCoordination,
+} from "../shared/session.ts";
 import type {
   ProviderControlAdapter,
   SessionAction,
@@ -69,6 +73,8 @@ function managedSession(overrides: Partial<SessionView> = {}): SessionView {
     control: {
       plane: "claude-sdk",
       authority: "manager",
+      coordination: providerControlCoordination("claude"),
+      recovery: null,
       capabilities: ["queue", "set-model"],
       withheld: [],
       takeover: null,
@@ -135,6 +141,8 @@ test("serves an authenticated Codex catalog with provider-declared model efforts
     control: {
       plane: "codex-private",
       authority: "manager",
+      coordination: providerControlCoordination("codex"),
+      recovery: null,
       capabilities: ["set-model"],
       withheld: [],
       takeover: null,
@@ -202,6 +210,8 @@ test("serves the catalog to a manager-owned session that cannot currently set a 
     control: {
       plane: "codex-private",
       authority: "manager",
+      coordination: providerControlCoordination("codex"),
+      recovery: null,
       capabilities: ["queue", "interrupt"],
       withheld: [{ capability: "set-model", reason: "Available when the Codex turn is idle" }],
       takeover: null,
@@ -353,11 +363,10 @@ test("does not borrow a manager-owned session for legacy draft catalogs", async 
     providerThreadId: "foreign",
     providerTreeId: "foreign",
     control: {
+      ...observeOnlyControl(),
       plane: "resume-only",
       authority: "foreign",
       capabilities: ["set-model"],
-      withheld: [],
-      takeover: null,
     },
   });
   const managed = managedSession();
@@ -506,11 +515,10 @@ test("reports remote, foreign, unsupported, and failed catalogs as explicitly un
     providerThreadId: "foreign-1",
     providerTreeId: "foreign-1",
     control: {
+      ...observeOnlyControl(),
       plane: "resume-only",
       authority: "foreign",
       capabilities: ["resume"],
-      withheld: [],
-      takeover: null,
     },
   });
   const unsupported = managedSession({
@@ -521,6 +529,8 @@ test("reports remote, foreign, unsupported, and failed catalogs as explicitly un
     control: {
       plane: "codex-private",
       authority: "manager",
+      coordination: providerControlCoordination("codex"),
+      recovery: null,
       capabilities: ["set-model"],
       withheld: [],
       takeover: null,

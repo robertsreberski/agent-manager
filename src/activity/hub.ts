@@ -59,6 +59,11 @@ interface AppendSourceState {
   saturated: boolean;
 }
 
+interface RetainedResetAppendState {
+  offsets: ReadonlyMap<string, number>;
+  sources: ReadonlyMap<string, AppendSourceState>;
+}
+
 export type TodoProgressListener = (
   sessionId: string,
   progress: TodoProgress | null,
@@ -162,20 +167,19 @@ export class ActivityHub {
   markRetentionBoundary(sessionId: string): void {
     const session = this.#sessions.get(sessionId);
     if (!session || session.truncated) return;
-    session.truncated = true;
-    const at = new Date(this.#now()).toISOString();
-    const frame = this.#resetFrame(sessionId, session, ++session.seq, at, "truncation");
-    this.#record(session, frame);
-    for (const listener of session.listeners) {
-      try {
-        listener(clone(frame));
-      } catch {
-        // Activity consumers cannot interrupt a provider pump.
-      }
-    }
+    this.ingest(sessionId, session.provider, { type: "retention-boundary" });
   }
 
   ingest(sessionId: string, provider: Provider, mutation: ActivityMutation): ActivityFrame {
+    return this.#ingest(sessionId, provider, mutation);
+  }
+
+  #ingest(
+    sessionId: string,
+    provider: Provider,
+    mutation: ActivityMutation,
+    retainedResetAppendState?: RetainedResetAppendState,
+  ): ActivityFrame {
     this.ensureSession(sessionId, provider);
     const session = this.#sessions.get(sessionId)!;
     const previousTodoProgress = clone(session.todoProgress);
@@ -186,13 +190,31 @@ export class ActivityHub {
     switch (mutation.type) {
       case "upsert": {
         const existing = session.items.get(mutation.item.id);
-        const correlated = mutation.item.source !== "transcript"
+        const correlationCandidates = mutation.item.source !== "transcript"
           && typeof mutation.item.correlationId === "string"
           && mutation.item.correlationId.length > 0
           ? [...session.items.values()].filter((candidate) =>
               candidate.id !== mutation.item.id
               && candidate.correlationId === mutation.item.correlationId
             )
+          : [];
+        // A correlation is an equality assertion, not a fuzzy dedupe hint. If
+        // either source accidentally emitted the same key for several events,
+        // retaining the ambiguity is safer than deleting distinct turns.
+        const soleCandidate = correlationCandidates.length === 1
+          ? correlationCandidates[0]
+          : undefined;
+        // A turn/text digest is a cross-source grouping key, not an occurrence
+        // identity. Two App Server messages may deliberately contain identical
+        // text in one turn; preserve both exact occurrences so transcript
+        // reconciliation can pair equal cardinalities in chronological order.
+        const repeatedExactCodexMessage = soleCandidate !== undefined
+          && soleCandidate.source !== "transcript"
+          && soleCandidate.kind === "message"
+          && mutation.item.kind === "message"
+          && mutation.item.correlationId?.startsWith("codex/message-correlation/") === true;
+        const correlated = soleCandidate && !repeatedExactCodexMessage
+          ? [soleCandidate]
           : [];
         const chronologicalSlot = correlated.reduce(
           (oldest, candidate) => Math.min(oldest, candidate.seq),
@@ -325,6 +347,14 @@ export class ActivityHub {
         };
         break;
       }
+      case "retention-boundary": {
+        // This is intentionally a reset frame, not a reset mutation: clients
+        // must learn the new truncation fact atomically with the unchanged
+        // retained view, while provider append cursors remain valid.
+        session.truncated = true;
+        frame = this.#resetFrame(sessionId, session, seq, at, "truncation");
+        break;
+      }
       case "reset": {
         session.items.clear();
         session.appendOffsets.clear();
@@ -355,6 +385,22 @@ export class ActivityHub {
         });
         session.seq = seq + Math.max(drafts.length, 1) - 1;
         this.#trimView(session);
+        // Transcript reconciliation can retain exact provider items whose wire
+        // text is redacted or truncated. Restore their raw cursor state before
+        // constructing or publishing the reset frame: listeners are
+        // synchronous and may ingest the provider's next append immediately.
+        if (retainedResetAppendState) {
+          for (const [key, offset] of retainedResetAppendState.offsets) {
+            if (session.items.has(itemIdFromAppendKey(key))) {
+              session.appendOffsets.set(key, offset);
+            }
+          }
+          for (const [key, source] of retainedResetAppendState.sources) {
+            if (session.items.has(itemIdFromAppendKey(key))) {
+              session.appendSources.set(key, { ...source });
+            }
+          }
+        }
         frame = this.#resetFrame(sessionId, session, session.seq, at, mutation.reason);
         break;
       }
@@ -411,39 +457,93 @@ export class ActivityHub {
     this.ensureSession(sessionId, provider);
     const session = this.#sessions.get(sessionId)!;
     const signature = JSON.stringify({ drafts, truncated });
-    if (session.transcriptSignature === signature) return false;
+    const draftIds = new Set(drafts.map((draft) => draft.id));
+    const hasStaleTranscriptItem = [...session.items.values()].some((item) =>
+      item.source === "transcript" && !draftIds.has(item.id)
+    );
+    // An availability fact can be added while the transcript is briefly
+    // unreadable without changing the last successful transcript signature.
+    // A byte-identical successful read still has to reconcile once to remove
+    // that stale fact; otherwise genuinely repeated hydration remains a no-op.
+    if (session.transcriptSignature === signature && !hasStaleTranscriptItem) return false;
 
     const ordered = this.#items(session);
-    const exactByCorrelation = new Map<string, ActivityItem>();
+    const exactByCorrelation = new Map<string, ActivityItem[]>();
     for (const item of ordered) {
       if (
         item.source !== "transcript"
         && item.correlationId
-        && !exactByCorrelation.has(item.correlationId)
-      ) exactByCorrelation.set(item.correlationId, item);
+      ) {
+        const exact = exactByCorrelation.get(item.correlationId) ?? [];
+        exact.push(item);
+        exactByCorrelation.set(item.correlationId, exact);
+      }
     }
 
+    const transcriptCorrelationCounts = new Map<string, number>();
+    for (const draft of drafts) {
+      if (!draft.correlationId) continue;
+      transcriptCorrelationCounts.set(
+        draft.correlationId,
+        (transcriptCorrelationCounts.get(draft.correlationId) ?? 0) + 1,
+      );
+    }
+
+    const correlationOccurrences = new Map<string, number>();
     const retainedExactIds = new Set<string>();
     const merged: ActivityItemDraft[] = drafts.map((draft) => {
+      const candidates = draft.correlationId
+        ? exactByCorrelation.get(draft.correlationId) ?? []
+        : [];
+      const occurrence = draft.correlationId
+        ? correlationOccurrences.get(draft.correlationId) ?? 0
+        : 0;
       const exact = draft.correlationId
-        ? exactByCorrelation.get(draft.correlationId)
+          && transcriptCorrelationCounts.get(draft.correlationId) === candidates.length
+          && candidates.length > 0
+        ? candidates[occurrence]
         : undefined;
+      if (draft.correlationId) {
+        correlationOccurrences.set(draft.correlationId, occurrence + 1);
+      }
       if (!exact) return clone(draft);
       retainedExactIds.add(exact.id);
       return clone(exact);
     });
     for (const item of ordered) {
-      if (item.source === "transcript" || retainedExactIds.has(item.id)) continue;
+      if (item.source === "transcript") continue;
+      if (retainedExactIds.has(item.id)) continue;
+      retainedExactIds.add(item.id);
       merged.push(clone(item));
     }
 
-    this.ingest(sessionId, provider, {
+    // The reset below rematerializes exact items from their safe wire values.
+    // Preserve the provider's raw append cursor and bounded raw prefix as
+    // separate internal state. Reconstructing either from a redacted or
+    // truncated display value would reject the next valid provider append (or
+    // could cause split secret fragments to be redacted incorrectly).
+    const retainedAppendOffsets = new Map<string, number>();
+    const retainedAppendSources = new Map<string, AppendSourceState>();
+    for (const [key, offset] of session.appendOffsets) {
+      if (retainedExactIds.has(itemIdFromAppendKey(key))) retainedAppendOffsets.set(key, offset);
+    }
+    for (const [key, source] of session.appendSources) {
+      if (retainedExactIds.has(itemIdFromAppendKey(key))) {
+        retainedAppendSources.set(key, { ...source });
+      }
+    }
+
+    this.#ingest(sessionId, provider, {
       type: "reset",
       reason,
       items: merged,
       truncated: truncated || session.truncated,
+    }, {
+      offsets: retainedAppendOffsets,
+      sources: retainedAppendSources,
     });
-    this.#sessions.get(sessionId)!.transcriptSignature = signature;
+    const reconciled = this.#sessions.get(sessionId)!;
+    reconciled.transcriptSignature = signature;
     return true;
   }
 
@@ -1068,6 +1168,11 @@ export class ActivityHub {
 
 function appendKey(id: string, channel: ActivityAppendChannel): string {
   return `${id}\u0000${channel}`;
+}
+
+function itemIdFromAppendKey(key: string): string {
+  const separator = key.indexOf("\u0000");
+  return separator < 0 ? key : key.slice(0, separator);
 }
 
 function positiveInteger(value: number | undefined, fallback: number): number {

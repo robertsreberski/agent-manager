@@ -74,6 +74,34 @@ function contentHash(...parts: string[]): string {
   return createHash("sha256").update(parts.join("\u0000")).digest("hex").slice(0, 20);
 }
 
+/**
+ * Canonical identity for a visible Codex message across the rollout, command
+ * hook, and App Server projections. Codex gives the App Server/rollout an
+ * item id, but command hooks expose only the turn and message body. Basing the
+ * cross-source key on every field all three surfaces share keeps the provider
+ * item id as the activity id while still allowing an exact hook/API item to
+ * replace its inferred rollout twin.
+ *
+ * The content digest is important for live steering: more than one user
+ * message can belong to the same provider turn. The turn id keeps identical
+ * prompts in different turns distinct.
+ */
+export function codexMessageCorrelationId(
+  threadId: string,
+  turnId: string,
+  role: "user" | "assistant",
+  text: string,
+): string {
+  const normalized = text.trim().slice(0, 262_144);
+  return scopedId(
+    "message-correlation",
+    threadId,
+    turnId,
+    role,
+    contentHash(normalized),
+  );
+}
+
 function itemActivityId(
   threadId: string,
   turnId: string,
@@ -483,14 +511,17 @@ function projectThreadItem(
 
   switch (itemType) {
     case "userMessage":
-      mutations.push(upsert({
-        ...baseItem(id, "message", turnId, state, times.startedAt, times.updatedAt, times.completedAt),
-        correlationId: `message:${itemId}`,
-        role: "user",
-        phase: null,
-        text: textContent(item.content),
-        label: null,
-      }));
+      {
+        const text = textContent(item.content);
+        mutations.push(upsert({
+          ...baseItem(id, "message", turnId, state, times.startedAt, times.updatedAt, times.completedAt),
+          correlationId: codexMessageCorrelationId(threadId, turnId, "user", text),
+          role: "user",
+          phase: null,
+          text,
+          label: null,
+        }));
+      }
       break;
     case "hookPrompt": {
       const text = Array.isArray(item.fragments)
@@ -510,18 +541,24 @@ function projectThreadItem(
       break;
     }
     case "agentMessage":
-      mutations.push(upsert({
-        ...baseItem(id, "message", turnId, state, times.startedAt, times.updatedAt, times.completedAt),
-        correlationId: `message:${itemId}`,
-        role: "assistant",
-        phase: item.phase === "commentary"
-          ? "commentary"
-          : item.phase === "final_answer"
-          ? "final"
-          : null,
-        text: stringValue(item.text) ?? "",
-        label: null,
-      }));
+      {
+        const text = stringValue(item.text) ?? "";
+        const final = item.phase === "final_answer";
+        mutations.push(upsert({
+          ...baseItem(id, "message", turnId, state, times.startedAt, times.updatedAt, times.completedAt),
+          correlationId: final
+            ? codexMessageCorrelationId(threadId, turnId, "assistant", text)
+            : `message:${itemId}`,
+          role: "assistant",
+          phase: item.phase === "commentary"
+            ? "commentary"
+            : final
+            ? "final"
+            : null,
+          text,
+          label: null,
+        }));
+      }
       break;
     // Codex plan items are transient prose proposals, not provider-backed plan
     // documents and not structured todos. The authoritative checklist arrives
@@ -1373,6 +1410,7 @@ export function recordCodexActivityOffsets(
     );
     return;
   }
+  if (mutation.type === "retention-boundary") return;
 
   const item = mutation.item as unknown as Record<string, unknown>;
   const id = stringValue(item.id);

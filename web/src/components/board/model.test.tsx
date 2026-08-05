@@ -10,7 +10,19 @@ function session(overrides: Partial<CockpitSessionView> & Pick<CockpitSessionVie
     provider: "codex", name: overrides.id, hostId: "local", hostLabel: "This Mac", remote: false,
     cwd: "/work/app", workspaceIdentity: { repoRoot: "/work/app", repoName: "app", worktreePath: "/work/app", linked: false, branch: "main", detached: false, dirtyCount: null, ahead: null, behind: null, insertions: null, deletions: null },
     activity: "idle", attention: [], updatedAt: "2026-08-04T12:00:00Z",
-    control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [], takeover: null },
+    control: {
+      plane: "observe-only",
+      authority: "none",
+      coordination: {
+        mode: "observe-only",
+        nativeAttach: "none",
+        responseResolution: "single-controller",
+      },
+      recovery: null,
+      capabilities: [],
+      withheld: [],
+      takeover: null,
+    },
     profile: null, model: null, effort: null, todo: null, ...overrides,
   };
 }

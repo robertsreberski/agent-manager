@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vitest";
 
-import type { ActivityTodoItem, SessionActivityView } from "../types";
+import {
+  WIRE_SCHEMA_VERSION,
+  type ActivityTodoItem,
+  type SessionActivityView,
+} from "../types";
 import { currentTodo, sessionTodoProgress, todoView } from "./session-activity";
 
 const todo: ActivityTodoItem = {
-  schemaVersion: 4,
+  schemaVersion: WIRE_SCHEMA_VERSION,
   id: "todo-1",
   sessionId: "local:codex:thread-1",
   provider: "codex",

@@ -1,8 +1,8 @@
-import { AlertTriangle, Check, ChevronRight, CircleHelp, CircleX, Copy, FolderGit2, LoaderCircle, Plus, PlugZap, RotateCcw, Server, WifiOff, X } from "lucide-react";
+import { AlertTriangle, Check, ChevronRight, CircleHelp, CircleX, Copy, FolderGit2, LoaderCircle, Plus, PlugZap, RotateCcw, Server, Trash2, WifiOff, X } from "lucide-react";
 import { workspaceChangeFacts, workspaceChangeLabel, type CockpitSessionView, type SessionCapability } from "../../lib/cockpit-view";
 import type { SetupHookOffer, SetupHostProbe, SetupNearbyWorkspace } from "../../../../src/shared/setup.ts";
 import type { SelectedSessionFactsResponse, SessionTurnUsage } from "../../../../src/shared/session-facts.ts";
-import { useState, type FormEvent, type ReactNode } from "react";
+import { useId, useState, type FormEvent, type ReactNode } from "react";
 import {
   Badge,
   Button,
@@ -52,31 +52,24 @@ export function EmptyState({ repositories, onOpen }: { repositories: readonly { 
 
 export function SessionEndedState({
   canResume,
-  resumeCommand,
-  resumeDescription,
-  resumeError,
   resumeUnavailableReason,
-  loadingResume = false,
+  resuming = false,
+  resumeDisabled = false,
   onResume,
   canContinue,
   onContinue,
 }: {
   canResume: boolean;
-  resumeCommand?: string | null;
-  resumeDescription?: string | null;
-  resumeError?: string | null;
   resumeUnavailableReason?: string | null;
-  loadingResume?: boolean;
+  resuming?: boolean;
+  resumeDisabled?: boolean;
   onResume?: () => void;
   canContinue: boolean;
   onContinue?: () => void;
 }) {
   return (
     <section className="border border-[var(--border)] p-4 text-center"><Check size={18} className="mx-auto text-[var(--text-muted)]" /><h3 className="mt-2 text-body-sm font-semibold">This session ended</h3>
-      {/* R3: revealing the wrapper is the operator's own action, so it is the lime one. */}
-      {canResume && !resumeCommand && <Button variant="primary" size="touch" className="mx-auto mt-3 gap-1.5" disabled={loadingResume} onClick={onResume}><RotateCcw size={13} />{loadingResume ? "Loading resume wrapper…" : "Show resume command"}</Button>}
-      {canResume && resumeCommand && <div className="mt-3 text-left"><p className="text-meta-sm text-[var(--text-muted)]">{resumeDescription ?? "Run this authenticated wrapper in a terminal to resume the same provider session."}</p><div className="mt-2 flex items-start gap-2"><pre className="min-w-0 flex-1 overflow-x-auto bg-[var(--surface-raised)] p-2 font-mono text-code-xs">{resumeCommand}</pre><Button variant="secondary" size="sm" data-compact-control onClick={() => void navigator.clipboard?.writeText(resumeCommand)}>Copy</Button></div></div>}
-      {resumeError && <p className="mt-2 text-code-sm text-[var(--warning)]">{resumeError}</p>}
+      {canResume && <><p className="mt-1 text-meta-sm text-[var(--text-muted)]">Continue this exact provider conversation in Agent Manager.</p><Button variant="primary" size="touch" className="mx-auto mt-3 gap-1.5" disabled={resuming || resumeDisabled} onClick={onResume}><RotateCcw size={13} />{resuming ? "Resuming…" : "Resume here"}</Button></>}
       {!canResume && resumeUnavailableReason && <p className="mt-2 text-code-sm text-[var(--text-muted)]">{resumeUnavailableReason}</p>}
       {canContinue && <Button variant={canResume ? "ghost" : "primary"} size="touch" className={`mx-auto gap-1.5 ${canResume ? "mt-2 underline" : "mt-3"}`} onClick={onContinue}><RotateCcw size={13} />Start a new thread in this worktree</Button>}
       {!canResume && !canContinue && !resumeUnavailableReason && <p className="mt-1 text-meta-sm text-[var(--text-muted)]">This harness does not expose a safe continuation.</p>}
@@ -85,7 +78,7 @@ export function SessionEndedState({
 }
 
 const CAPABILITY_SENTENCE: Record<SessionCapability, string> = {
-  queue: "Queue messages for the next turn", steer: "Steer the active turn", interrupt: "Stop the active turn", respond: "Answer exact questions and approvals", "set-profile": "Change the execution profile", "set-model": "Change the model", "set-effort": "Change reasoning effort", "remove-queued": "Remove queued messages", preview: "Preview the native terminal", attach: "Attach from a terminal", resume: "Resume this session", end: "End this managed run", archive: "Archive this thread", delete: "Delete this thread", "take-control": "Take exclusive control from a native CLI", "cancel-take-control": "Cancel a pending guided takeover", "open-editor": "Open changed files in the editor",
+  queue: "Queue messages for the next turn", steer: "Steer the active turn", interrupt: "Stop the active turn", respond: "Answer exact questions and approvals", "set-profile": "Change the execution profile", "set-model": "Change the model", "set-effort": "Change reasoning effort", "remove-queued": "Remove queued messages", preview: "Preview the native terminal", attach: "Attach from a terminal", resume: "Resume the exact session in the web app", end: "End this managed run", archive: "Archive this thread", delete: "Delete this thread", "take-control": "Connect provider control to the web app", "cancel-take-control": "Cancel a pending control migration", "retry-control": "Retry provider control recovery", "open-editor": "Open changed files in the editor",
 };
 const ALL_CAPABILITIES = Object.keys(CAPABILITY_SENTENCE) as SessionCapability[];
 
@@ -111,6 +104,22 @@ function FactRow({ label, children }: { label: string; children: ReactNode }) {
       <Separator className="last:hidden" />
     </>
   );
+}
+
+function capabilitySentence(session: CockpitSessionView, capability: SessionCapability): string {
+  if (capability === "attach" && session.control.coordination.nativeAttach === "join") {
+    return "Open the same conversation in Codex CLI";
+  }
+  if (capability === "attach" && session.control.coordination.nativeAttach === "handoff") {
+    return "Move provider control to the CLI";
+  }
+  if (capability === "take-control" && session.provider === "codex") {
+    return "Migrate once to shared CLI + web control";
+  }
+  if (capability === "take-control" && session.provider === "claude") {
+    return "Move exclusive Claude Code control to the web app";
+  }
+  return CAPABILITY_SENTENCE[capability];
 }
 
 function formatTokens(value: number): string {
@@ -159,30 +168,48 @@ function TurnFacts({ usage, factsStatus }: { usage: SessionTurnUsage | null; fac
 
 export function SessionCapabilityPanel({
   session,
+  archived = false,
   facts,
   factsStatus,
   attachCommand,
+  attachDescription,
+  attachRequiresHandoff = false,
   attachError,
   loadingAttach,
   onRevealAttach,
 }: {
   session: CockpitSessionView;
+  archived?: boolean;
   facts: SelectedSessionFactsResponse | null;
   factsStatus: "loading" | "loaded" | "error";
   attachCommand?: string | null;
+  attachDescription?: string | null;
+  attachRequiresHandoff?: boolean;
   attachError?: string | null;
   loadingAttach?: boolean;
   onRevealAttach?: () => void;
 }) {
-  const offered = new Set(session.control.capabilities);
+  const archivedReason = "Archived sessions are read-only.";
+  const offered = new Set(archived ? [] : session.control.capabilities);
   const withheld = new Map(session.control.withheld.map((item) => [item.capability, item.reason]));
+  if (archived) {
+    for (const capability of ALL_CAPABILITIES) withheld.set(capability, archivedReason);
+  }
   const workspace = session.workspaceIdentity;
   const changes = workspaceChangeFacts(workspace);
   const canRevealAttach = offered.has("attach") || offered.has("resume");
+  const joinsNative = session.control.coordination.nativeAttach === "join";
+  const handsOffNative = session.control.coordination.nativeAttach === "handoff";
+  const ended = ["completed", "failed", "interrupted"].includes(session.activity);
+  const nativeCommandLabel = joinsNative
+    ? "Show Codex CLI join command"
+    : session.provider === "claude"
+      ? ended ? "Show Claude Code resume command" : "Show Claude Code handoff command"
+      : "Show guarded resume command";
   const account = facts?.account.available ? facts.account : null;
   return (
     <section className="grid grid-cols-[minmax(0,1fr)] gap-5 text-meta">
-      <FactSection title="Where it runs"><div className="mt-1"><FactRow label="Host">{session.hostLabel}{session.hostId !== session.hostLabel ? <span className="ml-2 text-[var(--text-muted)]">{session.hostId}</span> : null}</FactRow><FactRow label="Repository">{workspace?.repoName ?? "Unknown"}</FactRow><FactRow label="Worktree">{workspace?.worktreePath ?? session.cwd ?? "Unknown"}</FactRow><FactRow label="Branch">{workspace?.detached ? "Detached HEAD" : workspace?.branch ?? "Unknown"}</FactRow>{workspace?.dirtyCount !== null && workspace?.dirtyCount !== undefined && <FactRow label="Changes">{changes === null ? "Clean" : `${workspaceChangeLabel(changes)} uncommitted`}</FactRow>}<FactRow label="Harness"><span className="font-sans font-medium">{HARNESS_LABEL[session.control.plane]}</span>{session.model && <span className="ml-2 text-[var(--text-muted)]">{session.model}</span>}{session.effort && <span className="ml-2 text-[var(--text-muted)]">{session.effort}</span>}</FactRow></div></FactSection>
+      <FactSection title="Where it runs"><div className="mt-1"><FactRow label="Host">{session.hostLabel}{session.hostId !== session.hostLabel ? <span className="ml-2 text-[var(--text-muted)]">{session.hostId}</span> : null}</FactRow><FactRow label="Repository">{workspace?.repoName ?? "Unknown"}</FactRow><FactRow label="Worktree">{workspace?.worktreePath ?? session.cwd ?? "Unknown"}</FactRow><FactRow label="Branch">{workspace?.detached ? "Detached HEAD" : workspace?.branch ?? "Unknown"}</FactRow>{workspace?.dirtyCount !== null && workspace?.dirtyCount !== undefined && <FactRow label="Changes">{changes === null ? "Clean" : `${workspaceChangeLabel(changes)} uncommitted`}</FactRow>}<FactRow label="Harness"><span className="font-sans font-medium">{HARNESS_LABEL[session.control.plane]}</span>{session.model && <span className="ml-2 text-[var(--text-muted)]">{session.model}</span>}{session.effort && <span className="ml-2 text-[var(--text-muted)]">{session.effort}</span>}</FactRow><FactRow label="Control">{archived ? "Archived · read-only" : session.control.coordination.mode === "shared" ? "Shared CLI + web" : session.control.coordination.mode === "exclusive" ? "One active writer" : "Observation only"}{session.control.recovery && <span className="ml-2 text-[var(--warning)]">{session.control.recovery.state === "waiting-for-native-exit" ? "Claude Code has control" : session.control.recovery.state === "needs-attention" ? "needs attention" : `${session.control.recovery.state.replaceAll("-", " ")} · attempt ${session.control.recovery.attempt}`}</span>}</FactRow></div></FactSection>
       {/*
         Frame 9b marks each sentence with a glyph rather than a character: a
         lime tick for offered, an amber question for genuinely unknown, and a
@@ -194,11 +221,20 @@ export function SessionCapabilityPanel({
         return <li key={capability} className="flex items-center gap-[11px]">
           {/* Frame 9b ticks an offered capability lime. */}
           <Glyph size={14} strokeWidth={1.75} className={`shrink-0 ${state === "offered" ? "text-[var(--accent)]" : state === "withheld" ? "text-[var(--text-muted)]" : "text-[var(--warning)]"}`} aria-label={state === "offered" ? "Available" : state === "withheld" ? "Unavailable" : "Unknown"} />
-          <span className={`min-w-0 flex-1 text-[13.5px] leading-[1.5] ${state === "withheld" ? "text-[var(--text-secondary)]" : ""}`}>{CAPABILITY_SENTENCE[capability]}{withheld.get(capability) && <span className="block text-code-sm text-[var(--text-muted)]">{withheld.get(capability)}</span>}</span>
+          <span className={`min-w-0 flex-1 text-[13.5px] leading-[1.5] ${state === "withheld" ? "text-[var(--text-secondary)]" : ""}`}>{capabilitySentence(session, capability)}{withheld.get(capability) && <span className="block text-code-sm text-[var(--text-muted)]">{withheld.get(capability)}</span>}</span>
         </li>;
       })}</ul><div className="mt-3 flex flex-wrap items-center gap-2.5">{/* R4: the profile is merely a fact, so it is the neutral chip. */}<Badge tone="neutral" className="font-sans"><span className="sr-only">Execution profile · </span>{formatProfile(session.profile)}</Badge>{offered.has("set-profile") && <span className="font-mono text-code-sm leading-[1.4] text-[var(--text-muted)]">changeable mid-session</span>}</div></FactSection>
       <FactSection title="What this turn cost"><TurnFacts usage={facts?.turnUsage ?? null} factsStatus={factsStatus} />{account?.usage && <><Separator className="mt-3" /><div className="pt-3"><p className="text-meta-sm"><span className="text-[var(--text-muted)]">Codex account</span>{account.usage.summary.lifetimeTokens !== null && <> · {formatTokens(account.usage.summary.lifetimeTokens)} lifetime tokens</>}{account.usage.summary.peakDailyTokens !== null && <> · {formatTokens(account.usage.summary.peakDailyTokens)} peak day</>}</p>{account.usage.recentDays.length > 0 && <ul className="mt-2 flex flex-wrap gap-2 font-mono text-eyebrow tracking-normal text-[var(--text-muted)]" aria-label="Recent account token usage">{account.usage.recentDays.slice(-7).map((day) => <li key={day.date}>{day.date.slice(5)} · {formatTokens(day.tokens)}</li>)}</ul>}</div></>}{account?.rateLimits && account.rateLimits.length > 0 && <><Separator className="mt-3" /><ul className="grid gap-2 pt-3">{account.rateLimits.map((limit, index) => <li key={`${limit.label ?? "limit"}:${index}`} className="text-meta-sm"><span className="font-medium">{limit.label ?? "Codex limit"}</span>{limit.planType && <span className="ml-2 text-[var(--text-muted)]">{formatPlan(limit.planType)}</span>}{limit.primary && <span className="block font-mono text-code-xs text-[var(--text-muted)]">Primary · {rateWindow(limit.primary)}</span>}{limit.secondary && <span className="block font-mono text-code-xs text-[var(--text-muted)]">Secondary · {rateWindow(limit.secondary)}</span>}{limit.spendControlReached === true && <span className="block text-[var(--warning)]">Account spend control reached</span>}</li>)}</ul></>}{facts?.account.available === false && facts.account.reason === "provider-unavailable" && <p className="mt-3 text-code-sm text-[var(--text-muted)]">Codex account facts are temporarily unavailable.</p>}</FactSection>
-      <FactSection title="How to attach from a terminal">{attachCommand ? <div className="mt-3 flex items-start gap-2.5 bg-[var(--surface-raised)] px-[13px] py-3"><pre className="min-w-0 flex-1 whitespace-pre-wrap break-all font-mono text-code leading-[19px] text-[var(--text)]">{attachCommand}</pre><Button variant="ghost" size="icon" data-compact-control className="size-[26px] shrink-0" aria-label="Copy guarded attach command" onClick={() => void navigator.clipboard?.writeText(attachCommand)}><Copy size={15} strokeWidth={1.75} /></Button></div> : canRevealAttach ? <Button variant="secondary" size="touch" className="mt-3 border-[var(--border)] px-3" disabled={loadingAttach} onClick={onRevealAttach}>{loadingAttach ? "Loading guarded wrapper…" : "Show guarded attach command"}</Button> : <p className="mt-3 text-meta-sm text-[var(--text-muted)]">{withheld.get("attach") ?? withheld.get("resume") ?? "This harness does not expose a guarded attach wrapper."}</p>}{attachError && <p className="mt-2 text-code-sm text-[var(--warning)]">{attachError}</p>}{attachCommand && <p className="mt-[9px] font-mono text-code-sm leading-[17px] text-[var(--text-muted)]">copied, not run — the browser never attaches</p>}</FactSection>
+      <Collapsible data-advanced-cli-access>
+        <CollapsibleTrigger data-compact-control className="group flex min-h-9 w-full cursor-pointer items-center gap-2 border-t border-[var(--border-hairline)] pt-3 text-left font-mono text-code-sm text-[var(--text-muted)]">
+          <ChevronRight size={14} className="transition-transform group-data-[state=open]:rotate-90" aria-hidden="true" />
+          Advanced · CLI access
+        </CollapsibleTrigger>
+        <CollapsibleContent className="pt-1">
+          {attachCommand ? <><div className="mt-3 flex items-start gap-2.5 bg-[var(--surface-raised)] px-[13px] py-3"><pre className="min-w-0 flex-1 whitespace-pre-wrap break-all font-mono text-code leading-[19px] text-[var(--text)]">{attachCommand}</pre><Button variant="ghost" size="icon" data-compact-control className="size-[26px] shrink-0" aria-label={joinsNative ? "Copy Codex CLI join command" : "Copy guarded attach command"} onClick={() => void navigator.clipboard?.writeText(attachCommand)}><Copy size={15} strokeWidth={1.75} /></Button></div>{attachDescription && <p className="mt-2 text-meta-sm text-[var(--text-muted)]">{attachDescription}</p>}<p className="mt-[9px] font-mono text-code-sm leading-[17px] text-[var(--text-muted)]">{ended && session.provider === "claude" ? "resumes the exact conversation in Claude Code; web replies stay unavailable while it runs" : attachRequiresHandoff || handsOffNative ? "running this moves provider control to the CLI" : joinsNative ? "CLI joins; web control stays active" : "copied, not run — the browser never attaches"}</p></> : canRevealAttach ? <Button variant="secondary" size="touch" className="mt-3 border-[var(--border)] px-3" disabled={loadingAttach} onClick={onRevealAttach}>{loadingAttach ? (joinsNative ? "Preparing Codex CLI command…" : "Loading guarded wrapper…") : nativeCommandLabel}</Button> : <p className="mt-3 text-meta-sm text-[var(--text-muted)]">{withheld.get("attach") ?? withheld.get("resume") ?? "This harness does not expose a terminal continuation."}</p>}
+          {attachError && <p className="mt-2 text-code-sm text-[var(--warning)]">{attachError}</p>}
+        </CollapsibleContent>
+      </Collapsible>
     </section>
   );
 }
@@ -290,20 +326,42 @@ function hookStateLabel(hook: SetupHookOffer): string {
   }
 }
 
-/**
- * `standalone` drops the first-run wizard framing so the same component can be
- * reached later from the palette. It never adds a mutating affordance.
- */
-export function HookSetupStep({ hooks, onContinue, standalone = false }: {
+/** `standalone` drops the first-run wizard framing for the palette surface. */
+export function HookSetupStep({ hooks, onApply, onRefresh, onContinue, standalone = false }: {
   hooks: { claude: SetupHookOffer; codex: SetupHookOffer };
+  onApply?: (provider: "claude" | "codex", previewId: string) => Promise<void>;
+  onRefresh?: () => void;
   onContinue?: () => void;
   standalone?: boolean;
 }) {
+  const [applying, setApplying] = useState<"claude" | "codex" | null>(null);
+  const [applyError, setApplyError] = useState<{ provider: "claude" | "codex"; message: string } | null>(null);
+
+  async function applyHook(hook: SetupHookOffer): Promise<void> {
+    if (!hook.previewId || !onApply || applying !== null) return;
+    setApplying(hook.provider);
+    setApplyError(null);
+    try {
+      await onApply(hook.provider, hook.previewId);
+    } catch (error) {
+      setApplyError({
+        provider: hook.provider,
+        message: error instanceof Error ? error.message : "The hook could not be installed.",
+      });
+    } finally {
+      setApplying(null);
+    }
+  }
+
   return (
     <section className={`mx-auto grid max-w-3xl gap-5 ${standalone ? "p-5" : "p-6 sm:p-10"}`}>
-      <div><p className="font-mono text-eyebrow text-[var(--text-faint)] uppercase">{standalone ? "Provider hooks" : "Optional setup · 2 of 3"}</p><h1 className={`mt-2 ${standalone ? "text-title" : "text-display-md"}`}>See terminal-started sessions</h1><p className="mt-2 text-body-sm text-[var(--text-muted)]">Hooks let Agent Manager see and answer sessions you started in a terminal. Review the exact CLI command and redacted settings diff below, then run the command yourself if you want the integration. This browser never changes provider settings. {standalone ? "Nothing here changes until you run a command." : "Skipping this step changes nothing."}</p></div>
-      <div className="grid gap-3 sm:grid-cols-2">{([hooks.claude, hooks.codex] as const).map((hook) => <article key={hook.provider} className="min-w-0 border border-[var(--border)] p-4"><div className="flex items-start gap-2"><PlugZap size={15} className="mt-0.5 text-[var(--text-muted)]" /><div className="min-w-0"><h2 className="capitalize text-body-sm font-semibold">{hook.provider}</h2><p className="mt-0.5 text-code-sm text-[var(--text-muted)]">{hookStateLabel(hook)}</p></div></div><p className="mt-3 break-all font-mono text-eyebrow tracking-normal text-[var(--text-muted)]">{hook.settingsPath}</p><pre className="mt-3 overflow-x-auto bg-[var(--surface-raised)] p-2 font-mono text-code-xs leading-4">{hook.command}</pre>{hook.diff && <Collapsible defaultOpen className="mt-3">{/* Radix wires aria-controls and aria-expanded that the bare <details> never had. */}<CollapsibleTrigger data-compact-control className="cursor-pointer text-code-sm font-medium">Exact redacted settings diff</CollapsibleTrigger><CollapsibleContent><pre className="mt-2 max-h-72 overflow-auto bg-[var(--ground)] p-2 font-mono text-code-xs leading-4">{hook.diff}</pre></CollapsibleContent></Collapsible>}{hook.notice && <p className="mt-2 text-code-xs leading-4 text-[var(--text-muted)]">{hook.notice}</p>}<div className="mt-4 flex justify-end"><span className="flex items-center gap-1.5 text-code-sm text-[var(--text-muted)]"><Check size={13} />{hook.changed ? "Run the command in a terminal to apply" : "No settings change needed"}</span></div></article>)}</div>
-      {onContinue && !standalone && <div className="flex justify-end"><Button variant="ghost" size="touch" onClick={onContinue}>Continue without changing settings</Button></div>}
+      <div><p className="font-mono text-eyebrow text-[var(--text-faint)] uppercase">{standalone ? "Provider hooks" : "Optional setup · 2 of 3"}</p><h1 className={`mt-2 ${standalone ? "text-title" : "text-display-md"}`}>See terminal-started sessions</h1><p className="mt-2 text-body-sm text-[var(--text-muted)]">Hooks add exact live activity and surface held approvals or questions. Review the redacted settings change, then install it directly from Agent Manager. Sending new messages still requires provider control. {standalone ? "Manual installation remains available under Advanced." : "You can skip this optional step."}</p></div>
+      <div className="grid gap-3 sm:grid-cols-2">{([hooks.claude, hooks.codex] as const).map((hook) => {
+        const pending = applying === hook.provider;
+        const installLabel = hook.state === "absent" || hook.state === "provider-disabled" ? "Install" : "Update";
+        return <article key={hook.provider} className="min-w-0 border border-[var(--border)] p-4"><div className="flex items-start gap-2"><PlugZap size={15} className="mt-0.5 text-[var(--text-muted)]" /><div className="min-w-0"><h2 className="capitalize text-body-sm font-semibold">{hook.provider}</h2><p className="mt-0.5 text-code-sm text-[var(--text-muted)]">{hookStateLabel(hook)}</p></div></div><p className="mt-3 break-all font-mono text-eyebrow tracking-normal text-[var(--text-muted)]">{hook.settingsPath}</p>{hook.provider === "codex" && <p className="mt-3 text-code-xs leading-4 text-[var(--text-muted)]">Web-native manager control does not depend on this optional CLI observation hook. Installing it adds exact CLI activity; the browser does not bypass Codex hook trust.</p>}{hook.diff && <Collapsible defaultOpen className="mt-3">{/* Radix wires aria-controls and aria-expanded that the bare <details> never had. */}<CollapsibleTrigger data-compact-control className="cursor-pointer text-code-sm font-medium">Exact redacted settings diff</CollapsibleTrigger><CollapsibleContent><pre className="mt-2 max-h-72 overflow-auto bg-[var(--ground)] p-2 font-mono text-code-xs leading-4">{hook.diff}</pre></CollapsibleContent></Collapsible>}{hook.notice && <p className="mt-2 text-code-xs leading-4 text-[var(--text-muted)]">{hook.notice}</p>}{applyError?.provider === hook.provider && <div className="mt-3 flex items-start justify-between gap-3"><p role="alert" className="text-code-sm leading-4 text-[var(--warning)]">{applyError.message}</p>{onRefresh && <Button variant="ghost" size="sm" data-compact-control className="shrink-0" onClick={() => { setApplyError(null); onRefresh(); }}>Refresh preview</Button>}</div>}<div className="mt-4 flex justify-end">{hook.changed ? <Button variant="primary" size="touch" className="gap-1.5 px-4" disabled={!hook.previewId || !onApply || applying !== null} onClick={() => void applyHook(hook)}>{pending && <LoaderCircle size={13} className="motion-safe:animate-spin" aria-hidden="true" />}{pending ? (installLabel === "Install" ? "Installing…" : "Updating…") : `${installLabel} ${hook.provider} hook`}</Button> : <span className="flex items-center gap-1.5 text-code-sm text-[var(--text-muted)]"><Check size={13} />No settings change needed</span>}</div><Collapsible className="mt-3"><CollapsibleTrigger data-compact-control className="group flex w-full cursor-pointer items-center gap-1.5 border-t border-[var(--border-hairline)] pt-3 text-left font-mono text-code-sm text-[var(--text-muted)]"><ChevronRight size={13} className="transition-transform group-data-[state=open]:rotate-90" aria-hidden="true" />Advanced · manual installation</CollapsibleTrigger><CollapsibleContent><div className="mt-2 flex items-start gap-2 bg-[var(--surface-raised)] p-2"><pre className="min-w-0 flex-1 overflow-x-auto whitespace-pre-wrap break-all font-mono text-code-xs leading-4">{hook.command}</pre><Button variant="ghost" size="icon" data-compact-control className="size-[26px] shrink-0" aria-label={`Copy ${hook.provider} manual installation command`} onClick={() => void navigator.clipboard?.writeText(hook.command)}><Copy size={14} aria-hidden="true" /></Button></div></CollapsibleContent></Collapsible></article>;
+      })}</div>
+      {onContinue && !standalone && <div className="flex justify-end"><Button variant="ghost" size="touch" onClick={onContinue}>Continue without installing hooks</Button></div>}
     </section>
   );
 }
@@ -315,18 +373,76 @@ function harnessLabel(host: SetupHostProbe, provider: "codex" | "claude"): strin
   return `${provider} not checked`;
 }
 
-export function HostSetupStep({ hosts, onContinue, standalone = false }: { hosts: readonly SetupHostProbe[]; onContinue?: () => void; standalone?: boolean }) {
+export function HostSetupStep({ hosts, onAddHost, onRemoveHost, onContinue, standalone = false }: {
+  hosts: readonly SetupHostProbe[];
+  onAddHost: (label: string, target: string) => Promise<void>;
+  onRemoveHost: (hostId: string) => Promise<void>;
+  onContinue?: () => void;
+  standalone?: boolean;
+}) {
   const remote = hosts.filter((host) => host.kind === "ssh");
+  const fieldId = useId();
+  const [label, setLabel] = useState("");
+  const [target, setTarget] = useState("");
+  const [pending, setPending] = useState<"add" | `remove:${string}` | null>(null);
+  const [confirmingRemove, setConfirmingRemove] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  async function addHost(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    if (pending !== null) return;
+    const normalizedLabel = label.trim();
+    const normalizedTarget = target.trim();
+    if (!normalizedLabel || !normalizedTarget) {
+      setError("Enter both a host label and an SSH target.");
+      return;
+    }
+    setPending("add");
+    setError(null);
+    try {
+      await onAddHost(normalizedLabel, normalizedTarget);
+      setLabel("");
+      setTarget("");
+    } catch (addError) {
+      setError(addError instanceof Error ? addError.message : "The remote host could not be added.");
+    } finally {
+      setPending(null);
+    }
+  }
+
+  async function removeHost(host: SetupHostProbe): Promise<void> {
+    if (pending !== null) return;
+    setPending(`remove:${host.id}`);
+    setError(null);
+    try {
+      await onRemoveHost(host.id);
+      setConfirmingRemove(null);
+    } catch (removeError) {
+      setError(removeError instanceof Error ? removeError.message : `${host.label} could not be removed.`);
+    } finally {
+      setPending(null);
+    }
+  }
+
   return (
-    <section className={`mx-auto grid max-w-xl gap-5 ${standalone ? "p-5" : "p-6 sm:p-10"}`}>
-      <div><p className="font-mono text-eyebrow text-[var(--text-faint)] uppercase">{standalone ? "Remote hosts" : "Optional setup · 3 of 3"}</p><h1 className={`mt-2 ${standalone ? "text-title" : "text-display-md"}`}>Existing remote hosts</h1><p className="mt-2 text-body-sm text-[var(--text-muted)]">Each configured SSH host is checked within a short deadline. A missing harness only limits what that host can run; it does not fail setup.</p></div>
+    <section className={`mx-auto grid max-w-2xl gap-5 ${standalone ? "p-5" : "p-6 sm:p-10"}`}>
+      <div><p className="font-mono text-eyebrow text-[var(--text-faint)] uppercase">{standalone ? "Connections" : "Optional setup · 3 of 3"}</p><h1 className={`mt-2 ${standalone ? "text-title" : "text-display-md"}`}>{standalone ? "Remote hosts" : "Connect another host"}</h1><p className="mt-2 max-w-xl text-body-sm text-[var(--text-muted)]">Register the same SSH target you use in a terminal. Agent Manager keeps the connection locally and checks each host within a short deadline.</p></div>
+      <form className="grid gap-3 border border-[var(--border)] bg-[var(--surface-raised-hover)] p-4" aria-busy={pending === "add"} onSubmit={(event) => void addHost(event)}>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <label className="grid gap-1.5 text-meta-sm font-medium" htmlFor={`${fieldId}-label`}>Host label<input id={`${fieldId}-label`} value={label} onChange={(event) => { setLabel(event.target.value); setError(null); }} maxLength={120} required disabled={pending !== null} autoComplete="off" placeholder="Build host" className="min-h-10 border border-[var(--border)] bg-[var(--surface-raised)] px-3 text-body-sm font-normal outline-none focus:border-[var(--border-strong)] disabled:opacity-60" /></label>
+          <label className="grid gap-1.5 text-meta-sm font-medium" htmlFor={`${fieldId}-target`}>SSH target<input id={`${fieldId}-target`} value={target} onChange={(event) => { setTarget(event.target.value); setError(null); }} maxLength={512} required disabled={pending !== null} autoComplete="off" autoCapitalize="none" spellCheck={false} aria-describedby={`${fieldId}-target-help`} placeholder="dev@build.example" className="min-h-10 border border-[var(--border)] bg-[var(--surface-raised)] px-3 font-mono text-code font-normal outline-none focus:border-[var(--border-strong)] disabled:opacity-60" /></label>
+        </div>
+        <div className="flex flex-wrap items-center justify-between gap-3"><p id={`${fieldId}-target-help`} className="text-code-sm text-[var(--text-muted)]">Use a host alias or <span className="font-mono">user@host</span>; SSH configuration stays authoritative.</p><Button type="submit" variant="primary" size="touch" className="gap-1.5 px-4" disabled={pending !== null}>{pending === "add" && <LoaderCircle size={13} className="motion-safe:animate-spin" aria-hidden="true" />}{pending === "add" ? "Adding…" : "Add host"}</Button></div>
+      </form>
+      {error && <p role="alert" className="border-l-2 border-[var(--warning)] bg-[var(--warning-field)] px-3 py-2 text-code-sm text-[var(--warning)]">{error}</p>}
       {/*
         Frame 13c reports each probe as a line with its own tick or cross, so a
         missing harness reads as a limit on that host rather than a failure.
       */}
-      <div className="grid gap-4">{remote.map((host) => <article key={host.id} className="flex items-start gap-3.5 bg-[var(--surface-raised-hover)] px-[18px] py-4"><Server size={17} strokeWidth={1.75} className="mt-0.5 shrink-0 text-[var(--remote)]" /><div className="min-w-0 flex-1"><h2 className="text-body-sm font-semibold">{host.label}</h2><p className="mt-1 font-mono text-code-sm leading-[1.5] text-[var(--text-muted)]">{host.statusMessage ?? host.status}</p><div className="mt-3 grid gap-[9px]">{(["codex", "claude"] as const).map((provider) => { const available = host.harnesses[provider]; const missing = available.state === "missing"; return <p key={provider} className={`flex items-center gap-2.5 font-mono text-meta-sm leading-[1.5] ${missing ? "text-[var(--text-muted)]" : "text-[var(--text-secondary)]"}`}>{/* Frame 13c ticks a present harness green; spec 12 R4 reserves green for added lines, so the tick stays neutral. */}
+      <div className="grid gap-3" aria-busy={pending?.startsWith("remove:") ?? false}>{remote.map((host) => { const removing = pending === `remove:${host.id}`; const confirming = confirmingRemove === host.id; return <article key={host.id} className="flex items-start gap-3.5 border border-[var(--border-hairline)] bg-[var(--surface-raised-hover)] px-[18px] py-4"><Server size={17} strokeWidth={1.75} className="mt-0.5 shrink-0 text-[var(--remote)]" /><div className="min-w-0 flex-1"><div className="flex items-start justify-between gap-3"><div className="min-w-0"><h2 className="truncate text-body-sm font-semibold">{host.label}</h2><p className="mt-1 font-mono text-code-sm leading-[1.5] text-[var(--text-muted)]">{host.statusMessage ?? host.status}</p></div>{!confirming && <Button type="button" variant="ghost" size="sm" data-compact-control className="shrink-0 gap-1.5 px-2 [color:var(--text-muted)]" aria-label={`Remove ${host.label}`} disabled={pending !== null} onClick={() => { setConfirmingRemove(host.id); setError(null); }}><Trash2 size={13} aria-hidden="true" />Remove</Button>}</div>{confirming && <div className="mt-3 flex flex-wrap items-center gap-2 border-l-2 border-[var(--warning)] bg-[var(--warning-field)] px-3 py-2" aria-label={`Confirm removal of ${host.label}`}><p className="min-w-[220px] flex-1 text-code-sm text-[var(--text-muted)]">Forget this host and its remembered workspaces?</p><Button type="button" variant="ghost" size="sm" data-compact-control autoFocus disabled={removing} aria-label={`Cancel removal of ${host.label}`} onClick={() => setConfirmingRemove(null)}>Cancel</Button><Button type="button" variant="secondary" size="sm" data-compact-control className="gap-1.5 border-[var(--warning)]" disabled={removing} aria-label={removing ? `Removing ${host.label}` : `Confirm removal of ${host.label}`} onClick={() => void removeHost(host)}>{removing && <LoaderCircle size={13} className="motion-safe:animate-spin" aria-hidden="true" />}{removing ? "Removing…" : "Confirm remove"}</Button></div>}<div className="mt-3 grid gap-[9px]">{(["codex", "claude"] as const).map((provider) => { const available = host.harnesses[provider]; const missing = available.state === "missing"; return <p key={provider} className={`flex items-center gap-2.5 font-mono text-meta-sm leading-[1.5] ${missing ? "text-[var(--text-muted)]" : "text-[var(--text-secondary)]"}`}>{/* Frame 13c ticks a present harness green; spec 12 R4 reserves green for added lines, so the tick stays neutral. */}
                     {/* Frame 13c: a harness that is actually present reads green. */}
-                    {missing ? <X size={14} strokeWidth={1.75} className="shrink-0 text-[var(--text-muted)]" aria-hidden="true" /> : <Check size={14} strokeWidth={1.75} className={`shrink-0 ${available.state === "present" ? "text-[var(--added)]" : "text-[var(--text-muted)]"}`} aria-hidden="true" />}<span className="min-w-0">{harnessLabel(host, provider)}{available.reason && <span className="text-[var(--text-muted)]"> — {available.reason}</span>}</span></p>; })}</div></div></article>)}{remote.length === 0 && <p className="text-meta-sm text-[var(--text-muted)]">No remote hosts are configured. Add one later with <code className="font-mono">agent-manager host add</code>.</p>}</div>
+                    {missing ? <X size={14} strokeWidth={1.75} className="shrink-0 text-[var(--text-muted)]" aria-hidden="true" /> : <Check size={14} strokeWidth={1.75} className={`shrink-0 ${available.state === "present" ? "text-[var(--added)]" : "text-[var(--text-muted)]"}`} aria-hidden="true" />}<span className="min-w-0">{harnessLabel(host, provider)}{available.reason && <span className="text-[var(--text-muted)]"> — {available.reason}</span>}</span></p>; })}</div></div></article>; })}{remote.length === 0 && <p className="border border-dashed border-[var(--border)] px-4 py-5 text-center text-meta-sm text-[var(--text-muted)]">No remote hosts are configured yet.</p>}</div>
+      <p className="text-code-sm leading-5 text-[var(--text-muted)]">Removing a host forgets its remembered workspaces in Agent Manager. It does not delete remote files or stop remote processes.</p>
       {/* R3: leaving setup for the new thread is the operator's own action. */}
       {onContinue && !standalone && <div className="flex justify-end"><Button variant="primary" size="touch" onClick={onContinue}>Continue to new thread</Button></div>}
     </section>

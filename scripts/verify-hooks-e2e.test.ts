@@ -9,7 +9,7 @@ import type { SessionRecord } from "../src/core/types.ts";
 import { digestHookBearerToken } from "../src/providers/hooks/auth.ts";
 import { ManagerDatabase } from "../src/server/persistence.ts";
 import { createAgentManagerServer } from "../src/server/server.ts";
-import { sessionRecordId } from "../src/shared/session.ts";
+import { observeOnlyControl, sessionRecordId } from "../src/shared/session.ts";
 import {
   CODEX_HOOK_TRUST_EXPECT_SCRIPT,
   claudeCliArguments,
@@ -84,7 +84,7 @@ function externalClaudeSession(providerSessionId: string, cwd: string): SessionR
     todoProgress: null,
     attention: [],
     terminal: null,
-    control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [], takeover: null },
+    control: observeOnlyControl(),
     workspaceIdentity: null,
     generation: 0,
   };

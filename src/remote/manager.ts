@@ -32,6 +32,7 @@ export interface RemoteHostState extends RemoteHostDefinition {
 
 interface RemoteSessionReference {
   hostId: string;
+  hostEpoch: number;
   remoteId: string;
   remoteGeneration: number;
   provider: Provider;
@@ -54,6 +55,31 @@ interface ActiveRemoteActivity {
   stream: RemoteActivityStream | null;
   retry: NodeJS.Timeout | null;
   attempt: object | null;
+}
+
+export interface RemoteHostClient {
+  request<T = unknown>(
+    input: Parameters<SshNodeClient["request"]>[0],
+    timeoutMs?: number,
+  ): Promise<T>;
+  openActivityStream(
+    options: Parameters<SshNodeClient["openActivityStream"]>[0],
+  ): Promise<RemoteActivityStream>;
+  close(): void;
+}
+
+export interface RemoteHostManagerOptions {
+  pollIntervalMs?: number;
+  sshExecutable?: string;
+  /** Test/embedder seam for a transport with the same owner-only node protocol. */
+  clientFactory?: (definition: RemoteHostDefinition) => RemoteHostClient;
+}
+
+class StaleRemoteHostRequestError extends Error {
+  constructor() {
+    super("Remote host changed while the request was in flight");
+    this.name = "StaleRemoteHostRequestError";
+  }
 }
 
 function errorMessage(error: unknown): string {
@@ -101,31 +127,28 @@ function remapParentId(
 
 export class RemoteHostManager {
   #definitions = new Map<string, RemoteHostDefinition>();
-  #clients = new Map<string, SshNodeClient>();
+  #clients = new Map<string, RemoteHostClient>();
   #states = new Map<string, RemoteHostState>();
   #sessionReferences = new Map<string, RemoteSessionReference>();
   #leases = new Map<string, RemoteLease>();
   #pollers = new Map<string, NodeJS.Timeout>();
   #activityStreams = new Map<string, ActiveRemoteActivity>();
+  #hostEpochs = new Map<string, number>();
+  #nextHostEpoch = 0;
   #pollIntervalMs: number;
   #sshExecutable?: string;
+  #clientFactory?: (definition: RemoteHostDefinition) => RemoteHostClient;
   #callbacks: RemoteHostCallbacks | null = null;
   #clientId = `controller-${hostname().replace(/[^A-Za-z0-9._:-]/gu, "-")}-${String(process.pid)}`;
 
   constructor(
     definitions: readonly RemoteHostDefinition[],
-    options: { pollIntervalMs?: number; sshExecutable?: string } = {},
+    options: RemoteHostManagerOptions = {},
   ) {
     this.#pollIntervalMs = Math.max(1_000, options.pollIntervalMs ?? 4_000);
     if (options.sshExecutable !== undefined) this.#sshExecutable = options.sshExecutable;
-    for (const definition of definitions) {
-      this.#definitions.set(definition.id, definition);
-      this.#states.set(definition.id, {
-        ...definition,
-        status: "unknown",
-        statusMessage: null,
-      });
-    }
+    if (options.clientFactory !== undefined) this.#clientFactory = options.clientFactory;
+    for (const definition of definitions) this.#addHost(definition);
   }
 
   get configured(): boolean {
@@ -140,13 +163,14 @@ export class RemoteHostManager {
     return this.#definitions.has(hostId);
   }
 
-  upsertHost(definition: RemoteHostDefinition): void {
+  upsertHost(definition: RemoteHostDefinition): string[] {
     const previous = this.#definitions.get(definition.id);
     if (previous?.target !== definition.target) {
-      this.#clients.get(definition.id)?.close();
-      this.#clients.delete(definition.id);
+      const removed = previous ? this.removeHost(definition.id) : [];
+      this.#addHost(definition);
+      return removed;
     }
-    this.#definitions.set(definition.id, definition);
+    this.#definitions.set(definition.id, { ...definition });
     const current = this.#states.get(definition.id);
     this.#states.set(definition.id, {
       ...definition,
@@ -156,9 +180,26 @@ export class RemoteHostManager {
     if (this.#callbacks && !this.#pollers.has(definition.id)) {
       this.#startPoller(definition.id);
     }
+    return [];
+  }
+
+  reconcile(definitions: readonly RemoteHostDefinition[]): string[] {
+    const next = new Map<string, RemoteHostDefinition>();
+    for (const definition of definitions) next.set(definition.id, { ...definition });
+    const removed = new Set<string>();
+    for (const current of [...this.#definitions.values()]) {
+      const replacement = next.get(current.id);
+      if (replacement && replacement.target === current.target) continue;
+      for (const sessionId of this.removeHost(current.id)) removed.add(sessionId);
+    }
+    for (const definition of next.values()) {
+      for (const sessionId of this.upsertHost(definition)) removed.add(sessionId);
+    }
+    return [...removed];
   }
 
   removeHost(hostId: string): string[] {
+    this.#hostEpochs.set(hostId, ++this.#nextHostEpoch);
     const timer = this.#pollers.get(hostId);
     if (timer) clearInterval(timer);
     this.#pollers.delete(hostId);
@@ -170,10 +211,7 @@ export class RemoteHostManager {
     for (const [localId, reference] of this.#sessionReferences) {
       if (reference.hostId !== hostId) continue;
       removed.push(localId);
-      const activity = this.#activityStreams.get(localId);
-      if (activity?.retry) clearTimeout(activity.retry);
-      activity?.stream?.close();
-      this.#activityStreams.delete(localId);
+      this.#closeActivity(localId);
       this.#sessionReferences.delete(localId);
     }
     for (const key of this.#leases.keys()) {
@@ -188,10 +226,12 @@ export class RemoteHostManager {
   }
 
   async listSessions(hostId: string): Promise<SessionView[]> {
+    const epoch = this.#hostEpoch(hostId);
     const payload = await this.#request<unknown>(hostId, {
       method: "GET",
       path: "/api/v1/sessions",
     });
+    this.#assertCurrentHost(hostId, epoch);
     const snapshot = parseStateSnapshot(payload);
     return this.#mapSessions(hostId, snapshot.sessions);
   }
@@ -202,6 +242,7 @@ export class RemoteHostManager {
       method: "GET",
       path: `/api/v1/sessions/${encodeURIComponent(reference.remoteId)}`,
     });
+    this.#assertCurrentHost(reference.hostId, reference.hostEpoch);
     const envelope = exactRecord(payload, ["session"], "session response");
     const raw = sessionRecordSchema.parse(envelope.session);
     const mapped = this.#mapSessions(reference.hostId, [raw])[0];
@@ -210,10 +251,12 @@ export class RemoteHostManager {
   }
 
   async completePath(hostId: string, path: string, limit: number): Promise<string[]> {
+    const epoch = this.#hostEpoch(hostId);
     const payload = await this.#request<Record<string, unknown>>(hostId, {
       method: "GET",
       path: `/api/v1/hosts/local/directories?path=${encodeURIComponent(path)}&limit=${String(limit)}`,
     });
+    this.#assertCurrentHost(hostId, epoch);
     const envelope = exactRecord(payload, ["paths"], "directory completion response");
     if (
       !Array.isArray(envelope.paths)
@@ -224,10 +267,12 @@ export class RemoteHostManager {
   }
 
   async probeHarnesses(hostId: string): Promise<SetupHarnessProbe> {
+    const epoch = this.#hostEpoch(hostId);
     const payload = await this.#request<unknown>(hostId, {
       method: "GET",
       path: "/api/v1/setup/harnesses",
     });
+    this.#assertCurrentHost(hostId, epoch);
     return setupHarnessProbeResponseSchema.parse(payload).harnesses;
   }
 
@@ -237,11 +282,13 @@ export class RemoteHostManager {
     remoteWorkspaceId: string;
     workspaceIdentity: SessionView["workspaceIdentity"];
   }> {
+    const epoch = this.#hostEpoch(hostId);
     const payload = await this.#request<Record<string, unknown>>(hostId, {
       method: "POST",
       path: "/api/v1/workspaces/resolve",
       body: { hostId: "local", path },
     });
+    this.#assertCurrentHost(hostId, epoch);
     const { workspace } = workspaceResolutionResponseSchema.parse(payload);
     if (
       workspace.hostId !== "local"
@@ -262,13 +309,16 @@ export class RemoteHostManager {
     input: CreateSessionInput,
     workspace: WorkspaceRecord,
   ): Promise<SessionView> {
+    const epoch = this.#hostEpoch(hostId);
     const remoteWorkspaceId = workspace.remoteWorkspaceId
       ?? (await this.resolveWorkspace(hostId, workspace.path)).remoteWorkspaceId;
+    this.#assertCurrentHost(hostId, epoch);
     const payload = await this.#request<Record<string, unknown>>(hostId, {
       method: "POST",
       path: "/api/v1/sessions",
       body: { ...input, workspaceId: remoteWorkspaceId },
     }, 120_000);
+    this.#assertCurrentHost(hostId, epoch);
     const envelope = exactRecord(payload, ["session"], "created session response");
     const raw = sessionRecordSchema.parse(envelope.session);
     const mapped = this.#mapSessions(hostId, [raw])[0];
@@ -279,6 +329,7 @@ export class RemoteHostManager {
   async performAction(localId: string, action: SessionAction): Promise<ActionDispatchResult> {
     const reference = this.#reference(localId);
     const lease = await this.#lease(reference);
+    this.#assertCurrentHost(reference.hostId, reference.hostEpoch);
     const remoteAction = {
       ...action,
       expectedGeneration: reference.remoteGeneration,
@@ -289,6 +340,7 @@ export class RemoteHostManager {
       body: remoteAction,
       controlLease: lease.token,
     }, 120_000);
+    this.#assertCurrentHost(reference.hostId, reference.hostEpoch);
     const result = payloadRecord(payload.action ?? payload);
     const status = result.status;
     if (status !== "queued" && status !== "succeeded" && status !== "failed" && status !== "unknown") {
@@ -298,12 +350,15 @@ export class RemoteHostManager {
   }
 
   async acquireControl(localId: string, takeover = false, refresh = false): Promise<void> {
-    await this.#lease(this.#reference(localId), takeover, refresh);
+    const reference = this.#reference(localId);
+    await this.#lease(reference, takeover, refresh);
+    this.#assertCurrentHost(reference.hostId, reference.hostEpoch);
   }
 
   async releaseControl(localId: string): Promise<void> {
     const reference = this.#sessionReferences.get(localId);
     if (!reference) return;
+    this.#assertCurrentHost(reference.hostId, reference.hostEpoch);
     const key = `${reference.hostId}\0${reference.remoteId}`;
     const lease = this.#leases.get(key);
     if (!lease) return;
@@ -313,14 +368,17 @@ export class RemoteHostManager {
       path: `/api/v1/sessions/${encodeURIComponent(reference.remoteId)}/control-lease`,
       controlLease: lease.token,
     });
+    this.#assertCurrentHost(reference.hostId, reference.hostEpoch);
   }
 
   async preview(localId: string, query: string): Promise<Record<string, unknown>> {
     const reference = this.#reference(localId);
-    return this.#request(reference.hostId, {
+    const payload = await this.#request<Record<string, unknown>>(reference.hostId, {
       method: "GET",
       path: `/api/v1/sessions/${encodeURIComponent(reference.remoteId)}/preview${query}`,
     });
+    this.#assertCurrentHost(reference.hostId, reference.hostEpoch);
+    return payload;
   }
 
   async attach(localId: string): Promise<Record<string, unknown>> {
@@ -329,6 +387,7 @@ export class RemoteHostManager {
       method: "GET",
       path: `/api/v1/sessions/${encodeURIComponent(reference.remoteId)}/attach`,
     });
+    this.#assertCurrentHost(reference.hostId, reference.hostEpoch);
     const definition = this.#definition(reference.hostId);
     if (!payload.instruction || typeof payload.instruction !== "object") {
       return { instruction: null };
@@ -372,32 +431,38 @@ export class RemoteHostManager {
   }
 
   dispose(): void {
-    for (const timer of this.#pollers.values()) clearInterval(timer);
-    for (const activity of this.#activityStreams.values()) {
-      if (activity.retry) clearTimeout(activity.retry);
-      activity.stream?.close();
+    for (const hostId of this.#definitions.keys()) {
+      this.#hostEpochs.set(hostId, ++this.#nextHostEpoch);
     }
+    this.#callbacks = null;
+    for (const timer of this.#pollers.values()) clearInterval(timer);
+    for (const localId of [...this.#activityStreams.keys()]) this.#closeActivity(localId);
     for (const client of this.#clients.values()) client.close();
     this.#pollers.clear();
-    this.#activityStreams.clear();
     this.#clients.clear();
-    this.#callbacks = null;
+    this.#definitions.clear();
+    this.#states.clear();
+    this.#sessionReferences.clear();
+    this.#leases.clear();
   }
 
   #startPoller(hostId: string): void {
     if (this.#pollers.has(hostId)) return;
+    const epoch = this.#hostEpoch(hostId);
+    let polling = false;
     const poll = async (): Promise<void> => {
-      if (!this.has(hostId)) return;
+      if (polling || !this.#isCurrentHost(hostId, epoch)) return;
+      polling = true;
       if (this.#states.get(hostId)?.status === "unknown") {
         this.#setStatus(hostId, "connecting", null);
       }
       try {
         const sessions = await this.listSessions(hostId);
-        if (!this.has(hostId)) return;
+        if (!this.#isCurrentHost(hostId, epoch)) return;
         this.#setStatus(hostId, "online", null);
         this.#callbacks?.onSessions(hostId, sessions);
       } catch (error) {
-        if (!this.has(hostId)) return;
+        if (!this.#isCurrentHost(hostId, epoch)) return;
         const message = errorMessage(error);
         const prior = this.#states.get(hostId)?.statusMessage;
         this.#setStatus(hostId, "offline", message);
@@ -409,16 +474,19 @@ export class RemoteHostManager {
             message: `${definition.label} is unavailable over SSH: ${message}`,
           });
         }
+      } finally {
+        polling = false;
       }
     };
-    void poll();
     const timer = setInterval(() => void poll(), this.#pollIntervalMs);
     timer.unref();
     this.#pollers.set(hostId, timer);
+    void poll();
   }
 
   #mapSessions(hostId: string, values: readonly unknown[]): SessionView[] {
     const definition = this.#definition(hostId);
+    const hostEpoch = this.#hostEpoch(hostId);
     const valid = values.map((value) => {
       const raw = sessionRecordSchema.parse(value);
       return {
@@ -435,6 +503,7 @@ export class RemoteHostManager {
       const parent = remapParentId(hostId, raw, ids);
       this.#sessionReferences.set(localId, {
         hostId,
+        hostEpoch,
         remoteId,
         remoteGeneration: raw.generation,
         provider: raw.provider,
@@ -454,6 +523,7 @@ export class RemoteHostManager {
     takeover = false,
     refresh = false,
   ): Promise<RemoteLease> {
+    this.#assertCurrentHost(reference.hostId, reference.hostEpoch);
     const key = `${reference.hostId}\0${reference.remoteId}`;
     const current = this.#leases.get(key);
     if (!takeover && !refresh && current && Date.parse(current.expiresAt) > Date.now() + 5_000) {
@@ -465,6 +535,7 @@ export class RemoteHostManager {
       body: { clientId: this.#clientId, ttlSeconds: 60, takeover },
       ...(current ? { controlLease: current.token } : {}),
     });
+    this.#assertCurrentHost(reference.hostId, reference.hostEpoch);
     const lease = payloadRecord(payload.lease ?? payload);
     if (typeof lease.token !== "string" || typeof lease.expiresAt !== "string") {
       throw new Error("Remote node returned an invalid writer lease");
@@ -494,7 +565,14 @@ export class RemoteHostManager {
     void this.#client(reference.hostId).openActivityStream({
       path,
       ...(lastEventId ? { lastEventId } : {}),
-      onFrame: (frame) => active.mirror.accept(frame),
+      onFrame: (frame) => {
+        if (
+          this.#activityStreams.get(localId) !== active
+          || active.attempt !== attempt
+          || !this.#isCurrentHost(reference.hostId, reference.hostEpoch)
+        ) return;
+        active.mirror.accept(frame);
+      },
       onClose: (error) => {
         if (this.#activityStreams.get(localId) !== active || active.attempt !== attempt) return;
         active.attempt = null;
@@ -531,15 +609,25 @@ export class RemoteHostManager {
     if (!current) return;
     current.count -= 1;
     if (current.count > 0) return;
+    this.#closeActivity(localId);
+  }
+
+  #closeActivity(localId: string): void {
+    const current = this.#activityStreams.get(localId);
+    if (!current) return;
+    this.#activityStreams.delete(localId);
     current.attempt = null;
     if (current.retry) clearTimeout(current.retry);
-    current.stream?.close();
-    this.#activityStreams.delete(localId);
+    current.retry = null;
+    const stream = current.stream;
+    current.stream = null;
+    stream?.close();
   }
 
   #reference(localId: string): RemoteSessionReference {
     const reference = this.#sessionReferences.get(localId);
     if (!reference) throw new Error("Remote session routing information is unavailable");
+    this.#assertCurrentHost(reference.hostId, reference.hostEpoch);
     return reference;
   }
 
@@ -549,14 +637,44 @@ export class RemoteHostManager {
     return definition;
   }
 
-  #client(hostId: string): SshNodeClient {
+  #addHost(definition: RemoteHostDefinition): void {
+    const stored = { ...definition };
+    this.#definitions.set(stored.id, stored);
+    this.#states.set(stored.id, {
+      ...stored,
+      status: "unknown",
+      statusMessage: null,
+    });
+    this.#hostEpochs.set(stored.id, ++this.#nextHostEpoch);
+    if (this.#callbacks && !this.#pollers.has(stored.id)) this.#startPoller(stored.id);
+  }
+
+  #hostEpoch(hostId: string): number {
+    const epoch = this.#hostEpochs.get(hostId);
+    if (epoch === undefined || !this.#definitions.has(hostId)) {
+      throw new Error(`Unknown SSH host: ${hostId}`);
+    }
+    return epoch;
+  }
+
+  #isCurrentHost(hostId: string, epoch: number): boolean {
+    return this.#definitions.has(hostId) && this.#hostEpochs.get(hostId) === epoch;
+  }
+
+  #assertCurrentHost(hostId: string, epoch: number): void {
+    if (!this.#isCurrentHost(hostId, epoch)) throw new StaleRemoteHostRequestError();
+  }
+
+  #client(hostId: string): RemoteHostClient {
     const existing = this.#clients.get(hostId);
     if (existing) return existing;
     const definition = this.#definition(hostId);
-    const client = new SshNodeClient({
-      target: definition.target,
-      ...(this.#sshExecutable ? { sshExecutable: this.#sshExecutable } : {}),
-    });
+    const client = this.#clientFactory
+      ? this.#clientFactory({ ...definition })
+      : new SshNodeClient({
+          target: definition.target,
+          ...(this.#sshExecutable ? { sshExecutable: this.#sshExecutable } : {}),
+        });
     this.#clients.set(hostId, client);
     return client;
   }
@@ -566,12 +684,19 @@ export class RemoteHostManager {
     request: Parameters<SshNodeClient["request"]>[0],
     timeoutMs?: number,
   ): Promise<T> {
+    const epoch = this.#hostEpoch(hostId);
+    const client = this.#client(hostId);
     try {
-      return await this.#client(hostId).request<T>(request, timeoutMs);
+      const response = await client.request<T>(request, timeoutMs);
+      this.#assertCurrentHost(hostId, epoch);
+      return response;
     } catch (error) {
+      if (!this.#isCurrentHost(hostId, epoch)) throw new StaleRemoteHostRequestError();
       if (error instanceof RemoteNodeError) throw error;
-      this.#clients.get(hostId)?.close();
-      this.#clients.delete(hostId);
+      if (this.#clients.get(hostId) === client) {
+        client.close();
+        this.#clients.delete(hostId);
+      }
       throw error;
     }
   }

@@ -57,25 +57,90 @@ function tool(id: string, name: string, seq: number, turnId: string | null): Act
   };
 }
 
-function renderThread(items: readonly ActivityItem[]) {
+function renderThread(items: readonly ActivityItem[], options: {
+  connection?: SessionActivityView["connection"];
+  session?: SessionView;
+  onRetryActivity?: () => void;
+  loadAttach?: () => Promise<never>;
+  onResumeInWeb?: () => Promise<void>;
+} = {}) {
   return render(<SessionRuntimeProvider items={items}>{() => <SessionThread
-    session={session}
-    activity={{ items, truncated: false, connection: "live" } as unknown as SessionActivityView}
+    session={options.session ?? session}
+    activity={{ items, truncated: false, connection: options.connection ?? "open" } as unknown as SessionActivityView}
     remote={false}
     busy={false}
     mutationsReady
     onRespond={vi.fn(async () => undefined)}
     onRemoveQueued={vi.fn(async () => undefined)}
     onOpenEditor={vi.fn(async () => undefined)}
+    onResumeInWeb={options.onResumeInWeb ?? vi.fn(async () => undefined)}
     readKeys={new Set()}
     onReadChange={vi.fn()}
-    loadAttach={vi.fn(async () => ({ available: false }) as never)}
+    loadAttach={options.loadAttach ?? vi.fn(async () => ({ available: false }) as never)}
     loadSessionFacts={vi.fn(async () => ({}) as never)}
     loadPlanFile={vi.fn(async () => ({}) as never)}
     onContinueInWorkspace={vi.fn()}
+    {...(options.onRetryActivity ? { onRetryActivity: options.onRetryActivity } : {})}
     sessionsOnHost={null}
   />}</SessionRuntimeProvider>);
 }
+
+describe("thread-level transport and archive states", () => {
+  it("keeps retained history visible under a terminal activity banner and retries explicitly", () => {
+    const onRetryActivity = vi.fn();
+    renderThread([tool("t-1", "Read", 1, "turn-1")], { connection: "offline", onRetryActivity });
+
+    expect(screen.getByText("Activity stream unavailable.")).toBeInTheDocument();
+    expect(screen.getByText("1 tool call")).toBeInTheDocument();
+    screen.getByRole("button", { name: "Retry activity" }).click();
+    expect(onRetryActivity).toHaveBeenCalledOnce();
+  });
+
+  it("renders an empty archive as retained read-only history, never as waiting", () => {
+    renderThread([], { session: { ...session, archived: true, status: "completed" } as SessionView });
+
+    expect(screen.getAllByText("Archived · read-only").length).toBeGreaterThan(0);
+    expect(screen.getByText("No archived activity")).toBeInTheDocument();
+    expect(screen.queryByText("Waiting for provider activity")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["connecting", "Loading activity"],
+    ["retrying", "Reconnecting to activity"],
+    ["offline", "Activity stream unavailable"],
+  ] as const)("does not declare an empty archive while its stream is %s", (connection, title) => {
+    renderThread([], {
+      connection,
+      session: { ...session, archived: true, status: "completed" } as SessionView,
+    });
+
+    expect(screen.getByRole("heading", { name: title })).toBeInTheDocument();
+    expect(screen.queryByText("No retained transcript is available for this archived session.")).not.toBeInTheDocument();
+  });
+
+  it("resumes a dormant exact session in the web app without revealing a CLI command", () => {
+    const onResumeInWeb = vi.fn(async () => undefined);
+    const dormant = {
+      ...session,
+      status: "completed",
+      control: {
+        plane: "resume-only",
+        authority: "none",
+        coordination: { mode: "exclusive", nativeAttach: "handoff", responseResolution: "single-controller" },
+        recovery: null,
+        capabilities: ["resume", "attach"],
+        withheld: [],
+        takeover: null,
+      },
+    } as SessionView;
+    renderThread([], { session: dormant, onResumeInWeb });
+
+    const resume = screen.getByRole("button", { name: "Resume here" });
+    resume.click();
+    expect(onResumeInWeb).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("button", { name: /Claude Code resume|handoff/iu })).not.toBeInTheDocument();
+  });
+});
 
 describe("tool grouping in a rendered thread", () => {
   it("coalesces a run of tool calls a provider never assigned a turn to", () => {

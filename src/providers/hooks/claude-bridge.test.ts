@@ -368,10 +368,13 @@ test("folds MessageDisplay deltas without replaying duplicates", () => {
 test("source arbitration excludes manager-owned sessions and never re-opens transcript polling beside a live bridge", () => {
   const hook = parseClaudeHookInput({ ...common("Stop"), stop_hook_active: false });
   const arbiter = new ClaudeHookSourceArbiter();
+  const conflicts: string[] = [];
+  arbiter.onOwnershipConflict(({ sessionId }) => conflicts.push(sessionId));
   assert.deepEqual(arbiter.accept(hook, { ownerMarker: CLAUDE_MANAGER_OWNER_VALUE, now: 0 }), {
     accepted: false,
     reason: "manager-owned",
   });
+  assert.deepEqual(conflicts, [], "the manager-origin marker remains a duplicate-source no-op");
   assert.equal(arbiter.shouldPollTranscript("session-1"), true);
   assert.equal(arbiter.accept(hook, { now: 10 }).accepted, true);
   assert.equal(arbiter.shouldPollTranscript("session-1"), false);
@@ -382,8 +385,63 @@ test("source arbitration excludes manager-owned sessions and never re-opens tran
   assert.equal(arbiter.shouldPollTranscript("session-1"), false);
   arbiter.markManagerOwned("session-1");
   assert.equal(arbiter.shouldPollTranscript("session-1"), false);
+  assert.deepEqual(arbiter.accept(hook, { now: 20 }), {
+    accepted: false,
+    reason: "ownership-conflict",
+  });
+  assert.deepEqual(conflicts, ["session-1"]);
   arbiter.forget("session-1");
   assert.equal(arbiter.shouldPollTranscript("session-1"), true);
+});
+
+test("provisional adoption observes one native conflict without suppressing hook authority", () => {
+  const hook = parseClaudeHookInput({ ...common("Stop"), stop_hook_active: false });
+  const arbiter = new ClaudeHookSourceArbiter();
+  const conflicts: string[] = [];
+  const release = arbiter.reserveManagerAdoption(
+    "session-1",
+    () => conflicts.push("session-1"),
+  );
+
+  assert.deepEqual(
+    arbiter.accept(hook, { ownerMarker: CLAUDE_MANAGER_OWNER_VALUE, now: 5 }),
+    { accepted: false, reason: "manager-owned" },
+    "the provisional SDK's own hook is a duplicate, not a native conflict",
+  );
+  assert.deepEqual(conflicts, []);
+  assert.equal(arbiter.shouldPollTranscript("session-1"), true);
+
+  assert.deepEqual(arbiter.accept(hook, { now: 10 }), {
+    accepted: true,
+    suppressTranscriptPolling: true,
+  });
+  assert.deepEqual(conflicts, ["session-1"]);
+  assert.equal(arbiter.lastHookAt("session-1"), 10);
+  assert.equal(arbiter.shouldPollTranscript("session-1"), false);
+
+  arbiter.accept(hook, { now: 20 });
+  assert.deepEqual(conflicts, ["session-1"], "one reservation reports conflict exactly once");
+  release();
+  release();
+  assert.equal(arbiter.lastHookAt("session-1"), 20);
+});
+
+test("releasing a provisional adoption reservation is idempotent and preserves hook state", () => {
+  const hook = parseClaudeHookInput({ ...common("Stop"), stop_hook_active: false });
+  const arbiter = new ClaudeHookSourceArbiter();
+  let conflicts = 0;
+  const release = arbiter.reserveManagerAdoption("session-1", () => {
+    conflicts += 1;
+  });
+  release();
+  release();
+
+  assert.deepEqual(arbiter.accept(hook, { now: 30 }), {
+    accepted: true,
+    suppressTranscriptPolling: true,
+  });
+  assert.equal(conflicts, 0);
+  assert.equal(arbiter.lastHookAt("session-1"), 30);
 });
 
 test("bridge authenticates, projects, holds, answers, and resolves one external permission", async () => {

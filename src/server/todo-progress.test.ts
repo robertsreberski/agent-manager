@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { ActivityHub } from "../activity/index.ts";
-import type { SessionRecord } from "../shared/session.ts";
+import {
+  providerControlCoordination,
+  type SessionRecord,
+} from "../shared/session.ts";
 import { createAgentManagerServer } from "./server.ts";
 
 function session(updatedAt = "2026-08-04T10:00:00.000Z"): SessionRecord {
@@ -45,7 +48,15 @@ function session(updatedAt = "2026-08-04T10:00:00.000Z"): SessionRecord {
     effort: { value: null, providerValue: null, source: "provider-api", confidence: "exact" },
     attention: [],
     terminal: null,
-    control: { plane: "claude-hook-bridge", authority: "foreign", capabilities: [], withheld: [], takeover: null },
+    control: {
+      plane: "claude-hook-bridge",
+      authority: "foreign",
+      coordination: providerControlCoordination("claude"),
+      recovery: null,
+      capabilities: [],
+      withheld: [],
+      takeover: null,
+    },
     workspaceIdentity: null,
     generation: 0,
   };

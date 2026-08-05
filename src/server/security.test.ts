@@ -7,6 +7,7 @@ import {
   rmSync,
   symlinkSync,
 } from "node:fs";
+import { Socket } from "node:net";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -18,7 +19,10 @@ import {
   requestAttachAuthorizeSpawnFromControlSocket,
   requestAttachStartedFromControlSocket,
   requestBootstrapFromControlSocket,
+  closeOwnerInstanceLease,
+  probeOwnerSocket,
   startOwnerControlSocket,
+  startOwnerInstanceLease,
 } from "./control-socket.ts";
 import { ControlLeaseBroker, LeaseConflictError } from "./controls.ts";
 
@@ -41,6 +45,28 @@ function tailscaleRequest(cookie?: string): FastifyRequest {
     },
   } as unknown as FastifyRequest;
 }
+
+function simulatedSocketProbe(event: "connect" | "timeout" | NodeJS.ErrnoException) {
+  const socket = new Socket();
+  const result = probeOwnerSocket("/unused/test.sock", () => socket);
+  if (event === "connect") queueMicrotask(() => socket.emit("connect"));
+  else if (event !== "timeout") queueMicrotask(() => socket.emit("error", event));
+  return result;
+}
+
+test("owner socket probing classifies only refused sockets as dead", async () => {
+  assert.equal(await simulatedSocketProbe("connect"), "live");
+  assert.equal(await simulatedSocketProbe(Object.assign(new Error("refused"), {
+    code: "ECONNREFUSED",
+  })), "dead");
+  assert.equal(await simulatedSocketProbe(Object.assign(new Error("missing"), {
+    code: "ENOENT",
+  })), "missing");
+  assert.equal(await simulatedSocketProbe(Object.assign(new Error("denied"), {
+    code: "EACCES",
+  })), "inconclusive");
+  assert.equal(await simulatedSocketProbe("timeout"), "inconclusive");
+});
 
 test("leases are bound to one auth session and rotate on every renewal", () => {
   let now = 1_000;
@@ -197,6 +223,13 @@ test("owner control socket rejects unsafe parents and validates socket permissio
     assert.equal(lstatSync(runtime).mode & 0o777, 0o700);
     assert.equal(lstatSync(socketPath).mode & 0o777, 0o600);
     assert.equal((await requestBootstrapFromControlSocket(socketPath)).origin, "http://localhost:43127");
+    await assert.rejects(
+      startOwnerControlSocket(socketPath, {
+        auth,
+        bootstrapOrigin: "http://localhost:43127",
+      }),
+      /owner control socket is already active/,
+    );
     await requestAttachAuthorizeSpawnFromControlSocket(
       socketPath,
       "claude:session-1",
@@ -221,6 +254,31 @@ test("owner control socket rejects unsafe parents and validates socket permissio
     chmodSync(socketPath, 0o600);
 
     await new Promise<void>((resolve) => server.close(() => resolve()));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runtime owner lease admits exactly one manager and is reusable after clean close", async () => {
+  const root = mkdtempSync("/tmp/am-owner-lease-");
+  const runtime = join(root, "runtime");
+  mkdirSync(runtime, { mode: 0o700 });
+  const socketPath = join(runtime, "instance.sock");
+  try {
+    const owner = await startOwnerInstanceLease(socketPath);
+    try {
+      assert.equal(lstatSync(socketPath).mode & 0o777, 0o600);
+      await assert.rejects(
+        startOwnerInstanceLease(socketPath),
+        /another Agent Manager already owns this runtime/,
+      );
+    } finally {
+      await closeOwnerInstanceLease(owner);
+      await closeOwnerInstanceLease(owner);
+    }
+
+    const replacement = await startOwnerInstanceLease(socketPath);
+    await closeOwnerInstanceLease(replacement);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

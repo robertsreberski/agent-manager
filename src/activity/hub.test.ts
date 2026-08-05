@@ -64,6 +64,48 @@ test("creates an atomic empty snapshot and clones all public values", () => {
   assert.equal(stored?.kind === "message" ? stored.text : null, "hello");
 });
 
+test("a retention-boundary mutation marks truncation without replacing retained history", () => {
+  const hub = new ActivityHub({ streamEpoch: "retention-boundary" });
+  hub.ingest("session-a", "codex", {
+    type: "upsert",
+    item: message("message-1", "hello", "running"),
+  });
+  hub.ingest("session-a", "codex", {
+    type: "upsert",
+    item: message("message-2", "retained", "complete"),
+  });
+  const before = hub.snapshot("session-a")!;
+
+  const boundary = hub.ingest("session-a", "codex", { type: "retention-boundary" });
+  assert.equal(boundary.type, "activity.reset");
+  if (boundary.type !== "activity.reset") return;
+  assert.equal(boundary.reason, "truncation");
+  assert.equal(boundary.truncated, true);
+  assert.deepEqual(
+    boundary.items.map((item) => ({ id: item.id, text: item.kind === "message" ? item.text : null })),
+    [
+      { id: "message-1", text: "hello" },
+      { id: "message-2", text: "retained" },
+    ],
+  );
+  assert.deepEqual(
+    boundary.items.map((item) => item.revision),
+    before.items.map((item) => item.revision),
+  );
+
+  const append = hub.ingest("session-a", "codex", {
+    type: "append",
+    id: "message-1",
+    channel: "text",
+    offset: Buffer.byteLength("hello", "utf8"),
+    text: " world",
+  });
+  assert.equal(append.type, "activity.append", "the provider append cursor survives the boundary");
+  const after = hub.snapshot("session-a")!;
+  assert.equal(after.truncated, true);
+  assert.equal(after.items[0]?.kind === "message" ? after.items[0].text : null, "hello world");
+});
+
 test("upserts merge omitted fields, increment revisions, and preserve semantic ordering", () => {
   const hub = new ActivityHub({ streamEpoch: "merge-test" });
   hub.ingest("session-a", "claude", {
@@ -900,6 +942,91 @@ test("atomically reconciles transcript history with exact correlated activity", 
   );
 });
 
+test("transcript reset listeners see preserved exact raw append cursors and source state atomically", () => {
+  const hub = new ActivityHub({
+    streamEpoch: "transcript-append-state",
+    maxFieldBytes: 16,
+  });
+  const bearerPrefix = "Bearer abc";
+  const bearerSuffix = "defghijklmnop";
+  const oversized = "plain-provider-prefix-that-is-long";
+
+  hub.ingest("session-1", "codex", {
+    type: "upsert",
+    item: {
+      ...message("exact-redacted", bearerPrefix),
+      correlationId: "message:redacted",
+      source: "provider-api",
+      confidence: "exact",
+      exposure: "provider-exposed",
+    },
+  });
+  hub.ingest("session-1", "codex", {
+    type: "upsert",
+    item: {
+      ...message("exact-truncated", oversized),
+      correlationId: "message:truncated",
+      source: "provider-api",
+      confidence: "exact",
+      exposure: "provider-exposed",
+    },
+  });
+
+  const appendFrames: ActivityFrame[] = [];
+  let appendedFromReset = false;
+  const unsubscribe = hub.subscribe("session-1", (frame) => {
+    if (frame.type !== "activity.reset" || appendedFromReset) return;
+    appendedFromReset = true;
+    appendFrames.push(hub.ingest("session-1", "codex", {
+      type: "append",
+      id: "exact-redacted",
+      channel: "text",
+      offset: Buffer.byteLength(bearerPrefix, "utf8"),
+      text: bearerSuffix,
+    }));
+    appendFrames.push(hub.ingest("session-1", "codex", {
+      type: "append",
+      id: "exact-truncated",
+      channel: "text",
+      offset: Buffer.byteLength(oversized, "utf8"),
+      text: " and-the-next-provider-delta",
+    }));
+  });
+
+  hub.reconcileTranscript("session-1", "codex", [
+    {
+      ...message("transcript:redacted", "inferred redacted twin"),
+      correlationId: "message:redacted",
+      source: "transcript",
+      confidence: "inferred",
+      exposure: "transcript-derived",
+    },
+    {
+      ...message("transcript:truncated", "inferred truncated twin"),
+      correlationId: "message:truncated",
+      source: "transcript",
+      confidence: "inferred",
+      exposure: "transcript-derived",
+    },
+  ], false);
+  unsubscribe();
+
+  assert.equal(appendedFromReset, true);
+  const redactedAppend = appendFrames[0];
+  assert.ok(redactedAppend);
+  assert.notEqual(redactedAppend.type, "activity.reset");
+  const redacted = hub.snapshot("session-1")?.items.find((item) => item.id === "exact-redacted");
+  assert.equal(redacted?.kind === "message" ? redacted.text : null, "[REDACTED]");
+  assert.equal(JSON.stringify(redacted).includes(bearerSuffix), false);
+
+  const truncatedAppend = appendFrames[1];
+  assert.ok(truncatedAppend);
+  assert.notEqual(truncatedAppend.type, "activity.reset");
+  const truncated = hub.snapshot("session-1")?.items.find((item) => item.id === "exact-truncated");
+  assert.equal(truncated?.truncated, true);
+  assert.equal(truncated?.kind === "message" ? truncated.text : null, oversized.slice(0, 16));
+});
+
 test("repeated transcript hydration is a no-op and hook to API correlation keeps one slot", () => {
   const hub = new ActivityHub({ streamEpoch: "transcript-noop" });
   const transcript = [{
@@ -950,6 +1077,91 @@ test("repeated transcript hydration is a no-op and hook to API correlation keeps
   assert.equal(managed.type, "activity.reset");
   assert.deepEqual(hub.snapshot("session-1")!.items.map((item) => item.id), ["sdk-tool"]);
   assert.equal(hub.reconcileTranscript("session-1", "claude", transcript, false), false);
+});
+
+test("ambiguous correlation keys never collapse distinct transcript entries", () => {
+  const hub = new ActivityHub({ streamEpoch: "ambiguous-correlation" });
+  const transcript = [
+    {
+      ...message("transcript:first", "same", "complete"),
+      correlationId: "codex/message-correlation/thread/turn/user/digest",
+      source: "transcript" as const,
+      confidence: "inferred" as const,
+      exposure: "transcript-derived" as const,
+    },
+    {
+      ...message("transcript:second", "same", "complete"),
+      correlationId: "codex/message-correlation/thread/turn/user/digest",
+      source: "transcript" as const,
+      confidence: "inferred" as const,
+      exposure: "transcript-derived" as const,
+    },
+  ];
+  hub.reconcileTranscript("session-1", "codex", transcript, false);
+  hub.ingest("session-1", "codex", {
+    type: "upsert",
+    item: {
+      ...message("hook:ambiguous", "same", "complete"),
+      correlationId: "codex/message-correlation/thread/turn/user/digest",
+      source: "provider-api",
+      confidence: "exact",
+      exposure: "provider-exposed",
+    },
+  });
+
+  assert.deepEqual(
+    hub.snapshot("session-1")?.items.map((item) => item.id),
+    ["transcript:first", "transcript:second", "hook:ambiguous"],
+    "an invalid many-to-one correlation remains visible for diagnosis instead of deleting history",
+  );
+});
+
+test("equal repeated message correlations pair exact and transcript occurrences chronologically", () => {
+  const hub = new ActivityHub({ streamEpoch: "repeated-message-correlation" });
+  const correlationId = "codex/message-correlation/thread/turn/user/digest";
+  for (const id of ["api:first", "api:second"] as const) {
+    hub.ingest("session-1", "codex", {
+      type: "upsert",
+      item: {
+        id,
+        kind: "message",
+        role: "user",
+        phase: null,
+        text: "same",
+        state: "complete",
+        correlationId,
+        source: "provider-api",
+        confidence: "exact",
+        exposure: "provider-exposed",
+      },
+    });
+  }
+  assert.deepEqual(
+    hub.snapshot("session-1")?.items.map((item) => item.id),
+    ["api:first", "api:second"],
+    "a content grouping key never deletes a distinct exact occurrence",
+  );
+
+  const transcript = ["first", "second"].map((occurrence) => ({
+    id: `transcript:${occurrence}`,
+    kind: "message" as const,
+    role: "user" as const,
+    phase: null,
+    text: "same",
+    state: "complete" as const,
+    correlationId,
+    source: "transcript" as const,
+    confidence: "inferred" as const,
+    exposure: "transcript-derived" as const,
+  }));
+  assert.equal(hub.reconcileTranscript("session-1", "codex", transcript, false), true);
+  assert.deepEqual(
+    hub.snapshot("session-1")?.items.map((item) => item.id),
+    ["api:first", "api:second"],
+  );
+  const hydratedSeq = hub.snapshot("session-1")!.seq;
+  assert.equal(hub.reconcileTranscript("session-1", "codex", transcript, false), false);
+  assert.equal(hub.snapshot("session-1")!.seq, hydratedSeq);
 });
 
 test("a source withdraws only its own items when it hands the session over", () => {

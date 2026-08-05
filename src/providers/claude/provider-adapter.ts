@@ -1,5 +1,6 @@
 import {
   emptyChildSummary,
+  providerControlCoordination,
   providerEffort,
   sessionRecordId,
   type AttentionDetails,
@@ -54,10 +55,39 @@ interface ManagedEntry {
   session: ClaudeManagedSession;
   name: string | null;
   published: boolean;
+  ended: boolean;
+  endTask: Promise<void> | null;
   projector: ClaudeActivityProjector;
   publishActivity(mutations: readonly ActivityMutation[]): void;
   unsubscribe: () => void;
 }
+
+interface DormantResumeProvisional {
+  dormant: ManagedEntry;
+  session: ClaudeManagedSession;
+  name: string | null;
+  committable: boolean;
+  cleanup: Promise<void> | null;
+  releaseReservation: () => void;
+}
+
+interface ExternalAdoptionProvisional {
+  session: ClaudeManagedSession;
+  name: string | null;
+  committable: boolean;
+  cleanup: Promise<void> | null;
+  releaseReservation: () => void;
+}
+
+interface ProvisionalInFlight {
+  controller: AbortController;
+  releaseReservation: () => void;
+}
+
+export type ClaudeManagedSessionLossReason =
+  | "unexpected-close"
+  | "unexpected-failure"
+  | "ownership-conflict";
 
 const CLAUDE_SETTINGS_LOOKUP_TIMEOUT_MS = 2_000;
 const WORKSPACE_IDENTITY_BUDGET_MS = 2_500;
@@ -70,6 +100,8 @@ export interface ClaudeProviderAdapterOptions {
     context: RequestContext,
   ): string | null | Promise<string | null>;
   runtime?: ClaudeSdkRuntime | (() => Promise<ClaudeSdkRuntime>);
+  /** Canonical executable resolved by the service bootstrap. */
+  claudeExecutable?: string;
   /**
    * Manager-owned sessions never pass through the discovery scan, so they
    * resolve their repository facts through the same bounded resolver discovery
@@ -80,7 +112,16 @@ export interface ClaudeProviderAdapterOptions {
   /** Bounds the git work one create may spend; exhaustion yields a null identity. */
   workspaceIdentityBudgetMs?: number;
   onSessionChanged?: (session: SessionView) => void;
+  onManagerControlStopped?: (managerSessionId: string) => void | Promise<void>;
   onActivity?: (managerSessionId: string, mutation: ActivityMutation) => void;
+  /**
+   * The SDK writer was withdrawn without an explicit End. Durable identity and
+   * activity remain server-owned so the caller can start managed recovery.
+   */
+  onSessionLost?: (
+    managerSessionId: string,
+    reason: ClaudeManagedSessionLossReason,
+  ) => void | Promise<void>;
   hookSourceArbiter?: ClaudeHookSourceArbiter;
 }
 
@@ -164,22 +205,34 @@ function actionFailure(code: string, message: string): ActionDispatchResult {
   };
 }
 
-function boundedSettingsLookup<T>(promise: Promise<T>): Promise<T> {
+function boundedSettingsLookup<T>(
+  promise: Promise<T>,
+  onTimeout?: (error: Error) => void,
+  signal?: AbortSignal,
+): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new Error("Claude settings lookup timed out")),
-      CLAUDE_SETTINGS_LOOKUP_TIMEOUT_MS,
-    );
+    let settled = false;
+    const finish = (callback: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      callback();
+    };
+    const abort = (): void => finish(() => reject(
+      signal?.reason ?? new Error("Claude settings lookup was cancelled"),
+    ));
+    const timer = setTimeout(() => {
+      const error = new Error("Claude settings lookup timed out");
+      onTimeout?.(error);
+      finish(() => reject(error));
+    }, CLAUDE_SETTINGS_LOOKUP_TIMEOUT_MS);
     timer.unref();
+    if (signal?.aborted) abort();
+    else signal?.addEventListener("abort", abort, { once: true });
     promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error) => {
-        clearTimeout(timer);
-        reject(error);
-      },
+      (value) => finish(() => resolve(value)),
+      (error) => finish(() => reject(error)),
     );
   });
 }
@@ -187,6 +240,15 @@ function boundedSettingsLookup<T>(promise: Promise<T>): Promise<T> {
 function recoveryError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   return Array.from(message.trim() || "Claude recovery failed").slice(0, 2_000).join("");
+}
+
+function forwardAbort(source: AbortSignal, target: AbortController): () => void {
+  const abort = (): void => {
+    if (!target.signal.aborted) target.abort(source.reason);
+  };
+  if (source.aborted) abort();
+  else source.addEventListener("abort", abort, { once: true });
+  return () => source.removeEventListener("abort", abort);
 }
 
 /**
@@ -464,10 +526,24 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
   readonly #workspaceIdentities = new Map<string, WorkspaceIdentity | null>();
   readonly #workspaceIdentityResolver: Pick<WorkspaceIdentityResolver, "resolveMany">;
   readonly #workspaceIdentityBudgetMs: number;
+  readonly #lifetime = new AbortController();
+  readonly #connecting = new Map<AbortController, Promise<unknown>>();
+  readonly #resuming = new Map<string, ProvisionalInFlight>();
+  readonly #dormantResumes = new Map<string, DormantResumeProvisional>();
+  readonly #adopting = new Map<string, ProvisionalInFlight>();
+  readonly #externalAdoptions = new Map<string, ExternalAdoptionProvisional>();
+  #unsubscribeOwnershipConflicts: () => void = () => undefined;
   #draftSettingsLookup: Promise<SessionSettingsOptions> | null = null;
   #runtime: Promise<ClaudeSdkRuntime> | null = null;
+  #disposed = false;
 
   constructor(options: ClaudeProviderAdapterOptions) {
+    if (
+      options.claudeExecutable !== undefined
+      && options.claudeExecutable.trim().length === 0
+    ) {
+      throw new Error("claudeExecutable must not be empty");
+    }
     this.#options = options;
     this.#workspaceIdentityBudgetMs = Math.max(
       1,
@@ -475,6 +551,9 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
     );
     this.#workspaceIdentityResolver = options.workspaceIdentityResolver
       ?? new WorkspaceIdentityResolver({ totalBudgetMs: this.#workspaceIdentityBudgetMs });
+    this.#unsubscribeOwnershipConflicts = options.hookSourceArbiter?.onOwnershipConflict(
+      ({ sessionId }) => this.#handleOwnershipConflict(sessionId),
+    ) ?? (() => undefined);
   }
 
   /**
@@ -516,26 +595,31 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
 
     const runtime = await this.#getRuntime();
     const effort = input.effort ? claudeEffort(input.effort) : undefined;
-    const session = await ClaudeManagedSession.start(runtime, {
-      cwd,
-      mode: profileMode(input.profile),
-      initialMessage: input.initialMessage,
-      ...(input.model ? { model: input.model } : {}),
-      ...(effort ? { effort } : {}),
-      // This enables a later explicit full-access profile selection. The
-      // active permission mode still controls access and starts narrow.
-      allowDangerouslySkipPermissions: true,
-    });
-    if (context.signal.aborted) {
-      session.dispose();
-      throw new Error("Claude session creation was cancelled");
+    const session = await this.#connectManagedSession(context.signal, (signal) =>
+      ClaudeManagedSession.start(runtime, {
+        cwd,
+        mode: profileMode(input.profile),
+        initialMessage: input.initialMessage,
+        ...this.#executableConfig(runtime),
+        ...(input.model ? { model: input.model } : {}),
+        ...(effort ? { effort } : {}),
+        // This enables a later explicit full-access profile selection. The
+        // active permission mode still controls access and starts narrow.
+        allowDangerouslySkipPermissions: true,
+      }, signal)
+    );
+    try {
+      if (this.#disposed) throw new Error("Claude provider adapter is disposed");
+      if (context.signal.aborted) {
+        throw new Error("Claude session creation was cancelled");
+      }
+      const id = session.snapshot.sessionId;
+      if (!id) throw new Error("Claude SDK initialized without a session id");
+      return this.#registerSession(session, input.name ?? null, true);
+    } catch (error) {
+      await session.dispose();
+      throw error;
     }
-    const id = session.snapshot.sessionId;
-    if (!id) {
-      session.dispose();
-      throw new Error("Claude SDK initialized without a session id");
-    }
-    return this.#registerSession(session, input.name ?? null, true);
   }
 
   async adoptExternalSession(
@@ -552,40 +636,298 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
     if (this.#entries.has(view.providerThreadId)) {
       throw new Error("Claude session is already managed by this adapter");
     }
+    if (
+      this.#adopting.has(view.providerThreadId)
+      || this.#externalAdoptions.has(view.providerThreadId)
+    ) {
+      throw new Error("Claude session adoption is already in progress");
+    }
     if (!context.workspace || context.workspace.path !== view.cwd) {
       throw new Error("Claude adoption workspace does not match the discovered session");
     }
-    context.signal.throwIfAborted();
-    await this.#resolveWorkspaceIdentity(view.cwd);
-    context.signal.throwIfAborted();
-    const runtime = await this.#getRuntime();
-    const desiredMode = profileMode(profile);
-    const desiredEffort = view.effort.value ? claudeEffort(view.effort.value) : undefined;
-    const session = await ClaudeManagedSession.resume(runtime, {
-      sessionId: view.providerThreadId,
-      cwd: view.cwd,
-      mode: desiredMode,
-      ...(view.model.value ? { model: view.model.value } : {}),
-      ...(desiredEffort ? { effort: desiredEffort } : {}),
-      allowDangerouslySkipPermissions: true,
-    });
+    const cwd = view.cwd;
+    const providerSessionId = view.providerThreadId;
+    const controller = new AbortController();
+    const releaseRequest = forwardAbort(context.signal, controller);
+    let releaseReservation = (): void => undefined;
+    const inFlight: ProvisionalInFlight = {
+      controller,
+      releaseReservation: () => releaseReservation(),
+    };
+    this.#adopting.set(providerSessionId, inFlight);
+    releaseReservation = this.#options.hookSourceArbiter?.reserveManagerAdoption(
+      providerSessionId,
+      () => {
+        const error = new Error("A native Claude owner appeared during web adoption");
+        if (!controller.signal.aborted) controller.abort(error);
+        const provisional = this.#externalAdoptions.get(providerSessionId);
+        if (provisional) {
+          provisional.committable = false;
+          void this.#cleanupProvisional(
+            this.#externalAdoptions,
+            providerSessionId,
+            provisional,
+          ).catch(() => undefined);
+        }
+      },
+    ) ?? (() => undefined);
+
+    let retainedReservation = false;
     try {
-      context.signal.throwIfAborted();
-      if (session.snapshot.sessionId !== view.providerThreadId || session.snapshot.cwd !== view.cwd) {
-        throw new Error("Claude resume changed the validated provider identity");
+      controller.signal.throwIfAborted();
+      await this.#resolveWorkspaceIdentity(cwd);
+      controller.signal.throwIfAborted();
+      const runtime = await this.#getRuntime();
+      const desiredMode = profileMode(profile);
+      const desiredEffort = view.effort.value
+        ? claudeEffort(view.effort.value)
+        : undefined;
+      const session = await this.#runConnectingOperation(
+        controller.signal,
+        async (signal) => {
+          let resumed: ClaudeManagedSession | null = null;
+          try {
+            resumed = await ClaudeManagedSession.resume(runtime, {
+              sessionId: providerSessionId,
+              cwd,
+              mode: desiredMode,
+              ...this.#executableConfig(runtime),
+              ...(view.model.value ? { model: view.model.value } : {}),
+              ...(desiredEffort ? { effort: desiredEffort } : {}),
+              allowDangerouslySkipPermissions: true,
+            }, signal);
+            const abortSession = (): void => {
+              void resumed?.dispose();
+            };
+            signal.addEventListener("abort", abortSession, { once: true });
+            try {
+              signal.throwIfAborted();
+              if (
+                resumed.snapshot.sessionId !== providerSessionId
+                || resumed.snapshot.cwd !== cwd
+              ) {
+                throw new Error("Claude resume changed the validated provider identity");
+              }
+              if (resumed.snapshot.mode !== desiredMode) {
+                await resumed.setMode(desiredMode);
+              }
+              signal.throwIfAborted();
+              if (view.model.value && resumed.snapshot.model !== view.model.value) {
+                await resumed.setModel(view.model.value);
+              }
+              signal.throwIfAborted();
+              if (desiredEffort && resumed.snapshot.effort !== desiredEffort) {
+                await resumed.setEffort(desiredEffort);
+              }
+              signal.throwIfAborted();
+              return resumed;
+            } finally {
+              signal.removeEventListener("abort", abortSession);
+            }
+          } catch (error) {
+            if (resumed) await resumed.dispose();
+            throw error;
+          }
+        },
+      );
+      try {
+        controller.signal.throwIfAborted();
+        if (
+          this.#disposed
+          || this.#adopting.get(providerSessionId) !== inFlight
+          || this.#entries.has(providerSessionId)
+          || this.#externalAdoptions.has(providerSessionId)
+        ) {
+          throw new Error("Claude adoption ownership changed during initialization");
+        }
+        this.#externalAdoptions.set(providerSessionId, {
+          session,
+          name: view.name,
+          committable: true,
+          cleanup: null,
+          releaseReservation,
+        });
+        retainedReservation = true;
+        return this.#toSessionView({
+          session,
+          name: view.name,
+          published: false,
+          ended: false,
+          endTask: null,
+          projector: new ClaudeActivityProjector(),
+          publishActivity: () => undefined,
+          unsubscribe: () => undefined,
+        }, session.snapshot);
+      } catch (error) {
+        await session.dispose();
+        throw error;
       }
-      if (session.snapshot.mode !== desiredMode) await session.setMode(desiredMode);
-      if (view.model.value && session.snapshot.model !== view.model.value) {
-        await session.setModel(view.model.value);
+    } finally {
+      releaseRequest();
+      if (!retainedReservation) releaseReservation();
+      if (this.#adopting.get(providerSessionId) === inFlight) {
+        this.#adopting.delete(providerSessionId);
       }
-      if (desiredEffort && session.snapshot.effort !== desiredEffort) {
-        await session.setEffort(desiredEffort);
+    }
+  }
+
+  /**
+   * Prepares an exact in-web resume without changing the public dormant entry.
+   * The caller must durably persist managerControl=active and then call
+   * commitExternalAdoption(), or call abortExternalAdoption() on every failure.
+   */
+  async resumeSession(
+    view: SessionView,
+    profile: ExecutionProfile,
+    context: RequestContext,
+  ): Promise<SessionView> {
+    if (
+      view.provider !== "claude"
+      || view.hostId !== "local"
+      || view.id !== sessionRecordId("local", "claude", view.providerThreadId)
+      || !view.cwd
+    ) {
+      throw new Error("Claude resume requires one exact local session identity");
+    }
+    const entry = this.#entries.get(view.providerThreadId);
+    if (!entry) return this.adoptExternalSession(view, profile, context);
+    if (this.#resuming.has(view.providerThreadId)) {
+      throw new Error("Claude session resume is already in progress");
+    }
+    if (this.#dormantResumes.has(view.providerThreadId)) {
+      throw new Error("Claude session resume is awaiting durable commit");
+    }
+    if (!context.workspace || context.workspace.path !== view.cwd) {
+      throw new Error("Claude resume workspace does not match the managed session");
+    }
+
+    const snapshot = entry.session.snapshot;
+    const current = this.#toSessionView(entry, snapshot);
+    if (
+      !entry.published
+      || !entry.ended
+      || snapshot.owner !== "manager"
+      || snapshot.activity !== "closed"
+      || snapshot.sessionId !== view.providerThreadId
+      || snapshot.cwd !== view.cwd
+      || current.generation !== view.generation
+      || current.profile.value !== view.profile.value
+      || current.model.value !== view.model.value
+      || current.effort.value !== view.effort.value
+    ) {
+      throw new Error("Claude session is not the exact current dormant manager record");
+    }
+    if (profile !== current.profile.value) {
+      throw new Error("Claude resume must preserve the dormant execution profile");
+    }
+
+    const controller = new AbortController();
+    const releaseRequest = forwardAbort(context.signal, controller);
+    let releaseReservation = (): void => undefined;
+    const inFlight: ProvisionalInFlight = {
+      controller,
+      releaseReservation: () => releaseReservation(),
+    };
+    this.#resuming.set(view.providerThreadId, inFlight);
+    releaseReservation = this.#options.hookSourceArbiter?.reserveManagerAdoption(
+      view.providerThreadId,
+      () => {
+        const error = new Error("A native Claude owner appeared during web resume");
+        if (!controller.signal.aborted) controller.abort(error);
+        const provisional = this.#dormantResumes.get(view.providerThreadId);
+        if (provisional) {
+          provisional.committable = false;
+          void this.#cleanupProvisional(
+            this.#dormantResumes,
+            view.providerThreadId,
+            provisional,
+          ).catch(() => undefined);
+        }
+      },
+    ) ?? (() => undefined);
+    let retainedReservation = false;
+    try {
+      const desiredMode = profileMode(profile);
+      const desiredEffort = view.effort.value
+        ? claudeEffort(view.effort.value)
+        : undefined;
+      const session = await this.#runConnectingOperation(
+        controller.signal,
+        async (signal) => {
+          let resumed: ClaudeManagedSession | null = null;
+          try {
+            resumed = await entry.session.resumeDormantExact({
+              sessionId: view.providerThreadId,
+              cwd: view.cwd as string,
+              mode: desiredMode,
+              ...(view.model.value ? { model: view.model.value } : {}),
+              ...(desiredEffort ? { effort: desiredEffort } : {}),
+            }, signal);
+            const abortSession = (): void => {
+              void resumed?.dispose();
+            };
+            signal.addEventListener("abort", abortSession, { once: true });
+            try {
+              signal.throwIfAborted();
+              if (resumed.snapshot.mode !== desiredMode) {
+                await resumed.setMode(desiredMode);
+              }
+              signal.throwIfAborted();
+              if (view.model.value && resumed.snapshot.model !== view.model.value) {
+                await resumed.setModel(view.model.value);
+              }
+              signal.throwIfAborted();
+              if (desiredEffort && resumed.snapshot.effort !== desiredEffort) {
+                await resumed.setEffort(desiredEffort);
+              }
+              signal.throwIfAborted();
+              return resumed;
+            } finally {
+              signal.removeEventListener("abort", abortSession);
+            }
+          } catch (error) {
+            if (resumed) await resumed.dispose();
+            throw error;
+          }
+        },
+      );
+
+      try {
+        controller.signal.throwIfAborted();
+        if (
+          this.#disposed
+          || this.#entries.get(view.providerThreadId) !== entry
+          || entry.session.snapshot.generation !== snapshot.generation
+          || this.#dormantResumes.has(view.providerThreadId)
+        ) {
+          throw new Error("Claude dormant manager record changed during resume");
+        }
+        this.#dormantResumes.set(view.providerThreadId, {
+          dormant: entry,
+          session,
+          name: entry.name,
+          committable: true,
+          cleanup: null,
+          releaseReservation,
+        });
+        retainedReservation = true;
+        return this.#toSessionView({
+          ...entry,
+          session,
+          published: false,
+          ended: false,
+          endTask: null,
+        }, session.snapshot);
+      } catch (error) {
+        await session.dispose();
+        throw error;
       }
-      context.signal.throwIfAborted();
-      return this.#registerSession(session, view.name, false);
-    } catch (error) {
-      session.dispose();
-      throw error;
+    } finally {
+      releaseRequest();
+      if (!retainedReservation) releaseReservation();
+      if (this.#resuming.get(view.providerThreadId) === inFlight) {
+        this.#resuming.delete(view.providerThreadId);
+      }
     }
   }
 
@@ -631,15 +973,22 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
           signal.throwIfAborted();
           const runtime = await this.#getRuntime();
           const effort = record.effort ? claudeEffort(record.effort) : undefined;
-          session = await ClaudeManagedSession.resume(runtime, {
-            sessionId: record.providerThreadId,
-            cwd: record.workspacePath,
-            mode: profileMode(record.profile),
-            ...(record.model ? { model: record.model } : {}),
-            ...(effort ? { effort } : {}),
-            allowDangerouslySkipPermissions: true,
-          });
+          const resumeConfig = {
+              sessionId: record.providerThreadId,
+              cwd: record.workspacePath,
+              mode: profileMode(record.profile),
+              ...this.#executableConfig(runtime),
+              ...(record.model ? { model: record.model } : {}),
+              ...(effort ? { effort } : {}),
+              allowDangerouslySkipPermissions: true,
+          };
+          session = record.managerControl === "stopped"
+            ? ClaudeManagedSession.dormant(runtime, resumeConfig)
+            : await this.#connectManagedSession(signal, (attemptSignal) =>
+                ClaudeManagedSession.resume(runtime, resumeConfig, attemptSignal)
+              );
           signal.throwIfAborted();
+          if (this.#disposed) throw new Error("Claude provider adapter is disposed");
           if (
             session.snapshot.sessionId !== record.providerThreadId
             || session.snapshot.cwd !== record.workspacePath
@@ -648,7 +997,7 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
           session = null;
           restored[index] = true;
         } catch (error) {
-          session?.dispose();
+          if (session) await session.dispose();
           failures[index] = recoveryError(error);
         }
       }
@@ -746,12 +1095,38 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
           }
           return { status: "succeeded", result: { messageId: action.messageId } };
         case "end":
-          entry.session.end();
+          // Mark intent before the synchronous snapshot notification so an
+          // unexpected-loss observer cannot mistake this deliberate close for
+          // a provider failure and retire the durable identity.
+          if (!entry.endTask) {
+            entry.ended = true;
+            let intentPersisted = false;
+            const endTask = Promise.resolve().then(async () => {
+              try {
+                // This write-ahead intent is the safety boundary: if it cannot
+                // be committed, leave the SDK consumer live so a failed End can
+                // never turn into an automatic restart resume.
+                await this.#options.onManagerControlStopped?.(view.id);
+                intentPersisted = true;
+                await entry.session.end();
+              } catch (error) {
+                if (!intentPersisted) {
+                  entry.ended = false;
+                  entry.endTask = null;
+                }
+                throw error;
+              }
+            });
+            entry.endTask = endTask;
+          }
+          await entry.endTask;
           return { status: "succeeded" };
         case "archive":
         case "delete":
+        case "resume":
         case "take-control":
         case "cancel-take-control":
+        case "retry-control":
           throw new Error(`Claude does not support ${action.type}`);
         case "open-editor":
           throw new Error("Claude provider does not own editor launch operations");
@@ -769,11 +1144,26 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
     context: RequestContext,
   ): Promise<AttachInstruction | null> {
     if (context.signal.aborted) return null;
+    if (
+      this.#resuming.has(view.providerThreadId)
+      || this.#dormantResumes.has(view.providerThreadId)
+    ) {
+      // A provisional SDK owner already exists. Native resume must stay
+      // unavailable until that owner is either committed or rolled back.
+      return null;
+    }
     const entry = this.#entries.get(view.providerThreadId);
     if (!entry) return null;
     const snapshot = entry.session.snapshot;
     if (!nativeHandoffReadiness(snapshot).ready) return null;
-    const handoff = entry.session.prepareCliHandoff();
+    const handoff = await entry.session.prepareCliHandoff(context.requestId, context.signal);
+    if (context.signal.aborted) {
+      entry.session.markCliAttachFailed(handoff.id, "Native handoff preparation was cancelled");
+      // Do not start an unbounded replacement SDK writer after the caller's
+      // deadline. Leave the exact handoff fail-closed for managed recovery.
+      await entry.session.reclaimFromCli(handoff.id, context.signal).catch(() => undefined);
+      context.signal.throwIfAborted();
+    }
     return {
       kind: "claude-resume",
       argv: [handoff.command.executable, ...handoff.command.args],
@@ -799,9 +1189,7 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
     }
     let lookup = this.#draftSettingsLookup;
     if (!lookup) {
-      lookup = boundedSettingsLookup(
-        this.#loadDraftSettingsOptions(context.workspace?.path ?? process.cwd()),
-      );
+      lookup = this.#loadDraftSettingsOptions(context.workspace?.path ?? process.cwd());
       this.#draftSettingsLookup = lookup;
       const activeLookup = lookup;
       const clearLookup = (): void => {
@@ -875,7 +1263,10 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
 
   async reclaimFromCli(sessionId: string, handoffId: string): Promise<SessionView> {
     const entry = this.#requireEntry(sessionId);
-    await entry.session.reclaimFromCli(handoffId);
+    await this.#runConnectingOperation(undefined, (signal) =>
+      entry.session.reclaimFromCli(handoffId, signal)
+    );
+    if (this.#disposed) throw new Error("Claude provider adapter is disposed");
     this.#options.hookSourceArbiter?.markManagerOwned(sessionId);
     return this.#toSessionView(entry, entry.session.snapshot);
   }
@@ -886,30 +1277,170 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
   }
 
   commitExternalAdoption(sessionId: string): SessionView {
+    const external = this.#externalAdoptions.get(sessionId);
+    if (external) {
+      if (this.#disposed) throw new Error("Claude provider adapter is disposed");
+      if (!external.committable || external.cleanup) {
+        throw new Error("Claude provisional adoption is quarantined during cleanup");
+      }
+      const snapshot = external.session.snapshot;
+      if (
+        this.#entries.has(sessionId)
+        || snapshot.sessionId !== sessionId
+        || snapshot.resumedFrom !== sessionId
+        || snapshot.owner !== "manager"
+        || snapshot.activity === "closed"
+        || snapshot.activity === "failed"
+      ) {
+        throw new Error("Claude provisional adoption is no longer a live exact owner");
+      }
+      this.#externalAdoptions.delete(sessionId);
+      external.releaseReservation();
+      try {
+        this.#registerSession(external.session, external.name, false);
+        const active = this.#requireEntry(sessionId);
+        active.published = true;
+        return this.#toSessionView(active, active.session.snapshot);
+      } catch (error) {
+        void external.session.dispose().catch(() => undefined);
+        throw error;
+      }
+    }
+    const provisional = this.#dormantResumes.get(sessionId);
+    if (provisional) {
+      if (this.#disposed) throw new Error("Claude provider adapter is disposed");
+      if (!provisional.committable || provisional.cleanup) {
+        throw new Error("Claude provisional resume is quarantined during cleanup");
+      }
+      if (this.#entries.get(sessionId) !== provisional.dormant) {
+        throw new Error("Claude dormant manager record changed before commit");
+      }
+      const snapshot = provisional.session.snapshot;
+      if (
+        snapshot.sessionId !== sessionId
+        || snapshot.resumedFrom !== sessionId
+        || snapshot.cwd !== provisional.dormant.session.snapshot.cwd
+        || snapshot.owner !== "manager"
+        || snapshot.activity === "closed"
+        || snapshot.activity === "failed"
+      ) {
+        throw new Error("Claude provisional resume is no longer a live exact owner");
+      }
+
+      // From here to #registerSession is synchronous: no other action can see a
+      // missing entry or interleave a second writer between the durable commit
+      // and the provider ownership swap.
+      this.#dormantResumes.delete(sessionId);
+      provisional.releaseReservation();
+      this.#entries.delete(sessionId);
+      this.#settingsLookups.delete(provisional.dormant);
+      provisional.dormant.unsubscribe();
+      this.#registerSession(
+        provisional.session,
+        provisional.name,
+        false,
+      );
+      const active = this.#requireEntry(sessionId);
+      active.published = true;
+      void provisional.dormant.session.dispose().catch(() => undefined);
+      return this.#toSessionView(active, active.session.snapshot);
+    }
     const entry = this.#requireEntry(sessionId);
+    if (entry.published) {
+      throw new Error("Claude session has no provisional adoption to commit");
+    }
     entry.published = true;
     return this.#toSessionView(entry, entry.session.snapshot);
   }
 
-  abortExternalAdoption(sessionId: string): void {
-    const entry = this.#entries.get(sessionId);
-    if (!entry || entry.published) return;
-    this.#entries.delete(sessionId);
-    entry.unsubscribe();
-    entry.session.dispose();
-    this.#options.hookSourceArbiter?.forget(sessionId);
+  async abortExternalAdoption(sessionId: string): Promise<void> {
+    const adopting = this.#adopting.get(sessionId);
+    if (adopting) {
+      if (!adopting.controller.signal.aborted) {
+        adopting.controller.abort(new Error("Claude provisional adoption was cancelled"));
+      }
+      adopting.releaseReservation();
+    }
+    const external = this.#externalAdoptions.get(sessionId);
+    if (external) {
+      external.committable = false;
+      await this.#cleanupProvisional(
+        this.#externalAdoptions,
+        sessionId,
+        external,
+      );
+      return;
+    }
+    const provisional = this.#dormantResumes.get(sessionId);
+    if (provisional) {
+      provisional.committable = false;
+      await this.#cleanupProvisional(
+        this.#dormantResumes,
+        sessionId,
+        provisional,
+      );
+      return;
+    }
+    // First-time and dormant provisionals live only in the quarantined maps
+    // above. #entries may be briefly unpublished only inside the synchronous
+    // commit swap, where no abort call can interleave.
   }
 
-  dispose(): void {
+  async dispose(): Promise<void> {
+    if (this.#disposed) {
+      await Promise.allSettled(this.#connecting.values());
+      return;
+    }
+    this.#disposed = true;
+    this.#unsubscribeOwnershipConflicts();
+    this.#unsubscribeOwnershipConflicts = () => undefined;
+    this.#lifetime.abort(new Error("Claude provider adapter was disposed"));
+    for (const controller of this.#connecting.keys()) {
+      if (!controller.signal.aborted) {
+        controller.abort(new Error("Claude provider adapter was disposed"));
+      }
+    }
+    const settlements: Promise<unknown>[] = [...this.#connecting.values()];
+    for (const resuming of this.#resuming.values()) {
+      if (!resuming.controller.signal.aborted) {
+        resuming.controller.abort(new Error("Claude provider adapter was disposed"));
+      }
+      resuming.releaseReservation();
+    }
+    this.#resuming.clear();
+    for (const adopting of this.#adopting.values()) {
+      if (!adopting.controller.signal.aborted) {
+        adopting.controller.abort(new Error("Claude provider adapter was disposed"));
+      }
+      adopting.releaseReservation();
+    }
+    this.#adopting.clear();
+    for (const [sessionId, external] of this.#externalAdoptions) {
+      external.committable = false;
+      settlements.push(this.#cleanupProvisional(
+        this.#externalAdoptions,
+        sessionId,
+        external,
+      ));
+    }
+    for (const [sessionId, provisional] of this.#dormantResumes) {
+      provisional.committable = false;
+      settlements.push(this.#cleanupProvisional(
+        this.#dormantResumes,
+        sessionId,
+        provisional,
+      ));
+    }
     for (const [sessionId, entry] of this.#entries) {
       entry.unsubscribe();
-      entry.session.dispose();
+      settlements.push(entry.session.dispose());
       this.#options.hookSourceArbiter?.forget(sessionId);
     }
     this.#entries.clear();
     this.#settingsLookups.clear();
     this.#workspaceIdentities.clear();
     this.#draftSettingsLookup = null;
+    await Promise.allSettled(settlements);
   }
 
   /**
@@ -920,38 +1451,74 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
    */
   async #loadDraftSettingsOptions(cwd: string): Promise<SessionSettingsOptions> {
     const runtime = await this.#getRuntime();
+    if (this.#disposed) throw new Error("Claude provider adapter is disposed");
     const prompt = new AsyncInbox<ClaudeSdkUserMessage>();
-    const query = runtime.createQuery({
-      prompt,
-      options: {
-        cwd,
-        persistSession: false,
-        includePartialMessages: true,
-        includeHookEvents: true,
-        forwardSubagentText: true,
-        permissionMode: "default",
-        allowDangerouslySkipPermissions: false,
-        env: {
-          ...process.env,
-          CLAUDE_AGENT_SDK_CLIENT_APP: "agent-manager",
-          [CLAUDE_MANAGER_OWNER_ENV]: CLAUDE_MANAGER_OWNER_VALUE,
+    const abortController = new AbortController();
+    const releaseLifetime = forwardAbort(this.#lifetime.signal, abortController);
+    let query: ReturnType<ClaudeSdkRuntime["createQuery"]> | null = null;
+    let closed = false;
+    const close = (reason?: unknown): void => {
+      if (closed) return;
+      closed = true;
+      if (reason !== undefined && !abortController.signal.aborted) {
+        abortController.abort(reason);
+      }
+      prompt.close();
+      try {
+        query?.close();
+      } catch {
+        // The owned abort signal and prompt have already withdrawn this probe.
+      }
+    };
+    try {
+      query = runtime.createQuery({
+        prompt,
+        options: {
+          abortController,
+          cwd,
+          persistSession: false,
+          includePartialMessages: true,
+          includeHookEvents: true,
+          forwardSubagentText: true,
+          permissionMode: "default",
+          allowDangerouslySkipPermissions: false,
+          env: {
+            ...process.env,
+            CLAUDE_AGENT_SDK_CLIENT_APP: "agent-manager",
+            [CLAUDE_MANAGER_OWNER_ENV]: CLAUDE_MANAGER_OWNER_VALUE,
+          },
+          ...((this.#options.claudeExecutable ?? runtime.claudeCodeExecutable)
+            ? {
+                pathToClaudeCodeExecutable:
+                  this.#options.claudeExecutable ?? runtime.claudeCodeExecutable,
+              }
+            : {}),
+          // A catalog read runs no turn. If the provider ever asked anyway, the
+          // only safe answer from a surface with no operator is refusal.
+          canUseTool: () => Promise.reject(
+            new Error("A Claude draft catalog probe cannot answer tool permissions"),
+          ),
+          onElicitation: () => Promise.resolve({ action: "cancel" as const }),
         },
-        // A catalog read runs no turn. If the provider ever asked anyway, the
-        // only safe answer from a surface with no operator is refusal.
-        canUseTool: () => Promise.reject(
-          new Error("A Claude draft catalog probe cannot answer tool permissions"),
-        ),
-        onElicitation: () => Promise.resolve({ action: "cancel" as const }),
-      },
-    });
+      });
+    } catch (error) {
+      close(error);
+      releaseLifetime();
+      throw error;
+    }
+    abortController.signal.addEventListener("abort", () => close(), { once: true });
     try {
       return sessionSettingsOptionsSchema.parse({
         source: "provider-api",
-        models: (await query.supportedModels()).map(claudeModelOption),
+        models: (await boundedSettingsLookup(
+          query.supportedModels(),
+          (error) => close(error),
+          abortController.signal,
+        )).map(claudeModelOption),
       });
     } finally {
-      prompt.close();
-      query.close();
+      releaseLifetime();
+      close();
     }
   }
 
@@ -1006,9 +1573,87 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
         ? typeof configured === "function"
           ? configured()
           : Promise.resolve(configured)
-        : loadClaudeSdkRuntime();
+        : loadClaudeSdkRuntime({
+            ...(this.#options.claudeExecutable
+              ? { claudeCodeExecutable: this.#options.claudeExecutable }
+              : {}),
+          });
     }
     return this.#runtime;
+  }
+
+  #executableConfig(runtime: ClaudeSdkRuntime): { claudeCodeExecutable?: string } {
+    const executable = this.#options.claudeExecutable ?? runtime.claudeCodeExecutable;
+    return executable ? { claudeCodeExecutable: executable } : {};
+  }
+
+  #connectManagedSession(
+    parentSignal: AbortSignal,
+    connect: (signal: AbortSignal) => Promise<ClaudeManagedSession>,
+  ): Promise<ClaudeManagedSession> {
+    return this.#runConnectingOperation(parentSignal, connect);
+  }
+
+  async #runConnectingOperation<T>(
+    parentSignal: AbortSignal | undefined,
+    connect: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    if (this.#disposed) throw new Error("Claude provider adapter is disposed");
+    const controller = new AbortController();
+    const releaseParent = parentSignal
+      ? forwardAbort(parentSignal, controller)
+      : () => undefined;
+    const releaseLifetime = forwardAbort(this.#lifetime.signal, controller);
+    const promise = Promise.resolve().then(() => {
+      controller.signal.throwIfAborted();
+      return connect(controller.signal);
+    });
+    this.#connecting.set(controller, promise);
+    try {
+      return await promise;
+    } finally {
+      this.#connecting.delete(controller);
+      releaseParent();
+      releaseLifetime();
+    }
+  }
+
+  #cleanupProvisional<
+    T extends {
+      session: ClaudeManagedSession;
+      committable: boolean;
+      cleanup: Promise<void> | null;
+      releaseReservation: () => void;
+    },
+  >(
+    provisionals: Map<string, T>,
+    sessionId: string,
+    provisional: T,
+  ): Promise<void> {
+    provisional.committable = false;
+    provisional.releaseReservation();
+    if (provisional.cleanup) return provisional.cleanup;
+
+    let tracked!: Promise<void>;
+    tracked = Promise.resolve()
+      .then(() => provisional.session.dispose())
+      .then(
+        () => {
+          if (provisional.cleanup === tracked) provisional.cleanup = null;
+          if (provisionals.get(sessionId) === provisional) {
+            provisionals.delete(sessionId);
+          }
+        },
+        (error: unknown) => {
+          // A positively rejected close can be retried, but the exact record
+          // remains quarantined between attempts. A hanging close never reaches
+          // this branch, so every concurrent abort keeps sharing `tracked`.
+          if (provisional.cleanup === tracked) provisional.cleanup = null;
+          throw error;
+        },
+      );
+    provisional.cleanup = tracked;
+    return tracked;
   }
 
   #registerSession(
@@ -1016,6 +1661,7 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
     name: string | null,
     published: boolean,
   ): SessionView {
+    if (this.#disposed) throw new Error("Claude provider adapter is disposed");
     const id = session.snapshot.sessionId;
     if (!id || this.#entries.has(id)) {
       throw new Error(id ? "Claude session is already managed" : "Claude session has no provider identity");
@@ -1035,23 +1681,47 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
       session,
       name,
       published,
+      // A dormant session is the durable representation of an explicit prior
+      // End. It must not immediately trigger the unexpected-loss path merely
+      // because its intentionally query-free snapshot is closed.
+      ended: session.snapshot.activity === "closed",
+      endTask: null,
       projector,
       publishActivity,
       unsubscribe: () => undefined,
     };
     this.#entries.set(id, entry);
-    this.#options.hookSourceArbiter?.markManagerOwned(id);
+    const initialSnapshot = session.snapshot;
+    this.#options.hookSourceArbiter?.markManagerOwned(
+      id,
+      initialSnapshot.owner === "manager"
+        && initialSnapshot.activity !== "closed"
+        && initialSnapshot.activity !== "failed",
+    );
     const unsubscribeMessages = session.onMessage((message) => {
       publishActivity(projector.projectMessage(message));
     });
     const unsubscribeSession = session.subscribe((snapshot) => {
+      publishActivity(projector.projectSnapshot(snapshot));
+      if (
+        !this.#disposed
+        && !entry.ended
+        && snapshot.owner === "manager"
+        && (snapshot.activity === "closed" || snapshot.activity === "failed")
+      ) {
+        this.#retireLostEntry(
+          id,
+          entry,
+          snapshot.activity === "closed" ? "unexpected-close" : "unexpected-failure",
+        );
+        return;
+      }
       this.#options.hookSourceArbiter?.markManagerOwned(
         id,
         snapshot.owner === "manager"
           && snapshot.activity !== "closed"
           && snapshot.activity !== "failed",
       );
-      publishActivity(projector.projectSnapshot(snapshot));
       if (!entry.published) return;
       try {
         this.#options.onSessionChanged?.(this.#toSessionView(entry, snapshot));
@@ -1064,6 +1734,61 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
       unsubscribeSession();
     };
     return this.#toSessionView(entry, session.snapshot);
+  }
+
+  #handleOwnershipConflict(providerSessionId: string): void {
+    if (this.#disposed) return;
+    const resuming = this.#resuming.get(providerSessionId);
+    if (resuming && !resuming.controller.signal.aborted) {
+      resuming.controller.abort(new Error("A native Claude owner appeared during web resume"));
+    }
+    const provisional = this.#dormantResumes.get(providerSessionId);
+    if (provisional) {
+      provisional.committable = false;
+      void this.#cleanupProvisional(
+        this.#dormantResumes,
+        providerSessionId,
+        provisional,
+      ).catch(() => undefined);
+    }
+    const entry = this.#entries.get(providerSessionId);
+    if (!entry || entry.ended) return;
+    this.#retireLostEntry(providerSessionId, entry, "ownership-conflict");
+  }
+
+  #retireLostEntry(
+    providerSessionId: string,
+    entry: ManagedEntry,
+    reason: ClaudeManagedSessionLossReason,
+  ): void {
+    if (
+      this.#disposed
+      || entry.ended
+      || this.#entries.get(providerSessionId) !== entry
+    ) return;
+
+    // This is the local ownership commit point: no later action lookup can
+    // reach the writer, and observers are detached before dispose publishes its
+    // deliberate terminal snapshot. The durable record is intentionally left
+    // to the server's recovery coordinator.
+    entry.ended = true;
+    this.#entries.delete(providerSessionId);
+    this.#settingsLookups.delete(entry);
+    entry.unsubscribe();
+    this.#options.hookSourceArbiter?.forget(providerSessionId);
+    const disposal = entry.session.dispose();
+
+    try {
+      const notification = this.#options.onSessionLost?.(
+        sessionRecordId("local", "claude", providerSessionId),
+        reason,
+      );
+      void Promise.resolve(notification).catch(() => undefined);
+    } catch {
+      // Recovery notification is an observer edge. Local writer withdrawal is
+      // already committed and must not be rolled back if the server is closing.
+    }
+    void disposal.catch(() => undefined);
   }
 
   #toSessionView(
@@ -1200,6 +1925,8 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
       control: {
         plane: writableManagerControls ? "claude-sdk" : "resume-only",
         authority: managerControls ? "manager" : "foreign",
+        coordination: providerControlCoordination("claude"),
+        recovery: null,
         capabilities,
         withheld,
         takeover: null,

@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
+import { providerControlCoordination } from "../../../../src/shared/session.ts";
 import type { CockpitSessionView } from "../../lib/cockpit-view";
 import { toBoardSession, type BoardSession } from "../board/model";
 import { SelectionBar } from "./SelectionBar";
@@ -18,7 +19,15 @@ function session(id: string, capabilities: CockpitSessionView["control"]["capabi
     activity: "idle",
     attention: [],
     updatedAt: "2026-08-04T12:00:00Z",
-    control: { plane: "codex-private", authority: "manager", capabilities, withheld: [], takeover: null },
+    control: {
+      plane: "codex-private",
+      authority: "manager",
+      coordination: providerControlCoordination("codex"),
+      recovery: null,
+      capabilities,
+      withheld: [],
+      takeover: null,
+    },
     profile: null,
     model: null,
     effort: null,

@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import type { ActivityFrame, ActivityMessageItem } from "../types";
+import {
+  WIRE_SCHEMA_VERSION,
+  type ActivityFrame,
+  type ActivityMessageItem,
+} from "../types";
 import {
   encodeActivityCursor,
   emptySessionActivity,
@@ -12,7 +16,7 @@ const EPOCH = "epoch:with-colon";
 
 function message(overrides: Partial<ActivityMessageItem> = {}): ActivityMessageItem {
   return {
-    schemaVersion: 4,
+    schemaVersion: WIRE_SCHEMA_VERSION,
     id: "message-1",
     sessionId: SESSION_ID,
     provider: "codex",
@@ -42,7 +46,7 @@ function frame(
   value: { type: ActivityFrame["type"]; seq: number; [key: string]: unknown },
 ): ActivityFrame {
   return {
-    schemaVersion: 4,
+    schemaVersion: WIRE_SCHEMA_VERSION,
     streamEpoch: EPOCH,
     sessionId: SESSION_ID,
     provider: "codex",

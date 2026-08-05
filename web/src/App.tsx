@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
+  Archive,
   BellOff,
   Check,
   CodeXml,
@@ -10,6 +11,7 @@ import {
   GitBranch,
   Laptop,
   ListTodo,
+  LoaderCircle,
   Plus,
   RefreshCw,
   Search,
@@ -83,6 +85,7 @@ import {
 } from "./components/ui";
 import { toCockpitSessionView, workspaceChangeFacts, workspaceChangeLabel } from "./lib/cockpit-view";
 import type { ProviderSettingsOptionsResponse, SessionSettingsOptionsResponse, SetupReadModel, TranscriptSearchMatch } from "./lib/api";
+import type { SessionScope } from "./lib/session-navigation";
 import { isTypingTarget } from "./lib/shortcuts";
 import { coveringModelOption } from "./lib/model-catalog";
 import type { ActivityItem, HostOption, ReasoningEffort, SessionView } from "./types";
@@ -129,6 +132,7 @@ function drawerFacts(session: SessionView, remote: boolean) {
     session.workspaceIdentity?.branch ? { label: session.workspaceIdentity.branch, icon: GitBranch } : null,
     changes ? { label: workspaceChangeLabel(changes), icon: FileDiff, tone: "dirty" as const } : null,
     remote ? { label: session.hostLabel, icon: Server, tone: "remote" as const } : null,
+    session.archived ? { label: "Archived · read-only", icon: Archive } : null,
   ].filter((fact): fact is NonNullable<typeof fact> => fact !== null);
 }
 
@@ -301,12 +305,15 @@ export type SetupFactsState =
   | { state: "error"; value: null; error: string }
   | null;
 
-/**
- * The one standalone surface for hook and host integration facts. It reads the
- * same bounded `/setup` model first run uses and, like first run, only ever
- * shows the exact CLI command and redacted diff for the operator to run.
- */
-export function SetupDialog({ setup, onRetry, onClose }: { setup: SetupFactsState; onRetry: () => void; onClose: () => void }) {
+/** The standalone surface for reviewing and installing local integrations. */
+export function SetupDialog({ setup, onApplyHook, onAddHost, onRemoveHost, onRetry, onClose }: {
+  setup: SetupFactsState;
+  onApplyHook?: (provider: "claude" | "codex", previewId: string) => Promise<void>;
+  onAddHost: (label: string, target: string) => Promise<void>;
+  onRemoveHost: (hostId: string) => Promise<void>;
+  onRetry: () => void;
+  onClose: () => void;
+}) {
   const openerRef = useRef<HTMLElement | null>(null);
   return (
     <Dialog open onOpenChange={(next) => { if (!next) onClose(); }}>
@@ -314,7 +321,7 @@ export function SetupDialog({ setup, onRetry, onClose }: { setup: SetupFactsStat
         <header className="flex shrink-0 items-center gap-3 border-b border-[var(--rule)] px-5 py-3">
           <div className="min-w-0">
             <DialogTitle className="pr-0">Setup and integrations</DialogTitle>
-            <DialogDescription className="mt-0.5 text-meta-sm text-[var(--text-muted)]">This browser never changes provider settings. Run the commands yourself.</DialogDescription>
+            <DialogDescription className="mt-0.5 text-meta-sm text-[var(--text-muted)]">Install optional provider integrations and manage remote hosts without leaving the web app.</DialogDescription>
           </div>
           <DialogClose asChild>
             <Button variant="ghost" size="icon" data-compact-control className="ml-auto size-10 shrink-0" aria-label="Close setup and integrations"><X size={16} /></Button>
@@ -322,7 +329,7 @@ export function SetupDialog({ setup, onRetry, onClose }: { setup: SetupFactsStat
         </header>
         <div className="min-h-0 flex-1 overflow-y-auto">
           {setup?.state === "loaded"
-            ? <><HookSetupStep hooks={setup.value.hooks} standalone /><HostSetupStep hosts={setup.value.hosts} standalone /></>
+            ? <><HookSetupStep hooks={setup.value.hooks} {...(onApplyHook ? { onApply: onApplyHook } : {})} onRefresh={onRetry} standalone /><HostSetupStep hosts={setup.value.hosts} onAddHost={onAddHost} onRemoveHost={onRemoveHost} standalone /></>
             : setup?.state === "error"
               ? <section className="grid place-items-center p-10 text-center"><AlertCircle className="text-[var(--warning)]" /><h3 className="mt-3 text-title-sm">Setup facts are unavailable</h3><p className="mt-1 text-meta-sm text-[var(--text-muted)]">{setup.error}</p><Button variant="primary" size="touch" className="mt-4" onClick={onRetry}>Try again</Button></section>
               : <ConnectingState sources={["provider hook settings", "configured remote hosts"]} />}
@@ -487,9 +494,33 @@ function ArchivedCatalogBar({
   );
 }
 
+function ArchivedCatalogEmpty({ status, error, query, onRetry }: {
+  status: "idle" | "loading" | "loaded" | "error";
+  error: string | null;
+  query: string;
+  onRetry: () => void;
+}) {
+  if (status === "error") {
+    return (
+      <section className="grid min-h-0 flex-1 place-content-center p-6 text-center" role="status">
+        <AlertCircle className="mx-auto text-[var(--warning)]" />
+        <h2 className="mt-3 text-title-sm">Archived sessions unavailable</h2>
+        <p className="mt-1 max-w-md text-meta-sm text-[var(--text-muted)]">{error ?? "Agent Manager could not load the archived-session catalog."}</p>
+        <Button variant="secondary" size="sm" className="mx-auto mt-3 gap-1.5" onClick={onRetry}><RefreshCw size={13} aria-hidden="true" />Try again</Button>
+      </section>
+    );
+  }
+  if (status === "loading" || status === "idle") {
+    return <section className="grid min-h-0 flex-1 place-content-center p-6 text-center" role="status"><LoaderCircle className="mx-auto motion-safe:animate-spin text-[var(--text-muted)]" /><h2 className="mt-3 text-title-sm">Loading archived sessions</h2><p className="mt-1 text-meta-sm text-[var(--text-muted)]">Reading the searchable archive catalog.</p></section>;
+  }
+  const searching = query.trim().length > 0;
+  return <section className="grid min-h-0 flex-1 place-content-center p-6 text-center"><Archive className="mx-auto text-[var(--text-muted)]" /><h2 className="mt-3 text-title-sm">{searching ? "No archived sessions match" : "No archived sessions yet"}</h2><p className="mt-1 text-meta-sm text-[var(--text-muted)]">{searching ? "Search by title, provider ID, or workspace." : "Archived Codex sessions will remain searchable and read-only here."}</p></section>;
+}
+
 export default function App() {
   const cockpit = useCockpit();
-  const activity = useSessionActivity(cockpit.selectedId);
+  const [activityRetryGeneration, setActivityRetryGeneration] = useState(0);
+  const activity = useSessionActivity(cockpit.selectedId, activityRetryGeneration);
   const [draft, setDraft] = useState<DraftSession | null>(() => new URLSearchParams(window.location.search).get("draft") === "1" ? newDraftSession() : null);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [paletteQuery, setPaletteQuery] = useState("");
@@ -547,6 +578,32 @@ export default function App() {
       if (setupRequest.current === request) setSetupFacts({ state: "error", value: null, error: errorText(error) });
     });
   }, [cockpit.loadSetup]);
+  const applySetupHook = useCallback(async (provider: "claude" | "codex", previewId: string): Promise<void> => {
+    await cockpit.applySetupHook(provider, previewId);
+    setupProbes.current = 0;
+    refreshSetup();
+  }, [cockpit.applySetupHook, refreshSetup]);
+  const addSetupHost = useCallback(async (label: string, target: string): Promise<void> => {
+    await cockpit.addHost(label, target);
+    setupProbes.current = 0;
+    refreshSetup();
+  }, [cockpit.addHost, refreshSetup]);
+  const removeSetupHost = useCallback(async (hostId: string): Promise<void> => {
+    const closeRemoteDrawer = cockpit.selectedSession?.hostId === hostId;
+    const resetFirstWorkspace = pendingFirstWorkspace?.hostId === hostId;
+    await cockpit.removeHost(hostId);
+    if (closeRemoteDrawer) {
+      setReviewOpen(false);
+      await cockpit.closeSelected();
+    }
+    setDraft((current) => current?.workspace?.hostId === hostId ? null : current);
+    if (resetFirstWorkspace) {
+      setPendingFirstWorkspace(null);
+      setFirstRunStep("folder");
+    }
+    setupProbes.current = 0;
+    refreshSetup();
+  }, [cockpit.closeSelected, cockpit.removeHost, cockpit.selectedSession?.hostId, pendingFirstWorkspace?.hostId, refreshSetup]);
   // Hook and host facts change outside this browser, so every explicit open
   // re-reads them instead of trusting a first-run snapshot.
   const openSetup = useCallback(() => { setupProbes.current = 0; setSetupOpen(true); refreshSetup(); }, [refreshSetup]);
@@ -558,17 +615,15 @@ export default function App() {
 
 
   /*
-    Adding a hook edits a settings file, and a settings edit emits no provider
-    event — so a session stays "installed-unseen" until its next real event, and
-    "absent" until the operator has actually run the command. Neither transition
-    reaches this browser on its own. While the dialog is open on an unfinished
-    hook, re-read the facts so the state moves without a restart. `/api/v1/setup`
-    allows ten reads a minute; this stays under it and stops after two.
+    A hook settings edit emits no provider event, including when another browser
+    or process makes it. While the dialog is open on an unfinished hook, re-read
+    the facts so the state moves without a restart. A successful in-app install
+    also refreshes immediately above.
   */
   useEffect(() => {
     if (!setupOpen || setupFacts?.state !== "loaded") return;
     const unfinished = ([setupFacts.value.hooks.claude, setupFacts.value.hooks.codex] as const)
-      .some((hook) => hook.state === "absent" || hook.state === "installed-unseen");
+      .some((hook) => hook.state !== "active");
     if (!unfinished || setupProbes.current >= SETUP_REPROBE_LIMIT) return;
     const timer = setTimeout(() => { setupProbes.current += 1; refreshSetup(); }, SETUP_REPROBE_MS);
     return () => clearTimeout(timer);
@@ -685,6 +740,7 @@ export default function App() {
     cockpit.loadProviderSettingsOptions,
     cockpit.loadSettingsOptions,
     selected?.control.authority,
+    selected?.control.recovery?.state,
     selected?.hostId,
     selected?.id,
     selected?.provider,
@@ -797,6 +853,19 @@ export default function App() {
     setDraft(null);
     setReviewOpen(false);
     void cockpit.closeSelected();
+  }, [cockpit]);
+  const changeScope = useCallback((next: SessionScope) => {
+    const crossesArchiveBoundary = (cockpit.scope === "archived") !== (next === "archived");
+    if (crossesArchiveBoundary) {
+      // Archived and active drawers are different trust surfaces. Clear the
+      // old selection synchronously (and release its browser lease) before the
+      // new board can render, so a writable drawer never overlays Archives.
+      setDraft(null);
+      setReviewOpen(false);
+      setSelectedIds(new Set());
+      void cockpit.closeSelected();
+    }
+    cockpit.setScope(next);
   }, [cockpit]);
 
   const firstSend = useCallback(async () => {
@@ -1024,7 +1093,7 @@ export default function App() {
         hostFilter={cockpit.hostFilter}
         connection={cockpit.connection}
         diagnostics={cockpit.snapshot.diagnostics.length}
-        onScope={cockpit.setScope}
+        onScope={changeScope}
         onToggleHost={toggleHost}
         onPalette={() => setPaletteOpen(true)}
         onHelp={() => setShortcutsOpen(true)}
@@ -1069,15 +1138,15 @@ export default function App() {
               ? firstRunStep === "folder"
                 ? <FirstRun nearby={setupFacts.value.nearby} hosts={setupFacts.value.hosts} onChooseFolder={(workspace) => { setPendingFirstWorkspace({ hostId: workspace.hostId, path: workspace.path }); setFirstRunStep("hooks"); }} onBrowse={cockpit.completeWorkspacePath} />
                 : firstRunStep === "hooks"
-                  ? <HookSetupStep hooks={setupFacts.value.hooks} onContinue={() => setFirstRunStep("ssh")} />
-                  : <HostSetupStep hosts={setupFacts.value.hosts} onContinue={() => { openDraft(pendingFirstWorkspace ?? undefined); setFirstRunStep("folder"); }} />
+                  ? <HookSetupStep hooks={setupFacts.value.hooks} onApply={applySetupHook} onRefresh={refreshSetup} onContinue={() => setFirstRunStep("ssh")} />
+                  : <HostSetupStep hosts={setupFacts.value.hosts} onAddHost={addSetupHost} onRemoveHost={removeSetupHost} onContinue={() => { openDraft(pendingFirstWorkspace ?? undefined); setFirstRunStep("folder"); }} />
               : setupFacts?.state === "error"
                 ? <section className="mx-auto grid max-w-lg place-items-center p-10 text-center"><AlertCircle className="text-[var(--warning)]" /><h2 className="mt-3 text-title-md">Setup facts are unavailable</h2><p className="mt-1 text-meta-sm text-[var(--text-muted)]">{setupFacts.error}</p><Button variant="primary" size="touch" className="mt-4" onClick={refreshSetup}>Try again</Button></section>
                 : <ConnectingState sources={["discovered repositories", "provider hook settings", "configured remote hosts"]} />}
           </div>
         ) : board.columns.length === 0 && board.bands.length === 0 ? (
           cockpit.scope === "archived"
-            ? <section className="grid min-h-0 flex-1 place-content-center p-6 text-center"><Search className="mx-auto text-[var(--text-muted)]" /><h2 className="mt-3 text-title-sm">{cockpit.archivedCatalog.status === "loading" ? "Loading archived sessions" : "No archived sessions match"}</h2><p className="mt-1 text-meta-sm text-[var(--text-muted)]">Search by title, provider ID, or workspace.</p></section>
+            ? <ArchivedCatalogEmpty status={cockpit.archivedCatalog.status} error={cockpit.archivedCatalog.error} query={cockpit.archivedCatalog.query} onRetry={() => void cockpit.searchArchived(cockpit.archivedCatalog.query)} />
             : <section className="grid min-h-0 flex-1 place-content-center p-6 text-center"><Search className="mx-auto text-[var(--text-muted)]" /><h2 className="mt-3 text-title-sm">No sessions match these filters</h2><Button variant="ghost" size="sm" data-compact-control className="mx-auto mt-3 underline [color:var(--accent)]" onClick={() => { cockpit.setScope("all"); cockpit.setHostFilter(new Set()); }}>Clear filters</Button></section>
         ) : (
           <>
@@ -1122,9 +1191,10 @@ export default function App() {
             modelOptions={selectedModelCatalog.models}
             modelOptionsStatus={selectedModelCatalog.status}
             onOpenSetup={openSetup}
-            onTakeControl={(method) => cockpit.takeCliControl(selected, method)}
+            onTakeControl={(method, takeoverId) => cockpit.takeCliControl(selected, method, takeoverId)}
             onCancelTakeControl={(takeoverId) => cockpit.cancelCliTakeover(selected, takeoverId)}
-            onNativeContinue={() => cockpit.loadAttach(selected)}
+            onRetryControl={() => cockpit.retryControl(selected)}
+            onResumeInWeb={() => cockpit.resumeInWeb(selected)}
             {...(selectedRemote || selected.archived ? {} : { onSearchFiles: (query: string) => cockpit.loadWorkspaceFiles(selected.id, query) })}
             {...(selectedModelCatalog.effortOptions !== undefined ? { effortOptions: selectedModelCatalog.effortOptions } : {})}
             {...(restoredDraft?.sessionId === selected.id ? { restoredDraft: { key: restoredDraft.key, text: restoredDraft.text } } : {})}
@@ -1140,6 +1210,7 @@ export default function App() {
             onRespond={(requestId, response) => cockpit.respond(selected, requestId, response)}
             onRemoveQueued={(id) => cockpit.removeQueued(selected, id)}
             onOpenEditor={(path) => cockpit.openEditor(selected, path)}
+            onResumeInWeb={() => cockpit.resumeInWeb(selected)}
             readKeys={readKeys}
             onReadChange={(key, read) => setReadKeys((current) => { const next = new Set(current); if (read) next.add(key); else next.delete(key); return next; })}
             loadAttach={() => cockpit.loadAttach(selected)}
@@ -1147,6 +1218,7 @@ export default function App() {
             loadPlanFile={loadSelectedPlanFile}
             sessionsOnHost={selectedSessionsOnHost}
             onContinueInWorkspace={() => openDraft({ hostId: selected.hostId, path: selected.workspaceIdentity?.worktreePath ?? selected.cwd ?? "" })}
+            onRetryActivity={() => setActivityRetryGeneration((generation) => generation + 1)}
           /> : draft ? <DraftThread draft={draft} hosts={cockpit.hosts} workspaces={cockpit.workspaces} busy={Boolean(cockpit.busy.create)} mutationsReady={cockpit.mutationsReady} modelOptions={draftModelCatalog.models} modelOptionsStatus={draftModelCatalog.status} {...(draftModelCatalog.effortOptions !== undefined ? { effortOptions: draftModelCatalog.effortOptions } : {})} dispatch={dispatchDraft} onFirstSend={firstSend} /> : null}
         </ThreadDrawer>
         )}</SessionRuntimeProvider>
@@ -1156,7 +1228,7 @@ export default function App() {
       <CommandPalette open={paletteOpen} sources={paletteSources} onOpenChange={setPaletteOpen} onChoose={choosePalette} onQueryChange={setPaletteQuery} />
       <ShortcutSheet open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
       {notificationSettingsOpen && <NotificationSettings preferences={notificationPreferences} onChange={setNotificationPreferences} onClose={() => setNotificationSettingsOpen(false)} />}
-      {setupOpen && <SetupDialog setup={setupFacts} onRetry={refreshSetup} onClose={() => setSetupOpen(false)} />}
+      {setupOpen && <SetupDialog setup={setupFacts} onApplyHook={applySetupHook} onAddHost={addSetupHost} onRemoveHost={removeSetupHost} onRetry={refreshSetup} onClose={() => setSetupOpen(false)} />}
 
       <CockpitToast
         actionError={cockpit.actionError}

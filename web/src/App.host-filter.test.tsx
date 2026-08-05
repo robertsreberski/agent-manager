@@ -223,6 +223,8 @@ describe("cockpit presentation contracts", () => {
         <button type="button" onClick={() => setOpen(true)}>Open setup</button>
         {open && <SetupDialog
           setup={{ state: "error", value: null, error: "The cockpit is offline." }}
+          onAddHost={vi.fn(async () => undefined)}
+          onRemoveHost={vi.fn(async () => undefined)}
           onRetry={onRetry}
           onClose={() => setOpen(false)}
         />}
@@ -238,8 +240,7 @@ describe("cockpit presentation contracts", () => {
     const close = within(dialog).getByRole("button", { name: "Close setup and integrations" });
     await waitFor(() => expect(close).toHaveFocus());
     expect(dialog).toHaveTextContent("The cockpit is offline.");
-    // The copy-the-command posture: the browser never writes provider settings.
-    expect(dialog).toHaveTextContent("This browser never changes provider settings. Run the commands yourself.");
+    expect(dialog).toHaveTextContent("Install optional provider integrations and manage remote hosts without leaving the web app.");
     expect(within(dialog).queryByRole("button", { name: /install|apply|write/iu })).not.toBeInTheDocument();
 
     fireEvent.click(within(dialog).getByRole("button", { name: "Try again" }));

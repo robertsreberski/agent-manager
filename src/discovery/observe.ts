@@ -38,6 +38,7 @@ import {
   iso,
   normalizedText,
   object,
+  observedResumeControl,
   string,
   type JsonObject,
 } from "./observe-values.ts";
@@ -498,12 +499,13 @@ function discoverCodex(
       );
       const profile = analysis.profile ?? codexProfile(row);
       const parent = queried.parentByChild.get(row.id) ?? null;
+      const cwd = row.cwd || active?.cwd || null;
       return {
         ...baseRecord("codex", row.id, now),
         providerTreeId: rootOf(row.id, queried.parentByChild),
         parentId: parent ? sessionRecordId("local", "codex", parent) : null,
         name: row.title,
-        cwd: row.cwd || active?.cwd || null,
+        cwd,
         kind: parent || row.threadSource === "subagent" ? "subagent"
           : /exec|batch/iu.test(row.threadSource ?? row.source ?? "") ? "batch" : "interactive",
         presence: active ? "live" : "recent",
@@ -526,6 +528,9 @@ function discoverCodex(
           ? providerEffort("codex", row.effort, "provider-cli")
           : unknownEffort(),
         attention: analysis.attention,
+        ...(parent === null && cwd && active === null
+          ? { control: observedResumeControl("codex") }
+          : {}),
       };
     });
     return { sessions, diagnostics, succeeded: true };

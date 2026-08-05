@@ -32,7 +32,6 @@ import type {
   CodexAdapterEvent,
   CodexAdapterEventListener,
   CodexAttachCommand,
-  CodexControllerState,
   CodexControlCapability,
   CodexExecutionProfile,
   CodexModelOption,
@@ -100,9 +99,8 @@ interface InternalThreadState {
   lastTurnStatus: CodexTurnStatus | null;
   pendingRequests: Map<string, CodexPendingRequest>;
   queue: CodexQueuedMessage[];
-  environmentIds: Set<string>;
-  controller: CodexControllerState;
-  writeBlockedReason: string | null;
+  /** Observational remote exec-server presence, never client ownership. */
+  executionEnvironmentIds: Set<string>;
   pendingSettings: CodexPendingSettings | null;
   nextTurnOverrides: JsonObject | null;
   generation: number;
@@ -139,8 +137,6 @@ export interface CodexManagedAdapterOptions {
   requestTimeoutMs?: number;
   now?: () => Date;
   createId?: () => string;
-  /** Environment IDs this client is explicitly allowed to control. */
-  ownedEnvironmentIds?: readonly string[];
 }
 
 export type CodexManagedCreationFailureStage = "profile" | "initial-message";
@@ -446,7 +442,6 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
   #detachedThreads = new Map<string, DetachedThreadFacts>();
   #adoptedThreadIds = new Set<string>();
   #pendingAdoptions = new Map<string, PendingAdoption>();
-  #ownedEnvironmentIds: ReadonlySet<string>;
   #listeners = new Set<CodexAdapterEventListener>();
   #removeRpcListeners: Array<() => void> = [];
   #activityOffsets = new Map<string, number>();
@@ -462,7 +457,6 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     this.#clientVersion = options.clientVersion ?? "0.2.1";
     this.#now = options.now ?? (() => new Date());
     this.#createId = options.createId ?? randomUUID;
-    this.#ownedEnvironmentIds = new Set(options.ownedEnvironmentIds ?? []);
     this.rpc = new CodexRpcClient(
       options.transport,
       options.requestTimeoutMs ?? 30_000,
@@ -1093,20 +1087,24 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     if (!request.respondable || !isValidRequestResponse(request, response)) {
       throw new Error(`Invalid or unsupported response for ${request.method}`);
     }
-    await this.rpc.respond(request.id, response);
-    state.pendingRequests.delete(key);
+    // Every client subscribed to the shared App Server thread receives the same
+    // request. Sending a response only submits this client's candidate; the
+    // provider's `serverRequest/resolved` notification is the authoritative
+    // first-response-wins outcome. Mark this local candidate non-respondable so
+    // one UI cannot submit twice while another client may still win the race.
+    request.respondable = false;
     this.#touch(state);
-    this.#emit({
-      type: "request.resolved",
-      threadId,
-      requestId: request.id,
-    });
-    this.#emitActivityProjection(projectCodexRequestResolved(
-      threadId,
-      request.id,
-      this.#now().getTime(),
-      request,
-    ));
+    try {
+      await this.rpc.respond(request.id, response);
+    } catch (error) {
+      // Restore the action only if the request still exists. A concurrent
+      // provider resolution must win over a failed local send.
+      if (state.pendingRequests.get(key) === request) {
+        request.respondable = request.kind !== "unsupported";
+        this.#touch(state);
+      }
+      throw error;
+    }
   }
 
   async setProfile(
@@ -1255,8 +1253,10 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
           requestId: request.id,
         });
       }
+      // Runtime loss does not mean the provider conversation was reset. Keep
+      // the bounded combined transcript/API history in the hub and append the
+      // exact crash fact; the replacement adapter will reconcile fresh state.
       const mutations: ActivityMutation[] = [
-        { type: "reset", reason: "provider-reset" },
         ...projectCodexDiagnostic(
           state.threadId,
           "codex.connection.closed",
@@ -1406,7 +1406,6 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     if (!this.#adoptedThreadIds.has(state.threadId)) {
       throw new Error(`Codex thread ${state.threadId} has not been adopted by this client`);
     }
-    if (state.writeBlockedReason) throw new Error(state.writeBlockedReason);
   }
 
   #forgetThread(
@@ -1420,30 +1419,6 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     this.#activityOffsets.delete(threadId);
     this.#activityTodos.delete(threadId);
     if (known) this.#emit({ type: "thread.removed", threadId, reason });
-  }
-
-  #recomputeController(state: InternalThreadState): void {
-    const foreign = [...state.environmentIds].filter(
-      (environmentId) => !this.#ownedEnvironmentIds.has(environmentId),
-    );
-    const mixed = foreign.length > 0 &&
-      foreign.length !== state.environmentIds.size;
-    if (foreign.length === 0) {
-      state.controller = "available";
-      state.writeBlockedReason = null;
-    } else if (foreign.length === 1 && !mixed && state.environmentIds.size === 1) {
-      state.controller = "foreign-environment";
-      state.writeBlockedReason =
-        `Codex thread ${state.threadId} is controlled by foreign environment ${foreign[0]}`;
-    } else {
-      state.controller = "ambiguous-environment";
-      state.writeBlockedReason =
-        `Codex thread ${state.threadId} has ambiguous controller environments`;
-    }
-    for (const request of state.pendingRequests.values()) {
-      request.respondable = request.kind !== "unsupported" &&
-        state.writeBlockedReason === null;
-    }
   }
 
   #ensureThread(threadId: string): InternalThreadState {
@@ -1466,9 +1441,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
         lastTurnStatus: null,
         pendingRequests: new Map(),
         queue: [],
-        environmentIds: new Set(),
-        controller: "available",
-        writeBlockedReason: null,
+        executionEnvironmentIds: new Set(),
         pendingSettings: null,
         nextTurnOverrides: null,
         generation: 0,
@@ -1595,9 +1568,9 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
         [...state.pendingRequests.values()].map(cloneRequest),
       ),
       queue: Object.freeze(state.queue.map(cloneQueueItem)),
-      environmentIds: Object.freeze([...state.environmentIds].sort()),
-      controller: state.controller,
-      writeBlockedReason: state.writeBlockedReason,
+      executionEnvironmentIds: Object.freeze(
+        [...state.executionEnvironmentIds].sort(),
+      ),
       pendingSettings: state.pendingSettings
         ? Object.freeze({ ...state.pendingSettings })
         : null,
@@ -1799,14 +1772,12 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
       }
       case "thread/environment/connected":
         if (typeof params.environmentId !== "string") return;
-        state.environmentIds.add(params.environmentId);
-        this.#recomputeController(state);
+        state.executionEnvironmentIds.add(params.environmentId);
         this.#touch(state);
         break;
       case "thread/environment/disconnected":
         if (typeof params.environmentId !== "string") return;
-        state.environmentIds.delete(params.environmentId);
-        this.#recomputeController(state);
+        state.executionEnvironmentIds.delete(params.environmentId);
         this.#touch(state);
         break;
       case "thread/name/updated":
@@ -1916,7 +1887,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
       threadId,
       turnId: stringField(request.params, "turnId"),
       params: structuredClone(request.params),
-      respondable: kind !== "unsupported" && state.writeBlockedReason === null,
+      respondable: kind !== "unsupported",
       receivedAt: this.#now().toISOString(),
     };
     state.pendingRequests.set(jsonRpcIdKey(request.id), pending);

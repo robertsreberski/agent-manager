@@ -10,6 +10,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test, { afterEach } from "node:test";
+import { ActivityHub } from "../activity/hub.ts";
+import type { SessionView } from "../core/types.ts";
+import { projectCodexNotification } from "../providers/codex/activity-projector.ts";
+import { projectCodexHook } from "../providers/codex/codex-hook-projector.ts";
+import { parseCodexHookInput } from "../providers/codex/codex-hook.ts";
+import { SelectedTranscriptActivityObserver } from "./activity-observer.ts";
 import {
   LocalSessionTranscriptReader,
   TRANSCRIPT_LIMITS,
@@ -177,6 +183,183 @@ test("Codex reads ordered user/assistant response items and ignores provider int
   assert.equal(result.items[0]?.correlationId, "message:user-provider-id");
 });
 
+test("Codex derives the same turn-scoped message identity as hooks without merging repeated prompts", () => {
+  const firstTurn = "turn-11111111-1111-4111-8111-111111111111";
+  const secondTurn = "turn-22222222-2222-4222-8222-222222222222";
+  const fixture = codexFixture([
+    codexMeta(),
+    {
+      type: "event_msg",
+      timestamp: "2026-08-03T10:00:00Z",
+      payload: { type: "task_started", turn_id: firstTurn },
+    },
+    codexMessage("user", "<environment_context><cwd>/fixture</cwd></environment_context>"),
+    {
+      type: "turn_context",
+      timestamp: "2026-08-03T10:00:01Z",
+      payload: { turn_id: firstTurn, cwd: "/fixture" },
+    },
+    codexMessage("user", "Repeat this prompt"),
+    codexMessage("assistant", "First progress", {
+      id: "msg-commentary-first",
+      phase: "commentary",
+    }),
+    codexMessage("assistant", "First final", {
+      id: "msg-final-first",
+      phase: "final_answer",
+    }),
+    {
+      type: "event_msg",
+      timestamp: "2026-08-03T10:00:04Z",
+      payload: { type: "task_complete", turn_id: firstTurn },
+    },
+    {
+      type: "event_msg",
+      timestamp: "2026-08-03T10:01:00Z",
+      payload: { type: "task_started", turn_id: secondTurn },
+    },
+    {
+      type: "turn_context",
+      timestamp: "2026-08-03T10:01:01Z",
+      payload: { turn_id: secondTurn, cwd: "/fixture" },
+    },
+    codexMessage("user", "Repeat this prompt"),
+    // Older rollouts did not always persist phase. task_complete still gives
+    // the bounded reader an exact, safe final-message boundary.
+    codexMessage("assistant", "Second final", { id: "msg-final-second" }),
+    {
+      type: "event_msg",
+      timestamp: "2026-08-03T10:01:04Z",
+      payload: { type: "task_complete", turn_id: secondTurn },
+    },
+  ]);
+
+  const result = new LocalSessionTranscriptReader({ codexHome: fixture.home })
+    .read(codexSession());
+  const messages = result.items.filter((item) => item.kind === "message");
+  const firstUser = messages.find((item) => item.role === "user");
+  const secondUser = messages.filter((item) => item.role === "user")[1];
+  const commentary = messages.find((item) => item.text === "First progress");
+  const firstFinal = messages.find((item) => item.text === "First final");
+  const secondFinal = messages.find((item) => item.text === "Second final");
+  assert.ok(firstUser && secondUser && commentary && firstFinal && secondFinal);
+
+  const hookItem = (
+    event: "UserPromptSubmit" | "Stop",
+    turnId: string,
+    message: string,
+  ) => {
+    const projection = projectCodexHook(parseCodexHookInput(JSON.stringify({
+      session_id: CODEX_ID,
+      transcript_path: fixture.file,
+      cwd: "/fixture",
+      hook_event_name: event,
+      model: "gpt-5.6",
+      turn_id: turnId,
+      ...(event === "UserPromptSubmit"
+        ? { prompt: message }
+        : { last_assistant_message: message }),
+    })), "2026-08-03T10:02:00.000Z").mutations[0];
+    assert.ok(projection?.type === "upsert");
+    return projection.item;
+  };
+
+  assert.equal(
+    firstUser.correlationId,
+    hookItem("UserPromptSubmit", firstTurn, "Repeat this prompt").correlationId,
+  );
+  assert.equal(
+    firstFinal.correlationId,
+    hookItem("Stop", firstTurn, "First final").correlationId,
+  );
+  assert.equal(
+    secondFinal.correlationId,
+    hookItem("Stop", secondTurn, "Second final").correlationId,
+  );
+  assert.notEqual(
+    firstUser.correlationId,
+    secondUser.correlationId,
+    "the turn identity keeps identical prompts in separate turns distinct",
+  );
+  assert.equal(
+    commentary.correlationId,
+    "message:msg-commentary-first",
+    "uncovered commentary retains the exact rollout/App Server item identity",
+  );
+});
+
+test("Codex retains and reconciles identical same-turn message occurrences end to end", () => {
+  const turnId = "turn-identical-occurrences";
+  const fixture = codexFixture([
+    codexMeta(),
+    {
+      type: "event_msg",
+      timestamp: "2026-08-03T10:00:00Z",
+      payload: { type: "task_started", turn_id: turnId },
+    },
+    {
+      type: "turn_context",
+      timestamp: "2026-08-03T10:00:01Z",
+      payload: { turn_id: turnId, cwd: "/fixture" },
+    },
+    codexMessage("user", "Repeat exactly", { id: "user-occurrence-1" }),
+    codexMessage("user", "Repeat exactly", { id: "user-occurrence-2" }),
+  ]);
+  const reader = new LocalSessionTranscriptReader({ codexHome: fixture.home });
+  const read = reader.read(codexSession());
+  const transcriptMessages = read.items.filter((item) => item.kind === "message");
+  assert.deepEqual(
+    transcriptMessages.map((item) => item.id),
+    ["codex:user-occurrence-1", "codex:user-occurrence-2"],
+  );
+  assert.equal(transcriptMessages[0]?.correlationId, transcriptMessages[1]?.correlationId);
+
+  const managerSessionId = `local:codex:${CODEX_ID}`;
+  const hub = new ActivityHub({ streamEpoch: "identical-occurrences" });
+  for (const itemId of ["user-occurrence-1", "user-occurrence-2"] as const) {
+    const projection = projectCodexNotification({
+      method: "item/completed",
+      emittedAtMs: Date.parse("2026-08-03T10:00:02.000Z"),
+      params: {
+        threadId: CODEX_ID,
+        turnId,
+        item: {
+          type: "userMessage",
+          id: itemId,
+          content: [{ type: "text", text: "Repeat exactly" }],
+        },
+      },
+    });
+    assert.ok(projection);
+    for (const mutation of projection.mutations) {
+      hub.ingest(managerSessionId, "codex", mutation);
+    }
+  }
+  assert.equal(hub.snapshot(managerSessionId)?.items.length, 2);
+
+  const session = {
+    id: managerSessionId,
+    provider: "codex",
+    providerThreadId: CODEX_ID,
+    providerTreeId: CODEX_ID,
+    parentId: null,
+    status: "running",
+  } as SessionView;
+  const observer = new SelectedTranscriptActivityObserver({ hub, reader });
+  observer.seedOnce(session);
+  assert.deepEqual(
+    hub.snapshot(managerSessionId)?.items.map((item) => item.id),
+    [
+      `codex/item/${CODEX_ID}/${turnId}/user-occurrence-1`,
+      `codex/item/${CODEX_ID}/${turnId}/user-occurrence-2`,
+    ],
+  );
+  const hydratedSeq = hub.snapshot(managerSessionId)!.seq;
+  observer.seedOnce(session);
+  assert.equal(hub.snapshot(managerSessionId)!.seq, hydratedSeq);
+  observer.dispose();
+});
+
 test("Codex reads archived transcripts only from the equally validated archive root", () => {
   const root = temporaryRoot();
   const home = join(root, ".codex");
@@ -210,6 +393,44 @@ test("Codex reads archived transcripts only from the equally validated archive r
 
   const rejected = new LocalSessionTranscriptReader({ codexHome: symlinkHome }).read(codexSession());
   assert.equal(rejected.transcript.reason, "unreadable");
+});
+
+test("Codex rejects symlinked CODEX_HOME, sessions, and archived_sessions roots", () => {
+  const linkedHomeRoot = temporaryRoot();
+  const actualHome = join(linkedHomeRoot, "actual-codex");
+  const actualSessions = join(actualHome, "sessions");
+  mkdirSync(actualSessions, { recursive: true });
+  const actualFile = join(actualSessions, `rollout-${CODEX_ID}.jsonl`);
+  writeFileSync(actualFile, jsonl([codexMeta()]));
+  const actualDatabase = new DatabaseSync(join(actualHome, "state_1.sqlite"));
+  actualDatabase.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)");
+  actualDatabase.prepare("INSERT INTO threads VALUES (?, ?)").run(CODEX_ID, actualFile);
+  actualDatabase.close();
+  const linkedHome = join(linkedHomeRoot, "linked-codex");
+  symlinkSync(actualHome, linkedHome);
+  assert.equal(
+    new LocalSessionTranscriptReader({ codexHome: linkedHome }).read(codexSession()).transcript.reason,
+    "unreadable",
+  );
+
+  for (const rootName of ["sessions", "archived_sessions"] as const) {
+    const root = temporaryRoot();
+    const home = join(root, ".codex");
+    mkdirSync(home);
+    const externalRoot = join(root, `actual-${rootName}`);
+    mkdirSync(externalRoot);
+    const file = join(externalRoot, `rollout-${CODEX_ID}.jsonl`);
+    writeFileSync(file, jsonl([codexMeta()]));
+    symlinkSync(externalRoot, join(home, rootName));
+    const database = new DatabaseSync(join(home, "state_1.sqlite"));
+    database.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)");
+    database.prepare("INSERT INTO threads VALUES (?, ?)").run(CODEX_ID, file);
+    database.close();
+    assert.equal(
+      new LocalSessionTranscriptReader({ codexHome: home }).read(codexSession()).transcript.reason,
+      "unreadable",
+    );
+  }
 });
 
 test("Codex excludes injected context envelopes while preserving the actual user prompt", () => {
@@ -511,7 +732,9 @@ test("message count, per-message UTF-8, and aggregate byte caps retain the newes
   const countFixture = codexFixture(countValues);
   const countResult = new LocalSessionTranscriptReader({ codexHome: countFixture.home }).read(codexSession());
   assert.equal(countResult.items.length, TRANSCRIPT_LIMITS.messages);
-  assert.equal(textsOf(countResult)[0], "message-5");
+  assert.equal(textsOf(countResult)[0], "message-0");
+  assert.ok(textsOf(countResult).includes("message-15"));
+  assert.equal(textsOf(countResult).includes("message-16"), false);
   assert.equal(textsOf(countResult).at(-1), "message-124");
   assert.equal(countResult.transcript.truncated, true);
 
@@ -535,6 +758,167 @@ test("message count, per-message UTF-8, and aggregate byte caps retain the newes
   assert.equal(cappedLongText.endsWith("suffix"), false);
   assert.ok(textsOf(byteResult).reduce((sum, text) => sum + Buffer.byteLength(text, "utf8"), 0) <= TRANSCRIPT_LIMITS.totalBytes);
   assert.ok(textsOf(byteResult).every((text) => !text.includes("�")));
+});
+
+test("tool-heavy history reserves opening messages while retaining newest activity", () => {
+  const values: unknown[] = [
+    codexMeta(),
+    codexMessage("user", "Opening prompt"),
+    codexMessage("assistant", "Opening answer", { id: "opening-answer" }),
+  ];
+  for (let index = 0; index < 150; index += 1) {
+    values.push({
+      type: "response_item",
+      timestamp: "2026-08-03T10:00:02Z",
+      payload: {
+        type: "reasoning",
+        id: `reasoning-${String(index)}`,
+        summary: [{ type: "summary_text", text: `reasoning-${String(index)}` }],
+      },
+    });
+  }
+  values.push(
+    codexMessage("user", "Newest prompt"),
+    codexMessage("assistant", "Newest answer", { id: "newest-answer" }),
+  );
+  const fixture = codexFixture(values);
+  const result = new LocalSessionTranscriptReader({ codexHome: fixture.home }).read(codexSession());
+
+  assert.equal(result.items.length, TRANSCRIPT_LIMITS.messages);
+  assert.deepEqual(messagesOf(result), [
+    { role: "user", text: "Opening prompt" },
+    { role: "assistant", text: "Opening answer" },
+    { role: "user", text: "Newest prompt" },
+    { role: "assistant", text: "Newest answer" },
+  ]);
+  assert.equal(result.items.at(-1)?.id, "codex:newest-answer");
+  assert.equal(result.transcript.truncated, true);
+});
+
+test("large Codex rollouts read bounded head and tail windows without joining turns across the gap", () => {
+  const firstTurn = "turn-first";
+  const latestTurn = "turn-latest";
+  const fixture = codexFixture([], { trailingNewline: false });
+  const opening = [
+    codexMeta(),
+    {
+      type: "event_msg",
+      payload: { type: "task_started", turn_id: firstTurn },
+    },
+    codexMessage("user", "Opening prompt"),
+    codexMessage("assistant", "Opening answer", {
+      id: "opening-final",
+      phase: "final_answer",
+    }),
+    {
+      type: "event_msg",
+      payload: { type: "task_complete", turn_id: firstTurn },
+    },
+  ].map((value) => JSON.stringify(value)).join("\n");
+  const skippedMiddle = JSON.stringify({
+    type: "event_msg",
+    payload: {
+      type: "provider_internal",
+      bytes: "x".repeat(TRANSCRIPT_LIMITS.sourceBytes + 128 * 1024),
+    },
+  });
+  const newest = [
+    {
+      type: "event_msg",
+      payload: { type: "task_started", turn_id: latestTurn },
+    },
+    codexMessage("user", "Newest prompt"),
+    codexMessage("assistant", "Newest answer", {
+      id: "newest-final",
+      phase: "final_answer",
+    }),
+    {
+      type: "event_msg",
+      payload: { type: "task_complete", turn_id: latestTurn },
+    },
+  ].map((value) => JSON.stringify(value)).join("\n");
+  writeFileSync(fixture.file, `${opening}\n${skippedMiddle}\n${newest}\n`);
+
+  const result = new LocalSessionTranscriptReader({ codexHome: fixture.home }).read(codexSession());
+  const messages = result.items.filter((item) => item.kind === "message");
+  assert.deepEqual(messages.map((item) => item.text), [
+    "Opening prompt",
+    "Opening answer",
+    "Newest prompt",
+    "Newest answer",
+  ]);
+  assert.equal(result.transcript.truncated, true);
+  assert.match(messages[0]?.correlationId ?? "", new RegExp(`/${firstTurn}/user/`, "u"));
+  assert.match(messages[2]?.correlationId ?? "", new RegExp(`/${latestTurn}/user/`, "u"));
+});
+
+test("large Claude transcripts retain independent opening and newest chains across a skipped middle", () => {
+  const fixture = claudeHome();
+  const project = join(fixture.projects, "-fixture-project");
+  mkdirSync(project);
+  const file = join(project, `${CLAUDE_ID}.jsonl`);
+  const opening = [
+    claudeRow({ uuid: "opening-u", type: "user", content: "Opening prompt" }),
+    claudeRow({
+      uuid: "opening-a",
+      parentUuid: "opening-u",
+      type: "assistant",
+      content: [
+        { type: "text", text: "Opening answer" },
+        { type: "tool_use", id: "head-tool", name: "Read", input: { file: "old" } },
+      ],
+      messageId: "opening-answer",
+    }),
+  ];
+  const skippedMiddle = claudeRow({
+    uuid: "middle-parent",
+    parentUuid: "opening-a",
+    type: "user",
+    content: "x".repeat(TRANSCRIPT_LIMITS.sourceBytes + 128 * 1024),
+    meta: true,
+  });
+  const newest = [
+    claudeRow({
+      uuid: "tail-result",
+      parentUuid: "middle-parent",
+      type: "user",
+      content: [{
+        type: "tool_result",
+        tool_use_id: "head-tool",
+        content: "must not bridge the unread gap",
+      }],
+    }),
+    claudeRow({
+      uuid: "newest-u",
+      parentUuid: "tail-result",
+      type: "user",
+      content: "Newest prompt",
+    }),
+    claudeRow({
+      uuid: "newest-a",
+      parentUuid: "newest-u",
+      type: "assistant",
+      content: [{ type: "text", text: "Newest answer" }],
+      messageId: "newest-answer",
+    }),
+  ];
+  writeFileSync(file, jsonl([...opening, skippedMiddle, ...newest]));
+
+  const result = new LocalSessionTranscriptReader({ claudeHome: fixture.home })
+    .read(claudeRootSession());
+
+  assert.deepEqual(messagesOf(result), [
+    { role: "user", text: "Opening prompt" },
+    { role: "assistant", text: "Opening answer" },
+    { role: "user", text: "Newest prompt" },
+    { role: "assistant", text: "Newest answer" },
+  ]);
+  assert.equal(result.transcript.truncated, true);
+  assert.equal(new Set(result.items.map((item) => item.id)).size, result.items.length);
+  assert.deepEqual(
+    toolsOf(result).map((item) => ({ id: item.id, result: item.result, status: item.status })),
+    [{ id: "claude:tool:head-tool", result: null, status: "incomplete" }],
+  );
 });
 
 test("physical source tail is bounded and discards a leading partial UTF-8 line safely", () => {
