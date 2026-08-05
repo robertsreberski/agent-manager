@@ -165,6 +165,9 @@ export interface WorkspaceIdentity {
   dirtyCount: number | null;
   ahead: number | null;
   behind: number | null;
+  /** Lines added and removed across tracked changes; null when git could not say. */
+  insertions: number | null;
+  deletions: number | null;
 }
 
 export type ControlPlane =

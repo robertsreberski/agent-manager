@@ -1,5 +1,5 @@
 import { AlertTriangle, Check, ChevronRight, CircleHelp, CircleX, Copy, FolderGit2, LoaderCircle, Plus, PlugZap, RotateCcw, Server, WifiOff, X } from "lucide-react";
-import type { CockpitSessionView, SessionCapability } from "../../lib/cockpit-view";
+import { workspaceChangeFacts, workspaceChangeLabel, type CockpitSessionView, type SessionCapability } from "../../lib/cockpit-view";
 import type { SetupHookOffer, SetupHostProbe, SetupNearbyWorkspace } from "../../../../src/shared/setup.ts";
 import type { SelectedSessionFactsResponse, SessionTurnUsage } from "../../../../src/shared/session-facts.ts";
 import { useState, type FormEvent, type ReactNode } from "react";
@@ -177,11 +177,12 @@ export function SessionCapabilityPanel({
   const offered = new Set(session.control.capabilities);
   const withheld = new Map(session.control.withheld.map((item) => [item.capability, item.reason]));
   const workspace = session.workspaceIdentity;
+  const changes = workspaceChangeFacts(workspace);
   const canRevealAttach = offered.has("attach") || offered.has("resume");
   const account = facts?.account.available ? facts.account : null;
   return (
     <section className="grid grid-cols-[minmax(0,1fr)] gap-5 text-meta">
-      <FactSection title="Where it runs"><div className="mt-1"><FactRow label="Host">{session.hostLabel}{session.hostId !== session.hostLabel ? <span className="ml-2 text-[var(--text-muted)]">{session.hostId}</span> : null}</FactRow><FactRow label="Repository">{workspace?.repoName ?? "Unknown"}</FactRow><FactRow label="Worktree">{workspace?.worktreePath ?? session.cwd ?? "Unknown"}</FactRow><FactRow label="Branch">{workspace?.detached ? "Detached HEAD" : workspace?.branch ?? "Unknown"}</FactRow>{workspace?.dirtyCount !== null && workspace?.dirtyCount !== undefined && <FactRow label="Changes">{workspace.dirtyCount === 0 ? "Clean" : `${workspace.dirtyCount} uncommitted`}</FactRow>}<FactRow label="Harness"><span className="font-sans font-medium">{HARNESS_LABEL[session.control.plane]}</span>{session.model && <span className="ml-2 text-[var(--text-muted)]">{session.model}</span>}{session.effort && <span className="ml-2 text-[var(--text-muted)]">{session.effort}</span>}</FactRow></div></FactSection>
+      <FactSection title="Where it runs"><div className="mt-1"><FactRow label="Host">{session.hostLabel}{session.hostId !== session.hostLabel ? <span className="ml-2 text-[var(--text-muted)]">{session.hostId}</span> : null}</FactRow><FactRow label="Repository">{workspace?.repoName ?? "Unknown"}</FactRow><FactRow label="Worktree">{workspace?.worktreePath ?? session.cwd ?? "Unknown"}</FactRow><FactRow label="Branch">{workspace?.detached ? "Detached HEAD" : workspace?.branch ?? "Unknown"}</FactRow>{workspace?.dirtyCount !== null && workspace?.dirtyCount !== undefined && <FactRow label="Changes">{changes === null ? "Clean" : `${workspaceChangeLabel(changes)} uncommitted`}</FactRow>}<FactRow label="Harness"><span className="font-sans font-medium">{HARNESS_LABEL[session.control.plane]}</span>{session.model && <span className="ml-2 text-[var(--text-muted)]">{session.model}</span>}{session.effort && <span className="ml-2 text-[var(--text-muted)]">{session.effort}</span>}</FactRow></div></FactSection>
       {/*
         Frame 9b marks each sentence with a glyph rather than a character: a
         lime tick for offered, an amber question for genuinely unknown, and a

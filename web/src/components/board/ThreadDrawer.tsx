@@ -1,6 +1,6 @@
 import { useRef } from "react";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
-import { X } from "lucide-react";
+import { X, type LucideIcon } from "lucide-react";
 import { useKeyboardInset } from "../../hooks/use-keyboard-inset";
 import type { TodoProgressView } from "../../lib/cockpit-view";
 import { Badge, Button, Separator } from "../ui";
@@ -19,7 +19,7 @@ const FACT_TONE = { default: "neutral", dirty: "warning", remote: "remote" } as 
 export interface ThreadDrawerProps {
   open: boolean;
   title: string;
-  facts?: readonly { label: string; tone?: FactTone }[];
+  facts?: readonly { label: string; tone?: FactTone; icon?: LucideIcon }[];
   todo?: TodoProgressView | null;
   onClose: () => void;
   children: React.ReactNode;
@@ -92,16 +92,20 @@ export function ThreadDrawer({ open, title, facts = [], todo = null, onClose, ch
                   {facts.map((fact) => fact.label).join(" · ")}
                 </p>
                 <div className="hidden min-w-0 shrink-0 gap-1.5 min-[901px]:flex">
-                  {facts.map((fact, index) => (
-                    <Badge
-                      key={`${fact.label}:${index}`}
-                      tone={FACT_TONE[fact.tone ?? "default"]}
-                      className="px-[9px] py-1 leading-none"
-                      data-tone={fact.tone ?? "default"}
-                    >
-                      {fact.label}
-                    </Badge>
-                  ))}
+                  {facts.map((fact, index) => {
+                    const Icon = fact.icon;
+                    return (
+                      <Badge
+                        key={`${fact.label}:${index}`}
+                        tone={FACT_TONE[fact.tone ?? "default"]}
+                        className="px-[9px] py-1 leading-none"
+                        data-tone={fact.tone ?? "default"}
+                      >
+                        {Icon && <Icon strokeWidth={1.75} aria-hidden="true" />}
+                        {fact.label}
+                      </Badge>
+                    );
+                  })}
                 </div>
               </>
             )}

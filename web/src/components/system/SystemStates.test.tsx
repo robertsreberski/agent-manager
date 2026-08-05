@@ -36,7 +36,7 @@ function cockpitSession(overrides: Partial<CockpitSessionView> = {}): CockpitSes
       detached: false,
       dirtyCount: 3,
       ahead: null,
-      behind: null,
+      behind: null, insertions: 312, deletions: 87,
     },
     activity: "running",
     attention: [],
@@ -104,7 +104,7 @@ describe("SessionCapabilityPanel", () => {
       "How to attach from a terminal",
     ]);
     const rendered = document.body.textContent ?? "";
-    for (const text of ["This Mac", "project", "/workspace/project-worktree", "feature/session-facts", "3 uncommitted", "Codex managed app server", "Queue messages for the next turn", "This provider cannot change models mid-session.", "150", "$0.0123", "12.3K lifetime tokens", "25% used"]) expect(rendered).toContain(text);
+    for (const text of ["This Mac", "project", "/workspace/project-worktree", "feature/session-facts", "3 files · +312 −87 uncommitted", "Codex managed app server", "Queue messages for the next turn", "This provider cannot change models mid-session.", "150", "$0.0123", "12.3K lifetime tokens", "25% used"]) expect(rendered).toContain(text);
     expect(screen.queryByText("codex-private")).not.toBeInTheDocument();
     expect(screen.queryByText("danger-full-access")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Show guarded attach command" })).toBeInTheDocument();

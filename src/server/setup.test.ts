@@ -51,7 +51,7 @@ function discoveredSession(path: string): SessionView {
       detached: false,
       dirtyCount: null,
       ahead: null,
-      behind: null,
+      behind: null, insertions: null, deletions: null,
     },
     generation: 1,
   };

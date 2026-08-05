@@ -174,7 +174,7 @@ test("enriches only local sessions before publishing and keeps scans coalesced",
     detached: false,
     dirtyCount: 2,
     ahead: null,
-    behind: null,
+    behind: null, insertions: null, deletions: null,
   };
   const remoteIdentity: WorkspaceIdentity = {
     ...localIdentity,

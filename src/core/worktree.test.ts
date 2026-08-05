@@ -63,7 +63,7 @@ test("resolves main and linked worktrees with argv-safe paths and exact dirty fa
     detached: false,
     dirtyCount: 2,
     ahead: null,
-    behind: null,
+    behind: null, insertions: null, deletions: null,
   });
 
   const main = await resolver.resolve(fixture.main, { selected: true });
@@ -187,7 +187,7 @@ test("never runs local git against a remote session path", async () => {
     detached: false,
     dirtyCount: null,
     ahead: null,
-    behind: null,
+    behind: null, insertions: null, deletions: null,
   };
   assert.deepEqual(await resolver.resolveSession({
     hostId: "studio",
@@ -195,4 +195,33 @@ test("never runs local git against a remote session path", async () => {
     workspaceIdentity: remoteIdentity,
   }), remoteIdentity);
   assert.equal(calls, 0);
+});
+
+test("counts the lines behind an uncommitted change, not just the files", async (t) => {
+  /*
+    "25 uncommitted" was a file count and nothing else, so a rename and a
+    rewrite read the same. `--shortstat` is one summary line whatever the
+    repository size, and git omits a clause when it is zero.
+  */
+  const fixture = repositoryFixture(t);
+  const resolver = new WorkspaceIdentityResolver();
+
+  writeFileSync(join(fixture.main, "README.md"), "fixture\nadded one\nadded two\n");
+  const edited = await resolver.resolve(fixture.main, { selected: true });
+  assert.equal(edited?.dirtyCount, 1);
+  assert.equal(edited?.insertions, 2);
+  assert.equal(edited?.deletions, 0);
+
+  writeFileSync(join(fixture.main, "README.md"), "rewritten\n");
+  const rewritten = await resolver.resolve(fixture.main, { selected: true });
+  assert.equal(rewritten?.dirtyCount, 1, "still one file");
+  assert.equal(rewritten?.insertions, 1, "but a different amount of change");
+  assert.equal(rewritten?.deletions, 1);
+
+  // An untracked file is in the file count but not in a diff against HEAD, so
+  // the two facts are reported separately rather than folded into one total.
+  writeFileSync(join(fixture.main, "untracked.txt"), "new\n");
+  const withUntracked = await resolver.resolve(fixture.main, { selected: true });
+  assert.equal(withUntracked?.dirtyCount, 2);
+  assert.equal(withUntracked?.insertions, 1);
 });

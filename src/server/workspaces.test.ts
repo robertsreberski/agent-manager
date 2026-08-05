@@ -65,7 +65,7 @@ test("delegates an SSH path to the remote node without invoking local Git", asyn
     detached: false,
     dirtyCount: 4,
     ahead: 1,
-    behind: 0,
+    behind: 0, insertions: null, deletions: null,
   };
   const resolved = await resolveWorkspaceForHost({
     hostId: "studio",

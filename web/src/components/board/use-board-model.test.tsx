@@ -13,7 +13,7 @@ function session(id: string, updatedAt: string, activity: CockpitSessionView["ac
     hostLabel: "This Mac",
     remote: false,
     cwd: "/work/app",
-    workspaceIdentity: { repoRoot: "/work/app", repoName: "app", worktreePath: "/work/app", linked: false, branch: "main", detached: false, dirtyCount: null, ahead: null, behind: null },
+    workspaceIdentity: { repoRoot: "/work/app", repoName: "app", worktreePath: "/work/app", linked: false, branch: "main", detached: false, dirtyCount: null, ahead: null, behind: null, insertions: null, deletions: null },
     activity,
     attention: [],
     updatedAt,

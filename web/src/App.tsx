@@ -3,13 +3,18 @@ import {
   AlertCircle,
   BellOff,
   Check,
+  CodeXml,
   Command,
+  Cpu,
+  FileDiff,
+  GitBranch,
   Laptop,
   ListTodo,
   Plus,
   RefreshCw,
   Search,
   Server,
+  Shield,
   Tag,
   TriangleAlert,
   WifiOff,
@@ -77,7 +82,7 @@ import {
   DialogDescription,
   DialogTitle,
 } from "./components/ui";
-import { toCockpitSessionView } from "./lib/cockpit-view";
+import { toCockpitSessionView, workspaceChangeFacts, workspaceChangeLabel } from "./lib/cockpit-view";
 import type { ProviderSettingsOptionsResponse, SessionSettingsOptionsResponse, SetupReadModel, TranscriptSearchMatch } from "./lib/api";
 import { isTypingTarget } from "./lib/shortcuts";
 import type { ActivityItem, HostOption, ReasoningEffort, SessionView } from "./types";
@@ -102,14 +107,21 @@ function errorCode(error: unknown): string | null {
   return typeof nested.code === "string" ? nested.code : null;
 }
 
+/*
+  Every chip carries an icon. Six mono strings in a row read as one run of text
+  and the operator has to parse each to find the one they wanted; a glyph makes
+  each scannable without reading it. The icon states the *kind* of fact — the
+  chip's tone still states its meaning (spec 12 R4).
+*/
 function drawerFacts(session: SessionView, remote: boolean) {
+  const changes = workspaceChangeFacts(toCockpitSessionView(session, { remote }).workspaceIdentity);
   return [
-    { label: session.provider },
-    session.profile.value ? { label: session.profile.value, tone: session.profile.value === "full-access" ? "dirty" as const : "default" as const } : null,
-    session.model.value ? { label: session.model.value } : null,
-    session.workspaceIdentity?.branch ? { label: session.workspaceIdentity.branch } : null,
-    session.workspaceIdentity?.dirtyCount ? { label: `${session.workspaceIdentity.dirtyCount} uncommitted`, tone: "dirty" as const } : null,
-    remote ? { label: session.hostLabel, tone: "remote" as const } : null,
+    { label: session.provider, icon: CodeXml },
+    session.profile.value ? { label: session.profile.value, icon: Shield, tone: session.profile.value === "full-access" ? "dirty" as const : "default" as const } : null,
+    session.model.value ? { label: session.model.value, icon: Cpu } : null,
+    session.workspaceIdentity?.branch ? { label: session.workspaceIdentity.branch, icon: GitBranch } : null,
+    changes ? { label: workspaceChangeLabel(changes), icon: FileDiff, tone: "dirty" as const } : null,
+    remote ? { label: session.hostLabel, icon: Server, tone: "remote" as const } : null,
   ].filter((fact): fact is NonNullable<typeof fact> => fact !== null);
 }
 

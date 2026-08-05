@@ -12,7 +12,7 @@ function session(overrides: Partial<BoardSession> & Pick<BoardSession, "id">): B
     hostLabel: "This Mac",
     remote: false,
     cwd: "/work/app",
-    workspaceIdentity: { repoRoot: "/work/app", repoName: "app", worktreePath: "/work/app-feature", linked: true, branch: "feature", detached: false, dirtyCount: null, ahead: null, behind: null },
+    workspaceIdentity: { repoRoot: "/work/app", repoName: "app", worktreePath: "/work/app-feature", linked: true, branch: "feature", detached: false, dirtyCount: null, ahead: null, behind: null, insertions: null, deletions: null },
     activity: "running",
     attention: [],
     updatedAt: "2026-08-04T12:00:00Z",

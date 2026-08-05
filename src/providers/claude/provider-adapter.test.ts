@@ -1187,7 +1187,7 @@ test("manager-owned Claude sessions publish resolved workspace identity", async 
     detached: false,
     dirtyCount: 3,
     ahead: null,
-    behind: null,
+    behind: null, insertions: null, deletions: null,
   };
   const requests: Array<readonly (string | null | undefined)[]> = [];
   const changes: SessionView[] = [];

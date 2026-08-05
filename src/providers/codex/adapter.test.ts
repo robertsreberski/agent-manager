@@ -2729,7 +2729,7 @@ const PAOLA_IDENTITY: WorkspaceIdentity = {
   detached: false,
   dirtyCount: 25,
   ahead: null,
-  behind: null,
+  behind: null, insertions: null, deletions: null,
 };
 
 class FakeWorkspaceIdentityResolver {

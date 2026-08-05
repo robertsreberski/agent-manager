@@ -152,6 +152,8 @@ export const workspaceIdentitySchema: z.ZodType<WorkspaceIdentity> = z.object({
   dirtyCount: z.number().int().nonnegative().nullable(),
   ahead: z.number().int().nonnegative().nullable(),
   behind: z.number().int().nonnegative().nullable(),
+  insertions: z.number().int().nonnegative().nullable(),
+  deletions: z.number().int().nonnegative().nullable(),
 }).strict();
 
 export const sessionRecordSchema: z.ZodType<SessionRecord> = z.object({

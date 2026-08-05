@@ -92,6 +92,46 @@ export function toCockpitSessionView(
   };
 }
 
+export interface WorkspaceChangeFacts {
+  /** Files in a non-clean state, including untracked ones. */
+  files: number;
+  /** Lines across *tracked* changes. Null where git could not say. */
+  insertions: number | null;
+  deletions: number | null;
+}
+
+/**
+ * What "uncommitted" actually amounts to.
+ *
+ * The board used to say "25 uncommitted" and stop there, which answered none of
+ * the questions an operator asks next: 25 of what, and how much? It was files,
+ * and a rename counted the same as a rewrite.
+ *
+ * The two measurements cover different sets — `dirtyCount` includes untracked
+ * files, the line counts come from `git diff` and so cover tracked changes only
+ * — so they are reported side by side rather than folded into one total that
+ * would be true of neither.
+ */
+export function workspaceChangeFacts(
+  identity: CockpitSessionView["workspaceIdentity"],
+): WorkspaceChangeFacts | null {
+  if (!identity || identity.dirtyCount === null || identity.dirtyCount === 0) return null;
+  return {
+    files: identity.dirtyCount,
+    insertions: identity.insertions,
+    deletions: identity.deletions,
+  };
+}
+
+/** `12 files · +312 −87`, dropping any half git did not supply. */
+export function workspaceChangeLabel(facts: WorkspaceChangeFacts): string {
+  const lines = facts.insertions === null && facts.deletions === null
+    ? null
+    : `+${facts.insertions ?? 0} −${facts.deletions ?? 0}`;
+  const files = `${facts.files} ${facts.files === 1 ? "file" : "files"}`;
+  return lines ? `${files} · ${lines}` : files;
+}
+
 export function can(session: Pick<CockpitSessionView, "control">, capability: SessionCapability): boolean {
   return session.control.capabilities.includes(capability);
 }

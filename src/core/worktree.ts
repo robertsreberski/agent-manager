@@ -50,6 +50,8 @@ interface ExpensiveFacts {
   dirtyCount: number | null;
   ahead: number | null;
   behind: number | null;
+  insertions: number | null;
+  deletions: number | null;
 }
 
 interface PositiveCacheEntry {
@@ -99,6 +101,27 @@ function absoluteGitPath(path: string, worktreePath: string): string | null {
   if (path.includes("\0")) return null;
   const candidate = normalize(isAbsolute(path) ? path : resolve(worktreePath, path));
   return isAbsolute(candidate) ? candidate : null;
+}
+
+/**
+ * The line counts out of `git diff --shortstat`.
+ *
+ * Git prints one line — "12 files changed, 312 insertions(+), 87 deletions(-)"
+ * — and omits either clause when it is zero, so an absent clause is a real zero
+ * rather than an unknown. An unparseable or missing line stays null, because
+ * "no changed lines" and "we could not find out" must not look the same.
+ */
+function parseShortstat(line: string | null): { insertions: number | null; deletions: number | null } {
+  if (line === null) return { insertions: null, deletions: null };
+  const trimmed = line.trim();
+  if (trimmed.length === 0) return { insertions: 0, deletions: 0 };
+  if (!/^\d+ files? changed/u.test(trimmed)) return { insertions: null, deletions: null };
+  const insertions = trimmed.match(/(\d+) insertions?\(\+\)/u);
+  const deletions = trimmed.match(/(\d+) deletions?\(-\)/u);
+  return {
+    insertions: insertions ? Number(insertions[1]) : 0,
+    deletions: deletions ? Number(deletions[1]) : 0,
+  };
 }
 
 function countPorcelainRecords(output: Buffer): number | null {
@@ -239,7 +262,7 @@ export class WorkspaceIdentityResolver {
         cheapAt: this.#now(),
         expensive: reusable
           ? reusable.expensive
-          : { dirtyCount: null, ahead: null, behind: null },
+          : { dirtyCount: null, ahead: null, behind: null, insertions: null, deletions: null },
         expensiveAt: reusable?.expensiveAt ?? 0,
         touchedAt: this.#now(),
       };
@@ -350,7 +373,7 @@ export class WorkspaceIdentityResolver {
   }
 
   async #resolveExpensive(worktreePath: string, deadline: number): Promise<ExpensiveFacts> {
-    const [statusResult, divergenceResult] = await Promise.all([
+    const [statusResult, divergenceResult, diffstatResult] = await Promise.all([
       this.#command(
         worktreePath,
         ["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
@@ -362,6 +385,21 @@ export class WorkspaceIdentityResolver {
         ["rev-list", "--left-right", "--count", "@{upstream}...HEAD"],
         deadline,
       ),
+      /*
+        "25 uncommitted" said how many files were in a non-clean state and
+        nothing about how much had actually changed — a rename and a rewrite
+        counted the same. `--shortstat` is the line side of that, and it is one
+        summary line regardless of repository size.
+
+        It measures *tracked* changes, where `dirtyCount` also counts untracked
+        files, so the two are deliberately reported as separate facts rather
+        than folded into one total that would be true of neither.
+      */
+      this.#command(
+        worktreePath,
+        ["diff", "--shortstat", "HEAD"],
+        deadline,
+      ),
     ]);
     const dirtyCount = statusResult
       && statusResult.status === 0
@@ -371,10 +409,12 @@ export class WorkspaceIdentityResolver {
       : null;
     const divergence = divergenceResult ? cleanLine(divergenceResult) : null;
     const match = divergence?.match(/^(\d+)\s+(\d+)$/u) ?? null;
+    const shortstat = diffstatResult ? cleanLine(diffstatResult) : null;
     return {
       dirtyCount,
       behind: match ? Number(match[1]) : null,
       ahead: match ? Number(match[2]) : null,
+      ...parseShortstat(shortstat),
     };
   }
 

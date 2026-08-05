@@ -61,6 +61,8 @@ function remoteSession() {
       dirtyCount: 3,
       ahead: null,
       behind: null,
+      insertions: 312,
+      deletions: 87,
     },
     generation: 7,
   } as const;

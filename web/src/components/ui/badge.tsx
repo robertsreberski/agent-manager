@@ -37,8 +37,16 @@ const badgeVariants = cva(
         square: "rounded-sm",
         pill: "rounded-full px-2.5",
       },
+      // assistant-ui's badge sizes, kept for API parity. `tone` stays the
+      // app's own axis: spec 12 R4 names variants by meaning rather than
+      // colour, so a wrong badge reads wrong in review.
+      size: {
+        sm: "px-1.5 py-0",
+        default: "",
+        lg: "px-2.5 py-1 text-meta-sm",
+      },
     },
-    defaultVariants: { tone: "neutral", shape: "square" },
+    defaultVariants: { tone: "neutral", shape: "square", size: "default" },
   },
 );
 
@@ -47,9 +55,9 @@ type BadgeProps = React.ComponentProps<"span"> &
     asChild?: boolean | undefined;
   };
 
-function Badge({ className, tone, shape, asChild = false, ...props }: BadgeProps) {
+function Badge({ className, tone, shape, size, asChild = false, ...props }: BadgeProps) {
   const Comp = asChild ? Slot : "span";
-  return <Comp data-slot="badge" className={cn(badgeVariants({ tone, shape, className }))} {...props} />;
+  return <Comp data-slot="badge" className={cn(badgeVariants({ tone, shape, size, className }))} {...props} />;
 }
 
 export { Badge, badgeVariants };

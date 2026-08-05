@@ -14,7 +14,7 @@ function session(id: string, capabilities: CockpitSessionView["control"]["capabi
     hostLabel: "This Mac",
     remote: false,
     cwd: "/work/app",
-    workspaceIdentity: { repoRoot: "/work/app", repoName: "app", worktreePath: "/work/app", linked: false, branch: "main", detached: false, dirtyCount: 0, ahead: null, behind: null },
+    workspaceIdentity: { repoRoot: "/work/app", repoName: "app", worktreePath: "/work/app", linked: false, branch: "main", detached: false, dirtyCount: 0, ahead: null, behind: null, insertions: null, deletions: null },
     activity: "idle",
     attention: [],
     updatedAt: "2026-08-04T12:00:00Z",

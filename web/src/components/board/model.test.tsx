@@ -8,7 +8,7 @@ import { buildBoard, type BoardModel } from "./model";
 function session(overrides: Partial<CockpitSessionView> & Pick<CockpitSessionView, "id">): CockpitSessionView {
   return {
     provider: "codex", name: overrides.id, hostId: "local", hostLabel: "This Mac", remote: false,
-    cwd: "/work/app", workspaceIdentity: { repoRoot: "/work/app", repoName: "app", worktreePath: "/work/app", linked: false, branch: "main", detached: false, dirtyCount: null, ahead: null, behind: null },
+    cwd: "/work/app", workspaceIdentity: { repoRoot: "/work/app", repoName: "app", worktreePath: "/work/app", linked: false, branch: "main", detached: false, dirtyCount: null, ahead: null, behind: null, insertions: null, deletions: null },
     activity: "idle", attention: [], updatedAt: "2026-08-04T12:00:00Z",
     control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [] },
     profile: null, model: null, effort: null, todo: null, ...overrides,
@@ -26,12 +26,12 @@ function phoneSessionIds(model: BoardModel, state: "wants-you" | "working" | "id
 describe("buildBoard", () => {
   it("uses host-qualified repos, keeps main first, and preserves an existing column order", () => {
     const initial = buildBoard([
-      session({ id: "codex:linked", workspaceIdentity: { repoRoot: "/work/app", repoName: "app", worktreePath: "/work/app-feature", linked: true, branch: "feature", detached: false, dirtyCount: 2, ahead: null, behind: null } }),
+      session({ id: "codex:linked", workspaceIdentity: { repoRoot: "/work/app", repoName: "app", worktreePath: "/work/app-feature", linked: true, branch: "feature", detached: false, dirtyCount: 2, ahead: null, behind: null, insertions: null, deletions: null } }),
       session({ id: "codex:main" }),
       session({ id: "codex:remote", hostId: "remote", hostLabel: "Studio", remote: true, updatedAt: "2026-08-04T11:00:00Z" }),
     ]);
     const model = buildBoard([
-      session({ id: "codex:linked", workspaceIdentity: { repoRoot: "/work/app", repoName: "app", worktreePath: "/work/app-feature", linked: true, branch: "feature", detached: false, dirtyCount: 2, ahead: null, behind: null } }),
+      session({ id: "codex:linked", workspaceIdentity: { repoRoot: "/work/app", repoName: "app", worktreePath: "/work/app-feature", linked: true, branch: "feature", detached: false, dirtyCount: 2, ahead: null, behind: null, insertions: null, deletions: null } }),
       session({ id: "codex:main" }),
       session({ id: "codex:remote", hostId: "remote", hostLabel: "Studio", remote: true, updatedAt: "2026-08-04T13:00:00Z" }),
     ], { previousOrder: initial.order });
@@ -44,7 +44,7 @@ describe("buildBoard", () => {
       session({
         id: "codex:scanned",
         cwd: "/Users/me/agents/paola-bot",
-        workspaceIdentity: { repoRoot: "/Users/me/agents/paola-bot", repoName: "paola-bot", worktreePath: "/Users/me/agents/paola-bot", linked: false, branch: "master", detached: false, dirtyCount: 25, ahead: null, behind: null },
+        workspaceIdentity: { repoRoot: "/Users/me/agents/paola-bot", repoName: "paola-bot", worktreePath: "/Users/me/agents/paola-bot", linked: false, branch: "master", detached: false, dirtyCount: 25, ahead: null, behind: null, insertions: null, deletions: null },
       }),
       session({ id: "codex:managed", cwd: "/Users/me/agents/paola-bot", workspaceIdentity: null }),
     ]);
@@ -61,7 +61,7 @@ describe("buildBoard", () => {
       session({
         id: "codex:scanned",
         cwd: "/Users/me/agents/paola-bot",
-        workspaceIdentity: { repoRoot: "/Users/me/agents/paola-bot", repoName: "paola-bot", worktreePath: "/Users/me/agents/paola-bot", linked: false, branch: "master", detached: false, dirtyCount: 25, ahead: null, behind: null },
+        workspaceIdentity: { repoRoot: "/Users/me/agents/paola-bot", repoName: "paola-bot", worktreePath: "/Users/me/agents/paola-bot", linked: false, branch: "master", detached: false, dirtyCount: 25, ahead: null, behind: null, insertions: null, deletions: null },
       }),
     ]);
     expect(model.columns).toHaveLength(1);
@@ -208,7 +208,7 @@ describe("board presentations", () => {
       session({
         id: "codex:clean",
         cwd: "/work/clean",
-        workspaceIdentity: { repoRoot: "/work/clean", repoName: "clean", worktreePath: "/work/clean", linked: false, branch: "main", detached: false, dirtyCount: 0, ahead: null, behind: null },
+        workspaceIdentity: { repoRoot: "/work/clean", repoName: "clean", worktreePath: "/work/clean", linked: false, branch: "main", detached: false, dirtyCount: 0, ahead: null, behind: null, insertions: null, deletions: null },
       }),
     ]);
     render(<DesktopBoard columns={model.columns} onOpenSession={onOpen} onToggleSelection={onSelect} />);

@@ -19,7 +19,7 @@ function targetSession(worktreePath: string): Pick<SessionView, "hostId" | "work
       detached: false,
       dirtyCount: 1,
       ahead: 0,
-      behind: 0,
+      behind: 0, insertions: null, deletions: null,
     },
   };
 }

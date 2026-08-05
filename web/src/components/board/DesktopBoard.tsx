@@ -1,4 +1,5 @@
-import { GitBranch, Plus, Server } from "lucide-react";
+import { FileDiff, Folder, GitBranch, Plus, Server } from "lucide-react";
+import { workspaceChangeFacts, workspaceChangeLabel } from "../../lib/cockpit-view";
 import { Badge, Button } from "../ui";
 import { SessionCard } from "./SessionCard";
 import type { BoardColumn, BoardSession } from "./model";
@@ -59,9 +60,7 @@ export function DesktopBoard({
           </header>
           {column.worktrees.map((group) => {
             const directory = worktreeDirectory(group);
-            const dirty = typeof group.identity?.dirtyCount === "number" && group.identity.dirtyCount > 0
-              ? group.identity.dirtyCount
-              : null;
+            const changes = workspaceChangeFacts(group.identity ?? null);
             return <section key={group.key} aria-label={`${group.label} sessions`}>
               <div className="flex flex-col gap-[5px] pb-2 pt-[13px]">
                 <div className="flex min-w-0 items-center gap-[7px]">
@@ -77,15 +76,29 @@ export function DesktopBoard({
                     <Badge tone="neutral" className="px-1.5 py-0.5 text-[9.5px] leading-[1.4] tracking-[0.06em] uppercase">worktree</Badge>
                   )}
                 </div>
-                {(dirty !== null || directory !== null) && (
+                {(changes !== null || directory !== null) && (
                   <div className="flex min-w-0 items-center gap-[9px] pl-[19px]">
-                    {dirty !== null && (
-                      <span className="flex shrink-0 items-center gap-[5px] font-mono text-eyebrow leading-none tracking-normal text-[var(--dirty)]">
-                        <span className="size-[5px] rounded-full bg-current" />{dirty} uncommitted
+                    {/*
+                      "25 uncommitted" answered neither question an operator
+                      asks next — 25 of what, and how much. It was files, and a
+                      rename counted the same as a rewrite. Files and lines are
+                      separate facts here because they measure different sets:
+                      the file count includes untracked files, the line counts
+                      come from `git diff` and so cover tracked changes only.
+                    */}
+                    {changes !== null && (
+                      <span className="flex shrink-0 items-center gap-[5px] font-mono text-eyebrow leading-none tracking-normal text-[var(--dirty)]" title={`${workspaceChangeLabel(changes)} uncommitted`}>
+                        <FileDiff size={11} strokeWidth={1.75} aria-hidden="true" />
+                        {changes.files}
+                        {changes.insertions !== null && <span className="text-[var(--added)]">+{changes.insertions}</span>}
+                        {changes.deletions !== null && <span className="text-[var(--removed)]">−{changes.deletions}</span>}
                       </span>
                     )}
                     {directory !== null && (
-                      <span className="truncate font-mono text-eyebrow leading-none tracking-normal text-[var(--text-muted)]" title={group.key}>{directory}</span>
+                      <span className="flex min-w-0 items-center gap-[5px] font-mono text-eyebrow leading-none tracking-normal text-[var(--text-muted)]" title={group.key}>
+                        <Folder size={11} strokeWidth={1.75} aria-hidden="true" className="shrink-0" />
+                        <span className="truncate">{directory}</span>
+                      </span>
                     )}
                   </div>
                 )}
