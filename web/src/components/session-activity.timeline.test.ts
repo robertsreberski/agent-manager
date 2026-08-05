@@ -382,3 +382,52 @@ describe("a request sits under the tool call that raised it", () => {
     ]);
   });
 });
+
+/*
+  `useMessageTiming` was rejected during the refactor because its fields are
+  browser-stream measurements — when the first chunk arrived, how many there
+  were, a rate off a client clock — and printing those beside provider totals
+  is inventing facts. The component is adopted by changing where the numbers
+  come from, not by relaxing that.
+*/
+describe("turn timing carries provider facts only", () => {
+  function timingOf(items: ActivityItem[]) {
+    const message = activityToThreadMessages(items).at(-1) as { metadata?: { timing?: Record<string, number> } };
+    return message.metadata?.timing;
+  }
+
+  it("takes the span from the provider's own start and end", () => {
+    const timing = timingOf(invertedTurn());
+    // 21:59:00 → 21:59:05 as the fixture reports them.
+    expect(timing?.totalStreamTime).toBe(5_000);
+    expect(timing?.streamStartTime).toBe(Date.parse("2026-08-04T21:59:00.000Z"));
+  });
+
+  it("derives the rate from provider output tokens over the provider's span", () => {
+    // 72 output tokens over 5s.
+    expect(timingOf(invertedTurn())?.tokensPerSecond).toBeCloseTo(14.4, 5);
+    expect(timingOf(invertedTurn())?.tokenCount).toBe(24_426);
+  });
+
+  it("counts the turn's tool calls, and never a stream chunk", () => {
+    const timing = timingOf(invertedTurn());
+    expect(timing?.toolCallCount).toBe(1);
+    // Required by the type and unknowable here: the cockpit is not the thing
+    // receiving the stream. The vendored component does not render it.
+    expect(timing?.totalChunks).toBe(0);
+  });
+
+  it("states no timing at all for a turn the provider never closed", () => {
+    const open = invertedTurn().filter((item) => !(item.kind === "lifecycle" && item.event === "turn-completed"));
+    expect(timingOf(open)).toBeUndefined();
+  });
+
+  it("omits the rate when the provider reported no output tokens", () => {
+    const items = invertedTurn().map((item) => (
+      item.kind === "usage" ? { ...item, outputTokens: null } : item
+    ));
+    const timing = timingOf(items);
+    expect(timing?.totalStreamTime).toBe(5_000);
+    expect(timing?.tokensPerSecond).toBeUndefined();
+  });
+});

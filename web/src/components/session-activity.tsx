@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import type {
   MessagePartStatus,
   MessageStatus,
+  MessageTiming,
   ThreadMessageLike,
 } from "@assistant-ui/react";
 import { AlertTriangle, CircleAlert, Gauge, Radio } from "lucide-react";
@@ -270,6 +271,47 @@ function restatedByTurnMarker(item: ActivityItem, facts: TurnFacts): boolean {
     && !item.truncated;
 }
 
+/**
+ * The turn's timing, in the shape `useMessageTiming` reads — built only from
+ * what the provider said.
+ *
+ * Upstream this metadata holds browser-stream measurements: when the first
+ * chunk arrived, how many there were, a rate derived from a client clock. None
+ * of that is knowable here, and printing it beside provider totals is what got
+ * `useMessageTiming` rejected in the first place. So the span comes from the
+ * provider's own `startedAt`/`completedAt`, the token count from its usage
+ * totals, and the rate is those two divided — every input a provider fact.
+ *
+ * `firstTokenTime` is omitted because the provider does not report it.
+ * `totalChunks` is required by the type and unknowable, so it is zero and the
+ * vendored component does not render it.
+ */
+function turnTiming(items: readonly ActivityItem[]): MessageTiming | undefined {
+  const startedAt = items.map((item) => item.startedAt).filter((value): value is string => value !== null).sort()[0] ?? null;
+  const terminal = [...items].reverse().find(isTurnEnd);
+  const endedAt = terminal?.completedAt ?? terminal?.updatedAt ?? null;
+  if (!startedAt || !endedAt) return undefined;
+  const start = Date.parse(startedAt);
+  const end = Date.parse(endedAt);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return undefined;
+  const elapsed = end - start;
+  const usage = [...items].reverse().find((item) => item.kind === "usage");
+  const tokens = usage?.kind === "usage" ? usage.totalTokens : null;
+  const outputTokens = usage?.kind === "usage" ? usage.outputTokens : null;
+  return {
+    streamStartTime: start,
+    totalStreamTime: elapsed,
+    totalChunks: 0,
+    toolCallCount: items.filter((item) => item.kind === "tool").length,
+    ...(tokens === null ? {} : { tokenCount: tokens }),
+    // Rate is only meaningful from the tokens the provider actually produced,
+    // over a span it actually reported.
+    ...(outputTokens !== null && elapsed > 0
+      ? { tokensPerSecond: (outputTokens * 1_000) / elapsed }
+      : {}),
+  };
+}
+
 function assistantMessage(
   id: string,
   items: readonly ActivityItem[],
@@ -280,6 +322,7 @@ function assistantMessage(
   const state = groupState(items);
   const facts = turnFacts(factItems);
   const rendered = facts ? items.filter((item) => !restatedByTurnMarker(item, facts)) : items;
+  const timing = turnTiming(factItems);
   return {
     id,
     role: "assistant",
@@ -288,6 +331,7 @@ function assistantMessage(
       ...rendered.map((item) => activityPart(item, subagents, items)),
       ...(facts ? [{ type: "data" as const, name: `${DATA_PREFIX}turn-marker`, data: facts }] : []),
     ] satisfies ThreadContent,
+    ...(timing ? { metadata: { custom: {}, timing } } : {}),
     ...(itemDate(items[0]!) ? { createdAt: itemDate(items[0]!) } : {}),
   };
 }
