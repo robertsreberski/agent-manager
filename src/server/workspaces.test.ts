@@ -38,6 +38,7 @@ test("resolves a local workspace and returns its exact public identity", async (
     hostKind: "local",
     remoteWorkspaceId: null,
     createdAt: "2026-08-04T00:00:00.000Z",
+    lastOpenedAt: null,
   }, resolved.workspaceIdentity);
   assert.deepEqual(response.workspace.workspaceIdentity, resolved.workspaceIdentity);
   assert.deepEqual(Object.keys(response.workspace).sort(), [
@@ -47,6 +48,7 @@ test("resolves a local workspace and returns its exact public identity", async (
     "hostLabel",
     "id",
     "label",
+    "lastOpenedAt",
     "path",
     "remoteWorkspaceId",
     "workspaceIdentity",

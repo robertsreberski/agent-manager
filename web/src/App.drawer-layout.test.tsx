@@ -19,6 +19,7 @@ const selectedSession = {
   todoProgress: null,
   attention: [] as SessionView["attention"],
   profile: { value: "execute" },
+  sandbox: { value: null },
   model: { value: "gpt-live" },
   effort: { value: "high" },
   workspaceIdentity: { repoRoot: "/work/app", repoName: "app", worktreePath: "/work/app", linked: false, branch: "main", detached: false, dirtyCount: null, ahead: null, behind: null },

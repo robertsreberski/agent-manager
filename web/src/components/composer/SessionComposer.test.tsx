@@ -176,6 +176,50 @@ describe("SessionComposer", () => {
     await waitFor(() => expect(screen.queryByRole("menu", { name: "Execution profile" })).not.toBeInTheDocument());
   });
 
+  it("sets the Codex sandbox separately from the execution profile", async () => {
+    const onSandboxChange = vi.fn();
+    const onProfileChange = vi.fn();
+    renderComposer({
+      canQueue: true,
+      profile: "full-access",
+      sandbox: { mode: "workspace-write", networkAccess: false },
+      onSandboxChange,
+      onProfileChange,
+    });
+
+    // Full access is the profile's business; the sandbox says "Workspace".
+    expect(screen.getByRole("button", { name: /Full access/ })).toBeInTheDocument();
+    click(screen.getByRole("button", { name: /^Workspace/ }));
+    const danger = await screen.findByRole("menuitemradio", { name: /Danger: full access/ });
+    expect(danger.className).toContain("var(--access)");
+
+    fireEvent.click(danger);
+    expect(onSandboxChange).toHaveBeenCalledWith({ mode: "danger-full-access", networkAccess: true });
+    expect(onProfileChange).not.toHaveBeenCalled();
+  });
+
+  it("offers network access only for the sandbox that can have it", async () => {
+    const onSandboxChange = vi.fn();
+    const { rerender } = render(<SessionComposer value="Keep this" onChange={vi.fn()} onSend={vi.fn()} isRunning={false} canQueue canSteer={false} canStop={false} provider="codex" model="gpt" effort="medium" profile="execute" sandbox={{ mode: "read-only", networkAccess: false }} onSandboxChange={onSandboxChange} />);
+
+    click(screen.getByRole("button", { name: /Read-only/ }));
+    expect(await screen.findByRole("menuitemcheckbox", { name: "Network access" }))
+      .toHaveAttribute("aria-disabled", "true");
+    fireEvent.keyDown(document.body, { key: "Escape" });
+
+    rerender(<SessionComposer value="Keep this" onChange={vi.fn()} onSend={vi.fn()} isRunning={false} canQueue canSteer={false} canStop={false} provider="codex" model="gpt" effort="medium" profile="execute" sandbox={{ mode: "workspace-write", networkAccess: false }} onSandboxChange={onSandboxChange} />);
+    click(screen.getByRole("button", { name: /^Workspace/ }));
+    const network = await screen.findByRole("menuitemcheckbox", { name: "Network access" });
+    expect(network).toBeEnabled();
+    fireEvent.click(network);
+    expect(onSandboxChange).toHaveBeenCalledWith({ mode: "workspace-write", networkAccess: true });
+  });
+
+  it("shows no sandbox control for a harness that has no sandbox", () => {
+    renderComposer({ provider: "claude", canQueue: true, sandbox: null, onSandboxChange: vi.fn() });
+    expect(screen.queryByRole("button", { name: /Sandbox|Workspace|Read-only/ })).not.toBeInTheDocument();
+  });
+
   it("explains when the selected harness exposes no model catalog", async () => {
     renderComposer({ canQueue: true, modelOptionsStatus: "This provider does not expose a live model catalog.", onModelChange: vi.fn() });
 

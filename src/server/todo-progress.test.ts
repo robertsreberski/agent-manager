@@ -7,9 +7,11 @@ import {
   type SessionRecord,
 } from "../shared/session.ts";
 import { createAgentManagerServer } from "./server.ts";
+import { unknownSandbox } from "../shared/session.ts";
 
 function session(updatedAt = "2026-08-04T10:00:00.000Z"): SessionRecord {
   return {
+    sandbox: unknownSandbox(),
     id: "local:claude:thread-1",
     provider: "claude",
     providerThreadId: "thread-1",

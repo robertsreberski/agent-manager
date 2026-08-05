@@ -110,7 +110,8 @@ validation, and a provider transaction that stays unpublished until its managed 
 durable. `attach` remains optional advanced native access. Remote `resume` and takeover actions
 are proxied to the node that owns the provider boundary rather than reinterpreted locally.
 
-Wire schema 5 is one strict cutover for these fields. The envelope includes the required
+Wire schema 6 is one strict cutover for these fields and for the required per-session
+`sandbox`. The envelope includes the required
 schema/build identity. A mismatch returns a typed upgrade error and closes the stream. The PWA
 hard-reloads; a remote node reports that it needs updating. There are no aliases or compatibility
 parsers for earlier takeover, coordination, recovery, archive, or activity shapes.
@@ -154,21 +155,36 @@ Lifecycle actions are exact:
 
 ## Execution profile mapping
 
-The profile is provider-neutral product intent and maps atomically at the adapter boundary.
+The profile is provider-neutral product intent and maps atomically at the adapter boundary. For
+Codex it is the approval axis alone; what a permitted action may reach is the sandbox's business.
 
 | Profile | Claude | Codex |
 | --- | --- | --- |
-| `ask-first` | default permission mode | approval on request + workspace-write sandbox |
-| `plan` | plan permission mode | plan collaboration mode + safe approval/sandbox |
-| `execute` | accept-edits equivalent | on-request approval + workspace-write sandbox |
-| `full-access` | bypass permissions | never approve + danger-full-access sandbox |
+| `ask-first` | default permission mode | default collaboration + approval on request |
+| `plan` | plan permission mode | plan collaboration + approval on request |
+| `execute` | accept-edits equivalent | default collaboration + approval on request |
+| `full-access` | bypass permissions | default collaboration + never approve |
+
+## Sandbox mapping
+
+The sandbox is Codex-only and independent of the profile. `read-only`, `workspace-write` (writable
+roots limited to the session's cwd, network access as chosen), and `danger-full-access` map
+directly onto the provider's sandbox policy. Creation defaults to workspace-write without network
+when the operator requested nothing, so a thread is contained until someone says otherwise.
+
+Both axes are read back independently from `thread/settings/updated`: the sandbox is stated
+outright and is taken as evidence, while the profile is inferred from approval and collaboration
+alone. A policy this build does not recognize leaves the last known sandbox in place rather than
+being read as a permissive one — an unknown sandbox and a wide-open sandbox must never look the
+same. Claude has no sandbox and publishes none.
 
 Provider vocabulary is internal. If a provider/version cannot express the whole mapping, that
 profile is unavailable; the app does not apply half of it. Codex settings are selected only
 while idle. With `experimentalApi: true`, the pinned 0.146 experimental schema exposes
 `thread/settings/update`; send that exact request and treat `thread/settings/updated` as the
 effective state. On `-32601`, withdraw the live-setting method and use the selected values as
-`turn/start` overrides on the next turn. Never optimistically assert effective state. Claude SDK
+`turn/start` overrides on the next turn — a profile and a sandbox chosen before that turn starts
+both survive, in one request. Never optimistically assert effective state. Claude SDK
 changes use its real live methods while the UI honours adapter-level capability withdrawal.
 
 ## Provenance and arbitration

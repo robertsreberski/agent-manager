@@ -49,6 +49,12 @@ function sessionRecord() {
       source: "provider-api",
       confidence: "exact",
     },
+    sandbox: {
+      value: { mode: "workspace-write", networkAccess: false },
+      providerValue: "workspace-write;network=false",
+      source: "provider-api",
+      confidence: "exact",
+    },
     model: {
       value: null,
       providerValue: null,
@@ -732,6 +738,7 @@ describe("CockpitApi", () => {
       workspaceId: "workspace-1",
       initialMessage: "Start",
       profile: "full-access",
+      sandbox: null,
       model: null,
       effort: null,
       idempotencyKey: "create-session-1",
@@ -819,6 +826,7 @@ describe("CockpitApi", () => {
           hostKind: "ssh",
           remoteWorkspaceId: "remote-workspace",
           createdAt: "2026-08-04T10:00:00.000Z",
+          lastOpenedAt: null,
           workspaceIdentity: null,
         },
       }), { status: 200, headers: { "content-type": "application/json" } });

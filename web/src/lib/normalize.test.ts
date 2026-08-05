@@ -44,6 +44,12 @@ function session() {
       source: "provider-api",
       confidence: "exact",
     },
+    sandbox: {
+      value: { mode: "workspace-write", networkAccess: false },
+      providerValue: "workspace-write;network=false",
+      source: "provider-api",
+      confidence: "exact",
+    },
     model: {
       value: "gpt-5.6",
       providerValue: "gpt-5.6",

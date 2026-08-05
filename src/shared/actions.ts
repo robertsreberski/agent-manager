@@ -2,6 +2,7 @@ import type {
   ExecutionProfile,
   Provider,
   ReasoningEffort,
+  SandboxPolicy,
   TakeoverMethod,
 } from "./session.ts";
 
@@ -46,6 +47,7 @@ export type SessionAction =
     })
   | (ExpectedSessionState & { type: "interrupt" })
   | (ExpectedSessionState & { type: "set-profile"; profile: ExecutionProfile })
+  | (ExpectedSessionState & { type: "set-sandbox"; sandbox: SandboxPolicy })
   | (ExpectedSessionState & { type: "set-model"; model: string })
   | (ExpectedSessionState & { type: "set-effort"; effort: ReasoningEffort })
   | (ExpectedSessionState & { type: "remove-queued"; messageId: string })
@@ -77,6 +79,8 @@ export interface CreateSessionInput {
   name?: string | undefined;
   initialMessage: string;
   profile: ExecutionProfile;
+  /** Codex only; null asks the provider adapter for its conservative default. */
+  sandbox: SandboxPolicy | null;
   model: string | null;
   effort: ReasoningEffort | null;
   idempotencyKey: string;

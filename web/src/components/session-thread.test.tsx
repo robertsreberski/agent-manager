@@ -28,6 +28,7 @@ const session = {
   model: { value: "gpt-live" },
   effort: { value: "high" },
   profile: { value: "execute" },
+  sandbox: { value: { mode: "workspace-write", networkAccess: false } },
   control: {
     plane: "codex-private",
     authority: "manager",
@@ -99,6 +100,8 @@ describe("SessionThreadComposer", () => {
       onSend={vi.fn(async () => undefined)}
       onInterrupt={vi.fn(async () => undefined)}
       onSetProfile={vi.fn(async () => undefined)}
+      onSetSandbox={vi.fn()}
+      
       onSetModel={vi.fn(async () => undefined)}
       onSetEffort={vi.fn(async () => undefined)}
       modelOptions={[]}
@@ -132,6 +135,8 @@ describe("SessionThreadComposer", () => {
       onSend={vi.fn(async () => undefined)}
       onInterrupt={vi.fn(async () => undefined)}
       onSetProfile={vi.fn(async () => undefined)}
+      onSetSandbox={vi.fn()}
+      
       onSetModel={vi.fn(async () => undefined)}
       onSetEffort={vi.fn(async () => undefined)}
       modelOptions={[]}
@@ -154,6 +159,8 @@ describe("SessionThreadComposer", () => {
       onSend={vi.fn(async () => undefined)}
       onInterrupt={vi.fn(async () => undefined)}
       onSetProfile={vi.fn(async () => undefined)}
+      onSetSandbox={vi.fn()}
+      
       onSetModel={vi.fn(async () => undefined)}
       onSetEffort={vi.fn(async () => undefined)}
       modelOptions={[]}
@@ -196,6 +203,8 @@ describe("SessionThreadComposer", () => {
       onSend={vi.fn(async () => undefined)}
       onInterrupt={vi.fn(async () => undefined)}
       onSetProfile={vi.fn(async () => undefined)}
+      onSetSandbox={vi.fn()}
+      
       onSetModel={vi.fn(async () => undefined)}
       onSetEffort={vi.fn(async () => undefined)}
       modelOptions={[]}
@@ -251,6 +260,7 @@ describe("SessionThreadComposer", () => {
       onSend={vi.fn(async () => undefined)}
       onInterrupt={vi.fn(async () => undefined)}
       onSetProfile={vi.fn(async () => undefined)}
+      onSetSandbox={vi.fn()}
       onSetModel={vi.fn(async () => undefined)}
       onSetEffort={vi.fn(async () => undefined)}
       modelOptions={[]}
@@ -300,6 +310,8 @@ describe("SessionThreadComposer", () => {
       onSend={vi.fn(async () => undefined)}
       onInterrupt={vi.fn(async () => undefined)}
       onSetProfile={vi.fn(async () => undefined)}
+      onSetSandbox={vi.fn()}
+      
       onSetModel={vi.fn(async () => undefined)}
       onSetEffort={vi.fn(async () => undefined)}
       modelOptions={[]}
@@ -333,6 +345,8 @@ describe("SessionThreadComposer", () => {
       onSend={vi.fn(async () => undefined)}
       onInterrupt={vi.fn(async () => undefined)}
       onSetProfile={vi.fn(async () => undefined)}
+      onSetSandbox={vi.fn()}
+      
       onSetModel={vi.fn(async () => undefined)}
       onSetEffort={vi.fn(async () => undefined)}
       modelOptions={[]}
@@ -366,6 +380,7 @@ describe("SessionThreadComposer", () => {
       onSend={vi.fn(async () => undefined)}
       onInterrupt={vi.fn(async () => undefined)}
       onSetProfile={vi.fn(async () => undefined)}
+      onSetSandbox={vi.fn()}
       onSetModel={vi.fn(async () => undefined)}
       onSetEffort={vi.fn(async () => undefined)}
       modelOptions={[]}
@@ -399,6 +414,7 @@ describe("SessionThreadComposer", () => {
       onSend={vi.fn(async () => undefined)}
       onInterrupt={vi.fn(async () => undefined)}
       onSetProfile={vi.fn(async () => undefined)}
+      onSetSandbox={vi.fn()}
       onSetModel={vi.fn(async () => undefined)}
       onSetEffort={vi.fn(async () => undefined)}
       modelOptions={[]}
@@ -431,6 +447,7 @@ describe("SessionThreadComposer", () => {
       onSend={vi.fn(async () => undefined)}
       onInterrupt={vi.fn(async () => undefined)}
       onSetProfile={vi.fn(async () => undefined)}
+      onSetSandbox={vi.fn()}
       onSetModel={vi.fn(async () => undefined)}
       onSetEffort={vi.fn(async () => undefined)}
       modelOptions={[]}
@@ -475,6 +492,8 @@ describe("SessionThreadComposer", () => {
       onSend={vi.fn(async () => undefined)}
       onInterrupt={vi.fn(async () => undefined)}
       onSetProfile={vi.fn(async () => undefined)}
+      onSetSandbox={vi.fn()}
+      
       onSetModel={vi.fn(async () => undefined)}
       onSetEffort={vi.fn(async () => undefined)}
       modelOptions={[]}
@@ -521,6 +540,7 @@ describe("SessionThreadComposer", () => {
       onSend={vi.fn(async () => undefined)}
       onInterrupt={vi.fn(async () => undefined)}
       onSetProfile={vi.fn(async () => undefined)}
+      onSetSandbox={vi.fn()}
       onSetModel={vi.fn(async () => undefined)}
       onSetEffort={vi.fn(async () => undefined)}
       modelOptions={[]}
@@ -567,6 +587,7 @@ describe("SessionThreadComposer", () => {
       onSend={vi.fn(async () => undefined)}
       onInterrupt={vi.fn(async () => undefined)}
       onSetProfile={vi.fn(async () => undefined)}
+      onSetSandbox={vi.fn()}
       onSetModel={vi.fn(async () => undefined)}
       onSetEffort={vi.fn(async () => undefined)}
       modelOptions={[]}
@@ -614,6 +635,7 @@ describe("SessionThreadComposer", () => {
       onSend={vi.fn(async () => undefined)}
       onInterrupt={vi.fn(async () => undefined)}
       onSetProfile={vi.fn(async () => undefined)}
+      onSetSandbox={vi.fn()}
       onSetModel={vi.fn(async () => undefined)}
       onSetEffort={vi.fn(async () => undefined)}
       modelOptions={[]}
@@ -668,6 +690,7 @@ describe("SessionThreadComposer", () => {
       onSend={vi.fn(async () => undefined)}
       onInterrupt={vi.fn(async () => undefined)}
       onSetProfile={vi.fn(async () => undefined)}
+      onSetSandbox={vi.fn()}
       onSetModel={vi.fn(async () => undefined)}
       onSetEffort={vi.fn(async () => undefined)}
       modelOptions={[]}
@@ -693,6 +716,8 @@ describe("SessionThreadComposer", () => {
       onSend={vi.fn(async () => undefined)}
       onInterrupt={vi.fn(async () => undefined)}
       onSetProfile={vi.fn(async () => undefined)}
+      onSetSandbox={vi.fn()}
+      
       onSetModel={vi.fn(async () => undefined)}
       onSetEffort={vi.fn(async () => undefined)}
       modelOptions={[{ value: "gpt-live", label: "Live", description: null }]}
@@ -753,6 +778,7 @@ describe("a managed session with granted model and effort control", () => {
       onSend={vi.fn(async () => undefined)}
       onInterrupt={vi.fn(async () => undefined)}
       onSetProfile={vi.fn(async () => undefined)}
+      onSetSandbox={vi.fn()}
       onSetModel={onSetModel}
       onSetEffort={onSetEffort}
       modelOptions={catalog}
@@ -813,6 +839,7 @@ describe("a managed session with granted model and effort control", () => {
       onSend={vi.fn(async () => undefined)}
       onInterrupt={vi.fn(async () => undefined)}
       onSetProfile={vi.fn(async () => undefined)}
+      onSetSandbox={vi.fn()}
       onSetModel={vi.fn(async () => undefined)}
       onSetEffort={vi.fn(async () => undefined)}
       modelOptions={[{ value: "gpt-live", label: "Live", description: null }]}
@@ -849,6 +876,8 @@ describe("the upgrade path off a read-only session", () => {
       onSend={vi.fn(async () => undefined)}
       onInterrupt={vi.fn(async () => undefined)}
       onSetProfile={vi.fn(async () => undefined)}
+      onSetSandbox={vi.fn()}
+      
       onSetModel={vi.fn(async () => undefined)}
       onSetEffort={vi.fn(async () => undefined)}
       modelOptions={[]}

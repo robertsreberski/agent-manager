@@ -5,6 +5,7 @@ import type { SessionView } from "../core/types.ts";
 import {
   observeOnlyControl,
   providerControlCoordination,
+  unknownSandbox,
 } from "../shared/session.ts";
 import type { AvailableSessionAccountFacts } from "../shared/session-facts.ts";
 import type { ProviderControlAdapter, SessionAction } from "./contracts.ts";
@@ -39,6 +40,7 @@ function session(overrides: Partial<SessionView> = {}): SessionView {
     statusSource: "provider-api",
     source: "fixture",
     profile: { value: "execute", providerValue: "default", source: "provider-api", confidence: "exact" },
+    sandbox: unknownSandbox(),
     model: { value: "gpt-5.6", providerValue: "gpt-5.6", source: "provider-api", confidence: "exact" },
     effort: { value: "high", providerValue: "high", source: "provider-api", confidence: "exact" },
     todoProgress: null,

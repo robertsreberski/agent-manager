@@ -22,6 +22,7 @@ import {
   sessionScopeFromSearch,
   type SessionScope,
 } from "../lib/session-navigation";
+import type { WorkspaceGitContext } from "../../../src/shared/workspace.ts";
 import { idempotencyKey } from "../lib/utils";
 import { decideOfflineFlush, enqueueOfflineMessage, type OfflineMessage, type OutboxSessionState } from "../components/system/offline-outbox";
 import type {
@@ -36,6 +37,7 @@ import type {
   PanePreview,
   ReasoningEffort,
   RequestResponse,
+  SandboxPolicy,
   SessionAction,
   SessionView,
   StateEvent,
@@ -259,6 +261,7 @@ function outboxState(session: SessionView): OutboxSessionState {
     id: session.id,
     providerTurnId: session.providerTurnId,
     profile: session.profile.value,
+    sandbox: session.sandbox.value,
     status: session.status,
     exactRequestIds: session.attention.flatMap((item) => item.id && item.confidence === "exact" ? [item.id] : []),
     capabilities: session.control.capabilities,
@@ -641,6 +644,7 @@ export function useCockpit() {
   const respond = useCallback((session: SessionView, requestId: string, response: RequestResponse) => perform(session, { type: "respond", requestId, response, ...expectedState(session) }), [perform]);
   const interrupt = useCallback((session: SessionView) => perform(session, { type: "interrupt", ...expectedState(session) }), [perform]);
   const setProfile = useCallback((session: SessionView, profile: ExecutionProfile) => perform(session, { type: "set-profile", profile, ...expectedState(session) }), [perform]);
+  const setSandbox = useCallback((session: SessionView, sandbox: SandboxPolicy) => perform(session, { type: "set-sandbox", sandbox, ...expectedState(session) }), [perform]);
   const setModel = useCallback((session: SessionView, model: string) => perform(session, { type: "set-model", model, ...expectedState(session) }), [perform]);
   const setEffort = useCallback((session: SessionView, effort: ReasoningEffort) => perform(session, { type: "set-effort", effort, ...expectedState(session) }), [perform]);
   const removeQueued = useCallback((session: SessionView, messageId: string) => perform(session, { type: "remove-queued", messageId, ...expectedState(session) }), [perform]);
@@ -786,7 +790,7 @@ export function useCockpit() {
     const session = await withBusy("create", async () => {
       const workspace = await api.resolveWorkspace(input.hostId, input.workspacePath);
       setWorkspaces((current) => [workspace, ...current.filter((item) => item.id !== workspace.id)]);
-      return api.createSession({ provider: input.provider, workspaceId: workspace.id, ...(input.name ? { name: input.name } : {}), initialMessage: input.initialMessage, profile: input.profile, model: input.model, effort: input.effort, idempotencyKey: input.idempotencyKey });
+      return api.createSession({ provider: input.provider, workspaceId: workspace.id, ...(input.name ? { name: input.name } : {}), initialMessage: input.initialMessage, profile: input.profile, sandbox: input.sandbox, model: input.model, effort: input.effort, idempotencyKey: input.idempotencyKey });
     });
     commitSnapshot({ ...snapshotRef.current, sessions: [...snapshotRef.current.sessions.filter((item) => item.id !== session.id), session] });
     setSelectedId(session.id); setNotice("Session created."); return session;
@@ -794,6 +798,16 @@ export function useCockpit() {
 
   const closeSelected = useCallback(async () => { const id = selectedId; setSelectedId(null); if (id) await releaseSessionWriter(id); }, [releaseSessionWriter, selectedId, setSelectedId]);
   const completeWorkspacePath = useCallback((hostId: string, path: string) => api ? api.completeDirectories(hostId, path) : Promise.resolve([]), [api]);
+  const loadGitContext = useCallback((hostId: string, path: string): Promise<WorkspaceGitContext> => {
+    if (!api) return Promise.resolve({ status: "unavailable", reason: "The cockpit is offline." } as const);
+    return api.gitContext(hostId, path);
+  }, [api]);
+  const createWorktree = useCallback(async (input: { hostId: string; repoRoot: string; name: string }) => {
+    if (!api || !mutationsReady) throw new Error("Reconnect before creating a worktree.");
+    const workspace = await withBusy("create", () => api.createWorktree(input));
+    setWorkspaces((current) => [workspace, ...current.filter((item) => item.id !== workspace.id)]);
+    return workspace;
+  }, [api, mutationsReady, withBusy]);
   const loadPreview = useCallback((session: SessionView): Promise<PanePreview> => { if (!api) throw new Error("The cockpit is offline."); return api.preview(session.id); }, [api]);
   const loadAttach = useCallback((session: SessionView): Promise<AttachInstruction> => { if (!api) throw new Error("The cockpit is offline."); return api.attach(session.id); }, [api]);
   const loadAttentionDetails = useCallback((
@@ -856,8 +870,8 @@ export function useCockpit() {
     clearNotice: () => setNotice(null), actionError, clearActionError: () => setActionError(null),
     refresh, retryConnection: recoverBrowserSession, controlConflict: selectedSession ? controlConflicts[selectedSession.id] : undefined,
     takeOverControl, hasBusyAction: Object.values(busy).some(Boolean),
-    sendMessage, respond, interrupt, setProfile, setModel, setEffort, removeQueued, resumeInWeb, lifecycleAction, openEditor, takeCliControl, cancelCliTakeover, retryControl,
-    addHost, removeHost, createSession, completeWorkspacePath, loadPreview, loadAttach, loadAttentionDetails, loadTodoDetail, searchTranscript, loadWorkspaceFiles, loadSettingsOptions, loadProviderSettingsOptions, loadSessionFacts, loadPlanFile, loadSetup, applySetupHook, outbox, offlineReview,
+    sendMessage, respond, interrupt, setProfile, setSandbox, setModel, setEffort, removeQueued, resumeInWeb, lifecycleAction, openEditor, takeCliControl, cancelCliTakeover, retryControl,
+    addHost, removeHost, createSession, createWorktree, completeWorkspacePath, loadGitContext, loadPreview, loadAttach, loadAttentionDetails, loadTodoDetail, searchTranscript, loadWorkspaceFiles, loadSettingsOptions, loadProviderSettingsOptions, loadSessionFacts, loadPlanFile, loadSetup, applySetupHook, outbox, offlineReview,
     dismissOfflineReview: (id: string) => setOfflineReview((items) => items.filter((item) => item.id !== id)),
   };
 }

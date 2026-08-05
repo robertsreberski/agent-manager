@@ -9,9 +9,12 @@ import {
   type WorkspaceIdentity,
 } from "../../core/worktree.ts";
 import {
+  DEFAULT_SANDBOX_POLICY,
   providerControlCoordination,
   providerEffort,
+  sandboxEquals,
   sessionRecordId,
+  type SandboxPolicy,
 } from "../../shared/session.ts";
 import { sessionSettingsOptionsSchema } from "../../server/contracts.ts";
 import type {
@@ -45,6 +48,7 @@ import {
 interface ManagedMetadata {
   name: string | null;
   requestedProfile: CreateSessionInput["profile"];
+  requestedSandbox: SandboxPolicy;
   createdAt: string;
   creationIssue: CodexManagedCreationIssue | null;
   workspaceId: string;
@@ -98,6 +102,7 @@ const UNLOADED_CAPABILITIES: SessionView["control"]["withheld"][number]["capabil
   "interrupt",
   "respond",
   "set-profile",
+  "set-sandbox",
   "set-model",
   "set-effort",
   "remove-queued",
@@ -279,6 +284,7 @@ function mappedCapabilities(
       controls.has("request.respond")) result.push("respond");
   if (!state.activeTurnId && state.status !== "running") {
     if (controls.has("profile.set")) result.push("set-profile");
+    if (controls.has("sandbox.set")) result.push("set-sandbox");
     if (controls.has("model.set")) result.push("set-model");
     if (controls.has("effort.set")) result.push("set-effort");
     if (controls.has("thread.archive")) result.push("archive");
@@ -295,7 +301,7 @@ function withheldCapabilities(
   state: CodexThreadState,
 ): SessionView["control"]["withheld"] {
   if (state.activeTurnId || state.status === "running") {
-    return ["set-profile", "set-model", "set-effort", "archive", "delete"].map(
+    return ["set-profile", "set-sandbox", "set-model", "set-effort", "archive", "delete"].map(
       (capability) => ({
         capability: capability as SessionView["control"]["withheld"][number]["capability"],
         reason: "Available when the Codex turn is idle",
@@ -567,6 +573,9 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     context.signal.throwIfAborted();
     let state: CodexThreadState;
     let creationIssue: CodexManagedCreationIssue | null = null;
+    // The profile decides only whether Codex asks before acting. What it may
+    // reach is the operator's separate choice, and defaults to containment.
+    const sandbox = input.sandbox ?? DEFAULT_SANDBOX_POLICY;
     try {
       state = await this.adapter.startThread({
         cwd,
@@ -576,9 +585,7 @@ export class CodexProviderBridge implements ProviderControlAdapter {
         ...(input.effort ? { effort: input.effort } : {}),
         initialMessage: input.initialMessage,
         approvalPolicy: input.profile === "full-access" ? "never" : "on-request",
-        sandbox: input.profile === "full-access"
-          ? "danger-full-access"
-          : "workspace-write",
+        sandbox,
       });
     } catch (error) {
       if (!(error instanceof CodexManagedCreationError)) throw error;
@@ -591,6 +598,7 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     this.#metadata.set(state.threadId, {
       name: input.name ?? null,
       requestedProfile: input.profile,
+      requestedSandbox: sandbox,
       createdAt: this.#now().toISOString(),
       creationIssue,
       workspaceId: input.workspaceId,
@@ -659,9 +667,12 @@ export class CodexProviderBridge implements ProviderControlAdapter {
       await this.adapter.releaseThread(threadId);
       context.signal.throwIfAborted();
 
+      // An unproven sandbox is contained, never assumed to be what it was.
+      const sandbox = session.sandbox.value ?? DEFAULT_SANDBOX_POLICY;
       const metadata: ManagedMetadata = {
         name: session.name,
         requestedProfile: profile,
+        requestedSandbox: sandbox,
         createdAt: session.startedAt ?? this.#now().toISOString(),
         creationIssue: null,
         workspaceId: context.workspace.id,
@@ -684,6 +695,7 @@ export class CodexProviderBridge implements ProviderControlAdapter {
       context.signal.throwIfAborted();
 
       if (adopted.profile !== profile) await this.adapter.setProfile(threadId, profile);
+      if (!sandboxEquals(adopted.sandbox, sandbox)) await this.adapter.setSandbox(threadId, sandbox);
       if (session.model.value && adopted.model !== session.model.value) {
         await this.adapter.setModel(threadId, session.model.value);
       }
@@ -698,9 +710,13 @@ export class CodexProviderBridge implements ProviderControlAdapter {
         || confirmed.treeId !== read.treeId
         || confirmed.parentThreadId !== read.parentThreadId
         || confirmed.profile !== profile
+        // A sandbox whose update fell back to next-turn delivery is still
+        // pending rather than wrong, so a staged request counts as applied.
+        || !(sandboxEquals(confirmed.sandbox, sandbox)
+          || sandboxEquals(confirmed.pendingSettings?.sandbox ?? null, sandbox))
         || (session.model.value !== null && confirmed.model !== session.model.value)
         || (session.effort.value !== null && confirmed.effort !== session.effort.value)
-      ) throw new Error("Codex adoption did not preserve the confirmed profile, model, effort, or identity");
+      ) throw new Error("Codex adoption did not preserve the confirmed profile, sandbox, model, effort, or identity");
 
       await this.#resolveWorkspaceIdentity(confirmed.cwd);
       context.signal.throwIfAborted();
@@ -793,6 +809,7 @@ export class CodexProviderBridge implements ProviderControlAdapter {
         this.#metadata.set(record.providerThreadId, {
           name: record.name,
           requestedProfile: record.profile,
+          requestedSandbox: record.sandbox ?? DEFAULT_SANDBOX_POLICY,
           createdAt: record.createdAt,
           creationIssue: null,
           workspaceId: record.workspaceId,
@@ -1076,6 +1093,9 @@ export class CodexProviderBridge implements ProviderControlAdapter {
       case "set-profile":
         await this.adapter.setProfile(session.providerThreadId, action.profile);
         return { status: "succeeded", result: { profile: action.profile } };
+      case "set-sandbox":
+        await this.adapter.setSandbox(session.providerThreadId, action.sandbox);
+        return { status: "succeeded", result: { sandbox: action.sandbox } };
       case "set-model":
         await this.adapter.setModel(session.providerThreadId, action.model);
         return { status: "succeeded", result: { model: action.model } };
@@ -1190,6 +1210,7 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     const metadata = this.#metadata.get(state.threadId) ?? {
       name: null,
       requestedProfile: "plan" as const,
+      requestedSandbox: DEFAULT_SANDBOX_POLICY,
       createdAt: this.#now().toISOString(),
       creationIssue: null,
       workspaceId: "",
@@ -1265,6 +1286,14 @@ export class CodexProviderBridge implements ProviderControlAdapter {
         providerValue: state.profile,
         source: "provider-api",
         confidence: state.profile === null ? "heuristic" : "exact",
+      },
+      sandbox: {
+        value: state.sandbox,
+        providerValue: state.sandbox
+          ? `${state.sandbox.mode};network=${String(state.sandbox.networkAccess)}`
+          : null,
+        source: "provider-api",
+        confidence: state.sandbox === null ? "heuristic" : "exact",
       },
       model: {
         value: state.model,

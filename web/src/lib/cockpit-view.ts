@@ -4,10 +4,13 @@ import type {
   ExecutionProfile as SharedExecutionProfile,
   Provider,
   ReasoningEffort,
+  SandboxPolicy,
   SessionControl,
   SessionRecord,
   WorkspaceIdentity,
 } from "@shared/session";
+
+export type { SandboxPolicy } from "@shared/session";
 
 export type CockpitProvider = Provider;
 export type ExecutionProfile = SharedExecutionProfile;
@@ -52,6 +55,8 @@ export interface CockpitSessionView {
   updatedAt: string | null;
   control: SessionControlView;
   profile: ExecutionProfile | null;
+  /** Null for Claude, which has no sandbox, and for an unproven Codex one. */
+  sandbox: SandboxPolicy | null;
   model: string | null;
   effort: ReasoningEffort | null;
   todo: TodoProgressView | null;
@@ -82,6 +87,7 @@ export function toCockpitSessionView(
     updatedAt: record.updatedAt,
     control: record.control,
     profile: record.profile.value,
+    sandbox: record.sandbox.value,
     model: record.model.value,
     effort: record.effort.value,
     todo: record.todoProgress ? {

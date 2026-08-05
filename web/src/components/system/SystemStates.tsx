@@ -78,7 +78,7 @@ export function SessionEndedState({
 }
 
 const CAPABILITY_SENTENCE: Record<SessionCapability, string> = {
-  queue: "Queue messages for the next turn", steer: "Steer the active turn", interrupt: "Stop the active turn", respond: "Answer exact questions and approvals", "set-profile": "Change the execution profile", "set-model": "Change the model", "set-effort": "Change reasoning effort", "remove-queued": "Remove queued messages", preview: "Preview the native terminal", attach: "Attach from a terminal", resume: "Resume the exact session in the web app", end: "End this managed run", archive: "Archive this thread", delete: "Delete this thread", "take-control": "Connect provider control to the web app", "cancel-take-control": "Cancel a pending control migration", "retry-control": "Retry provider control recovery", "open-editor": "Open changed files in the editor",
+  queue: "Queue messages for the next turn", steer: "Steer the active turn", interrupt: "Stop the active turn", respond: "Answer exact questions and approvals", "set-profile": "Change the execution profile", "set-sandbox": "Change the Codex sandbox while the thread is idle", "set-model": "Change the model", "set-effort": "Change reasoning effort", "remove-queued": "Remove queued messages", preview: "Preview the native terminal", attach: "Attach from a terminal", resume: "Resume the exact session in the web app", end: "End this managed run", archive: "Archive this thread", delete: "Delete this thread", "take-control": "Connect provider control to the web app", "cancel-take-control": "Cancel a pending control migration", "retry-control": "Retry provider control recovery", "open-editor": "Open changed files in the editor",
 };
 const ALL_CAPABILITIES = Object.keys(CAPABILITY_SENTENCE) as SessionCapability[];
 
@@ -133,6 +133,16 @@ function formatProfile(value: CockpitSessionView["profile"]): string {
     case "execute": return "Standard access";
     case "full-access": return "Full access";
     case null: return "Unknown";
+  }
+}
+
+function formatSandbox(value: CockpitSessionView["sandbox"]): string {
+  if (value === null) return "No sandbox";
+  switch (value.mode) {
+    case "read-only": return "Read-only sandbox";
+    case "danger-full-access": return "Full access sandbox";
+    case "workspace-write":
+      return `Workspace sandbox · network ${value.networkAccess ? "on" : "off"}`;
   }
 }
 
@@ -223,7 +233,7 @@ export function SessionCapabilityPanel({
           <Glyph size={14} strokeWidth={1.75} className={`shrink-0 ${state === "offered" ? "text-[var(--accent)]" : state === "withheld" ? "text-[var(--text-muted)]" : "text-[var(--warning)]"}`} aria-label={state === "offered" ? "Available" : state === "withheld" ? "Unavailable" : "Unknown"} />
           <span className={`min-w-0 flex-1 text-[13.5px] leading-[1.5] ${state === "withheld" ? "text-[var(--text-secondary)]" : ""}`}>{capabilitySentence(session, capability)}{withheld.get(capability) && <span className="block text-code-sm text-[var(--text-muted)]">{withheld.get(capability)}</span>}</span>
         </li>;
-      })}</ul><div className="mt-3 flex flex-wrap items-center gap-2.5">{/* R4: the profile is merely a fact, so it is the neutral chip. */}<Badge tone="neutral" className="font-sans"><span className="sr-only">Execution profile · </span>{formatProfile(session.profile)}</Badge>{offered.has("set-profile") && <span className="font-mono text-code-sm leading-[1.4] text-[var(--text-muted)]">changeable mid-session</span>}</div></FactSection>
+      })}</ul><div className="mt-3 flex flex-wrap items-center gap-2.5">{/* R4: the profile is merely a fact, so it is the neutral chip. */}<Badge tone="neutral" className="font-sans"><span className="sr-only">Execution profile · </span>{formatProfile(session.profile)}</Badge>{session.provider === "codex" && <Badge tone="neutral" className="font-sans"><span className="sr-only">Sandbox · </span>{formatSandbox(session.sandbox)}</Badge>}{offered.has("set-profile") && <span className="font-mono text-code-sm leading-[1.4] text-[var(--text-muted)]">changeable mid-session</span>}</div></FactSection>
       <FactSection title="What this turn cost"><TurnFacts usage={facts?.turnUsage ?? null} factsStatus={factsStatus} />{account?.usage && <><Separator className="mt-3" /><div className="pt-3"><p className="text-meta-sm"><span className="text-[var(--text-muted)]">Codex account</span>{account.usage.summary.lifetimeTokens !== null && <> · {formatTokens(account.usage.summary.lifetimeTokens)} lifetime tokens</>}{account.usage.summary.peakDailyTokens !== null && <> · {formatTokens(account.usage.summary.peakDailyTokens)} peak day</>}</p>{account.usage.recentDays.length > 0 && <ul className="mt-2 flex flex-wrap gap-2 font-mono text-eyebrow tracking-normal text-[var(--text-muted)]" aria-label="Recent account token usage">{account.usage.recentDays.slice(-7).map((day) => <li key={day.date}>{day.date.slice(5)} · {formatTokens(day.tokens)}</li>)}</ul>}</div></>}{account?.rateLimits && account.rateLimits.length > 0 && <><Separator className="mt-3" /><ul className="grid gap-2 pt-3">{account.rateLimits.map((limit, index) => <li key={`${limit.label ?? "limit"}:${index}`} className="text-meta-sm"><span className="font-medium">{limit.label ?? "Codex limit"}</span>{limit.planType && <span className="ml-2 text-[var(--text-muted)]">{formatPlan(limit.planType)}</span>}{limit.primary && <span className="block font-mono text-code-xs text-[var(--text-muted)]">Primary · {rateWindow(limit.primary)}</span>}{limit.secondary && <span className="block font-mono text-code-xs text-[var(--text-muted)]">Secondary · {rateWindow(limit.secondary)}</span>}{limit.spendControlReached === true && <span className="block text-[var(--warning)]">Account spend control reached</span>}</li>)}</ul></>}{facts?.account.available === false && facts.account.reason === "provider-unavailable" && <p className="mt-3 text-code-sm text-[var(--text-muted)]">Codex account facts are temporarily unavailable.</p>}</FactSection>
       <Collapsible data-advanced-cli-access>
         <CollapsibleTrigger data-compact-control className="group flex min-h-9 w-full cursor-pointer items-center gap-2 border-t border-[var(--border-hairline)] pt-3 text-left font-mono text-code-sm text-[var(--text-muted)]">

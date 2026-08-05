@@ -14,8 +14,11 @@ import {
   type SelectedSessionFactsResponse,
 } from "../../../src/shared/session-facts.ts";
 import {
+  gitContextResponseSchema,
   workspaceListResponseSchema,
   workspaceResolutionResponseSchema,
+  worktreeCreationResponseSchema,
+  type WorkspaceGitContext,
 } from "../../../src/shared/workspace.ts";
 import {
   setupHookApplyResponseSchema,
@@ -508,6 +511,30 @@ export class CockpitApi {
       paths: z.array(z.string()),
     }).strict(), result, "directory completion");
     return parsed.paths;
+  }
+
+  async gitContext(hostId: string, path: string): Promise<WorkspaceGitContext> {
+    const result = await this.request<unknown>(
+      `/api/v1/hosts/${encodeURIComponent(hostId)}/git-context?path=${encodeURIComponent(path)}`,
+    );
+    return parseResponse(gitContextResponseSchema, result, "git context").context;
+  }
+
+  async createWorktree(input: { hostId: string; repoRoot: string; name: string }): Promise<WorkspaceOption> {
+    const result = await this.request<unknown>("/api/v1/worktrees", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+    const { workspace } = parseResponse(worktreeCreationResponseSchema, result, "worktree");
+    return {
+      id: workspace.id,
+      label: workspace.label,
+      path: workspace.path,
+      hostId: workspace.hostId,
+      hostLabel: workspace.hostLabel,
+      hostKind: workspace.hostKind,
+      temporary: false,
+    };
   }
 
   async resolveWorkspace(hostId: string, path: string): Promise<WorkspaceOption> {

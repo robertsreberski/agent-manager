@@ -77,7 +77,7 @@ The previous emerald primary is retired entirely (spec 13).
 | --- | --- | --- |
 | lime | wants you; operator's own primary action | any other status |
 | amber | warning; uncommitted changes | errors |
-| orange | non-standard access | warnings |
+| orange | non-standard access: the `full-access` profile and the `danger-full-access` sandbox, each stated once on the control that sets it | warnings |
 | red | danger; outside the workspace; failed | anything routine |
 | violet | remote host; subagent | local anything |
 | green | added lines | success generally |

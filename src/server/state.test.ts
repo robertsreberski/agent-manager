@@ -4,6 +4,7 @@ import test from "node:test";
 import { observeOnlyControl, type SessionRecord } from "../shared/session.ts";
 import { AGENT_MANAGER_BUILD_ID, WIRE_SCHEMA_VERSION } from "../shared/wire.ts";
 import { SessionStateStore } from "./state.ts";
+import { unknownSandbox } from "../shared/session.ts";
 
 function strictSession(overrides: Partial<SessionRecord> = {}): SessionRecord {
   return {
@@ -31,6 +32,7 @@ function strictSession(overrides: Partial<SessionRecord> = {}): SessionRecord {
     statusSource: "transcript",
     source: "fixture",
     profile: { value: null, providerValue: null, source: "inferred", confidence: "heuristic" },
+    sandbox: unknownSandbox(),
     model: { value: null, providerValue: null, source: "inferred", confidence: "heuristic" },
     effort: { value: null, providerValue: null, source: "inferred", confidence: "heuristic" },
     todoProgress: null,

@@ -34,11 +34,12 @@ import {
   canAttemptDraftCreation,
   DraftThread,
   draftIdempotencyKey,
+  draftLaunchPath,
   draftReducer,
   newDraftSession,
   type DraftAction,
   type DraftSession,
-  type DraftWorkspace,
+  type DraftWorkspaceInput,
 } from "./components/composer";
 import { DiffReview, diffIdentityKey, fileChangeIsUpserting, relativeEditorPath, type FileChangeView } from "./components/diffs";
 import {
@@ -136,7 +137,7 @@ function drawerFacts(session: SessionView, remote: boolean) {
   ].filter((fact): fact is NonNullable<typeof fact> => fact !== null);
 }
 
-function workspaceForColumn(column: BoardColumn): DraftWorkspace | undefined {
+function workspaceForColumn(column: BoardColumn): DraftWorkspaceInput | undefined {
   const group = column.worktrees[0];
   if (!group) return undefined;
   const path = group.identity?.worktreePath ?? (group.key === "unknown" ? null : group.key);
@@ -542,7 +543,7 @@ export default function App() {
   const [notificationSettingsOpen, setNotificationSettingsOpen] = useState(false);
   const [notificationPreferences, setNotificationPreferences] = useState<ClientNotificationPreferences>(loadNotificationPreferences);
   const [firstRunStep, setFirstRunStep] = useState<"folder" | "hooks" | "ssh">("folder");
-  const [pendingFirstWorkspace, setPendingFirstWorkspace] = useState<DraftWorkspace | null>(null);
+  const [pendingFirstWorkspace, setPendingFirstWorkspace] = useState<DraftWorkspaceInput | null>(null);
   const [setupFacts, setSetupFacts] = useState<SetupFactsState>(null);
   const [setupOpen, setSetupOpen] = useState(false);
   const setupLoadStarted = useRef(false);
@@ -845,7 +846,7 @@ export default function App() {
     setDraft(null);
     cockpit.setSelectedId(session.id);
   }, [cockpit]);
-  const openDraft = useCallback((workspace?: DraftWorkspace) => {
+  const openDraft = useCallback((workspace?: DraftWorkspaceInput) => {
     void cockpit.closeSelected();
     setDraft(newDraftSession(workspace ? { workspace } : {}));
   }, [cockpit]);
@@ -871,15 +872,29 @@ export default function App() {
   const firstSend = useCallback(async () => {
     if (!draft || !canAttemptDraftCreation(draft) || !draft.workspace) return;
     const current = draft;
-    const workspace = draft.workspace;
+    let workspace = draft.workspace;
     dispatchDraft({ type: "creating" });
     try {
+      if (workspace.worktree.kind === "new") {
+        // Creating the worktree is its own step: one that succeeds before a
+        // failed session create leaves a worktree the retry reuses.
+        const created = await cockpit.createWorktree({
+          hostId: workspace.hostId,
+          repoRoot: workspace.worktree.repoRoot,
+          name: workspace.worktree.name,
+        });
+        const worktree = { kind: "existing" as const, path: created.path, branch: workspace.worktree.name };
+        dispatchDraft({ type: "worktree-created", path: created.path, branch: workspace.worktree.name });
+        workspace = { ...workspace, worktree };
+      }
       await cockpit.createSession({
         hostId: workspace.hostId,
-        workspacePath: workspace.path,
+        workspacePath: draftLaunchPath(workspace),
         provider: current.provider,
         initialMessage: current.text.trim(),
         profile: current.profile,
+        // The sandbox is a Codex containment setting; Claude has none to send.
+        sandbox: current.provider === "codex" ? current.sandbox : null,
         model: current.model,
         effort: current.effort,
         idempotencyKey: draftIdempotencyKey(current),
@@ -1186,6 +1201,7 @@ export default function App() {
             onSend={(text, delivery) => cockpit.sendMessage(selected, text, delivery)}
             onInterrupt={() => cockpit.interrupt(selected)}
             onSetProfile={(profile) => cockpit.setProfile(selected, profile)}
+            onSetSandbox={(sandbox) => cockpit.setSandbox(selected, sandbox)}
             onSetModel={(model) => cockpit.setModel(selected, model)}
             onSetEffort={(effort) => cockpit.setEffort(selected, effort)}
             modelOptions={selectedModelCatalog.models}
@@ -1219,7 +1235,7 @@ export default function App() {
             sessionsOnHost={selectedSessionsOnHost}
             onContinueInWorkspace={() => openDraft({ hostId: selected.hostId, path: selected.workspaceIdentity?.worktreePath ?? selected.cwd ?? "" })}
             onRetryActivity={() => setActivityRetryGeneration((generation) => generation + 1)}
-          /> : draft ? <DraftThread draft={draft} hosts={cockpit.hosts} workspaces={cockpit.workspaces} busy={Boolean(cockpit.busy.create)} mutationsReady={cockpit.mutationsReady} modelOptions={draftModelCatalog.models} modelOptionsStatus={draftModelCatalog.status} {...(draftModelCatalog.effortOptions !== undefined ? { effortOptions: draftModelCatalog.effortOptions } : {})} dispatch={dispatchDraft} onFirstSend={firstSend} /> : null}
+          /> : draft ? <DraftThread draft={draft} hosts={cockpit.hosts} workspaces={cockpit.workspaces} busy={Boolean(cockpit.busy.create)} mutationsReady={cockpit.mutationsReady} modelOptions={draftModelCatalog.models} modelOptionsStatus={draftModelCatalog.status} {...(draftModelCatalog.effortOptions !== undefined ? { effortOptions: draftModelCatalog.effortOptions } : {})} dispatch={dispatchDraft} onFirstSend={firstSend} onCompletePath={cockpit.completeWorkspacePath} onLoadGitContext={cockpit.loadGitContext} /> : null}
         </ThreadDrawer>
         )}</SessionRuntimeProvider>
       </div>

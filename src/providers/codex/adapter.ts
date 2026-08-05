@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
 
 import type { ActivityMutation } from "../../activity/index.ts";
+import { sandboxEquals, sandboxPolicy, type SandboxPolicy } from "../../shared/session.ts";
 import {
   codexAccountFacts,
   parseCodexAccountRateLimits,
@@ -72,6 +73,7 @@ const ALL_CONTROLS: readonly CodexControlCapability[] = [
   "turn.interrupt",
   "request.respond",
   "profile.set",
+  "sandbox.set",
   "model.set",
   "effort.set",
   "native.attach",
@@ -88,6 +90,7 @@ interface InternalThreadState {
   model: string | null;
   effort: CodexReasoningEffort | null;
   profile: CodexExecutionProfile | null;
+  sandbox: SandboxPolicy | null;
   status: CodexThreadStatus;
   activeTurnId: string | null;
   /**
@@ -115,6 +118,7 @@ interface InternalThreadState {
 interface DetachedThreadFacts {
   queue: CodexQueuedMessage[];
   profile: CodexExecutionProfile | null;
+  sandbox: SandboxPolicy | null;
   pendingSettings: CodexPendingSettings | null;
   nextTurnOverrides: JsonObject | null;
 }
@@ -224,57 +228,76 @@ function codexThreadName(source: string | undefined): string | null {
     : `${points.slice(0, MAX_THREAD_NAME_CODE_POINTS - 1).join("").trimEnd()}…`;
 }
 
-function profileSettings(
+/**
+ * The approval half of a settings update: whether the harness asks before it
+ * acts, and in which collaboration mode. The profile decides only this. What
+ * an action may touch is the sandbox's business, and the two compose freely —
+ * "never ask" plus a read-only sandbox is a coherent, and safe, request.
+ */
+function collaborationSettings(
   profile: CodexExecutionProfile,
-  cwd: string | null,
   model: string,
   effort: CodexReasoningEffort | null,
 ): JsonObject {
-  const collaborationMode = {
-    mode: providerMode(profile),
-    // Codex 0.146 models this as a complete `Settings` object, not a patch.
-    // Preserve the provider-selected defaults when the manager did not
-    // explicitly request a model or effort instead of inventing either one.
-    settings: {
-      model,
-      reasoning_effort: effort,
-      developer_instructions: null,
-    },
-  } satisfies JsonObject;
-  if (profile === "full-access") {
-    return {
-      collaborationMode,
-      approvalPolicy: "never",
-      sandboxPolicy: { type: "dangerFullAccess" },
-    };
-  }
   return {
-    collaborationMode,
-    approvalPolicy: "on-request",
-    sandboxPolicy: {
-      type: "workspaceWrite",
-      writableRoots: cwd ? [cwd] : [],
-      networkAccess: false,
+    collaborationMode: {
+      mode: providerMode(profile),
+      // Codex 0.146 models this as a complete `Settings` object, not a patch.
+      // Preserve the provider-selected defaults when the manager did not
+      // explicitly request a model or effort instead of inventing either one.
+      settings: {
+        model,
+        reasoning_effort: effort,
+        developer_instructions: null,
+      },
     },
+    approvalPolicy: profile === "full-access" ? "never" : "on-request",
   };
 }
 
-function settingsMatchProfile(
+/** The containment half: what the harness may reach, whatever it is allowed to do. */
+function sandboxSettings(sandbox: SandboxPolicy, cwd: string | null): JsonObject {
+  switch (sandbox.mode) {
+    case "read-only":
+      return { sandboxPolicy: { type: "readOnly" } };
+    case "danger-full-access":
+      return { sandboxPolicy: { type: "dangerFullAccess" } };
+    case "workspace-write":
+      return {
+        sandboxPolicy: {
+          type: "workspaceWrite",
+          writableRoots: cwd ? [cwd] : [],
+          networkAccess: sandbox.networkAccess,
+        },
+      };
+  }
+}
+
+function settingsMatchCollaboration(
   settings: Record<string, unknown>,
   profile: CodexExecutionProfile,
 ): boolean {
   const collaboration = isObject(settings.collaborationMode)
     ? settings.collaborationMode.mode
     : null;
-  const sandbox = isObject(settings.sandboxPolicy)
-    ? settings.sandboxPolicy.type
-    : null;
-  if (profile === "full-access") {
-    return collaboration === "default" &&
-      settings.approvalPolicy === "never" && sandbox === "dangerFullAccess";
+  const approval = profile === "full-access" ? "never" : "on-request";
+  return collaboration === providerMode(profile) && settings.approvalPolicy === approval;
+}
+
+/**
+ * The sandbox a settings payload actually describes, or null when the payload
+ * is silent or names something this build does not know. An unrecognized policy
+ * is never guessed at: an unknown sandbox and a permissive one must not look
+ * the same.
+ */
+function parseSandboxPolicy(value: unknown): SandboxPolicy | null {
+  if (!isObject(value)) return null;
+  switch (value.type) {
+    case "readOnly": return sandboxPolicy("read-only");
+    case "dangerFullAccess": return sandboxPolicy("danger-full-access");
+    case "workspaceWrite": return sandboxPolicy("workspace-write", value.networkAccess === true);
+    default: return null;
   }
-  return collaboration === providerMode(profile) &&
-    settings.approvalPolicy === "on-request" && sandbox === "workspaceWrite";
 }
 
 function normalizedThreadStatus(value: unknown): CodexThreadStatus {
@@ -548,7 +571,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
         cwd: options.cwd,
         model: options.model,
         approvalPolicy: options.approvalPolicy,
-        sandbox: options.sandbox,
+        sandbox: options.sandbox?.mode,
         permissions: options.permissions,
         historyMode: "paginated",
         threadSource: "agent-manager",
@@ -558,7 +581,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     this.#adoptedThreadIds.add(state.threadId);
     const thread = this.#requireThread(state.threadId);
 
-    if (options.profile || options.effort) {
+    if (options.profile || options.effort || options.sandbox) {
       const effectiveModel = options.model ?? thread.model;
       const effectiveEffort = options.effort ?? thread.effort;
       let requestedProfileSettings: JsonObject = {};
@@ -571,9 +594,8 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
             initialMessageDisposition: "not-sent",
           });
         }
-        requestedProfileSettings = profileSettings(
+        requestedProfileSettings = collaborationSettings(
           options.profile,
-          state.cwd,
           effectiveModel,
           effectiveEffort,
         );
@@ -581,10 +603,12 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
       try {
         await this.#updateSettings(state.threadId, withoutUndefined({
           ...requestedProfileSettings,
+          ...(options.sandbox ? sandboxSettings(options.sandbox, state.cwd) : {}),
           model: options.model,
           effort: options.effort,
         }), {
           ...(options.profile ? { profile: options.profile } : {}),
+          ...(options.sandbox ? { sandbox: options.sandbox } : {}),
           ...(options.model ? { model: options.model } : {}),
           ...(options.effort ? { effort: options.effort } : {}),
         });
@@ -687,7 +711,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
         cwd: options.cwd,
         model: options.model,
         approvalPolicy: options.approvalPolicy,
-        sandbox: options.sandbox,
+        sandbox: options.sandbox?.mode,
         permissions: options.permissions,
         // The experimental 0.146 runtime honors this schema-omitted flag for
         // both legacy and paginated histories. Selection needs identity and
@@ -946,13 +970,14 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
       });
     }
     if (
-      retained.length === 0 && state.profile === null
+      retained.length === 0 && state.profile === null && state.sandbox === null
       && state.pendingSettings === null && state.nextTurnOverrides === null
     ) return;
     this.#detachedThreads.delete(threadId);
     this.#detachedThreads.set(threadId, {
       queue: retained.map(cloneQueueItem),
       profile: state.profile,
+      sandbox: state.sandbox,
       pendingSettings: state.pendingSettings,
       nextTurnOverrides: state.nextTurnOverrides,
     });
@@ -976,6 +1001,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     if (detached) {
       this.#detachedThreads.delete(threadId);
       state.profile ??= detached.profile;
+      state.sandbox ??= detached.sandbox;
       state.pendingSettings ??= detached.pendingSettings;
       if (detached.nextTurnOverrides) {
         state.nextTurnOverrides = {
@@ -1120,9 +1146,15 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     }
     await this.#updateSettings(
       threadId,
-      profileSettings(profile, state.cwd, state.model, state.effort),
+      collaborationSettings(profile, state.model, state.effort),
       { profile },
     );
+  }
+
+  async setSandbox(threadId: string, sandbox: SandboxPolicy): Promise<void> {
+    this.#assertControl("sandbox.set");
+    const state = this.#requireThread(threadId);
+    await this.#updateSettings(threadId, sandboxSettings(sandbox, state.cwd), { sandbox });
   }
 
   async setModel(threadId: string, model: string): Promise<void> {
@@ -1325,7 +1357,11 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
 
     const previousPending = state.pendingSettings;
     const previousOverrides = state.nextTurnOverrides;
+    // Settings are two independent axes now, so a sandbox change made while a
+    // profile change is still unconfirmed must not discard the profile's
+    // pending entry — both have to survive to be confirmed.
     state.pendingSettings = {
+      ...(previousPending ?? {}),
       ...pending,
       delivery: this.#settingsDelivery === "experimental-rpc"
         ? "experimental-rpc"
@@ -1350,7 +1386,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     } catch (error) {
       if (error instanceof CodexRpcError && error.code === -32601) {
         this.#settingsDelivery = "next-turn";
-        state.pendingSettings = { ...pending, delivery: "next-turn" };
+        state.pendingSettings = { ...(previousPending ?? {}), ...pending, delivery: "next-turn" };
         state.nextTurnOverrides = {
           ...(state.nextTurnOverrides ?? {}),
           ...providerSettings,
@@ -1435,6 +1471,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
         model: null,
         effort: null,
         profile: null,
+        sandbox: null,
         status: "unknown",
         activeTurnId: null,
         retiredTurnId: null,
@@ -1561,6 +1598,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
       model: state.model,
       effort: state.effort,
       profile: state.profile,
+      sandbox: state.sandbox,
       status: state.status,
       activeTurnId: state.activeTurnId,
       lastTurnStatus: state.lastTurnStatus,
@@ -1748,7 +1786,12 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
         state.model = stringField(settings, "model") ?? state.model;
         state.effort = stringField(settings, "effort") ?? state.effort;
         const pending = state.pendingSettings;
-        if (pending?.profile && settingsMatchProfile(settings, pending.profile)) {
+        // The sandbox is stated outright in every settings payload, so it is
+        // read directly rather than inferred from the profile it no longer
+        // travels with.
+        const observedSandbox = parseSandboxPolicy(settings.sandboxPolicy);
+        if (observedSandbox) state.sandbox = observedSandbox;
+        if (pending?.profile && settingsMatchCollaboration(settings, pending.profile)) {
           state.profile = pending.profile;
         } else if (isObject(settings.collaborationMode)) {
           const normalized = normalizedProfile(settings.collaborationMode.mode);
@@ -1760,10 +1803,11 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
         }
         if (pending) {
           const profileConfirmed = !pending.profile ||
-            settingsMatchProfile(settings, pending.profile);
+            settingsMatchCollaboration(settings, pending.profile);
+          const sandboxConfirmed = !pending.sandbox || sandboxEquals(observedSandbox, pending.sandbox);
           const modelConfirmed = !pending.model || state.model === pending.model;
           const effortConfirmed = !pending.effort || state.effort === pending.effort;
-          if (profileConfirmed && modelConfirmed && effortConfirmed) {
+          if (profileConfirmed && sandboxConfirmed && modelConfirmed && effortConfirmed) {
             state.pendingSettings = null;
           }
         }

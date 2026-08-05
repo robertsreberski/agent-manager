@@ -57,6 +57,12 @@ function snapshot(): unknown {
         source: "inferred",
         confidence: "heuristic",
       },
+      sandbox: {
+        value: null,
+        providerValue: null,
+        source: "inferred",
+        confidence: "heuristic",
+      },
       model: {
         value: "gpt-5.6",
         providerValue: "gpt-5.6",
@@ -93,7 +99,7 @@ function snapshot(): unknown {
 
 test("parses the exact current wire epoch", () => {
   const parsed = parseStateSnapshot(snapshot());
-  assert.equal(parsed.schemaVersion, 5);
+  assert.equal(parsed.schemaVersion, 6);
   assert.equal(parsed.buildId, AGENT_MANAGER_BUILD_ID);
   assert.equal(parsed.sessions[0]?.providerThreadId, "thread-1");
   assert.equal(parsed.sessions[0]?.id, sessionRecordId("local", "codex", "thread-1"));
@@ -200,6 +206,7 @@ test("parses the server-issued graceful-stop confirmation phase", () => {
     requestedAt: "2026-08-04T10:00:00.000Z",
     deadlineAt: null,
     fallbackProfile: null,
+    fallbackSandbox: null,
     error: null,
   };
   assert.equal(

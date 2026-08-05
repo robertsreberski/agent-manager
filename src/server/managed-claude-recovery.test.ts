@@ -17,6 +17,7 @@ import type {
 import { ManagerDatabase } from "./persistence.ts";
 import { createAgentManagerServer } from "./server.ts";
 import { SessionStateStore } from "./state.ts";
+import { unknownSandbox } from "../shared/session.ts";
 
 const createdAt = "2026-08-05T08:00:00.000Z";
 
@@ -46,6 +47,7 @@ function persistClaude(
 
 function recoveredView(record: ManagedSessionRecoveryRecord): SessionView {
   return {
+    sandbox: unknownSandbox(),
     id: record.managerSessionId,
     provider: "claude",
     providerThreadId: record.providerThreadId,

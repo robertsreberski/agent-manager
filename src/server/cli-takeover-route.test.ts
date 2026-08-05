@@ -5,6 +5,7 @@ import type { SessionView } from "../core/types.ts";
 import {
   observeOnlyControl,
   providerControlCoordination,
+  unknownSandbox,
 } from "../shared/session.ts";
 import type {
   ActionDispatchResult,
@@ -50,6 +51,7 @@ function session(overrides: Partial<SessionView> = {}): SessionView {
     statusSource: "process",
     source: "fixture",
     profile: { value: null, providerValue: null, source: "inferred", confidence: "heuristic" },
+    sandbox: unknownSandbox(),
     model: { value: "gpt-test", providerValue: "gpt-test", source: "provider-cli", confidence: "exact" },
     effort: { value: "high", providerValue: "high", source: "provider-cli", confidence: "exact" },
     todoProgress: null,

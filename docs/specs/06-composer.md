@@ -20,17 +20,25 @@ The public settings are:
 - provider/harness: selectable only for a draft; immutable after creation;
 - model and effort: capability-derived and populated from the provider where possible;
 - `ExecutionProfile`: `ask-first | plan | execute | full-access`, applied through the one
-  `set-profile` action; and
+  `set-profile` action;
+- `SandboxPolicy`, Codex only: `read-only | workspace-write | danger-full-access` plus a network
+  toggle that only `workspace-write` can carry, applied through the one `set-sandbox` action; and
 - reset to the configured defaults for a draft or the next supported idle transition.
 
-There is no separate access field, `set-access`, two-value planning/execution mode, or provider
-permission/sandbox enum in browser state.
+The profile and the sandbox are two axes of one decision and neither implies the other: the
+profile decides whether the harness asks before it acts, the sandbox decides what acting can
+reach. They compose freely — never-ask with a read-only sandbox is a coherent request — so
+`full-access` no longer forces a permissive sandbox, and a permissive sandbox is not read back as
+`full-access`. Claude has no sandbox: it renders no control at all, because an unavailable setting
+and a nonexistent one are different facts. There is still no separate access field, `set-access`,
+or two-value planning/execution mode, and raw provider policy strings never render.
 
 `full-access` is stated **once**, orange, on the profile control that changes it — its trigger
-label and its menu item. There is no derived access chip beside the control and no profile chip
-in the drawer header: the same fact rendered three times reads as decoration, which is the one
-thing an alarm colour cannot afford. The Session facts panel still states the profile neutrally,
-because that panel is a full inventory rather than an alert.
+label and its menu item — and `danger-full-access` likewise once on the sandbox control. There is
+no derived access chip beside either control and no profile chip in the drawer header: the same
+fact rendered three times reads as decoration, which is the one thing an alarm colour cannot
+afford. The Session facts panel still states the profile and sandbox neutrally, because that panel
+is a full inventory rather than an alert.
 
 ### Live settings
 
@@ -83,15 +91,25 @@ honest statement of a withheld capability.
 
 ## Draft sessions
 
-- Header **New thread** creates a client draft and asks for one host/workspace path using the
-  existing bounded resolver. **New thread here** inherits host, repository, and worktree.
+- Header **New thread** creates a client draft and asks progressively, on one screen with the
+  composer always below it: a recently opened project or a typed path completed from bounded,
+  server-confirmed directory suggestions; then, once that path resolves to a repository, where in
+  it to run — an existing worktree, a new one, or none. **New thread here** inherits host,
+  repository, and worktree.
+- A folder that is not a repository has nothing to ask, so no worktree control appears at all. A
+  host that cannot manage worktrees says so plainly instead of offering one that cannot work.
+- A new worktree is always based on the repository's default branch and named once, for both the
+  directory and its branch (see `04-workspace-model.md`). There is no branch step: choosing no
+  worktree runs in the folder exactly as given.
 - A draft has no server/provider ID. It opens the normal drawer with an empty timeline and
-  focused composer; provider/model/effort/profile are local create parameters.
-- First send performs one persisted-idempotent `POST /sessions` containing create parameters and
-  the initial prompt, then replaces the draft with the returned session.
+  focused composer; provider/model/effort/profile/sandbox are local create parameters.
+- First send creates the worktree, when one was requested, through its own explicit call before
+  performing one persisted-idempotent `POST /sessions` containing create parameters and the
+  initial prompt, then replaces the draft with the returned session.
 - Duplicate clicks/reconnects resolve to the same create attempt. `CREATE_OUTCOME_UNKNOWN`
   remains visible and is never retried silently; the operator explicitly starts a new attempt or
-  checks the provider.
+  checks the provider. A worktree that outlives a failed session create is durable: the draft
+  re-targets it, so a retry reuses it and never asks git for a second one under the same name.
 - No launch dialog, advanced-options block, or shadow session row survives.
 
 ## Writer coordination
@@ -112,11 +130,14 @@ must not resemble a connection or writer-coordination failure.
 
 1. Only the round action button is solid at rest; controls match frame 5a and are keyboard/focus
    accessible.
-2. One profile action replaces mode/access, full access applies immediately in orange, and raw
-   provider policy strings do not render.
-3. Claude settings use the real SDK methods; Codex settings are idle-only, provider-confirmed,
-   and fall back from the pinned experimental update to next-turn overrides.
-4. Draft first-send creation is idempotent and unknown outcomes are never silently retried.
+2. One profile action and one Codex sandbox action replace mode/access; full access and the danger
+   sandbox each apply immediately in orange on their own control, and raw provider policy strings
+   do not render.
+3. Claude settings use the real SDK methods and expose no sandbox control; Codex settings are
+   idle-only, provider-confirmed on each axis independently, and fall back from the pinned
+   experimental update to next-turn overrides carrying both axes at once.
+4. Draft first-send creation is idempotent and unknown outcomes are never silently retried; a
+   worktree created before a failed session create is reused rather than recreated.
 5. Queue/steer/interrupt preserve drafts on unsupported paths; queued items can be removed by
    stable server identity.
 6. Two writers produce a conflict/takeover flow without any routine lease UI or lost/replayed

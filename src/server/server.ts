@@ -26,7 +26,15 @@ import type {
   SessionRecord,
   SessionView,
 } from "../core/types.ts";
+import { unknownSandbox } from "../shared/session.ts";
 import { WorkspaceIdentityResolver } from "../core/worktree.ts";
+import {
+  createRepoWorktree,
+  detectDefaultBranch,
+  listRepoWorktrees,
+  WorktreeCreationError,
+  type CreatedWorktree,
+} from "../core/worktree-admin.ts";
 import {
   CodexHookBridge,
 } from "../providers/codex/codex-hook-bridge.ts";
@@ -66,7 +74,11 @@ import {
   type SessionControlRecovery,
 } from "../shared/session.ts";
 import { AGENT_MANAGER_BUILD_ID, WIRE_SCHEMA_VERSION } from "../shared/wire.ts";
-import { workspaceListResponseSchema } from "../shared/workspace.ts";
+import {
+  gitContextResponseSchema,
+  workspaceListResponseSchema,
+  worktreeCreationResponseSchema,
+} from "../shared/workspace.ts";
 import {
   DiscoveryReconciler,
   type DiscoveryReconcilerOptions,
@@ -79,8 +91,11 @@ import {
 import { AuthManager, type AuthManagerOptions, type AuthSession } from "./auth.ts";
 import {
   createSessionSchema,
+  createWorktreeSchema,
+  sandboxPolicySchema,
   directoryCompletionQuerySchema,
   executionProfileSchema,
+  gitContextQuerySchema,
   reasoningEffortSchema,
   leaseRequestSchema,
   requiredCapability,
@@ -151,7 +166,9 @@ import {
 import type { RemoteHostRegistry } from "./remote-host-registry.ts";
 import {
   localDirectoryCompletions,
+  resolveLocalWorkspacePath,
   workspaceFileCompletions,
+  workspaceLabel,
   resolveWorkspaceForHost,
   workspaceResolutionResponse,
 } from "./workspaces.ts";
@@ -628,6 +645,9 @@ function managedRecoveryRecords(database: ManagerDatabase, provider: Provider): 
       : null;
     const profile = executionProfileSchema.safeParse(persisted.metadata.profile);
     const effort = reasoningEffortSchema.nullable().safeParse(persisted.metadata.effort);
+    // Records written before the sandbox became its own setting have none;
+    // recovering them into containment is the honest default.
+    const sandbox = sandboxPolicySchema.nullable().safeParse(persisted.metadata.sandbox ?? null);
     const name = persisted.metadata.name;
     const model = persisted.metadata.model;
     const defaultOwnership = provider === "codex" ? "shared" : "manager-exclusive";
@@ -663,6 +683,7 @@ function managedRecoveryRecords(database: ManagerDatabase, provider: Provider): 
       && ownership.success
       && nativeOwner.success
       && managerControl.success
+      && sandbox.success
       && (provider === "codex"
         ? ownership.data === "shared"
           && nativeOwner.data === null
@@ -698,6 +719,7 @@ function managedRecoveryRecords(database: ManagerDatabase, provider: Provider): 
       workspacePath: workspace.path,
       name: name as string | null,
       profile: profile.data,
+      sandbox: sandbox.success ? sandbox.data : null,
       model: model as string | null,
       effort: effort.data,
       createdAt: persisted.createdAt,
@@ -721,6 +743,7 @@ const RECOVERY_WITHHELD_CAPABILITIES = [
   "interrupt",
   "respond",
   "set-profile",
+  "set-sandbox",
   "set-model",
   "set-effort",
   "remove-queued",
@@ -787,6 +810,8 @@ function managedRecoveryPlaceholder(
       source: "provider-api",
       confidence: "exact",
     },
+    // The recovering thread has not reported its sandbox yet.
+    sandbox: unknownSandbox(),
     model: {
       value: record.model ?? null,
       providerValue: record.model ?? null,
@@ -1268,6 +1293,9 @@ export async function createAgentManagerServer(
           ...(adoptedFromCli ? { adoptedFromCli: true } : {}),
           name: adopted.name,
           profile,
+          // What the adoption actually applied, which for an unproven
+          // sandbox is the conservative one rather than the original.
+          sandbox: adopted.sandbox.value,
           model: original.model.value,
           effort: original.effort.value,
           hostId: "local",
@@ -2904,6 +2932,140 @@ export async function createAgentManagerServer(
     });
   });
 
+  /*
+    What the draft screen needs to offer a worktree choice for a folder the
+    operator is still typing: whether it is a repository, what its worktrees
+    are, and what a new one would be based on. Read-only on purpose — a path
+    being inspected must not become a durable workspace row, which is why this
+    is not folded into `/workspaces/resolve`.
+  */
+  app.get("/api/v1/hosts/:id/git-context", {
+    config: { rateLimit: { max: 60, timeWindow: "1 minute" } },
+  }, async (request) => {
+    syncRemoteHostDefinitions();
+    const hostId = (request.params as { id?: string }).id ?? "";
+    const host = database.getHost(hostId);
+    if (!host) throw new ApiError(404, "HOST_NOT_FOUND", "host is not configured");
+    const query = gitContextQuerySchema.parse(request.query);
+    if (host.kind !== "local") {
+      return gitContextResponseSchema.parse({
+        hostId,
+        path: query.path,
+        context: { status: "unavailable", reason: "Worktrees are managed for local projects only." },
+      });
+    }
+
+    let canonical: string;
+    try {
+      canonical = resolveLocalWorkspacePath(query.path);
+    } catch {
+      // A half-typed path is the normal case here, not an error to report.
+      return gitContextResponseSchema.parse({
+        hostId,
+        path: query.path,
+        context: { status: "not-a-repo" },
+      });
+    }
+
+    const identity = await workspaceIdentityResolver.resolve(canonical);
+    if (!identity) {
+      return gitContextResponseSchema.parse({ hostId, path: canonical, context: { status: "not-a-repo" } });
+    }
+    const [worktrees, base] = await Promise.all([
+      listRepoWorktrees(identity.repoRoot),
+      detectDefaultBranch(identity.repoRoot),
+    ]);
+    return gitContextResponseSchema.parse({
+      hostId,
+      path: canonical,
+      context: {
+        status: "repo",
+        repoRoot: identity.repoRoot,
+        repoName: identity.repoName,
+        defaultBranch: base?.branch ?? null,
+        worktrees,
+      },
+    });
+  });
+
+  /*
+    The only route in the manager that writes to a repository. It creates one
+    worktree from the repository's default branch and registers it as a
+    workspace; it never removes, switches or reuses an existing one. A retry
+    that finds the worktree already there is refused rather than replayed, so
+    an ambiguous outcome is resolved by re-reading the repository.
+  */
+  app.post("/api/v1/worktrees", {
+    config: { rateLimit: { max: 10, timeWindow: "1 minute" } },
+  }, async (request, reply) => {
+    syncRemoteHostDefinitions();
+    const input = createWorktreeSchema.parse(request.body);
+    const authSession = requireSession(request);
+    const host = database.getHost(input.hostId);
+    if (!host) throw new ApiError(404, "HOST_NOT_FOUND", "host is not configured");
+    if (host.kind !== "local") {
+      throw new ApiError(409, "WORKTREES_UNAVAILABLE", "worktrees can only be created on this Mac");
+    }
+
+    let repoRoot: string;
+    try {
+      repoRoot = resolveLocalWorkspacePath(input.repoRoot);
+    } catch {
+      throw new ApiError(400, "REPO_ROOT_INVALID", "repository path is not an accessible directory");
+    }
+    const identity = await workspaceIdentityResolver.resolve(repoRoot);
+    if (!identity || identity.repoRoot !== repoRoot) {
+      throw new ApiError(400, "REPO_ROOT_INVALID", "path is not the root of a Git repository");
+    }
+
+    let created: CreatedWorktree;
+    try {
+      created = await createRepoWorktree({ repoRoot, name: input.name });
+    } catch (error) {
+      if (!(error instanceof WorktreeCreationError)) throw error;
+      const status = error.code === "NAME_INVALID"
+        ? 400
+        : error.code === "GIT_FAILED" || error.code === "TIMEOUT"
+          ? 502
+          : 409;
+      throw new ApiError(status, error.code, error.message);
+    }
+
+    // A new worktree changes what the repository's cached facts say.
+    workspaceIdentityResolver.invalidate();
+    const workspace = database.addWorkspace({
+      hostId: host.id,
+      label: workspaceLabel(created.path),
+      path: created.path,
+    });
+    try {
+      database.auditOperation({
+        actor: authSession.actor,
+        operation: "worktree.create",
+        targetId: workspace.id,
+        phase: "outcome",
+        outcome: "succeeded",
+        details: { hostId: host.id, repoRoot, branch: created.branch, baseBranch: created.baseBranch },
+      });
+    } catch {
+      state.addDiagnostic({
+        provider: "system",
+        level: "error",
+        message: `Worktree ${created.path} was created but its audit entry could not be persisted`,
+      });
+    }
+
+    void reply.status(201);
+    return worktreeCreationResponseSchema.parse({
+      workspace: {
+        ...workspace,
+        workspaceIdentity: await workspaceIdentityResolver.resolve(created.path, { selected: true }),
+      },
+      branch: created.branch,
+      baseBranch: created.baseBranch,
+    });
+  });
+
   app.get("/api/v1/workspaces", async () => workspaceListResponseSchema.parse({
     workspaces: database.listWorkspaces(),
   }));
@@ -3386,6 +3548,9 @@ export async function createAgentManagerServer(
           workspaceId: input.workspaceId,
           hostId: workspace.hostId,
           profile: input.profile,
+          sandbox: input.sandbox
+            ? `${input.sandbox.mode};network=${String(input.sandbox.networkAccess)}`
+            : null,
           model: input.model,
           effort: input.effort,
         },
@@ -3460,6 +3625,7 @@ export async function createAgentManagerServer(
             managerRequestId: begun.intent.managerRequestId,
             name: input.name ?? null,
             profile: input.profile,
+            sandbox: input.sandbox,
             model: input.model,
             effort: input.effort,
             hostId: workspace.hostId,
@@ -3494,6 +3660,9 @@ export async function createAgentManagerServer(
       );
     }
     const stored = state.upsert(withLocalEditorCapability(created, editorLauncher !== null));
+    // Recency is what the new-thread screen offers first, so it follows an
+    // actual session rather than every path that was merely resolved.
+    database.touchWorkspaceOpened(workspace.id, now);
     try {
       database.auditOperation({
         actor: authSession.actor,
@@ -3528,6 +3697,7 @@ export async function createAgentManagerServer(
         "interrupt",
         "respond",
         "set-profile",
+        "set-sandbox",
         "set-model",
         "set-effort",
         "remove-queued",

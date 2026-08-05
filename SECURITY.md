@@ -71,6 +71,12 @@ pre-prototype may cold-reset only its exact incompatible `config.json`, SQLite d
 sidecars, and obsolete browser caches. It never resets provider transcripts/settings/hooks,
 credentials, repositories, worktrees, tmux state, or the user's daemon.
 
+Creating a worktree from the new-thread screen is the one write this product makes to a
+repository: an authenticated, rate-limited, local-host-only `git worktree add -b` under
+`<repoRoot>/.worktrees/`, plus an append to `info/exclude`. The name is validated before any
+process is spawned and is argv-only with `shell: false`; an existing directory or branch is
+refused rather than replaced, and nothing here deletes a worktree, a branch, or history.
+
 Session creation/actions are idempotency-keyed before provider dispatch. Ambiguous outcomes are
 `unknown` and never replayed automatically. Audit records contain structural metadata, a payload
 digest, character count, and fixed summary—not prompt/answer/denial text or arbitrary provider

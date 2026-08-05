@@ -31,6 +31,7 @@ import {
   requestAttachStartedFromControlSocket,
 } from "./control-socket.ts";
 import { ManagerDatabase, type OperationalAuditInput } from "./persistence.ts";
+import { unknownSandbox } from "../shared/session.ts";
 import type { SessionTranscriptReader } from "./transcript.ts";
 
 const host = "127.0.0.1:43127";
@@ -109,6 +110,7 @@ function session(overrides: Partial<SessionView> = {}): SessionView {
       source: "provider-api",
       confidence: "exact",
     },
+    sandbox: unknownSandbox(),
     model: {
       value: "gpt-5.6",
       providerValue: "gpt-5.6",
@@ -1695,6 +1697,7 @@ test("proxies remote sessions through SSH and reserves takeover for a real write
     hostKind: "local",
     remoteWorkspaceId: null,
     createdAt: "2026-08-04T12:00:00.000Z",
+    lastOpenedAt: null,
     workspaceIdentity: null,
   };
   writeFileSync(fakeSsh, `#!/usr/bin/env node

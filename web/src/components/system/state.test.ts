@@ -99,7 +99,7 @@ describe("notification reducer", () => {
 });
 
 describe("offline outbox", () => {
-  const baseline: OutboxSessionState = { id: "codex:one", providerTurnId: "turn-1", profile: "execute", status: "running", exactRequestIds: [], capabilities: ["queue", "steer"], generation: 1 };
+  const baseline: OutboxSessionState = { id: "codex:one", providerTurnId: "turn-1", profile: "execute", sandbox: { mode: "workspace-write", networkAccess: false }, status: "running", exactRequestIds: [], capabilities: ["queue", "steer"], generation: 1 };
   const message: OfflineMessage = { id: "m", sessionId: baseline.id, text: "continue", delivery: "queue", idempotencyKey: "same", baseline, queuedAt: "2026-08-04T12:00:00Z" };
   it("refreshes only the generation when material state is unchanged", () => {
     expect(decideOfflineFlush(message, { ...baseline, generation: 8 })).toEqual({ kind: "send", generation: 8 });
@@ -107,6 +107,7 @@ describe("offline outbox", () => {
   it("returns text for review after every material boundary", () => {
     expect(decideOfflineFlush(message, { ...baseline, providerTurnId: "turn-2" })).toMatchObject({ kind: "review" });
     expect(decideOfflineFlush(message, { ...baseline, profile: "plan" })).toMatchObject({ kind: "review" });
+    expect(decideOfflineFlush(message, { ...baseline, sandbox: { mode: "danger-full-access", networkAccess: true } })).toMatchObject({ kind: "review" });
     expect(decideOfflineFlush(message, { ...baseline, exactRequestIds: ["q"] })).toMatchObject({ kind: "review" });
     expect(decideOfflineFlush(message, { ...baseline, status: "completed" })).toMatchObject({ kind: "review" });
     expect(decideOfflineFlush({

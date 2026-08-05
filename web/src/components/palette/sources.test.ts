@@ -30,6 +30,7 @@ function session(overrides: Partial<BoardSession> & Pick<BoardSession, "id">): B
       takeover: null,
     },
     profile: null,
+    sandbox: null,
     model: null,
     effort: null,
     todo: null,

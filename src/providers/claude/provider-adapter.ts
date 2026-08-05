@@ -37,7 +37,7 @@ import {
   CLAUDE_MANAGER_OWNER_ENV,
   CLAUDE_MANAGER_OWNER_VALUE,
 } from "../hooks/claude-source.ts";
-import { CLAUDE_REASONING_EFFORTS } from "../../shared/session.ts";
+import { CLAUDE_REASONING_EFFORTS, noSandbox } from "../../shared/session.ts";
 import {
   CLAUDE_CODE_VERSION,
   type ClaudeEffortLevel,
@@ -1083,6 +1083,10 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
         case "set-profile":
           await entry.session.setMode(profileMode(action.profile));
           return { status: "succeeded", result: { profile: action.profile } };
+        case "set-sandbox":
+          // Never reachable through the capability list; refused rather than
+          // silently accepted so a mistake stays visible.
+          return actionFailure("UNSUPPORTED_ACTION", "Claude has no sandbox setting");
         case "set-model":
           await entry.session.setModel(action.model);
           return { status: "succeeded", result: { model: action.model } };
@@ -1866,6 +1870,7 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
       });
     }
     withheld.push(
+      { capability: "set-sandbox", reason: "Claude has no sandbox setting" },
       { capability: "archive", reason: "Claude does not expose session archive" },
       { capability: "delete", reason: "Claude does not expose session deletion" },
     );
@@ -1900,6 +1905,9 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
         source: "provider-api",
         confidence: "exact",
       },
+      // Claude having no sandbox is a fact this adapter knows exactly, not a
+      // gap in what it could observe.
+      sandbox: noSandbox(),
       model: {
         value: snapshot.model,
         providerValue: snapshot.model,

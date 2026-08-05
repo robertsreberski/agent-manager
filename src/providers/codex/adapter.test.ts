@@ -23,6 +23,7 @@ import type {
   JsonRpcId,
   JsonValue,
 } from "./types.ts";
+import { sandboxPolicy, unknownSandbox } from "../../shared/session.ts";
 
 type RpcHandler = (params: JsonObject) => JsonValue | Promise<JsonValue>;
 
@@ -149,6 +150,7 @@ function threadResultWithIdentity(
 
 function externalCodexSession(): SessionView {
   return {
+    sandbox: unknownSandbox(),
     id: "local:codex:takeover-thread",
     provider: "codex",
     providerThreadId: "takeover-thread",
@@ -640,7 +642,7 @@ test("starts a managed thread, stages a plan profile, and dispatches initial inp
     profile: "plan",
     initialMessage: "Build the cockpit",
     approvalPolicy: "on-request",
-    sandbox: "workspace-write",
+    sandbox: sandboxPolicy("workspace-write"),
   });
   assert.equal(state.profile, null);
   assert.equal(state.pendingSettings?.profile, "plan");
@@ -702,7 +704,9 @@ test("uses the thread/start default model to stage a null-model managed create",
         },
       },
       approvalPolicy: "never",
-      sandboxPolicy: { type: "dangerFullAccess" },
+      // Full access is the approval axis alone: the sandbox stays contained
+      // unless the operator asked for a permissive one.
+      sandboxPolicy: { type: "workspaceWrite", writableRoots: ["/workspace"], networkAccess: false },
       effort: "medium",
     });
     return {};
@@ -720,6 +724,7 @@ test("uses the thread/start default model to stage a null-model managed create",
     workspaceId: "workspace",
     initialMessage: "Dispatch with the provider default model",
     profile: "full-access",
+    sandbox: null,
     model: null,
     effort: "medium",
     idempotencyKey: "provider-default-model",
@@ -1065,6 +1070,7 @@ test("shared bridge responses are submitted once and every losing peer gets a ty
     workspace: { id: "workspace", label: "Workspace", path: "/workspace" },
   };
   await bridge.createSession({
+    sandbox: null,
     provider: "codex",
     workspaceId: "workspace",
     name: "Shared response",
@@ -1403,6 +1409,7 @@ test("Codex MCP elicitation fails closed across SessionView and action dispatch"
     workspaceId: "workspace",
     initialMessage: "Start",
     profile: "plan",
+    sandbox: null,
     model: null,
     effort: null,
     idempotencyKey: "create-elicit-session",
@@ -1544,6 +1551,101 @@ test("method-not-found falls back to next-turn settings without optimistic state
   assert.equal(adapter.getThreadState("thread-1")?.pendingSettings?.profile, "plan");
   assert.equal(adapter.capabilities.controls.includes("profile.set"), true);
   assert.equal(adapter.capabilities.controls.includes("turn.queue"), true);
+  await adapter.dispose();
+});
+
+test("the sandbox is set on its own axis and confirmed independently of the profile", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("thread/start", () => threadResult());
+  transport.handlers.set("thread/settings/update", () => ({}));
+  await adapter.startThread({ cwd: "/workspace" });
+
+  await adapter.setSandbox("thread-1", sandboxPolicy("workspace-write", true));
+  assert.deepEqual(methodMessages(transport, "thread/settings/update").at(-1)?.params, {
+    threadId: "thread-1",
+    sandboxPolicy: { type: "workspaceWrite", writableRoots: ["/workspace"], networkAccess: true },
+  });
+
+  await adapter.setSandbox("thread-1", sandboxPolicy("read-only"));
+  assert.deepEqual(methodMessages(transport, "thread/settings/update").at(-1)?.params, {
+    threadId: "thread-1",
+    sandboxPolicy: { type: "readOnly" },
+  });
+  assert.equal(adapter.getThreadState("thread-1")?.sandbox, null, "nothing is applied until the provider confirms it");
+
+  transport.notify("thread/settings/updated", {
+    threadId: "thread-1",
+    threadSettings: {
+      cwd: "/workspace",
+      model: "gpt-5.6",
+      approvalPolicy: "on-request",
+      sandboxPolicy: { type: "readOnly" },
+      collaborationMode: { mode: "default", settings: { model: "gpt-5.6" } },
+    },
+  });
+  assert.deepEqual(adapter.getThreadState("thread-1")?.sandbox, sandboxPolicy("read-only"));
+  assert.equal(adapter.getThreadState("thread-1")?.pendingSettings, null);
+
+  // A permissive sandbox no longer implies full access; only never-ask does.
+  transport.notify("thread/settings/updated", {
+    threadId: "thread-1",
+    threadSettings: {
+      cwd: "/workspace",
+      model: "gpt-5.6",
+      approvalPolicy: "on-request",
+      sandboxPolicy: { type: "dangerFullAccess" },
+      collaborationMode: { mode: "default", settings: { model: "gpt-5.6" } },
+    },
+  });
+  assert.deepEqual(adapter.getThreadState("thread-1")?.sandbox, sandboxPolicy("danger-full-access"));
+  assert.notEqual(adapter.getThreadState("thread-1")?.profile, "full-access");
+  await adapter.dispose();
+});
+
+test("an unrecognized sandbox policy leaves the last known one rather than guessing", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("thread/start", () => threadResult());
+  transport.handlers.set("thread/settings/update", () => ({}));
+  await adapter.startThread({ cwd: "/workspace", sandbox: sandboxPolicy("read-only") });
+  transport.notify("thread/settings/updated", {
+    threadId: "thread-1",
+    threadSettings: { sandboxPolicy: { type: "readOnly" } },
+  });
+  assert.deepEqual(adapter.getThreadState("thread-1")?.sandbox, sandboxPolicy("read-only"));
+
+  transport.notify("thread/settings/updated", {
+    threadId: "thread-1",
+    threadSettings: { sandboxPolicy: { type: "somethingNewerThanThisBuild" } },
+  });
+  assert.deepEqual(
+    adapter.getThreadState("thread-1")?.sandbox,
+    sandboxPolicy("read-only"),
+    "an unknown policy must not be read as a permissive one",
+  );
+  await adapter.dispose();
+});
+
+test("a profile and a sandbox changed together both survive the next-turn fallback", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("thread/start", () => threadResult());
+  // No `thread/settings/update` handler: the RPC answers -32601 and both
+  // changes demote to next-turn overrides.
+  await adapter.startThread({ cwd: "/workspace" });
+  await adapter.setProfile("thread-1", "plan");
+  await adapter.setSandbox("thread-1", sandboxPolicy("danger-full-access"));
+
+  const pending = adapter.getThreadState("thread-1")?.pendingSettings;
+  assert.equal(pending?.profile, "plan", "the first pending change is not dropped by the second");
+  assert.deepEqual(pending?.sandbox, sandboxPolicy("danger-full-access"));
+
+  transport.handlers.set("turn/start", () => ({
+    turn: { id: "turn-overrides", status: "inProgress", items: [] },
+  }));
+  await adapter.queueMessage("thread-1", "Go");
+  const started = methodMessages(transport, "turn/start")[0]?.params as JsonObject;
+  assert.equal((started.collaborationMode as JsonObject).mode, "plan");
+  assert.equal(started.approvalPolicy, "on-request");
+  assert.deepEqual(started.sandboxPolicy, { type: "dangerFullAccess" });
   await adapter.dispose();
 });
 
@@ -2586,6 +2688,7 @@ test("bridge normalizes Codex effort facts without discarding unknown provider v
     workspaceId: "workspace",
     initialMessage: "Start",
     profile: "plan",
+    sandbox: null,
     model: null,
     effort: null,
     idempotencyKey: "create-effort-session",
@@ -2688,6 +2791,7 @@ test("ProviderControlAdapter bridge creates normalized sessions and streams chan
     name: "Cockpit builder",
     initialMessage: "Build it",
     profile: "plan",
+    sandbox: null,
     model: null,
     effort: null,
     idempotencyKey: "create-cockpit-builder",
@@ -2770,6 +2874,7 @@ test("ProviderControlAdapter surfaces an addressable recovery handle after mode 
     workspaceId: "workspace",
     initialMessage: "This must not be sent before mode is confirmed",
     profile: "plan",
+    sandbox: null,
     model: null,
     effort: null,
     idempotencyKey: "mode-recovery",
@@ -2870,6 +2975,7 @@ test("ProviderControlAdapter retains buffered live activity when turn acknowledg
     workspaceId: "workspace",
     initialMessage: "Run exactly once",
     profile: "execute",
+    sandbox: null,
     model: null,
     effort: null,
     idempotencyKey: "uncertain-ack",
@@ -2947,6 +3053,7 @@ test("ProviderControlAdapter buffers first-turn activity until the manager sessi
     workspaceId: "workspace",
     initialMessage: "Start immediately",
     profile: "execute",
+    sandbox: null,
     model: null,
     effort: null,
     idempotencyKey: "first-activity-race",
@@ -3007,6 +3114,7 @@ test("Codex SessionView publishes exact questions and bounded approval details",
     workspaceId: "workspace",
     initialMessage: "Start",
     profile: "plan",
+    sandbox: null,
     model: null,
     effort: null,
     idempotencyKey: "create-details-session",
@@ -3132,6 +3240,7 @@ test("transport death atomically fails managed sessions and in-flight controls",
     workspaceId: "workspace",
     initialMessage: "bootstrap",
     profile: "execute",
+    sandbox: null,
     model: null,
     effort: null,
     idempotencyKey: "runtime-death-session",
@@ -3277,6 +3386,7 @@ test("remove-queued is advertised exactly while a queued activity item is render
     workspaceId: "workspace",
     initialMessage: "first",
     profile: "plan",
+    sandbox: null,
     model: null,
     effort: null,
     idempotencyKey: "queue-projection-session",
@@ -3384,7 +3494,9 @@ test("a manager-created thread reports manager provenance and keeps its confirme
     ?.params as JsonObject;
   assert.equal((update.collaborationMode as JsonObject).mode, "plan");
   assert.equal(update.approvalPolicy, "on-request");
-  assert.equal((update.sandboxPolicy as JsonObject).type, "workspaceWrite");
+  // The profile carries the approval axis only; a start that requested no
+  // sandbox must not silently assert one.
+  assert.equal(Object.hasOwn(update, "sandboxPolicy"), false);
   assert.equal(
     adapter.getThreadState("thread-1")?.profile,
     null,
@@ -3536,6 +3648,7 @@ test("bridge-published Codex sessions carry resolved workspace identity", async 
     workspaceId: "workspace",
     initialMessage: "first",
     profile: "plan",
+    sandbox: null,
     model: null,
     effort: null,
     idempotencyKey: "workspace-identity-session",
@@ -3579,6 +3692,7 @@ test("workspace identity stays null when the bounded git resolution cannot answe
     workspaceId: "workspace",
     initialMessage: "first",
     profile: "plan",
+    sandbox: null,
     model: null,
     effort: null,
     idempotencyKey: "workspace-identity-budget-session",
@@ -3612,6 +3726,7 @@ test("bridge reports manager provenance and the created thread name", async () =
     workspaceId: "workspace",
     initialMessage: "Fix the stranded queue",
     profile: "plan",
+    sandbox: null,
     model: null,
     effort: null,
     idempotencyKey: "provenance-session",

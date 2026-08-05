@@ -27,11 +27,12 @@ import {
   type SessionAttention,
   type SessionProfile,
   type SessionRecord,
+  type SessionSandbox,
   type SessionStatus,
 } from "../core/types.ts";
 import { attachTmuxTerminals, discoverTmuxPanes } from "../core/tmux.ts";
 import { WIRE_SCHEMA_VERSION } from "../shared/wire.ts";
-import { sessionRecordId } from "../shared/session.ts";
+import { sandboxPolicy, sessionRecordId, unknownSandbox } from "../shared/session.ts";
 import { discoverClaude } from "./claude-observer.ts";
 import {
   baseRecord,
@@ -349,15 +350,18 @@ export function analyzeCodexEvents(
   providerStatus: string | null;
   attention: SessionAttention[];
   profile: SessionProfile | null;
+  sandbox: SessionSandbox | null;
 } {
   let status: SessionStatus = live ? "running" : "unknown";
   let providerStatus: string | null = null;
   let profile: SessionProfile | null = null;
+  let sandbox: SessionSandbox | null = null;
   const pendingQuestions = new Map<string, string | null>();
   for (const event of events) {
     const payload = object(event.payload);
     if (event.type === "turn_context" && payload) {
       profile = codexProfileFromTurnContext(payload) ?? profile;
+      sandbox = codexSandboxFromTurnContext(payload) ?? sandbox;
     }
     if (event.type === "event_msg") {
       const type = string(payload?.type);
@@ -392,7 +396,7 @@ export function analyzeCodexEvents(
     },
   }));
   if (attention.length > 0 && live) status = "waiting";
-  return { status, providerStatus, attention, profile };
+  return { status, providerStatus, attention, profile, sandbox };
 }
 
 function codexFactType(value: unknown): string | null {
@@ -424,8 +428,46 @@ function codexProfileEvidence(
   };
 }
 
-function unrestrictedCodexPolicy(...values: Array<string | null>): boolean {
-  return values.some((value) => value === "disabled" || value === "danger-full-access" || value === "dangerfullaccess");
+/**
+ * The profile is the approval axis only. A thread that never asks is
+ * `full-access` however its sandbox is set, and a danger sandbox no longer
+ * implies the profile: an observed CLI running wide open under on-request
+ * approval truthfully reads as `execute` with a full-access sandbox.
+ */
+function unrestrictedCodexApproval(...values: Array<string | null>): boolean {
+  return values.some((value) => value === "never" || value === "disabled");
+}
+
+/** The sandbox is stated outright, so it is evidence rather than inference. */
+function codexSandboxEvidence(
+  raw: string | null,
+  networkAccess: boolean | null,
+  source: SessionSandbox["source"],
+): SessionSandbox | null {
+  const mode = raw === "danger-full-access" || raw === "dangerfullaccess"
+    ? "danger-full-access"
+    : raw === "workspace-write" || raw === "workspacewrite"
+      ? "workspace-write"
+      : raw === "read-only" || raw === "readonly"
+        ? "read-only"
+        : null;
+  if (mode === null) return null;
+  return {
+    value: sandboxPolicy(mode, networkAccess === true),
+    providerValue: networkAccess === null ? raw : `${raw ?? mode}; network=${String(networkAccess)}`,
+    source,
+    confidence: "exact",
+  };
+}
+
+function codexSandboxFromTurnContext(payload: JsonObject): SessionSandbox | null {
+  const policy = object(payload.sandbox_policy);
+  const network = typeof policy?.network_access === "boolean" ? policy.network_access : null;
+  return codexSandboxEvidence(codexFactType(payload.sandbox_policy), network, "rollout-events");
+}
+
+function codexSandboxFromRow(row: CodexRow): SessionSandbox | null {
+  return codexSandboxEvidence(codexFactType(row.sandboxPolicy), null, "provider-cli");
 }
 
 function codexProfileFromTurnContext(payload: JsonObject): SessionProfile | null {
@@ -439,7 +481,7 @@ function codexProfileFromTurnContext(payload: JsonObject): SessionProfile | null
     ["permission", permission],
     ["collaboration", collaboration],
   ] as const;
-  if (unrestrictedCodexPolicy(sandbox, permission)) {
+  if (unrestrictedCodexApproval(approval, permission)) {
     return codexProfileEvidence("full-access", "rollout-events", facts);
   }
   if (collaboration === "plan") return codexProfileEvidence("plan", "rollout-events", facts);
@@ -453,7 +495,7 @@ function codexProfile(row: CodexRow): SessionProfile | null {
   const sandbox = codexFactType(row.sandboxPolicy);
   const approval = row.approvalMode?.toLowerCase() ?? null;
   const facts = [["approval", approval], ["sandbox", sandbox]] as const;
-  if (unrestrictedCodexPolicy(sandbox)) {
+  if (unrestrictedCodexApproval(approval)) {
     return codexProfileEvidence("full-access", "provider-cli", facts);
   }
   return approval || sandbox ? codexProfileEvidence("execute", "provider-cli", facts) : null;
@@ -498,6 +540,7 @@ function discoverCodex(
         active !== null,
       );
       const profile = analysis.profile ?? codexProfile(row);
+      const sandbox = analysis.sandbox ?? codexSandboxFromRow(row);
       const parent = queried.parentByChild.get(row.id) ?? null;
       const cwd = row.cwd || active?.cwd || null;
       return {
@@ -518,6 +561,7 @@ function discoverCodex(
         statusSource: row.rolloutPath ? "rollout-events" : "inferred",
         source: row.threadSource ?? row.source,
         profile: profile ?? unknownProfile(),
+        sandbox: sandbox ?? unknownSandbox(),
         model: row.model ? {
           value: row.model,
           providerValue: row.model,

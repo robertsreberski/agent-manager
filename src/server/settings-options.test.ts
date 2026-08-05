@@ -11,6 +11,7 @@ import type {
   SessionAction,
 } from "./contracts.ts";
 import { createAgentManagerServer } from "./server.ts";
+import { unknownSandbox } from "../shared/session.ts";
 
 const host = "127.0.0.1:43127";
 const origin = "http://127.0.0.1:43127";
@@ -55,6 +56,7 @@ function managedSession(overrides: Partial<SessionView> = {}): SessionView {
       source: "provider-api",
       confidence: "exact",
     },
+    sandbox: unknownSandbox(),
     model: {
       value: "current-only",
       providerValue: "current-only",

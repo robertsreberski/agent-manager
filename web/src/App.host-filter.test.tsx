@@ -59,7 +59,7 @@ describe("cockpit presentation contracts", () => {
       { id: "build", kind: "ssh" as const },
       { id: "local-main", kind: "local" as const },
     ];
-    expect(effectiveDraftHostId({ workspace: { hostId: "build", path: "/srv/repo" } }, hosts)).toBe("build");
+    expect(effectiveDraftHostId({ workspace: { hostId: "build", path: "/srv/repo", worktree: { kind: "none" } } }, hosts)).toBe("build");
     expect(effectiveDraftHostId({ workspace: null }, hosts)).toBe("local-main");
     expect(effectiveDraftHostId({ workspace: null }, [{ id: "build", kind: "ssh" }])).toBe("build");
     expect(effectiveDraftHostId({ workspace: null }, [])).toBe("local");

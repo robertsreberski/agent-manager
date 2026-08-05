@@ -4,6 +4,7 @@ import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import type { Provider } from "../core/types.ts";
+import type { SandboxPolicy } from "../shared/session.ts";
 import type { WireWorkspaceRecord } from "../shared/workspace.ts";
 import {
   sessionActionSchema,
@@ -243,11 +244,16 @@ function parsePersistedAction(value: unknown): SessionAction | null {
   return result.data;
 }
 
+function sandboxText(sandbox: SandboxPolicy): string {
+  return `${sandbox.mode};network=${String(sandbox.networkAccess)}`;
+}
+
 function actionText(action: SessionAction): string {
   switch (action.type) {
     case "send": return action.text;
     case "respond": return JSON.stringify(action.response);
     case "set-profile": return action.profile;
+    case "set-sandbox": return sandboxText(action.sandbox);
     case "set-model": return action.model;
     case "set-effort": return action.effort;
     case "remove-queued": return action.messageId;
@@ -271,6 +277,7 @@ export function redactedPreview(action: SessionAction): string {
     case "respond": return `respond:${action.response.kind};content-omitted`;
     case "interrupt": return "interrupt";
     case "set-profile": return `set-profile:${action.profile}`;
+    case "set-sandbox": return `set-sandbox:${sandboxText(action.sandbox)}`;
     case "set-model": return "set-model:value-omitted";
     case "set-effort": return `set-effort:${action.effort}`;
     case "remove-queued": return "remove-queued:id-omitted";
@@ -285,7 +292,7 @@ export function redactedPreview(action: SessionAction): string {
   }
 }
 
-export const DATABASE_SCHEMA_VERSION = 4 as const;
+export const DATABASE_SCHEMA_VERSION = 5 as const;
 
 export class IncompatibleDatabaseError extends Error {
   readonly code = "INCOMPATIBLE_DATABASE";
@@ -361,6 +368,7 @@ export class ManagerDatabase {
         host_id TEXT NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
         remote_workspace_id TEXT,
         created_at TEXT NOT NULL,
+        last_opened_at TEXT,
         UNIQUE (host_id, path)
       ) STRICT;
       CREATE TABLE IF NOT EXISTS managed_sessions (
@@ -508,6 +516,7 @@ export class ManagerDatabase {
     hostId?: string;
     remoteWorkspaceId?: string | null;
     createdAt?: string;
+    lastOpenedAt?: string | null;
   }): WorkspaceRecord {
     const hostId = input.hostId ?? "local";
     const host = this.getHost(hostId);
@@ -521,19 +530,40 @@ export class ManagerDatabase {
       hostKind: host.kind,
       remoteWorkspaceId: input.remoteWorkspaceId ?? null,
       createdAt: input.createdAt ?? new Date().toISOString(),
+      lastOpenedAt: input.lastOpenedAt ?? null,
     };
     this.#database.prepare(`
-      INSERT INTO workspaces (id, label, path, host_id, remote_workspace_id, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO workspaces (id, label, path, host_id, remote_workspace_id, created_at, last_opened_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(host_id, path) DO UPDATE SET
         label = excluded.label,
-        remote_workspace_id = COALESCE(excluded.remote_workspace_id, workspaces.remote_workspace_id)
-    `).run(record.id, record.label, record.path, record.hostId, record.remoteWorkspaceId, record.createdAt);
+        remote_workspace_id = COALESCE(excluded.remote_workspace_id, workspaces.remote_workspace_id),
+        last_opened_at = COALESCE(excluded.last_opened_at, workspaces.last_opened_at)
+    `).run(
+      record.id,
+      record.label,
+      record.path,
+      record.hostId,
+      record.remoteWorkspaceId,
+      record.createdAt,
+      record.lastOpenedAt,
+    );
     return this.#workspaceByHostPath(record.hostId, record.path) ?? record;
   }
 
+  /**
+   * Records that a workspace was opened. Recency is what the new-thread screen
+   * offers first, so it is written when a session actually starts there rather
+   * than whenever a path is merely resolved.
+   */
+  touchWorkspaceOpened(id: string, at: string = new Date().toISOString()): boolean {
+    const result = this.#database.prepare("UPDATE workspaces SET last_opened_at = ? WHERE id = ?").run(at, id);
+    return Number(result.changes) > 0;
+  }
+
   listWorkspaces(): WorkspaceRecord[] {
-    const rows = this.#database.prepare(`${this.#workspaceSelect()} ORDER BY h.kind, h.label, w.label, w.path`)
+    const rows = this.#database.prepare(`${this.#workspaceSelect()}
+       ORDER BY w.last_opened_at IS NULL, w.last_opened_at DESC, h.kind, h.label, w.label, w.path`)
       .all() as unknown as Record<string, unknown>[];
     return rows.map((row) => this.#workspaceRecord(row));
   }
@@ -551,7 +581,7 @@ export class ManagerDatabase {
   }
 
   #workspaceSelect(): string {
-    return `SELECT w.id, w.label, w.path, w.host_id, w.remote_workspace_id, w.created_at,
+    return `SELECT w.id, w.label, w.path, w.host_id, w.remote_workspace_id, w.created_at, w.last_opened_at,
                    h.label AS host_label, h.kind AS host_kind
             FROM workspaces w JOIN hosts h ON h.id = w.host_id`;
   }
@@ -566,6 +596,9 @@ export class ManagerDatabase {
       hostKind: asString(row.host_kind) as WorkspaceRecord["hostKind"],
       remoteWorkspaceId: row.remote_workspace_id === null ? null : asString(row.remote_workspace_id),
       createdAt: asString(row.created_at),
+      lastOpenedAt: row.last_opened_at === null || row.last_opened_at === undefined
+        ? null
+        : asString(row.last_opened_at),
     };
   }
 
