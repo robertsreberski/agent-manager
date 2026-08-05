@@ -6,7 +6,7 @@ import { questionView, renderActivityData, type ActivityDataControls } from "./s
 import { SessionRuntimeProvider } from "./session-thread";
 
 const attention: ActivityAttentionItem = {
-  schemaVersion: 3,
+  schemaVersion: 4,
   id: "attention-1",
   sessionId: "local:codex:thread-1",
   provider: "codex",

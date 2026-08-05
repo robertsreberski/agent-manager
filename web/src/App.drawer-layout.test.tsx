@@ -27,6 +27,7 @@ const selectedSession = {
     authority: "none",
     capabilities: ["open-editor"],
     withheld: [{ capability: "queue", reason: "This terminal-started session has no hook bridge." }],
+    takeover: null,
   },
 } as SessionView;
 
@@ -68,6 +69,10 @@ const cockpit = {
   availability: "online",
   snapshot: { stale: false, generatedAt: "2026-08-04T12:00:00.000Z", diagnostics: [], seq: 1 },
   sessions: [selectedSession],
+  displaySessions: [selectedSession],
+  archivedCatalog: { items: [] as SessionView[], query: "", nextCursor: null as string | null, total: 0, status: "loaded" as "idle" | "loading" | "loaded" | "error", error: null as string | null },
+  searchArchived: vi.fn(async () => undefined),
+  loadMoreArchived: vi.fn(async () => undefined),
   selectedSession,
   selectedId: selectedSession.id,
   setSelectedId: vi.fn(),
@@ -99,6 +104,8 @@ const cockpit = {
   removeQueued: vi.fn(async () => undefined),
   lifecycleAction: vi.fn(async () => undefined),
   openEditor: vi.fn(async () => undefined),
+  takeCliControl: vi.fn(async () => undefined),
+  cancelCliTakeover: vi.fn(async () => undefined),
   createSession: vi.fn(async () => selectedSession),
   completeWorkspacePath: vi.fn(async () => []),
   loadPreview: vi.fn(async () => undefined),
@@ -106,6 +113,7 @@ const cockpit = {
   loadAttentionDetails: vi.fn(async () => undefined),
   loadTodoDetail: vi.fn(async () => undefined),
   searchTranscript: vi.fn(async () => ({ matches: [] })),
+  loadWorkspaceFiles: vi.fn(async () => []),
   loadSettingsOptions: vi.fn(async () => undefined),
   loadProviderSettingsOptions: vi.fn(async () => ({
     available: true as const,
@@ -166,6 +174,42 @@ describe("cockpit shell layout", () => {
 
     // The board stays mounted and un-shifted underneath the overlay.
     expect(region).toContainElement(document.querySelector<HTMLElement>("[data-desktop-board]"));
+  });
+
+  it("renders the archived catalog as a separate searchable read-only scope", () => {
+    const previous = {
+      sessions: cockpit.sessions,
+      displaySessions: cockpit.displaySessions,
+      selectedSession: cockpit.selectedSession,
+      scope: cockpit.scope,
+      archivedCatalog: cockpit.archivedCatalog,
+    };
+    const archived = {
+      ...selectedSession,
+      archived: true,
+      status: "completed",
+      control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [], takeover: null },
+    } as SessionView;
+    cockpit.sessions = [];
+    cockpit.displaySessions = [archived];
+    cockpit.selectedSession = archived;
+    cockpit.scope = "archived";
+    cockpit.archivedCatalog = { items: [archived], query: "", nextCursor: "next", total: 51, status: "loaded", error: null };
+    try {
+      render(<App />);
+      expect(screen.getByRole("button", { name: "Archived, 51 sessions" })).toHaveAttribute("aria-current", "page");
+      expect(screen.getByRole("searchbox", { name: "Search archived sessions" })).toBeInTheDocument();
+      expect(screen.getAllByText("Observed thread").length).toBeGreaterThan(0);
+      expect(screen.queryByRole("button", { name: "New thread here" })).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+      expect(cockpit.loadMoreArchived).toHaveBeenCalledOnce();
+    } finally {
+      cockpit.sessions = previous.sessions;
+      cockpit.displaySessions = previous.displaySessions;
+      cockpit.selectedSession = previous.selectedSession;
+      cockpit.scope = previous.scope;
+      cockpit.archivedCatalog = previous.archivedCatalog;
+    }
   });
 
   it("reaches hook and host setup from the palette once the board exists", async () => {

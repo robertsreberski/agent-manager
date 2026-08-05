@@ -130,6 +130,16 @@ export const sessionActionSchema = z.discriminatedUnion("type", [
     ...expectedState,
   }).strict(),
   z.object({
+    type: z.literal("take-control"),
+    method: z.enum(["guided-exit", "graceful-stop"]),
+    ...expectedState,
+  }).strict(),
+  z.object({
+    type: z.literal("cancel-take-control"),
+    takeoverId: z.string().min(1).max(256),
+    ...expectedState,
+  }).strict(),
+  z.object({
     type: z.literal("open-editor"),
     relativePath: z.string().min(1).max(4_096).refine((value) => (
       !value.includes("\0")
@@ -371,6 +381,20 @@ export interface ProviderControlAdapter {
     signal: AbortSignal,
   ): Promise<ManagedSessionRecoveryReport>;
   /**
+   * Adopt the exact provider conversation after its proven local CLI owner has
+   * exited. Implementations must re-read and resume the same identity before
+   * returning manager capabilities.
+   */
+  adoptExternalSession?(
+    session: SessionView,
+    profile: CreateSessionInput["profile"],
+    context: RequestContext,
+  ): Promise<SessionView>;
+  /** Publish a provisionally adopted session only after durable identity commit. */
+  commitExternalAdoption?(providerSessionId: string): SessionView | Promise<SessionView>;
+  /** Release a provisional provider client when durable commit fails. */
+  abortExternalAdoption?(providerSessionId: string): void | Promise<void>;
+  /**
    * Acquire the provider detail plane for one authenticated selected-session
    * stream. Implementations may ref-count concurrent browser selections, but
    * the returned release must detach the provider when the final selection
@@ -406,12 +430,14 @@ export interface ProviderControlAdapter {
 
 export interface ManagedSessionRecoveryRecord {
   managerSessionId: string;
-  provider: "codex";
+  provider: Provider;
   providerThreadId: string;
   workspaceId: string;
   workspacePath: string;
   name: string | null;
   profile: CreateSessionInput["profile"];
+  model?: string | null;
+  effort?: CreateSessionInput["effort"];
   createdAt: string;
 }
 
@@ -468,6 +494,10 @@ export function requiredCapability(action: SessionAction): ControlCapability {
       return "archive";
     case "delete":
       return "delete";
+    case "take-control":
+      return "take-control";
+    case "cancel-take-control":
+      return "cancel-take-control";
     case "open-editor":
       return "open-editor";
   }

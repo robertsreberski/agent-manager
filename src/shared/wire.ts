@@ -12,7 +12,7 @@ import {
   sessionRecordId,
 } from "./session.ts";
 
-export const WIRE_SCHEMA_VERSION = 3 as const;
+export const WIRE_SCHEMA_VERSION = 4 as const;
 
 export interface WireIdentity {
   schemaVersion: number | null;
@@ -85,8 +85,36 @@ const controlCapabilitySchema = z.enum([
   "end",
   "archive",
   "delete",
+  "take-control",
+  "cancel-take-control",
   "open-editor",
 ]);
+
+const takeoverMethodSchema = z.enum(["guided-exit", "graceful-stop"]);
+const sessionTakeoverSchema = z.object({
+  id: z.string().min(1).nullable(),
+  state: z.enum(["available", "waiting-for-exit", "stopping", "adopting", "failed"]),
+  methods: z.array(takeoverMethodSchema).min(1).max(2),
+  method: takeoverMethodSchema.nullable(),
+  requestedAt: z.string().nullable(),
+  deadlineAt: z.string().nullable(),
+  fallbackProfile: executionProfileSchema.nullable(),
+  error: z.string().nullable(),
+}).strict().superRefine((takeover, context) => {
+  const available = takeover.state === "available";
+  if (available !== (takeover.id === null)) {
+    context.addIssue({ code: "custom", message: "available takeover must not have an attempt id", path: ["id"] });
+  }
+  if (available !== (takeover.method === null)) {
+    context.addIssue({ code: "custom", message: "available takeover must not have a selected method", path: ["method"] });
+  }
+  if (takeover.method !== null && !takeover.methods.includes(takeover.method)) {
+    context.addIssue({ code: "custom", message: "selected takeover method must be offered", path: ["method"] });
+  }
+  if (takeover.state === "failed" && !takeover.error) {
+    context.addIssue({ code: "custom", message: "failed takeover requires an error", path: ["error"] });
+  }
+});
 
 const evidencedValue = <T extends z.ZodType>(value: T) => z.object({
   value,
@@ -169,6 +197,7 @@ export const sessionRecordSchema: z.ZodType<SessionRecord> = z.object({
   name: z.string().nullable(),
   cwd: z.string().nullable(),
   kind: z.enum(["interactive", "background", "batch", "subagent", "unknown"]),
+  archived: z.boolean(),
   presence: z.enum(["live", "recent"]),
   status: z.enum(["running", "waiting", "idle", "completed", "failed", "interrupted", "unknown"]),
   providerStatus: z.string().nullable(),
@@ -221,6 +250,7 @@ export const sessionRecordSchema: z.ZodType<SessionRecord> = z.object({
       capability: controlCapabilitySchema,
       reason: z.string().min(1),
     }).strict()),
+    takeover: sessionTakeoverSchema.nullable(),
   }).strict(),
   workspaceIdentity: workspaceIdentitySchema.nullable(),
   generation: z.number().int().nonnegative(),
@@ -327,6 +357,8 @@ export const sessionActionTypeSchema = z.enum([
   "end",
   "archive",
   "delete",
+  "take-control",
+  "cancel-take-control",
   "open-editor",
 ]);
 

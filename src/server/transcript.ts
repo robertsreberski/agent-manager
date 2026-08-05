@@ -74,6 +74,8 @@ export type TranscriptItemStatus = "running" | "complete" | "incomplete";
 
 interface TranscriptItemBase {
   id: string;
+  /** Exact provider identity shared with hook/API activity when one exists. */
+  correlationId?: string | null;
   createdAt: string | null;
   status: TranscriptItemStatus;
 }
@@ -259,6 +261,15 @@ function rootInfo(path: string, uid: number): RootInfo {
   }
   if (!stat.isDirectory() || stat.uid !== uid) failure("unreadable");
   return { lexical, canonical };
+}
+
+function optionalRootInfo(path: string, uid: number): RootInfo | null {
+  try {
+    return rootInfo(path, uid);
+  } catch (error) {
+    if (error instanceof TranscriptReadFailure && error.reason === "not-found") return null;
+    throw error;
+  }
 }
 
 /** Rejects symlinks below the configured transcript root, including the leaf. */
@@ -511,6 +522,10 @@ function stableItemId(
     : `${prefix}:file:${fileIdentity}:${String(offset)}`;
 }
 
+function correlationId(kind: "message" | "reasoning" | "tool", providerId: string | null): string | null {
+  return providerId ? `${kind}:${providerId}` : null;
+}
+
 function syntheticCodexUserContext(text: string): boolean {
   const candidate = text.trim();
   return SYNTHETIC_CODEX_USER_ENVELOPES.some((pattern) => pattern.test(candidate));
@@ -584,10 +599,19 @@ function codexItems(tail: JsonlTail, fileIdentity: string): ParsedItems {
     if (payload.type === "reasoning") {
       const text = codexReasoningText(payload);
       if (!text) continue;
-      const id = stableItemId("codex", stringValue(payload.id), fileIdentity, record.offset, "reasoning");
+      const providerId = stringValue(payload.id);
+      const id = stableItemId("codex", providerId, fileIdentity, record.offset, "reasoning");
       if (seenIds.has(id)) continue;
       seenIds.add(id);
-      items.push({ kind: "reasoning", id, text, createdAt, status: "complete", label: null });
+      items.push({
+        kind: "reasoning",
+        id,
+        correlationId: providerId ? `reasoning:${providerId}:summary:0` : null,
+        text,
+        createdAt,
+        status: "complete",
+        label: null,
+      });
       continue;
     }
 
@@ -599,6 +623,7 @@ function codexItems(tail: JsonlTail, fileIdentity: string): ParsedItems {
       items.push({
         kind: "tool",
         id: stableItemId("codex", callId, fileIdentity, record.offset, "tool"),
+        correlationId: correlationId("tool", callId),
         toolCallId: callId,
         name,
         arguments: codexArguments(payload),
@@ -646,7 +671,16 @@ function codexItems(tail: JsonlTail, fileIdentity: string): ParsedItems {
     seenAdjacent.clear();
     seenAdjacent.add(adjacentKey);
     previousKey = adjacentKey;
-    items.push({ kind: "message", id, role, text, createdAt, status: "complete", label: null });
+    items.push({
+      kind: "message",
+      id,
+      correlationId: correlationId("message", providerId),
+      role,
+      text,
+      createdAt,
+      status: "complete",
+      label: null,
+    });
   }
   const capped = capItems(settleToolCalls(items));
   truncated ||= capped.truncated;
@@ -770,6 +804,7 @@ function claudeAssistantBlocks(
   outer: Record<string, unknown>,
   message: Record<string, unknown>,
   messageKey: string,
+  providerMessageId: string | null,
   items: TranscriptItem[],
   byId: Map<string, { index: number; fragments: Set<string> }>,
   toolIndex: Map<string, number>,
@@ -781,7 +816,17 @@ function claudeAssistantBlocks(
       const text = block.thinking.trim();
       const id = `${messageKey}:thinking:${String(index)}`;
       if (!text || items.some((item) => item.id === id)) return;
-      items.push({ kind: "reasoning", id, text, createdAt, status: "complete", label: null });
+      items.push({
+        kind: "reasoning",
+        id,
+        correlationId: providerMessageId
+          ? `reasoning:${providerMessageId}:thinking:${String(index)}`
+          : null,
+        text,
+        createdAt,
+        status: "complete",
+        label: null,
+      });
       return;
     }
     if (block.type === "tool_use") {
@@ -793,6 +838,7 @@ function claudeAssistantBlocks(
       items.push({
         kind: "tool",
         id: `claude:tool:${callId}`,
+        correlationId: correlationId("tool", callId),
         toolCallId: callId,
         name,
         arguments: (block.input ?? null) as ActivityJsonValue | null,
@@ -815,7 +861,16 @@ function claudeAssistantBlocks(
       return;
     }
     byId.set(messageKey, { index: items.length, fragments: new Set([text]) });
-    items.push({ kind: "message", id: messageKey, role: "assistant", text, createdAt, status, label: null });
+    items.push({
+      kind: "message",
+      id: messageKey,
+      correlationId: correlationId("message", providerMessageId),
+      role: "assistant",
+      text,
+      createdAt,
+      status,
+      label: null,
+    });
   });
 }
 
@@ -852,12 +907,14 @@ function claudeItems(
       const text = textBlocks(message.content).join("\n\n").trim();
       if (!text || machineClaudeUser(outer, text)) continue;
       const providerId = stringValue(outer.uuid);
+      const promptId = stringValue(outer.promptId) ?? stringValue(outer.prompt_id);
       const id = stableItemId("claude", providerId, fileIdentity, record.offset);
       if (byId.has(id)) continue;
       byId.set(id, { index: items.length, fragments: new Set([text]) });
       items.push({
         kind: "message",
         id,
+        correlationId: correlationId("message", promptId ?? providerId),
         role: "user",
         text,
         createdAt: timestamp(outer.timestamp),
@@ -869,7 +926,15 @@ function claudeItems(
     if (outer.type !== "assistant" || message.role !== "assistant") continue;
     const providerId = stringValue(message.id) ?? stringValue(outer.uuid);
     const messageKey = stableItemId("claude", providerId, fileIdentity, record.offset);
-    claudeAssistantBlocks(outer, message, messageKey, items, byId, toolIndex);
+    claudeAssistantBlocks(
+      outer,
+      message,
+      messageKey,
+      providerId,
+      items,
+      byId,
+      toolIndex,
+    );
   }
   const capped = capItems(settleToolCalls(items));
   truncated ||= capped.truncated;
@@ -973,27 +1038,37 @@ function codexFile(
 ): { root: RootInfo; file: OpenTranscript } {
   if (!UUID_PATTERN.test(sessionId)) failure("unsupported");
   const codexHome = rootInfo(codexHomePath, uid);
-  const sessions = rootInfo(join(codexHome.lexical, "sessions"), uid);
+  const roots = [
+    optionalRootInfo(join(codexHome.lexical, "sessions"), uid),
+    optionalRootInfo(join(codexHome.lexical, "archived_sessions"), uid),
+  ].filter((root): root is RootInfo => root !== null);
+  if (roots.length === 0) failure("not-found");
   const databasePath = rolloutFromDatabase(codexHome, uid, sessionId);
   let candidate: string;
   if (databasePath !== null) {
     candidate = databasePath;
   } else {
-    const walked = walkMatchingFiles(sessions, (name) =>
+    const walked = roots.map((root) => walkMatchingFiles(root, (name) =>
       name.endsWith(`${sessionId}.jsonl`) &&
       name.match(/([0-9a-f-]{36})\.jsonl$/i)?.[1]?.toLowerCase() === sessionId.toLowerCase()
-    );
-    if (walked.exhausted) failure("unsupported");
-    const matches = walked.matches;
+    ));
+    if (walked.some((result) => result.exhausted)) failure("unsupported");
+    const matches = walked.flatMap((result) => result.matches);
     if (matches.length === 0) failure("not-found");
     if (matches.length !== 1) failure("unsupported");
     candidate = matches[0] as string;
   }
   const pathId = basename(candidate).match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i)?.[1];
   if (pathId?.toLowerCase() !== sessionId.toLowerCase()) failure("unsupported");
-  const file = openTranscript(sessions, candidate, uid);
+  const absoluteCandidate = resolve(candidate);
+  const root = roots.find((candidateRoot) =>
+    isConfined(candidateRoot.lexical, absoluteCandidate)
+    || isConfined(candidateRoot.canonical, absoluteCandidate)
+  );
+  if (!root) failure("unreadable");
+  const file = openTranscript(root, candidate, uid);
   try {
-    if (validHeaderSessionId(file, sessionId)) return { root: sessions, file };
+    if (validHeaderSessionId(file, sessionId)) return { root, file };
     failure("unsupported");
   } catch (error) {
     try {

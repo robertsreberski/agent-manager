@@ -174,6 +174,42 @@ test("Codex reads ordered user/assistant response items and ignores provider int
   assert.equal(result.items[0]?.id, "codex:user-provider-id");
   assert.match(result.items[1]?.id ?? "", /^codex:file:\d+:\d+:\d+$/);
   assert.equal(result.items[0]?.createdAt, "2026-08-03T10:00:01.000Z");
+  assert.equal(result.items[0]?.correlationId, "message:user-provider-id");
+});
+
+test("Codex reads archived transcripts only from the equally validated archive root", () => {
+  const root = temporaryRoot();
+  const home = join(root, ".codex");
+  mkdirSync(join(home, "sessions"), { recursive: true });
+  const archived = join(home, "archived_sessions", "2026", "08", "03");
+  mkdirSync(archived, { recursive: true });
+  const file = join(archived, `rollout-archived-${CODEX_ID}.jsonl`);
+  writeFileSync(file, jsonl([codexMeta(), codexMessage("assistant", "Archived history", { id: "archived-message" })]));
+  const database = new DatabaseSync(join(home, "state_5.sqlite"));
+  database.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)");
+  database.prepare("INSERT INTO threads VALUES (?, ?)").run(CODEX_ID, file);
+  database.close();
+
+  const result = new LocalSessionTranscriptReader({ codexHome: home }).read(codexSession());
+  assert.equal(result.transcript.state, "available");
+  assert.deepEqual(messagesOf(result), [{ role: "assistant", text: "Archived history" }]);
+
+  const symlinkRoot = temporaryRoot();
+  const symlinkHome = join(symlinkRoot, ".codex");
+  mkdirSync(join(symlinkHome, "sessions"), { recursive: true });
+  const symlinkArchive = join(symlinkHome, "archived_sessions");
+  mkdirSync(symlinkArchive, { recursive: true });
+  const target = join(symlinkArchive, "target.jsonl");
+  writeFileSync(target, jsonl([codexMeta()]));
+  const linked = join(symlinkArchive, `rollout-${CODEX_ID}.jsonl`);
+  symlinkSync(target, linked);
+  const symlinkDb = new DatabaseSync(join(symlinkHome, "state_5.sqlite"));
+  symlinkDb.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)");
+  symlinkDb.prepare("INSERT INTO threads VALUES (?, ?)").run(CODEX_ID, linked);
+  symlinkDb.close();
+
+  const rejected = new LocalSessionTranscriptReader({ codexHome: symlinkHome }).read(codexSession());
+  assert.equal(rejected.transcript.reason, "unreadable");
 });
 
 test("Codex excludes injected context envelopes while preserving the actual user prompt", () => {

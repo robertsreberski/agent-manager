@@ -31,6 +31,7 @@ function snapshot(): unknown {
       name: null,
       cwd: "/tmp/project",
       kind: "interactive",
+      archived: false,
       presence: "live",
       status: "idle",
       providerStatus: "idle",
@@ -76,6 +77,7 @@ function snapshot(): unknown {
         authority: "manager",
         capabilities: ["queue", "set-profile"],
         withheld: [],
+        takeover: null,
       },
       workspaceIdentity: null,
       generation: 4,
@@ -85,7 +87,7 @@ function snapshot(): unknown {
 
 test("parses the exact current wire epoch", () => {
   const parsed = parseStateSnapshot(snapshot());
-  assert.equal(parsed.schemaVersion, 3);
+  assert.equal(parsed.schemaVersion, 4);
   assert.equal(parsed.buildId, AGENT_MANAGER_BUILD_ID);
   assert.equal(parsed.sessions[0]?.providerThreadId, "thread-1");
   assert.equal(parsed.sessions[0]?.id, sessionRecordId("local", "codex", "thread-1"));

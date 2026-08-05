@@ -85,7 +85,7 @@ export function SessionEndedState({
 }
 
 const CAPABILITY_SENTENCE: Record<SessionCapability, string> = {
-  queue: "Queue messages for the next turn", steer: "Steer the active turn", interrupt: "Stop the active turn", respond: "Answer exact questions and approvals", "set-profile": "Change the execution profile", "set-model": "Change the model", "set-effort": "Change reasoning effort", "remove-queued": "Remove queued messages", preview: "Preview the native terminal", attach: "Attach from a terminal", resume: "Resume this session", end: "End this managed run", archive: "Archive this thread", delete: "Delete this thread", "open-editor": "Open changed files in the editor",
+  queue: "Queue messages for the next turn", steer: "Steer the active turn", interrupt: "Stop the active turn", respond: "Answer exact questions and approvals", "set-profile": "Change the execution profile", "set-model": "Change the model", "set-effort": "Change reasoning effort", "remove-queued": "Remove queued messages", preview: "Preview the native terminal", attach: "Attach from a terminal", resume: "Resume this session", end: "End this managed run", archive: "Archive this thread", delete: "Delete this thread", "take-control": "Take exclusive control from a native CLI", "cancel-take-control": "Cancel a pending guided takeover", "open-editor": "Open changed files in the editor",
 };
 const ALL_CAPABILITIES = Object.keys(CAPABILITY_SENTENCE) as SessionCapability[];
 

@@ -491,6 +491,7 @@ export class CodexProviderBridge implements ProviderControlAdapter {
   #recovering = new Map<string, symbol>();
   #selectedThreads = new Map<string, SelectedThreadLease>();
   #creationHandoffs = new Set<string>();
+  #provisionalAdoptions = new Set<string>();
   #bufferedActivity = new Map<string, ActivityMutation[]>();
   #overflowedActivity = new Set<string>();
   #unsubscribe: () => void;
@@ -578,6 +579,103 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     this.#creationHandoffs.add(state.threadId);
     this.#flushBufferedActivity(state.threadId);
     return this.toSessionView(state);
+  }
+
+  async adoptExternalSession(
+    session: SessionView,
+    profile: CreateSessionInput["profile"],
+    context: RequestContext,
+  ): Promise<SessionView> {
+    context.signal.throwIfAborted();
+    const threadId = session.providerThreadId;
+    if (
+      session.provider !== "codex"
+      || session.hostId !== "local"
+      || session.id !== sessionRecordId("local", "codex", threadId)
+      || !session.cwd
+      || session.parentId !== null
+    ) throw new Error("Codex adoption requires one exact local root-thread identity");
+    if (!context.workspace || context.workspace.path !== session.cwd) {
+      throw new Error("Codex adoption workspace does not match the discovered thread");
+    }
+    if (this.#metadata.has(threadId) || this.#recovering.has(threadId)) {
+      throw new Error("Codex thread is already managed by this bridge");
+    }
+
+    const read = await this.adapter.readThread(threadId);
+    context.signal.throwIfAborted();
+    if (
+      read.threadId !== threadId
+      || read.cwd !== session.cwd
+      || (session.providerTreeId !== null && read.treeId !== session.providerTreeId)
+      || read.parentThreadId !== null
+    ) {
+      await this.adapter.releaseThread(threadId).catch(() => undefined);
+      throw new Error("Codex thread/read changed the validated thread, tree, or workspace identity");
+    }
+    await this.adapter.releaseThread(threadId);
+    context.signal.throwIfAborted();
+
+    const metadata: ManagedMetadata = {
+      name: session.name,
+      requestedProfile: profile,
+      createdAt: session.startedAt ?? this.#now().toISOString(),
+      creationIssue: null,
+      workspaceId: context.workspace.id,
+      workspacePath: context.workspace.path,
+    };
+    this.#metadata.set(threadId, metadata);
+    this.#knownStates.set(threadId, read);
+    try {
+      const adopted = await this.adapter.adoptThread(threadId, {
+        threadId: read.threadId,
+        treeId: read.treeId,
+        parentThreadId: read.parentThreadId,
+        cwd: read.cwd,
+      });
+      this.#assertSelectedIdentity(adopted, read, metadata);
+      context.signal.throwIfAborted();
+
+      if (adopted.profile !== profile) await this.adapter.setProfile(threadId, profile);
+      if (session.model.value && adopted.model !== session.model.value) {
+        await this.adapter.setModel(threadId, session.model.value);
+      }
+      if (session.effort.value && adopted.effort !== session.effort.value) {
+        await this.adapter.setEffort(threadId, session.effort.value);
+      }
+      context.signal.throwIfAborted();
+      const confirmed = this.adapter.getThreadState(threadId) ?? adopted;
+      if (
+        confirmed.threadId !== threadId
+        || confirmed.cwd !== metadata.workspacePath
+        || confirmed.treeId !== read.treeId
+        || confirmed.parentThreadId !== read.parentThreadId
+        || confirmed.profile !== profile
+        || (session.model.value !== null && confirmed.model !== session.model.value)
+        || (session.effort.value !== null && confirmed.effort !== session.effort.value)
+      ) throw new Error("Codex adoption did not preserve the confirmed profile, model, effort, or identity");
+
+      await this.#resolveWorkspaceIdentity(confirmed.cwd);
+      context.signal.throwIfAborted();
+      this.#knownStates.set(threadId, confirmed);
+      this.#selectedThreads.set(threadId, {
+        refs: 0,
+        phase: "active",
+        settled: Promise.resolve(),
+      });
+      this.#provisionalAdoptions.add(threadId);
+      this.#flushBufferedActivity(threadId);
+      return this.toSessionView(confirmed);
+    } catch (error) {
+      this.#metadata.delete(threadId);
+      this.#knownStates.delete(threadId);
+      this.#selectedThreads.delete(threadId);
+      this.#dropBufferedActivity(threadId);
+      if (this.adapter.getThreadState(threadId)) {
+        await this.adapter.releaseThread(threadId).catch(() => undefined);
+      }
+      throw error;
+    }
   }
 
   async restoreManagedSessions(
@@ -688,6 +786,24 @@ export class CodexProviderBridge implements ProviderControlAdapter {
         : []),
       truncated: truncatedByRecordLimit,
     };
+  }
+
+  commitExternalAdoption(threadId: string): SessionView {
+    if (!this.#provisionalAdoptions.delete(threadId)) {
+      throw new Error("Codex adoption is not awaiting durable commit");
+    }
+    const session = this.getManagedSession(threadId);
+    if (!session) throw new Error("Codex adoption disappeared before commit");
+    return session;
+  }
+
+  async abortExternalAdoption(threadId: string): Promise<void> {
+    if (!this.#provisionalAdoptions.delete(threadId)) return;
+    this.#metadata.delete(threadId);
+    this.#knownStates.delete(threadId);
+    this.#selectedThreads.delete(threadId);
+    this.#dropBufferedActivity(threadId);
+    if (this.adapter.getThreadState(threadId)) await this.adapter.releaseThread(threadId);
   }
 
   async acquireSelectedSession(
@@ -879,6 +995,9 @@ export class CodexProviderBridge implements ProviderControlAdapter {
         return { status: "succeeded" };
       case "open-editor":
         throw new Error("Codex provider does not own editor launch operations");
+      case "take-control":
+      case "cancel-take-control":
+        throw new Error("Codex takeover is orchestrated by Agent Manager");
     }
   }
 
@@ -950,7 +1069,12 @@ export class CodexProviderBridge implements ProviderControlAdapter {
 
   toSessionView(state: CodexThreadState): SessionView {
     const selected = this.#selectedThreads.get(state.threadId);
-    const controlsLoaded = selected?.phase === "active" && selected.refs > 0;
+    // A successful external takeover installs one validated, live detail plane
+    // before the replacement activity stream reconnects, so it is briefly
+    // active with zero browser references. The provider controls are already
+    // real in that handoff window and must be present in the post-commit view;
+    // ordinary drawer release changes the phase to `releasing` before publish.
+    const controlsLoaded = selected?.phase === "active";
     const liveDetail = controlsLoaded || this.#creationHandoffs.has(state.threadId);
     const metadata = this.#metadata.get(state.threadId) ?? {
       name: null,
@@ -1013,6 +1137,7 @@ export class CodexProviderBridge implements ProviderControlAdapter {
       name: metadata.name ?? state.name,
       cwd,
       kind: "interactive",
+      archived: false,
       presence: liveDetail ? "live" : "recent",
       status: normalizedStatus,
       providerStatus: state.status,
@@ -1058,6 +1183,7 @@ export class CodexProviderBridge implements ProviderControlAdapter {
               */
               reason: "Loading exact Codex controls…",
             })),
+        takeover: null,
       },
       workspaceIdentity: structuredClone(this.#workspaceIdentities.get(cwd) ?? null),
       generation: state.generation,
@@ -1076,6 +1202,7 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     this.#recovering.clear();
     this.#selectedThreads.clear();
     this.#creationHandoffs.clear();
+    this.#provisionalAdoptions.clear();
     this.#bufferedActivity.clear();
     this.#overflowedActivity.clear();
     this.#workspaceIdentities.clear();

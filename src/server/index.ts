@@ -184,7 +184,10 @@ export async function createAgentManagerServer(
             });
           }
           state.remove(managerSessionId);
-          activityHub.clearSession(managerSessionId);
+          // Archiving moves the same conversation to a read-only catalog. Its
+          // selected drawer and transcript observer keep the existing bounded
+          // hub; end/delete are identity termination and still clear it.
+          if (reason !== "archived") activityHub.clearSession(managerSessionId);
         },
         onActivity: (managerSessionId, mutation) => {
           activityHub.ingest(managerSessionId, "codex", mutation);

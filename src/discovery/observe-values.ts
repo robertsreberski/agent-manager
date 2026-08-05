@@ -54,6 +54,7 @@ export function baseRecord(
     name: null,
     cwd: null,
     kind: "unknown",
+    archived: false,
     presence: "recent",
     status: "unknown",
     providerStatus: null,

@@ -458,6 +458,7 @@ function toolItem(
   const { output, ...rest } = fields;
   return upsert({
     ...baseItem(id, "tool", turnId, state, times.startedAt, times.updatedAt, times.completedAt),
+    correlationId: `tool:${fields.toolCallId}`,
     ...rest,
     ...(output === null ? {} : { output }),
   });
@@ -484,6 +485,7 @@ function projectThreadItem(
     case "userMessage":
       mutations.push(upsert({
         ...baseItem(id, "message", turnId, state, times.startedAt, times.updatedAt, times.completedAt),
+        correlationId: `message:${itemId}`,
         role: "user",
         phase: null,
         text: textContent(item.content),
@@ -499,6 +501,7 @@ function projectThreadItem(
         : "";
       mutations.push(upsert({
         ...baseItem(id, "message", turnId, state, times.startedAt, times.updatedAt, times.completedAt),
+        correlationId: `message:${itemId}`,
         role: "system",
         phase: null,
         text,
@@ -509,6 +512,7 @@ function projectThreadItem(
     case "agentMessage":
       mutations.push(upsert({
         ...baseItem(id, "message", turnId, state, times.startedAt, times.updatedAt, times.completedAt),
+        correlationId: `message:${itemId}`,
         role: "assistant",
         phase: item.phase === "commentary"
           ? "commentary"
@@ -538,6 +542,7 @@ function projectThreadItem(
             times.updatedAt,
             times.completedAt,
           ),
+          correlationId: `reasoning:${itemId}:summary:${String(index)}`,
           reasoningKind: "summary",
           label: "Thinking",
           text: value,
@@ -555,6 +560,7 @@ function projectThreadItem(
             times.updatedAt,
             times.completedAt,
           ),
+          correlationId: `reasoning:${itemId}:raw:${String(index)}`,
           reasoningKind: "raw",
           label: "Provider reasoning",
           text: value,

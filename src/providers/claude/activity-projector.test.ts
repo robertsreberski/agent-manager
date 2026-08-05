@@ -793,7 +793,7 @@ test("turns exact SDK callbacks into resolvable attention activity", () => {
     desiredModel: "sonnet",
     effort: "high",
     sdkVersion: "0.3.220",
-    claudeCodeVersion: "2.1.221",
+    claudeCodeVersion: "2.1.222",
     capabilities: [],
     canSteer: true,
     pendingRequests: [{
@@ -861,7 +861,7 @@ test("Claude approval activity carries SDK-supplied facts without shell inferenc
     desiredModel: "sonnet",
     effort: "high",
     sdkVersion: "0.3.220",
-    claudeCodeVersion: "2.1.221",
+    claudeCodeVersion: "2.1.222",
     capabilities: [],
     canSteer: true,
     pendingRequests: [{

@@ -20,6 +20,7 @@ function externalSession(): SessionView {
     name: "External",
     cwd: "/tmp",
     kind: "interactive",
+    archived: false,
     presence: "live",
     status: "running",
     providerStatus: "running",
@@ -65,6 +66,7 @@ function externalSession(): SessionView {
       authority: "none",
       capabilities: [],
       withheld: [],
+      takeover: null,
     },
     workspaceIdentity: null,
     generation: 1,
@@ -362,7 +364,7 @@ test("re-observes a tool call when only its result arrives", async () => {
   const settled = hub.snapshot(session.id)?.items[0];
   assert.equal(settled?.kind === "tool" ? settled.result : null, "README.md");
   assert.equal(settled?.state, "complete");
-  assert.equal(frames.at(-1)?.type, "activity.upsert");
+  assert.equal(frames.at(-1)?.type, "activity.reset");
 
   release();
   unsubscribe();
@@ -377,7 +379,7 @@ test("re-observes a tool call when only its result arrives", async () => {
   process. The operator was shown "Waiting for provider activity", which is not
   what happened.
 */
-test("fills an empty view from the transcript, once, without taking the session over", () => {
+test("hydrates an empty view from the transcript without taking the session over", () => {
   const hub = new ActivityHub({ streamEpoch: "observer-seed" });
   const session = externalSession();
   hub.ensureSession(session.id, session.provider);
@@ -390,7 +392,7 @@ test("fills an empty view from the transcript, once, without taking the session 
     eligible: () => false,
   });
 
-  assert.equal(observer.seedIfEmpty(session), true);
+  assert.equal(observer.hydrate(session), true);
   assert.equal(reads, 1);
   const items = hub.snapshot(session.id)?.items ?? [];
   assert.equal(items.length, 1);
@@ -404,7 +406,7 @@ test("fills an empty view from the transcript, once, without taking the session 
   hub.dispose();
 });
 
-test("does not seed a view that already holds provider activity", () => {
+test("hydrates history into a view that already holds provider activity", () => {
   const hub = new ActivityHub({ streamEpoch: "observer-seed-live" });
   const session = externalSession();
   hub.ingest(session.id, session.provider, {
@@ -418,16 +420,18 @@ test("does not seed a view that already holds provider activity", () => {
   });
 
   assert.equal(hub.isEmpty(session.id), false);
-  // The caller gates on `isEmpty`, but the observer must not double up either.
-  observer.acquire(session);
-  assert.equal(observer.seedIfEmpty(session), false);
-  assert.equal(reads, 1, "the ongoing observation read; the seed did not");
+  assert.equal(observer.hydrate(session), true);
+  assert.equal(reads, 1);
+  assert.deepEqual(
+    hub.snapshot(session.id)?.items.map((item) => item.id),
+    ["transcript:message-1", "codex/live"],
+  );
 
   observer.dispose();
   hub.dispose();
 });
 
-test("reports an unreadable transcript rather than seeding silence", () => {
+test("reports an unreadable transcript instead of presenting silence", () => {
   const hub = new ActivityHub({ streamEpoch: "observer-seed-missing" });
   const session = externalSession();
   hub.ensureSession(session.id, session.provider);
@@ -443,12 +447,10 @@ test("reports an unreadable transcript rather than seeding silence", () => {
     },
   });
 
-  assert.equal(observer.seedIfEmpty(session), false);
-  assert.equal(hub.snapshot(session.id)?.items.length, 0);
-
-  // Which is what lets the caller state the boundary instead of claiming quiet.
-  hub.markRetentionBoundary(session.id);
-  assert.equal(hub.snapshot(session.id)?.truncated, true);
+  assert.equal(observer.hydrate(session), false);
+  const items = hub.snapshot(session.id)?.items ?? [];
+  assert.equal(items.length, 1);
+  assert.equal(items[0]?.kind === "lifecycle" ? items[0].title : null, "No transcript found");
 
   observer.dispose();
   hub.dispose();
@@ -463,7 +465,7 @@ test("carries a provider truncation through the seed", () => {
     reader: { read() { return transcript("message-1", "earlier turn", true); } },
   });
 
-  assert.equal(observer.seedIfEmpty(session), true);
+  assert.equal(observer.hydrate(session), true);
   assert.equal(hub.snapshot(session.id)?.truncated, true);
 
   observer.dispose();

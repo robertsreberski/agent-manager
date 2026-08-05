@@ -217,7 +217,7 @@ describe("Header", () => {
     const onHelp = vi.fn();
     const onNew = vi.fn();
     render(<Header
-      counts={{ all: 5, "wants-you": 2, working: 1, failed: 1, idle: 2 }}
+      counts={{ all: 5, "wants-you": 2, working: 1, failed: 1, idle: 2, archived: 3 }}
       scope="wants-you"
       hosts={[
         { id: "local", label: "This Mac", kind: "local", status: "online", count: 3 },

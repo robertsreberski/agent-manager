@@ -371,6 +371,7 @@ export function attachTmuxTerminals(
           authority: "foreign" as const,
           capabilities: ["preview", "attach"] as const,
           withheld: record.control.withheld,
+          takeover: record.control.takeover,
         }
       : record.control;
     return {

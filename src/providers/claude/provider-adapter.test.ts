@@ -3,7 +3,7 @@ import test from "node:test";
 
 import type { SessionView } from "../../core/types.ts";
 import type { ActivityMutation } from "../../activity/index.ts";
-import type { RequestContext } from "../../server/contracts.ts";
+import type { ManagedSessionRecoveryRecord, RequestContext } from "../../server/contracts.ts";
 import { AsyncInbox } from "./async-inbox.ts";
 import { ClaudeHookSourceArbiter } from "../hooks/claude-source.ts";
 import { ClaudeProviderControlAdapter } from "./provider-adapter.ts";
@@ -102,7 +102,7 @@ class BridgeRuntime implements ClaudeSdkRuntime {
       type: "system",
       subtype: "init",
       session_id: params.options.resume ?? "managed-claude-1",
-      claude_code_version: "2.1.221",
+      claude_code_version: "2.1.222",
       model: params.options.model ?? "default-model",
       permissionMode: params.options.permissionMode,
       capabilities: ["interrupt_receipt_v1"],
@@ -134,6 +134,34 @@ function context(): RequestContext {
     requestId: "request",
     signal: new AbortController().signal,
     workspace: { id: "workspace", label: "Workspace", path: "/workspace" },
+  };
+}
+
+async function externalClaudeView(runtime: BridgeRuntime): Promise<SessionView> {
+  const source = new ClaudeProviderControlAdapter({
+    runtime,
+    resolveWorkspace: () => "/workspace",
+  });
+  const view = await source.createSession({
+    provider: "claude",
+    workspaceId: "workspace",
+    initialMessage: "Original CLI turn",
+    profile: "ask-first",
+    model: "sonnet",
+    effort: "high",
+    idempotencyKey: "external-claude-fixture",
+  }, context());
+  source.dispose();
+  return {
+    ...view,
+    source: "claude-hook",
+    control: {
+      plane: "claude-hook-bridge",
+      authority: "foreign",
+      capabilities: [],
+      withheld: view.control.withheld,
+      takeover: null,
+    },
   };
 }
 
@@ -971,6 +999,52 @@ test("returns the provider handoff id with native Claude attach instructions", a
   adapter.dispose();
 });
 
+test("restores only exact persisted Claude identities with their profile, model, and effort", async () => {
+  const runtime = new BridgeRuntime();
+  const changes: SessionView[] = [];
+  const adapter = new ClaudeProviderControlAdapter({
+    runtime,
+    onSessionChanged: (view) => changes.push(view),
+  });
+  const record: ManagedSessionRecoveryRecord = {
+    managerSessionId: "local:claude:claude-restart",
+    provider: "claude",
+    providerThreadId: "claude-restart",
+    workspaceId: "workspace",
+    workspacePath: "/workspace",
+    name: "Recovered Claude",
+    profile: "plan",
+    model: "opus",
+    effort: "high",
+    createdAt: "2026-08-03T08:00:00.000Z",
+  };
+
+  const report = await adapter.restoreManagedSessions([
+    record,
+    { ...record },
+    { ...record, managerSessionId: "local:claude:different", providerThreadId: "wrong" },
+  ], new AbortController().signal);
+
+  assert.deepEqual(report.restoredSessionIds, ["local:claude:claude-restart"]);
+  assert.equal(report.failures.length, 2);
+  assert.match(report.failures[0]?.reason ?? "", /duplicated/u);
+  assert.match(report.failures[1]?.reason ?? "", /do not match/u);
+  const query = runtime.queries[0];
+  assert.ok(query);
+  assert.equal(query.params.options.resume, "claude-restart");
+  assert.equal(query.params.options.cwd, "/workspace");
+  assert.equal(query.params.options.permissionMode, "plan");
+  assert.equal(query.params.options.model, "opus");
+  assert.equal(query.params.options.effort, "high");
+  const recovered = adapter.getManagedSession("claude-restart");
+  assert.ok(recovered);
+  assert.equal(recovered.name, "Recovered Claude");
+  assert.equal(recovered.control.authority, "manager");
+  assert.ok(recovered.control.capabilities.includes("queue"));
+  assert.ok(changes.some((view) => view.id === recovered.id));
+  adapter.dispose();
+});
+
 test("withdraws writable controls after stream close while preserving native resume", async () => {
   const runtime = new BridgeRuntime();
   const changes: SessionView[] = [];
@@ -1237,5 +1311,68 @@ test("a Claude session stays publishable when git facts cannot be resolved", asy
   }, context());
   assert.equal(created.workspaceIdentity, null);
   assert.equal(created.control.authority, "manager");
+  adapter.dispose();
+});
+
+test("external Claude adoption resumes the exact identity and stays unpublished until commit", async () => {
+  const runtime = new BridgeRuntime();
+  const external = await externalClaudeView(runtime);
+  const changes: SessionView[] = [];
+  const adapter = new ClaudeProviderControlAdapter({
+    runtime,
+    resolveWorkspace: () => "/workspace",
+    onSessionChanged: (session) => changes.push(session),
+  });
+
+  const provisional = await adapter.adoptExternalSession(external, "ask-first", context());
+  const resumed = runtime.queries.at(-1);
+  assert.ok(resumed);
+  assert.equal(resumed.params.options.resume, external.providerThreadId);
+  assert.equal(resumed.params.options.cwd, "/workspace");
+  assert.equal(resumed.params.options.permissionMode, "default");
+  assert.equal(resumed.params.options.model, "sonnet");
+  assert.equal(resumed.params.options.effort, "high");
+  assert.equal(provisional.providerThreadId, external.providerThreadId);
+  assert.equal(provisional.profile.value, "ask-first");
+  assert.equal(provisional.model.value, "sonnet");
+  assert.equal(provisional.effort.value, "high");
+  assert.deepEqual(changes, [], "a provisional adoption must not publish manager controls");
+
+  const committed = adapter.commitExternalAdoption(external.providerThreadId);
+  assert.equal(committed.control.authority, "manager");
+  assert.ok(committed.control.capabilities.includes("queue"));
+  adapter.abortExternalAdoption(external.providerThreadId);
+  assert.ok(adapter.getManagedSession(external.providerThreadId));
+  adapter.dispose();
+});
+
+test("external Claude adoption rejects provider identity drift without publishing controls", async () => {
+  const runtime = new BridgeRuntime();
+  const external = await externalClaudeView(runtime);
+  const changes: SessionView[] = [];
+  runtime.nextQueryHook = (query) => {
+    query.emit({
+      type: "system",
+      subtype: "init",
+      session_id: "different-claude-session",
+      claude_code_version: "2.1.222",
+      model: "sonnet",
+      permissionMode: "default",
+      capabilities: ["interrupt_receipt_v1"],
+    });
+  };
+  const adapter = new ClaudeProviderControlAdapter({
+    runtime,
+    resolveWorkspace: () => "/workspace",
+    onSessionChanged: (session) => changes.push(session),
+  });
+
+  await assert.rejects(
+    adapter.adoptExternalSession(external, "ask-first", context()),
+    /resumed unexpected session/u,
+  );
+  assert.deepEqual(changes, []);
+  assert.equal(adapter.getManagedSession(external.providerThreadId), null);
+  assert.equal(runtime.queries.at(-1)?.closed, true);
   adapter.dispose();
 });

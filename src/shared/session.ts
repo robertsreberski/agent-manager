@@ -55,6 +55,31 @@ export function normalizeProviderReasoningEffort(
 }
 
 export type SessionPresence = "live" | "recent";
+export type TakeoverMethod = "guided-exit" | "graceful-stop";
+export type TakeoverState =
+  | "available"
+  | "waiting-for-exit"
+  | "stopping"
+  | "adopting"
+  | "failed";
+
+/**
+ * Public state for an exclusive foreign-CLI to manager ownership transfer.
+ * `id` is null only while takeover is merely available; an active or failed
+ * attempt always carries the identity used to reject stale cancellation.
+ */
+export interface SessionTakeover {
+  id: string | null;
+  state: TakeoverState;
+  methods: TakeoverMethod[];
+  method: TakeoverMethod | null;
+  requestedAt: string | null;
+  deadlineAt: string | null;
+  /** Conservative mode applied only when discovery could not prove one. */
+  fallbackProfile: ExecutionProfile | null;
+  error: string | null;
+}
+
 export type SessionKind =
   | "interactive"
   | "background"
@@ -194,6 +219,8 @@ export type ControlCapability =
   | "end"
   | "archive"
   | "delete"
+  | "take-control"
+  | "cancel-take-control"
   | "open-editor";
 
 export interface WithheldCapability {
@@ -208,6 +235,8 @@ export interface SessionControl {
   capabilities: ControlCapability[];
   /** Display-only explanations. Authorization reads capabilities, never this list. */
   withheld: WithheldCapability[];
+  /** Null when this session is already manager-owned or cannot be adopted safely. */
+  takeover: SessionTakeover | null;
 }
 
 export interface ChildSummary {
@@ -252,6 +281,8 @@ export interface SessionRecord {
   name: string | null;
   cwd: string | null;
   kind: SessionKind;
+  /** Provider-owned archive lifecycle, independent of live/recent presence. */
+  archived: boolean;
   presence: SessionPresence;
   status: SessionStatus;
   providerStatus: string | null;
@@ -352,5 +383,6 @@ export function observeOnlyControl(): SessionControl {
     authority: "none",
     capabilities: [],
     withheld: [],
+    takeover: null,
   };
 }

@@ -9,10 +9,11 @@ const EPOCH = "epoch-1";
 
 function message(overrides: Partial<ActivityMessageItem> = {}): ActivityMessageItem {
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     id: "message-1",
     sessionId: SESSION_ID,
     provider: "codex",
+    correlationId: null,
     turnId: "turn-1",
     parentId: null,
     seq: 1,
@@ -36,7 +37,7 @@ function message(overrides: Partial<ActivityMessageItem> = {}): ActivityMessageI
 
 function frame(value: { type: ActivityFrame["type"]; seq: number; [key: string]: unknown }): ActivityFrame {
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     streamEpoch: EPOCH,
     sessionId: SESSION_ID,
     provider: "codex",

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { WireUpgradeRequiredError, WIRE_SCHEMA_VERSION } from "../../../src/shared/wire.ts";
+import { AGENT_MANAGER_BUILD_ID, WireUpgradeRequiredError, WIRE_SCHEMA_VERSION } from "../../../src/shared/wire.ts";
 import { ApiError, CockpitApi } from "./api";
 
 function sessionRecord() {
@@ -16,6 +16,7 @@ function sessionRecord() {
     name: null,
     cwd: "/tmp/project",
     kind: "interactive",
+    archived: false,
     presence: "live",
     status: "idle",
     providerStatus: "idle",
@@ -61,6 +62,7 @@ function sessionRecord() {
       authority: "manager",
       capabilities: ["queue", "set-profile"],
       withheld: [],
+      takeover: null,
     },
     workspaceIdentity: null,
     generation: 1,
@@ -72,6 +74,62 @@ afterEach(() => {
 });
 
 describe("CockpitApi", () => {
+  it("reads strict cursor-paginated archived sessions as read-only records", async () => {
+    let requested = "";
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      requested = String(input);
+      return new Response(JSON.stringify({
+        schemaVersion: WIRE_SCHEMA_VERSION,
+        buildId: AGENT_MANAGER_BUILD_ID,
+        query: "needle",
+        sessions: [{
+          ...sessionRecord(),
+          archived: true,
+          presence: "recent",
+          status: "completed",
+          providerStatus: "archived",
+          control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [], takeover: null },
+        }],
+        nextCursor: "next-page",
+        total: 51,
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }));
+    const api = new CockpitApi({ csrfToken: "csrf", actor: "Local" });
+
+    const page = await api.archivedSessions("needle", "opaque-cursor", 50);
+
+    expect(requested).toContain("/api/v1/archived-sessions?");
+    expect(requested).toContain("q=needle");
+    expect(requested).toContain("cursor=opaque-cursor");
+    expect(page.sessions[0]?.archived).toBe(true);
+    expect(page.sessions[0]?.control.capabilities).toEqual([]);
+    expect(page.nextCursor).toBe("next-page");
+    expect(page.total).toBe(51);
+  });
+
+  it("resolves an archived direct link without treating a missing record as fatal", async () => {
+    const responses = [
+      new Response(JSON.stringify({
+        schemaVersion: WIRE_SCHEMA_VERSION,
+        buildId: AGENT_MANAGER_BUILD_ID,
+        session: {
+          ...sessionRecord(),
+          archived: true,
+          presence: "recent",
+          status: "completed",
+          providerStatus: "archived",
+          control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [], takeover: null },
+        },
+      }), { status: 200, headers: { "content-type": "application/json" } }),
+      new Response(JSON.stringify({ error: { message: "missing" } }), { status: 404, headers: { "content-type": "application/json" } }),
+    ];
+    vi.stubGlobal("fetch", vi.fn(async () => responses.shift()!));
+    const api = new CockpitApi({ csrfToken: "csrf", actor: "Local" });
+
+    await expect(api.archivedSession("local:codex:new")).resolves.toMatchObject({ archived: true });
+    await expect(api.archivedSession("local:codex:missing")).resolves.toBeNull();
+  });
+
   it("turns immutable attach argv into a copyable display command", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
       instruction: {

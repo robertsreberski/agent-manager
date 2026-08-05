@@ -69,6 +69,7 @@ function session(
     name: null,
     cwd,
     kind: "interactive",
+    archived: false,
     presence: "live",
     status: "idle",
     providerStatus: null,
@@ -94,7 +95,7 @@ function session(
     todoProgress: null,
     attention: [],
     terminal: null,
-    control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [] },
+    control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [], takeover: null },
     workspaceIdentity,
     generation: 0,
   };

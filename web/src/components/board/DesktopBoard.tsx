@@ -10,6 +10,7 @@ export interface DesktopBoardProps {
   onOpenSession: (session: BoardSession) => void;
   onToggleSelection?: (session: BoardSession) => void;
   onNewThread?: (column: BoardColumn) => void;
+  showNewThread?: boolean;
 }
 
 /**
@@ -32,6 +33,7 @@ export function DesktopBoard({
   onOpenSession,
   onToggleSelection,
   onNewThread,
+  showNewThread = true,
 }: DesktopBoardProps) {
   const selectionActive = selectedSessionIds.size > 0;
   return (
@@ -119,7 +121,7 @@ export function DesktopBoard({
             R3 keeps the lime for the header's New thread; this per-column
             twin is the same action in a quieter place, so it stays an outline.
           */}
-          <Button
+          {showNewThread && <Button
             variant="ghost"
             size="touch"
             data-compact-control
@@ -127,7 +129,7 @@ export function DesktopBoard({
             onClick={() => onNewThread?.(column)}
           >
             <Plus size={13} strokeWidth={1.75} />New thread here
-          </Button>
+          </Button>}
         </section>
       ))}
     </section>

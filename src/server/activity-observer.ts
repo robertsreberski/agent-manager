@@ -72,6 +72,7 @@ function activityDraft(item: TranscriptItem): ActivityItemDraft {
     return {
       kind: "reasoning",
       id: `${TRANSCRIPT_ID_PREFIX}${item.id}`,
+      correlationId: item.correlationId ?? null,
       reasoningKind: "summary",
       label: item.label,
       text: item.text,
@@ -84,6 +85,7 @@ function activityDraft(item: TranscriptItem): ActivityItemDraft {
     return {
       kind: "tool",
       id: `${TRANSCRIPT_ID_PREFIX}${item.id}`,
+      correlationId: item.correlationId ?? null,
       toolCallId: item.toolCallId,
       name: item.name,
       // The transcript names a tool but never states which category the
@@ -100,6 +102,7 @@ function activityDraft(item: TranscriptItem): ActivityItemDraft {
   return {
     kind: "message",
     id: `${TRANSCRIPT_ID_PREFIX}${item.id}`,
+    correlationId: item.correlationId ?? null,
     role: item.role,
     // Transcript rows preserve message order but do not expose the provider's
     // commentary/final channel. Treating every complete assistant row as final
@@ -219,59 +222,29 @@ export class SelectedTranscriptActivityObserver {
   }
 
   seedOnce(session: SessionView): void {
-    if (!this.#reader) return;
+    this.hydrate(session);
+  }
+
+  /** @deprecated Use hydrate; retained for embedders during this source cutover. */
+  seedIfEmpty(session: SessionView): boolean {
+    return this.hydrate(session);
+  }
+
+  /** Hydrates history even when hook/API activity already occupies the hub. */
+  hydrate(session: SessionView): boolean {
+    if (!this.#reader) return false;
     const existing = this.#active.get(session.id);
     if (existing) {
-      this.#refresh(existing);
-      return;
+      existing.session = session;
+      return this.#refresh(existing, false);
     }
-    const temporary: ActiveObservation = {
+    return this.#refresh({
       refs: 0,
       session,
       timer: null,
       previous: null,
       stopped: false,
-    };
-    this.#refresh(temporary);
-  }
-
-  /**
-   * Fills an empty activity view from the transcript, once, and then gets out
-   * of the way.
-   *
-   * The activity hub is volatile: it holds one bounded window per session and
-   * nothing rehydrates it, so every restart leaves a manager-owned session with
-   * no history — and neither provider replays one (Codex resumes with
-   * `excludeTurns`, Claude's SDK child died with the process). The operator was
-   * shown "Waiting for provider activity", which is not what happened.
-   *
-   * This deliberately does not go through `eligible`. That predicate governs an
-   * *ongoing* observation and exists to keep two live producers off one
-   * session; routing this through it would make the observer withdraw its own
-   * seed the moment the view stopped being empty. The rule it protects is about
-   * concurrent producers, and this runs only when there is no producer at all —
-   * the seeded turns ended before this process started, and the live stream
-   * carries only what comes after.
-   *
-   * Returns whether anything was seeded, so the caller can tell an empty
-   * history from an unreadable one.
-   */
-  seedIfEmpty(session: SessionView): boolean {
-    if (!this.#reader || this.#active.has(session.id)) return false;
-    let result: TranscriptReadResult;
-    try {
-      result = this.#reader.read(session);
-    } catch {
-      return false;
-    }
-    if (result.transcript.state !== "available" || result.items.length === 0) return false;
-    this.#hub.ingest(session.id, session.provider, {
-      type: "reset",
-      reason: result.transcript.truncated ? "truncation" : "transcript-reset",
-      items: result.items.map(activityDraft),
-      truncated: result.transcript.truncated,
-    });
-    return true;
+    }, false);
   }
 
   acquire(session: SessionView): () => void {
@@ -314,26 +287,15 @@ export class SelectedTranscriptActivityObserver {
     this.#active.clear();
   }
 
-  #refresh(observation: ActiveObservation): void {
-    if (!this.#reader || observation.stopped) return;
+  #refresh(observation: ActiveObservation, respectEligibility = true): boolean {
+    if (!this.#reader || observation.stopped) return false;
     const latestSession = this.#resolveSession?.(observation.session.id);
     if (latestSession) observation.session = latestSession;
-    if (this.#eligible && !this.#eligible(observation.session)) {
-      /*
-        A hook bridge came online for a session this observer had already read.
-        Both producers write the same events under different ids and the hub
-        dedupes by id, so simply falling silent leaves every item duplicated for
-        the life of the session. The `transcript:` prefix is this observer's
-        alone, so withdrawing it is exact.
-      */
-      if (observation.previous !== null) {
-        observation.previous = null;
-        this.#hub.removeMatching(
-          observation.session.id,
-          (id) => id.startsWith(TRANSCRIPT_ID_PREFIX),
-        );
-      }
-      return;
+    if (respectEligibility && this.#eligible && !this.#eligible(observation.session)) {
+      // Eligibility can pause polling, but a source handoff never deletes the
+      // already-reconciled history. Exact events replace correlated inferred
+      // twins inside ActivityHub as they arrive.
+      return false;
     }
     let result: TranscriptReadResult;
     try {
@@ -363,54 +325,29 @@ export class SelectedTranscriptActivityObserver {
         };
     const previous = observation.previous;
     if (next.state === "unavailable") {
-      if (previous?.state === "unavailable" && previous.reason === next.reason) return;
-      this.#hub.ingest(observation.session.id, observation.session.provider, {
-        type: "reset",
-        reason: "transcript-reset",
-        items: [unavailableActivity(next.reason)],
-      });
+      this.#hub.reconcileTranscript(
+        observation.session.id,
+        observation.session.provider,
+        [unavailableActivity(next.reason)],
+        false,
+      );
       observation.previous = next;
-      return;
+      return false;
     }
-    if (!previous) {
-      this.#hub.ingest(observation.session.id, observation.session.provider, {
-        type: "reset",
-        reason: next.truncated ? "truncation" : "transcript-reset",
-        items: next.items.map(activityDraft),
-      });
-      observation.previous = structuredClone(next);
-      return;
-    }
-    if (previous.state === "unavailable") {
-      this.#hub.ingest(observation.session.id, observation.session.provider, {
-        type: "reset",
-        reason: "transcript-reset",
-        items: next.items.map(activityDraft),
-      });
-      observation.previous = structuredClone(next);
-      return;
-    }
-    const reset = replacementReason(previous, next);
-    if (reset) {
-      this.#hub.ingest(observation.session.id, observation.session.provider, {
-        type: "reset",
-        reason: reset,
-        items: next.items.map(activityDraft),
-      });
-      observation.previous = structuredClone(next);
-      return;
-    }
-    for (let index = 0; index < next.items.length; index += 1) {
-      const nextItem = next.items[index]!;
-      const previousItem = previous.items[index];
-      if (!previousItem || changed(previousItem, nextItem)) {
-        this.#hub.ingest(observation.session.id, observation.session.provider, {
-          type: "upsert",
-          item: activityDraft(nextItem),
-        });
-      }
-    }
+    const reason = next.truncated
+      ? "truncation"
+      : previous?.state === "available"
+        ? replacementReason(previous, next) ?? "transcript-reset"
+        : "transcript-reset";
+    this.#hub.reconcileTranscript(
+      observation.session.id,
+      observation.session.provider,
+      next.items.map(activityDraft),
+      next.truncated,
+      reason,
+    );
     observation.previous = structuredClone(next);
+    return next.items.length > 0;
   }
 
   #schedule(observation: ActiveObservation): void {

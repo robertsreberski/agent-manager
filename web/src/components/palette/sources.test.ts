@@ -16,7 +16,7 @@ function session(overrides: Partial<BoardSession> & Pick<BoardSession, "id">): B
     activity: "running",
     attention: [],
     updatedAt: "2026-08-04T12:00:00Z",
-    control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [] },
+    control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [], takeover: null },
     profile: null,
     model: null,
     effort: null,

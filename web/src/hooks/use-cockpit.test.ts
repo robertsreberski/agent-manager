@@ -3,7 +3,7 @@ import { ApiError } from "../lib/api";
 import { BrowserSessionError } from "../lib/auth";
 import type { ControlLease, SessionView, StateEvent, WireStateSnapshot } from "../types";
 import { AGENT_MANAGER_BUILD_ID, WireUpgradeRequiredError, WIRE_SCHEMA_VERSION } from "../types";
-import { acquireAutomaticLease, applyStateEvent, generateBrowserClientId, isStaleRequestRace, mutationsAreReady, releaseLeasesForPageExit, reloadForWireUpgrade, sensitiveBoundaryStatus, WIRE_UPGRADE_RELOAD_STORAGE_KEY } from "./use-cockpit";
+import { acquireAutomaticLease, applyStateEvent, generateBrowserClientId, isStaleRequestRace, mutationsAreReady, releaseLeasesForPageExit, reloadForWireUpgrade, resolveArchivedSelection, sensitiveBoundaryStatus, WIRE_UPGRADE_RELOAD_STORAGE_KEY } from "./use-cockpit";
 
 function lease(token: string, seconds = 300): ControlLease {
   return { token, clientId: "browser", expiresAt: new Date(Date.now() + seconds * 1_000).toISOString() };
@@ -23,6 +23,25 @@ describe("strict event reconciliation", () => {
   it("replaces diagnostics atomically", () => {
     const event = { schemaVersion: WIRE_SCHEMA_VERSION, buildId: AGENT_MANAGER_BUILD_ID, seq: 4, at: "2026-08-04T12:01:00Z", type: "diagnostic", payload: { stale: true, diagnostics: [{ provider: "system", level: "warning", message: "offline" }] } } satisfies StateEvent;
     expect(applyStateEvent(snapshot, event)).toMatchObject({ seq: 4, stale: true, diagnostics: event.payload.diagnostics });
+  });
+});
+
+describe("active-to-archive selection handoff", () => {
+  it("keeps the selection while the archive index catches up", async () => {
+    const archived = { ...target, archived: true } as SessionView;
+    const archivedSession = vi.fn()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(archived);
+    await expect(resolveArchivedSelection({ archivedSession }, target.id, { attempts: 3, delayMs: 0 }))
+      .resolves.toBe(archived);
+    expect(archivedSession).toHaveBeenCalledTimes(2);
+  });
+
+  it("clears only after the bounded archive lookup remains absent", async () => {
+    const archivedSession = vi.fn().mockResolvedValue(null);
+    await expect(resolveArchivedSelection({ archivedSession }, target.id, { attempts: 3, delayMs: 0 }))
+      .resolves.toBeNull();
+    expect(archivedSession).toHaveBeenCalledTimes(3);
   });
 });
 

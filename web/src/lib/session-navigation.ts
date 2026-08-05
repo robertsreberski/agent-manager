@@ -1,6 +1,6 @@
 import type { SessionView } from "../types";
 
-export const SESSION_SCOPES = ["all", "wants-you", "working", "idle"] as const;
+export const SESSION_SCOPES = ["all", "wants-you", "working", "idle", "archived"] as const;
 export type SessionScope = (typeof SESSION_SCOPES)[number];
 export type SessionScopeCounts = Record<SessionScope, number>;
 
@@ -41,10 +41,11 @@ export function searchWithSelectedSession(search: string, selectedId: string | n
 
 export function sessionMatchesScope(session: SessionView, scope: SessionScope): boolean {
   switch (scope) {
-    case "all": return true;
-    case "wants-you": return session.attention.length > 0;
-    case "working": return session.status === "running";
-    case "idle": return session.attention.length === 0 && session.status !== "running";
+    case "all": return !session.archived;
+    case "wants-you": return !session.archived && session.attention.length > 0;
+    case "working": return !session.archived && session.status === "running";
+    case "idle": return !session.archived && session.attention.length === 0 && session.status !== "running";
+    case "archived": return session.archived;
   }
 }
 

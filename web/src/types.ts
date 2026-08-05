@@ -34,8 +34,11 @@ export type {
   SessionProfile,
   SessionRecord,
   SessionStatus,
+  SessionTakeover,
   SessionTerminal,
   SessionView,
+  TakeoverMethod,
+  TakeoverState,
   WithheldCapability,
   WorkspaceIdentity,
 } from "../../src/shared/session.ts";

@@ -25,6 +25,7 @@ function managedSession(overrides: Partial<SessionView> = {}): SessionView {
     name: "Managed Claude",
     cwd: "/tmp/workspace",
     kind: "interactive",
+    archived: false,
     presence: "live",
     status: "idle",
     providerStatus: "idle",
@@ -70,6 +71,7 @@ function managedSession(overrides: Partial<SessionView> = {}): SessionView {
       authority: "manager",
       capabilities: ["queue", "set-model"],
       withheld: [],
+      takeover: null,
     },
     workspaceIdentity: null,
     generation: 0,
@@ -135,6 +137,7 @@ test("serves an authenticated Codex catalog with provider-declared model efforts
       authority: "manager",
       capabilities: ["set-model"],
       withheld: [],
+      takeover: null,
     },
   });
   const backend = await createAgentManagerServer({
@@ -201,6 +204,7 @@ test("serves the catalog to a manager-owned session that cannot currently set a 
       authority: "manager",
       capabilities: ["queue", "interrupt"],
       withheld: [{ capability: "set-model", reason: "Available when the Codex turn is idle" }],
+      takeover: null,
     },
   });
   const backend = await createAgentManagerServer({
@@ -353,6 +357,7 @@ test("does not borrow a manager-owned session for legacy draft catalogs", async 
       authority: "foreign",
       capabilities: ["set-model"],
       withheld: [],
+      takeover: null,
     },
   });
   const managed = managedSession();
@@ -505,6 +510,7 @@ test("reports remote, foreign, unsupported, and failed catalogs as explicitly un
       authority: "foreign",
       capabilities: ["resume"],
       withheld: [],
+      takeover: null,
     },
   });
   const unsupported = managedSession({
@@ -517,6 +523,7 @@ test("reports remote, foreign, unsupported, and failed catalogs as explicitly un
       authority: "manager",
       capabilities: ["set-model"],
       withheld: [],
+      takeover: null,
     },
   });
   const remote = managedSession({

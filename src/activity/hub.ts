@@ -48,6 +48,8 @@ interface ActivitySession {
   /** Content-free state retained across todo rewrites for exact stall metadata. */
   todoSemantic: string | null;
   todoProgress: TodoProgress | null;
+  /** Last transcript projection atomically reconciled into this combined view. */
+  transcriptSignature: string | null;
 }
 
 interface AppendSourceState {
@@ -138,6 +140,7 @@ export class ActivityHub {
       truncated: false,
       todoSemantic: null,
       todoProgress: null,
+      transcriptSignature: null,
     });
   }
 
@@ -183,13 +186,30 @@ export class ActivityHub {
     switch (mutation.type) {
       case "upsert": {
         const existing = session.items.get(mutation.item.id);
+        const correlated = mutation.item.source !== "transcript"
+          && typeof mutation.item.correlationId === "string"
+          && mutation.item.correlationId.length > 0
+          ? [...session.items.values()].filter((candidate) =>
+              candidate.id !== mutation.item.id
+              && candidate.correlationId === mutation.item.correlationId
+            )
+          : [];
+        const chronologicalSlot = correlated.reduce(
+          (oldest, candidate) => Math.min(oldest, candidate.seq),
+          existing?.seq ?? seq,
+        );
+        const previousRevision = correlated.reduce(
+          (highest, candidate) => Math.max(highest, candidate.revision),
+          existing?.revision ?? 0,
+        );
+        for (const candidate of correlated) this.#deleteItem(session, candidate.id);
         const item = this.#materialize(
           sessionId,
           provider,
           mutation.item,
           existing,
-          existing?.seq ?? seq,
-          (existing?.revision ?? 0) + 1,
+          chronologicalSlot,
+          previousRevision + 1,
           at,
         );
         session.items.set(item.id, item);
@@ -200,8 +220,14 @@ export class ActivityHub {
           !existing || existing.kind !== mutation.item.kind,
         );
         const evicted = this.#trimView(session);
-        frame = evicted
-          ? this.#resetFrame(sessionId, session, seq, at, "truncation")
+        frame = evicted || correlated.length > 0
+          ? this.#resetFrame(
+              sessionId,
+              session,
+              seq,
+              at,
+              evicted ? "truncation" : "provider-reset",
+            )
           : {
               schemaVersion: ACTIVITY_SCHEMA_VERSION,
               streamEpoch: this.streamEpoch,
@@ -304,6 +330,7 @@ export class ActivityHub {
         session.appendOffsets.clear();
         session.appendSources.clear();
         session.truncated = mutation.truncated ?? false;
+        session.transcriptSignature = null;
         /*
           Every reset item used to share one seq, so `#view`'s
           `seq - seq || id.localeCompare(id)` fell through to the id — and a
@@ -366,6 +393,58 @@ export class ActivityHub {
       items: this.#items(session),
       truncated: session.truncated,
     };
+  }
+
+  /**
+   * Atomically merges bounded provider transcript history with exact hook/API
+   * activity. A shared correlation replaces the inferred transcript twin in
+   * its original chronological slot; uncovered transcript entries and exact
+   * live entries are retained. Repeating the same hydration is a no-op.
+   */
+  reconcileTranscript(
+    sessionId: string,
+    provider: Provider,
+    drafts: readonly ActivityItemDraft[],
+    truncated: boolean,
+    reason: ActivityResetFrame["reason"] = "transcript-reset",
+  ): boolean {
+    this.ensureSession(sessionId, provider);
+    const session = this.#sessions.get(sessionId)!;
+    const signature = JSON.stringify({ drafts, truncated });
+    if (session.transcriptSignature === signature) return false;
+
+    const ordered = this.#items(session);
+    const exactByCorrelation = new Map<string, ActivityItem>();
+    for (const item of ordered) {
+      if (
+        item.source !== "transcript"
+        && item.correlationId
+        && !exactByCorrelation.has(item.correlationId)
+      ) exactByCorrelation.set(item.correlationId, item);
+    }
+
+    const retainedExactIds = new Set<string>();
+    const merged: ActivityItemDraft[] = drafts.map((draft) => {
+      const exact = draft.correlationId
+        ? exactByCorrelation.get(draft.correlationId)
+        : undefined;
+      if (!exact) return clone(draft);
+      retainedExactIds.add(exact.id);
+      return clone(exact);
+    });
+    for (const item of ordered) {
+      if (item.source === "transcript" || retainedExactIds.has(item.id)) continue;
+      merged.push(clone(item));
+    }
+
+    this.ingest(sessionId, provider, {
+      type: "reset",
+      reason,
+      items: merged,
+      truncated: truncated || session.truncated,
+    });
+    this.#sessions.get(sessionId)!.transcriptSignature = signature;
+    return true;
   }
 
   replay(sessionId: string, cursor: string | null): ActivityReplayResult {
@@ -467,6 +546,7 @@ export class ActivityHub {
     session.truncated = false;
     session.todoSemantic = null;
     session.todoProgress = null;
+    session.transcriptSignature = null;
     const frame = this.#resetFrame(
       sessionId,
       session,
@@ -632,6 +712,16 @@ export class ActivityHub {
     return evicted;
   }
 
+  #deleteItem(session: ActivitySession, id: string): void {
+    session.items.delete(id);
+    for (const key of session.appendOffsets.keys()) {
+      if (key.startsWith(`${id}\u0000`)) session.appendOffsets.delete(key);
+    }
+    for (const key of session.appendSources.keys()) {
+      if (key.startsWith(`${id}\u0000`)) session.appendSources.delete(key);
+    }
+  }
+
   #boundedText(value: string): { value: string; truncated: boolean } {
     const bounded = truncateUtf8(redactActivityText(value), this.#limits.maxFieldBytes);
     return {
@@ -673,6 +763,9 @@ export class ActivityHub {
       id: redactActivityText(draft.id),
       sessionId,
       provider,
+      correlationId: draft.correlationId === undefined
+        ? previous?.correlationId ?? null
+        : draft.correlationId,
       turnId: draft.turnId === undefined ? previous?.turnId ?? null : draft.turnId,
       parentId: draft.parentId === undefined ? previous?.parentId ?? null : draft.parentId,
       seq,

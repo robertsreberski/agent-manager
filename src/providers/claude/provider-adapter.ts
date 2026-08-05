@@ -18,6 +18,8 @@ import type {
   ActionDispatchResult,
   AttachInstruction,
   CreateSessionInput,
+  ManagedSessionRecoveryRecord,
+  ManagedSessionRecoveryReport,
   ProviderControlAdapter,
   RequestContext,
   SessionAction,
@@ -51,6 +53,7 @@ import { profileForClaudePermissionMode } from "./profile.ts";
 interface ManagedEntry {
   session: ClaudeManagedSession;
   name: string | null;
+  published: boolean;
   projector: ClaudeActivityProjector;
   publishActivity(mutations: readonly ActivityMutation[]): void;
   unsubscribe: () => void;
@@ -58,6 +61,8 @@ interface ManagedEntry {
 
 const CLAUDE_SETTINGS_LOOKUP_TIMEOUT_MS = 2_000;
 const WORKSPACE_IDENTITY_BUDGET_MS = 2_500;
+const MAX_RECOVERY_RECORDS = 100;
+const RECOVERY_CONCURRENCY = 4;
 
 export interface ClaudeProviderAdapterOptions {
   resolveWorkspace?(
@@ -177,6 +182,11 @@ function boundedSettingsLookup<T>(promise: Promise<T>): Promise<T> {
       },
     );
   });
+}
+
+function recoveryError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return Array.from(message.trim() || "Claude recovery failed").slice(0, 2_000).join("");
 }
 
 /**
@@ -522,49 +532,144 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
       session.dispose();
       throw new Error("Claude SDK initialized without a session id");
     }
+    return this.#registerSession(session, input.name ?? null, true);
+  }
 
-    const managerSessionId = sessionRecordId("local", "claude", id);
-    const projector = new ClaudeActivityProjector();
-    const publishActivity = (mutations: readonly ActivityMutation[]): void => {
-      for (const mutation of mutations) {
+  async adoptExternalSession(
+    view: SessionView,
+    profile: ExecutionProfile,
+    context: RequestContext,
+  ): Promise<SessionView> {
+    if (
+      view.provider !== "claude"
+      || view.hostId !== "local"
+      || view.id !== sessionRecordId("local", "claude", view.providerThreadId)
+      || !view.cwd
+    ) throw new Error("Claude adoption requires one exact local session identity");
+    if (this.#entries.has(view.providerThreadId)) {
+      throw new Error("Claude session is already managed by this adapter");
+    }
+    if (!context.workspace || context.workspace.path !== view.cwd) {
+      throw new Error("Claude adoption workspace does not match the discovered session");
+    }
+    context.signal.throwIfAborted();
+    await this.#resolveWorkspaceIdentity(view.cwd);
+    context.signal.throwIfAborted();
+    const runtime = await this.#getRuntime();
+    const desiredMode = profileMode(profile);
+    const desiredEffort = view.effort.value ? claudeEffort(view.effort.value) : undefined;
+    const session = await ClaudeManagedSession.resume(runtime, {
+      sessionId: view.providerThreadId,
+      cwd: view.cwd,
+      mode: desiredMode,
+      ...(view.model.value ? { model: view.model.value } : {}),
+      ...(desiredEffort ? { effort: desiredEffort } : {}),
+      allowDangerouslySkipPermissions: true,
+    });
+    try {
+      context.signal.throwIfAborted();
+      if (session.snapshot.sessionId !== view.providerThreadId || session.snapshot.cwd !== view.cwd) {
+        throw new Error("Claude resume changed the validated provider identity");
+      }
+      if (session.snapshot.mode !== desiredMode) await session.setMode(desiredMode);
+      if (view.model.value && session.snapshot.model !== view.model.value) {
+        await session.setModel(view.model.value);
+      }
+      if (desiredEffort && session.snapshot.effort !== desiredEffort) {
+        await session.setEffort(desiredEffort);
+      }
+      context.signal.throwIfAborted();
+      return this.#registerSession(session, view.name, false);
+    } catch (error) {
+      session.dispose();
+      throw error;
+    }
+  }
+
+  async restoreManagedSessions(
+    records: readonly ManagedSessionRecoveryRecord[],
+    signal: AbortSignal,
+  ): Promise<ManagedSessionRecoveryReport> {
+    const selected = records.slice(0, MAX_RECOVERY_RECORDS);
+    const failures: Array<string | null> = selected.map(() => null);
+    const restored = selected.map(() => false);
+    const seenSessionIds = new Set<string>();
+    const candidates: Array<{ index: number; record: ManagedSessionRecoveryRecord }> = [];
+    for (const [index, record] of selected.entries()) {
+      if (
+        record.provider !== "claude"
+        || record.managerSessionId !== sessionRecordId("local", "claude", record.providerThreadId)
+      ) {
+        failures[index] = "Persisted manager and Claude session identities do not match";
+        continue;
+      }
+      if (seenSessionIds.has(record.providerThreadId)) {
+        failures[index] = "Persisted Claude session identity is duplicated";
+        continue;
+      }
+      seenSessionIds.add(record.providerThreadId);
+      if (this.#entries.has(record.providerThreadId)) {
+        failures[index] = "Claude session is already managed by this adapter";
+        continue;
+      }
+      candidates.push({ index, record });
+    }
+
+    let cursor = 0;
+    const worker = async (): Promise<void> => {
+      while (cursor < candidates.length) {
+        const candidate = candidates[cursor++];
+        if (!candidate) return;
+        const { index, record } = candidate;
+        let session: ClaudeManagedSession | null = null;
         try {
-          this.#options.onActivity?.(managerSessionId, mutation);
-        } catch {
-          // Activity consumers are observers and cannot stop the SDK pump.
+          signal.throwIfAborted();
+          await this.#resolveWorkspaceIdentity(record.workspacePath);
+          signal.throwIfAborted();
+          const runtime = await this.#getRuntime();
+          const effort = record.effort ? claudeEffort(record.effort) : undefined;
+          session = await ClaudeManagedSession.resume(runtime, {
+            sessionId: record.providerThreadId,
+            cwd: record.workspacePath,
+            mode: profileMode(record.profile),
+            ...(record.model ? { model: record.model } : {}),
+            ...(effort ? { effort } : {}),
+            allowDangerouslySkipPermissions: true,
+          });
+          signal.throwIfAborted();
+          if (
+            session.snapshot.sessionId !== record.providerThreadId
+            || session.snapshot.cwd !== record.workspacePath
+          ) throw new Error("Claude recovery returned a different session identity or workspace");
+          this.#registerSession(session, record.name, true);
+          session = null;
+          restored[index] = true;
+        } catch (error) {
+          session?.dispose();
+          failures[index] = recoveryError(error);
         }
       }
     };
-    const entry: ManagedEntry = {
-      session,
-      name: input.name ?? null,
-      projector,
-      publishActivity,
-      unsubscribe: () => undefined,
+    await Promise.all(
+      Array.from(
+        { length: Math.min(RECOVERY_CONCURRENCY, candidates.length) },
+        () => worker(),
+      ),
+    );
+    return {
+      restoredSessionIds: selected.flatMap((record, index) =>
+        restored[index] ? [record.managerSessionId] : []
+      ),
+      failures: selected.flatMap((record, index) => {
+        const reason = failures[index];
+        return reason === null || reason === undefined ? [] : [{
+          managerSessionId: record.managerSessionId,
+          providerThreadId: record.providerThreadId,
+          reason,
+        }];
+      }),
+      truncated: records.length > selected.length,
     };
-    this.#entries.set(id, entry);
-    this.#options.hookSourceArbiter?.markManagerOwned(id);
-    const unsubscribeMessages = session.onMessage((message) => {
-      publishActivity(projector.projectMessage(message));
-    });
-    const unsubscribeSession = session.subscribe((snapshot) => {
-      this.#options.hookSourceArbiter?.markManagerOwned(
-        id,
-        snapshot.owner === "manager"
-          && snapshot.activity !== "closed"
-          && snapshot.activity !== "failed",
-      );
-      publishActivity(projector.projectSnapshot(snapshot));
-      try {
-        this.#options.onSessionChanged?.(this.#toSessionView(entry, snapshot));
-      } catch {
-        // A state consumer cannot be allowed to tear down the provider pump.
-      }
-    });
-    entry.unsubscribe = () => {
-      unsubscribeMessages();
-      unsubscribeSession();
-    };
-    return this.#toSessionView(entry, session.snapshot);
   }
 
   async performAction(
@@ -642,6 +747,8 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
           return { status: "succeeded" };
         case "archive":
         case "delete":
+        case "take-control":
+        case "cancel-take-control":
           throw new Error(`Claude does not support ${action.type}`);
         case "open-editor":
           throw new Error("Claude provider does not own editor launch operations");
@@ -775,6 +882,21 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
     return entry ? this.#toSessionView(entry, entry.session.snapshot) : null;
   }
 
+  commitExternalAdoption(sessionId: string): SessionView {
+    const entry = this.#requireEntry(sessionId);
+    entry.published = true;
+    return this.#toSessionView(entry, entry.session.snapshot);
+  }
+
+  abortExternalAdoption(sessionId: string): void {
+    const entry = this.#entries.get(sessionId);
+    if (!entry || entry.published) return;
+    this.#entries.delete(sessionId);
+    entry.unsubscribe();
+    entry.session.dispose();
+    this.#options.hookSourceArbiter?.forget(sessionId);
+  }
+
   dispose(): void {
     for (const [sessionId, entry] of this.#entries) {
       entry.unsubscribe();
@@ -886,6 +1008,61 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
     return this.#runtime;
   }
 
+  #registerSession(
+    session: ClaudeManagedSession,
+    name: string | null,
+    published: boolean,
+  ): SessionView {
+    const id = session.snapshot.sessionId;
+    if (!id || this.#entries.has(id)) {
+      throw new Error(id ? "Claude session is already managed" : "Claude session has no provider identity");
+    }
+    const managerSessionId = sessionRecordId("local", "claude", id);
+    const projector = new ClaudeActivityProjector();
+    const publishActivity = (mutations: readonly ActivityMutation[]): void => {
+      for (const mutation of mutations) {
+        try {
+          this.#options.onActivity?.(managerSessionId, mutation);
+        } catch {
+          // Activity consumers are observers and cannot stop the SDK pump.
+        }
+      }
+    };
+    const entry: ManagedEntry = {
+      session,
+      name,
+      published,
+      projector,
+      publishActivity,
+      unsubscribe: () => undefined,
+    };
+    this.#entries.set(id, entry);
+    this.#options.hookSourceArbiter?.markManagerOwned(id);
+    const unsubscribeMessages = session.onMessage((message) => {
+      publishActivity(projector.projectMessage(message));
+    });
+    const unsubscribeSession = session.subscribe((snapshot) => {
+      this.#options.hookSourceArbiter?.markManagerOwned(
+        id,
+        snapshot.owner === "manager"
+          && snapshot.activity !== "closed"
+          && snapshot.activity !== "failed",
+      );
+      publishActivity(projector.projectSnapshot(snapshot));
+      if (!entry.published) return;
+      try {
+        this.#options.onSessionChanged?.(this.#toSessionView(entry, snapshot));
+      } catch {
+        // A state consumer cannot be allowed to tear down the provider pump.
+      }
+    });
+    entry.unsubscribe = () => {
+      unsubscribeMessages();
+      unsubscribeSession();
+    };
+    return this.#toSessionView(entry, session.snapshot);
+  }
+
   #toSessionView(
     entry: ManagedEntry,
     snapshot: ClaudeManagedSessionSnapshot,
@@ -978,6 +1155,7 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
       name: entry.name,
       cwd: snapshot.cwd,
       kind: "interactive",
+      archived: false,
       presence: status === "completed" ? "recent" : "live",
       status,
       providerStatus: snapshot.activity,
@@ -1021,6 +1199,7 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
         authority: managerControls ? "manager" : "foreign",
         capabilities,
         withheld,
+        takeover: null,
       },
       workspaceIdentity: structuredClone(
         this.#workspaceIdentities.get(snapshot.cwd) ?? null,

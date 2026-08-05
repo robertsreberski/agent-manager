@@ -841,6 +841,117 @@ test("a later mutation still sequences after every item a reset placed", () => {
   );
 });
 
+test("atomically reconciles transcript history with exact correlated activity", () => {
+  const hub = new ActivityHub({ streamEpoch: "transcript-reconcile" });
+  hub.ingest("session-1", "codex", {
+    type: "upsert",
+    item: {
+      id: "hook-tool",
+      kind: "tool",
+      toolCallId: "call-1",
+      name: "Bash",
+      state: "complete",
+      correlationId: "tool:call-1",
+      source: "provider-api",
+      confidence: "exact",
+      exposure: "provider-exposed",
+    },
+  });
+
+  assert.equal(hub.reconcileTranscript("session-1", "codex", [
+    {
+      id: "transcript:user",
+      kind: "message",
+      role: "user",
+      text: "initial prompt",
+      state: "complete",
+      source: "transcript",
+      confidence: "inferred",
+      exposure: "transcript-derived",
+    },
+    {
+      id: "transcript:reasoning",
+      kind: "reasoning",
+      reasoningKind: "summary",
+      text: "uncovered reasoning",
+      source: "transcript",
+      confidence: "inferred",
+      exposure: "transcript-derived",
+    },
+    {
+      id: "transcript:tool",
+      kind: "tool",
+      toolCallId: "call-1",
+      name: "Bash",
+      correlationId: "tool:call-1",
+      source: "transcript",
+      confidence: "inferred",
+      exposure: "transcript-derived",
+    },
+  ], false), true);
+
+  assert.deepEqual(
+    hub.snapshot("session-1")?.items.map((item) => item.id),
+    ["transcript:user", "transcript:reasoning", "hook-tool"],
+  );
+  assert.equal(
+    hub.snapshot("session-1")?.items.filter((item) => item.correlationId === "tool:call-1").length,
+    1,
+  );
+});
+
+test("repeated transcript hydration is a no-op and hook to API correlation keeps one slot", () => {
+  const hub = new ActivityHub({ streamEpoch: "transcript-noop" });
+  const transcript = [{
+    ...message("transcript:tool", "placeholder", "complete"),
+    kind: "tool" as const,
+    toolCallId: "call-1",
+    name: "Bash",
+    correlationId: "tool:call-1",
+    source: "transcript" as const,
+    confidence: "inferred" as const,
+    exposure: "transcript-derived" as const,
+  }];
+  assert.equal(hub.reconcileTranscript("session-1", "claude", transcript, false), true);
+  const hydratedSeq = hub.snapshot("session-1")!.seq;
+  assert.equal(hub.reconcileTranscript("session-1", "claude", transcript, false), false);
+  assert.equal(hub.snapshot("session-1")!.seq, hydratedSeq);
+
+  const hook = hub.ingest("session-1", "claude", {
+    type: "upsert",
+    item: {
+      id: "hook-tool",
+      kind: "tool",
+      toolCallId: "call-1",
+      name: "Bash",
+      correlationId: "tool:call-1",
+      source: "provider-api",
+      confidence: "exact",
+      exposure: "provider-exposed",
+    },
+  });
+  assert.equal(hook.type, "activity.reset");
+  assert.deepEqual(hub.snapshot("session-1")!.items.map((item) => item.id), ["hook-tool"]);
+
+  const managed = hub.ingest("session-1", "claude", {
+    type: "upsert",
+    item: {
+      id: "sdk-tool",
+      kind: "tool",
+      toolCallId: "call-1",
+      name: "Bash",
+      result: "done",
+      correlationId: "tool:call-1",
+      source: "provider-api",
+      confidence: "exact",
+      exposure: "provider-exposed",
+    },
+  });
+  assert.equal(managed.type, "activity.reset");
+  assert.deepEqual(hub.snapshot("session-1")!.items.map((item) => item.id), ["sdk-tool"]);
+  assert.equal(hub.reconcileTranscript("session-1", "claude", transcript, false), false);
+});
+
 test("a source withdraws only its own items when it hands the session over", () => {
   // A hook bridge and the transcript reader id the same event differently and
   // the hub dedupes by id, so a producer that falls silent without withdrawing

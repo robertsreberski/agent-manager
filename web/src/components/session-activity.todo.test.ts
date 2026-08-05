@@ -4,7 +4,7 @@ import type { ActivityTodoItem, SessionActivityView } from "../types";
 import { currentTodo, sessionTodoProgress, todoView } from "./session-activity";
 
 const todo: ActivityTodoItem = {
-  schemaVersion: 3,
+  schemaVersion: 4,
   id: "todo-1",
   sessionId: "local:codex:thread-1",
   provider: "codex",

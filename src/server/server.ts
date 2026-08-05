@@ -74,6 +74,7 @@ import {
   createSessionSchema,
   directoryCompletionQuerySchema,
   executionProfileSchema,
+  reasoningEffortSchema,
   leaseRequestSchema,
   requiredCapability,
   resolveWorkspaceSchema,
@@ -114,6 +115,16 @@ import { probeLocalHarnesses } from "./harness-probe.ts";
 import { SetupHookManager, type SetupHookManagerOptions } from "./setup-hooks.ts";
 import { probeSetupHosts } from "./setup-hosts.ts";
 import {
+  ARCHIVED_SESSION_PAGE_LIMIT,
+  LocalCodexArchiveCatalog,
+  type ArchivedSessionCatalog,
+} from "./archive-catalog.ts";
+import { OrderedSseWriter } from "./sse-writer.ts";
+import {
+  CliTakeoverCoordinator,
+  type LocalCliProcessInspector,
+} from "./cli-takeover.ts";
+import {
   persistDiscoveredWorkspaces,
   setupNearbyWorkspaces,
 } from "./setup-workspaces.ts";
@@ -143,6 +154,11 @@ const workspaceFileQuerySchema = z.object({
     .refine((value) => !/[\u0000-\u001f\u007f]/u.test(value), "query contains an invalid character")
     .optional(),
   limit: z.coerce.number().int().min(1).max(50).default(20),
+}).strict();
+const archivedSessionQuerySchema = z.object({
+  q: z.string().trim().max(200).refine((value) => !value.includes("\0"), "query contains an invalid character").default(""),
+  cursor: z.string().min(1).max(1_024).optional(),
+  limit: z.coerce.number().int().min(1).max(ARCHIVED_SESSION_PAGE_LIMIT).default(ARCHIVED_SESSION_PAGE_LIMIT),
 }).strict();
 const workspaceFileResponseSchema = z.object({
   sessionId: z.string().min(1),
@@ -286,6 +302,15 @@ export interface AgentManagerServerOptions {
   codexHookTrustStatus?: SetupHookManagerOptions["codexTrustStatus"];
   /** Test/embedder seam; production hook authority evidence expires after 30 seconds. */
   codexHookFreshnessMs?: number;
+  /** Test seam for identity-checked local CLI takeover. */
+  cliTakeoverInspector?: LocalCliProcessInspector;
+  cliTakeoverTimings?: {
+    guidedTimeoutMs?: number;
+    gracefulExitTimeoutMs?: number;
+    adoptionTimeoutMs?: number;
+    pollIntervalMs?: number;
+  };
+  archivedSessionCatalog?: ArchivedSessionCatalog;
 }
 
 export interface AgentManagerBackend {
@@ -427,47 +452,53 @@ function providerAdapter(
   return adapter;
 }
 
-function codexRecoveryRecords(database: ManagerDatabase): {
+function managedRecoveryRecords(database: ManagerDatabase, provider: Provider): {
   records: ManagedSessionRecoveryRecord[];
   diagnostics: Diagnostic[];
 } {
   const records: ManagedSessionRecoveryRecord[] = [];
   const diagnostics: Diagnostic[] = [];
   for (const persisted of database.listManagedSessions()) {
-    if (persisted.provider !== "codex") continue;
+    if (persisted.provider !== provider) continue;
     const workspace = persisted.workspaceId
       ? database.getWorkspace(persisted.workspaceId)
       : null;
     const profile = executionProfileSchema.safeParse(persisted.metadata.profile);
+    const effort = reasoningEffortSchema.nullable().safeParse(persisted.metadata.effort);
     const name = persisted.metadata.name;
+    const model = persisted.metadata.model;
     const valid = persisted.providerSessionId.length > 0
       && persisted.providerSessionId.length <= 512
-      && persisted.id === sessionRecordId("local", "codex", persisted.providerSessionId)
+      && persisted.id === sessionRecordId("local", provider, persisted.providerSessionId)
       && workspace !== null
       && workspace.hostId === "local"
       && workspace.hostKind === "local"
       && isAbsolute(workspace.path)
       && persisted.metadata.hostId === "local"
       && (name === null || (typeof name === "string" && name.length <= 120))
+      && (model === null || (typeof model === "string" && model.length > 0 && model.length <= 256))
       && profile.success
+      && effort.success
       && Number.isFinite(Date.parse(persisted.createdAt))
       && Number.isFinite(Date.parse(persisted.updatedAt));
-    if (!valid || !workspace || !persisted.workspaceId || !profile.success) {
+    if (!valid || !workspace || !persisted.workspaceId || !profile.success || !effort.success) {
       diagnostics.push({
-        provider: "codex",
+        provider,
         level: "warning",
-        message: `Skipped invalid persisted Codex manager identity ${persisted.id}`,
+        message: `Skipped invalid persisted ${provider === "codex" ? "Codex" : "Claude"} manager identity ${persisted.id}`,
       });
       continue;
     }
     records.push({
       managerSessionId: persisted.id,
-      provider: "codex",
+      provider,
       providerThreadId: persisted.providerSessionId,
       workspaceId: persisted.workspaceId,
       workspacePath: workspace.path,
       name: name as string | null,
       profile: profile.data,
+      model: model as string | null,
+      effort: effort.data,
       createdAt: persisted.createdAt,
     });
   }
@@ -518,6 +549,16 @@ export async function createAgentManagerServer(
     (sessionId, progress) => state.setTodoProgress(sessionId, progress),
   );
   const database = options.database ?? new ManagerDatabase(options.databasePath);
+  const archivedSessions = options.archivedSessionCatalog ?? new LocalCodexArchiveCatalog();
+  const resolveArchivedSession = (id: string): SessionRecord | null => {
+    try {
+      return archivedSessions.get(id);
+    } catch {
+      return null;
+    }
+  };
+  const resolveReadableSession = (id: string): SessionRecord | null =>
+    state.get(id) ?? resolveArchivedSession(id);
   for (const remoteHost of options.remoteHosts ?? []) {
     database.addHost({
       id: remoteHost.id,
@@ -553,8 +594,88 @@ export async function createAgentManagerServer(
     sessionId: string | null;
     close: () => void;
   }>();
+  const cliTakeover = new CliTakeoverCoordinator({
+    ...(options.cliTakeoverInspector ? { inspector: options.cliTakeoverInspector } : {}),
+    ...(options.cliTakeoverTimings ?? {}),
+    canAdopt: (provider) => typeof adapters[provider]?.adoptExternalSession === "function",
+    adopt: async (session, profile, signal) => {
+      const adapter = adapters[session.provider];
+      if (!adapter?.adoptExternalSession || !session.cwd) {
+        throw new Error(`${session.provider} takeover is unavailable`);
+      }
+      const workspace = database.listWorkspaces().find((candidate) =>
+        candidate.hostId === "local"
+        && candidate.hostKind === "local"
+        && candidate.path === session.cwd
+      );
+      if (!workspace) throw new Error("The discovered session workspace is not registered locally");
+      return adapter.adoptExternalSession(session, profile, {
+        actor: { id: "cli-takeover", kind: "local", displayName: "Local owner" },
+        requestId: `cli-takeover:${randomUUID()}`,
+        signal,
+        workspace: { id: workspace.id, label: workspace.label, path: workspace.path },
+        managerSessionId: session.id,
+      });
+    },
+    persist: async (original, adopted, profile) => {
+      const workspace = database.listWorkspaces().find((candidate) =>
+        candidate.hostId === "local"
+        && candidate.hostKind === "local"
+        && candidate.path === adopted.cwd
+      );
+      if (!workspace) throw new Error("The adopted session workspace could not be committed");
+      const prior = database.listManagedSessions().find((record) => record.id === adopted.id) ?? null;
+      const now = new Date().toISOString();
+      const adapter = adapters[adopted.provider];
+      try {
+        database.upsertManagedSession({
+          id: adopted.id,
+          provider: adopted.provider,
+          providerSessionId: adopted.providerThreadId,
+          workspaceId: workspace.id,
+          metadata: {
+            adoptedFromCli: true,
+            name: adopted.name,
+            profile,
+            model: original.model.value,
+            effort: original.effort.value,
+            hostId: "local",
+          },
+          createdAt: adopted.startedAt ?? original.startedAt ?? now,
+          updatedAt: now,
+        });
+        await adapter?.commitExternalAdoption?.(adopted.providerThreadId);
+      } catch (error) {
+        if (prior) database.upsertManagedSession(prior);
+        else database.removeManagedSession(adopted.id);
+        await Promise.resolve(adapter?.abortExternalAdoption?.(adopted.providerThreadId))
+          .catch(() => undefined);
+        throw error;
+      }
+    },
+    rollback: async (session) => {
+      await Promise.resolve(
+        adapters[session.provider]?.abortExternalAdoption?.(session.providerThreadId),
+      ).catch(() => undefined);
+    },
+    onChange: (sessionId) => {
+      const current = state.get(sessionId) ?? cliTakeover.retainedSession(sessionId);
+      if (!current) return;
+      state.upsert(withLocalEditorCapability(
+        cliTakeover.decorate(current),
+        editorLauncher !== null,
+      ));
+    },
+    onAdopted: (session) => {
+      state.upsert(withLocalEditorCapability(session, editorLauncher !== null));
+      // The existing activity stream was opened while the session was foreign.
+      // Reconnect it so provider-specific selected-session adoption occurs.
+      for (const client of [...sseClients.values()]) {
+        if (client.channel === "activity" && client.sessionId === session.id) client.close();
+      }
+    },
+  });
   let scheduleClaudePermissionPresenceCheck = (): void => undefined;
-  const claudeHookLastSeenAt = new Map<string, number>();
   const claudeHookSession = (providerSessionId: string): string =>
     sessionRecordId("local", "claude", providerSessionId);
   const hookAttention = (
@@ -604,6 +725,7 @@ export async function createAgentManagerServer(
         withheld: session.control.withheld.filter(
           (withheld) => withheld.capability !== "respond",
         ),
+        takeover: session.control.takeover,
       },
     };
   };
@@ -620,7 +742,7 @@ export async function createAgentManagerServer(
     const base = claudeHookBases.get(sessionId);
     if (!base || !state.get(sessionId)) return;
     state.upsert(withLocalEditorCapability(
-      decorateClaudeHookSession(base),
+      cliTakeover.decorate(decorateClaudeHookSession(base)),
       editorLauncher !== null,
     ));
   };
@@ -637,19 +759,6 @@ export async function createAgentManagerServer(
     authorizationRecords: hookAuthorizationRecords(),
     sourceArbiter: claudeHookSourceArbiter,
     onHookSeen: (event) => {
-      const sessionId = claudeHookSession(event.providerSessionId);
-      const receivedAt = Date.parse(event.receivedAt);
-      const previous = claudeHookLastSeenAt.get(sessionId);
-      // A hook returning after transcript fallback is a source switch. Reset
-      // once so inferred transcript items never mix with exact hook items.
-      if (previous === undefined || receivedAt - previous > 30_000) {
-        activityHub.ingest(sessionId, "claude", {
-          type: "reset",
-          reason: "provider-reset",
-          items: [],
-        });
-      }
-      claudeHookLastSeenAt.set(sessionId, receivedAt);
       try {
         database.markClaudeHookSeen(event.installId, event.receivedAt);
       } catch {
@@ -689,7 +798,6 @@ export async function createAgentManagerServer(
   const codexHookLastSeenAt = new Map<string, number>();
   const codexHookBases = new Map<string, SessionRecord>();
   const codexHookExpiryTimers = new Map<string, NodeJS.Timeout>();
-  const codexHookNeedsReset = new Set<string>();
   const codexHookFreshnessMs = Math.max(
     1,
     options.codexHookFreshnessMs ?? CODEX_HOOK_FRESHNESS_MS,
@@ -702,17 +810,6 @@ export async function createAgentManagerServer(
       && lastSeenAt <= now
       && now - lastSeenAt <= codexHookFreshnessMs;
   };
-  /*
-    The freshness window above governs the *control plane*: capabilities lapse
-    when the evidence for them does. Source ownership is a different question.
-    A hook and the transcript reader id the same item differently
-    (`codex/item/…` against `transcript:codex:…`), and the hub dedupes by id, so
-    letting the window re-open polling put both producers on one session and
-    printed every item twice. Once the bridge has spoken for a session it owns
-    the stream, even while it is quiet.
-  */
-  const codexHookEverSeen = new Set<string>();
-  const codexBridgeOwnsStream = (sessionId: string): boolean => codexHookEverSeen.has(sessionId);
   const codexHookCapabilities = (
     session: SessionRecord,
   ): SessionRecord["control"]["capabilities"] => session.control.capabilities.filter(
@@ -738,6 +835,7 @@ export async function createAgentManagerServer(
         withheld: session.control.withheld.filter((withheld) =>
           capabilities.includes(withheld.capability)
         ),
+        takeover: session.control.takeover,
       },
     };
   };
@@ -758,7 +856,7 @@ export async function createAgentManagerServer(
     const base = codexHookBases.get(sessionId);
     if (!base) return;
     state.upsert(withLocalEditorCapability(
-      decorateCodexHookSession(base),
+      cliTakeover.decorate(decorateCodexHookSession(base)),
       editorLauncher !== null,
     ));
   };
@@ -769,7 +867,6 @@ export async function createAgentManagerServer(
       codexHookExpiryTimers.delete(sessionId);
       if (codexHookLastSeenAt.get(sessionId) !== seenAt) return;
       codexHookLastSeenAt.delete(sessionId);
-      codexHookNeedsReset.delete(sessionId);
       refreshCodexHookSession(sessionId);
     }, codexHookFreshnessMs + 1);
     timer.unref();
@@ -790,13 +887,6 @@ export async function createAgentManagerServer(
     onActivity: (providerSessionId, mutation) => {
       const sessionId = codexHookSession(providerSessionId);
       if (state.get(sessionId)?.control.authority === "manager") return;
-      if (codexHookNeedsReset.delete(sessionId)) {
-        activityHub.ingest(sessionId, "codex", {
-          type: "reset",
-          reason: "provider-reset",
-          items: [],
-        });
-      }
       activityHub.ingest(sessionId, "codex", mutation);
     },
     onHookSeen: (event) => {
@@ -804,10 +894,6 @@ export async function createAgentManagerServer(
       if (state.get(sessionId)?.control.authority !== "manager") {
         const receivedAt = Date.parse(event.receivedAt);
         const at = Number.isFinite(receivedAt) ? receivedAt : Date.now();
-        if (!hasRecentCodexHookEvidence(sessionId, at)) {
-          codexHookNeedsReset.add(sessionId);
-        }
-        codexHookEverSeen.add(sessionId);
         codexHookLastSeenAt.set(sessionId, at);
         refreshCodexHookSession(sessionId);
         scheduleCodexHookExpiry(sessionId, at);
@@ -952,23 +1038,14 @@ export async function createAgentManagerServer(
       remoteSessionIds.delete(remoteState.id);
     }
   };
-  /*
-    Exactly one producer per session. A hook bridge and the transcript reader
-    give the same tool call different ids, and the hub dedupes by id, so any
-    overlap renders the whole transcript twice.
-  */
-  const transcriptMayPoll = (session: SessionView): boolean => {
-    if (session.provider === "claude") {
-      return session.control.authority !== "manager"
-        && claudeHookSourceArbiter.shouldPollTranscript(session.providerThreadId);
-    }
-    if (codexBridgeOwnsStream(session.id)) return false;
-    return session.control.authority !== "manager" || nativeHandoffs.has(session.id);
-  };
+  // Transcript history remains the selected session's bounded historical
+  // source while hooks/APIs contribute exact live events. ActivityHub
+  // correlates overlaps atomically, so neither source has to erase the other.
+  const transcriptMayPoll = (_session: SessionView): boolean => true;
   const transcriptActivity = new SelectedTranscriptActivityObserver({
     hub: activityHub,
     ...(transcriptReader ? { reader: transcriptReader } : {}),
-    resolveSession: (id) => state.get(id),
+    resolveSession: resolveReadableSession,
     eligible: transcriptMayPoll,
   });
   const shouldObserveTranscript = (session: SessionView): boolean =>
@@ -1007,14 +1084,18 @@ export async function createAgentManagerServer(
     ) || (
       claudeHookPermissions.has(session.id)
       && !discoveredIds.has(session.id)
-    ) || isRemoteSession(session));
+    ) || isRemoteSession(session) || cliTakeover.retainedSession(session.id) !== null);
     const retainedIds = new Set(retained.map((session) => session.id));
     const external = sessions
       .filter((session) => !retainedIds.has(session.id))
       .map(rememberClaudeHookBase)
       .map(rememberCodexHookBase)
+      .map((session) => cliTakeover.decorate(session))
       .map((session) => withLocalEditorCapability(session, editorLauncher !== null));
-    state.replace([...external, ...retained], nextDiagnostics);
+    state.replace([
+      ...external,
+      ...retained.map((session) => cliTakeover.decorate(session)),
+    ], nextDiagnostics);
   };
 
   if (options.initialSessions || options.initialDiagnostics) {
@@ -1027,6 +1108,7 @@ export async function createAgentManagerServer(
       (options.initialSessions ?? state.list())
         .map(rememberClaudeHookBase)
         .map(rememberCodexHookBase)
+        .map((session) => cliTakeover.decorate(session))
         .map((session) => withLocalEditorCapability(session, editorLauncher !== null)),
       [],
     );
@@ -1035,62 +1117,65 @@ export async function createAgentManagerServer(
   database.markInterruptedDispatchesUnknown();
   database.recoverCreateSessionIntents();
 
-  try {
-    const recovery = codexRecoveryRecords(database);
-    for (const diagnostic of recovery.diagnostics) state.addDiagnostic(diagnostic);
-    if (recovery.records.length > 0) {
-      const restore = adapters.codex?.restoreManagedSessions;
+  for (const provider of ["codex", "claude"] as const) {
+    const providerLabel = provider === "codex" ? "Codex" : "Claude";
+    try {
+      const recovery = managedRecoveryRecords(database, provider);
+      for (const diagnostic of recovery.diagnostics) state.addDiagnostic(diagnostic);
+      if (recovery.records.length === 0) continue;
+      const adapter = adapters[provider];
+      const restore = adapter?.restoreManagedSessions;
       if (!restore) {
         state.addDiagnostic({
-          provider: "codex",
+          provider,
           level: "warning",
-          message: `${recovery.records.length} persisted Codex manager session(s) could not be restored because private controls are unavailable`,
+          message: `${recovery.records.length} persisted ${providerLabel} manager session(s) could not be restored because private controls are unavailable`,
         });
-      } else {
-        const controller = new AbortController();
-        const abortTimer = setTimeout(
-          () => controller.abort(new Error("Managed Codex recovery timed out")),
-          MANAGED_SESSION_RECOVERY_TIMEOUT_MS,
-        );
-        abortTimer.unref();
-        try {
-          const report = await bounded(
-            restore.call(adapters.codex, recovery.records, controller.signal),
-            MANAGED_SESSION_RECOVERY_TIMEOUT_MS,
-            "managed Codex recovery",
-          );
-          for (const failure of report.failures) {
-            state.addDiagnostic({
-              provider: "codex",
-              level: "warning",
-              message: `Could not restore ${failure.managerSessionId}: ${failure.reason}`,
-            });
-          }
-          if (report.truncated) {
-            state.addDiagnostic({
-              provider: "codex",
-              level: "warning",
-              message: "Managed Codex recovery reached its persisted-session limit",
-            });
-          }
-        } catch (error) {
-          controller.abort(error);
-          state.addDiagnostic({
-            provider: "codex",
-            level: "warning",
-            message: `Managed Codex recovery stopped safely: ${error instanceof Error ? error.message : String(error)}`,
-          });
-        } finally {
-          clearTimeout(abortTimer);
-        }
+        continue;
       }
+      const controller = new AbortController();
+      const abortTimer = setTimeout(
+        () => controller.abort(new Error(`Managed ${providerLabel} recovery timed out`)),
+        MANAGED_SESSION_RECOVERY_TIMEOUT_MS,
+      );
+      abortTimer.unref();
+      try {
+        const report = await bounded(
+          restore.call(adapter, recovery.records, controller.signal),
+          MANAGED_SESSION_RECOVERY_TIMEOUT_MS,
+          `managed ${providerLabel} recovery`,
+        );
+        for (const failure of report.failures) {
+          state.addDiagnostic({
+            provider,
+            level: "warning",
+            message: `Could not restore ${failure.managerSessionId}: ${failure.reason}`,
+          });
+        }
+        if (report.truncated) {
+          state.addDiagnostic({
+            provider,
+            level: "warning",
+            message: `Managed ${providerLabel} recovery reached its persisted-session limit`,
+          });
+        }
+      } catch (error) {
+        controller.abort(error);
+        state.addDiagnostic({
+          provider,
+          level: "warning",
+          message: `Managed ${providerLabel} recovery stopped safely: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      } finally {
+        clearTimeout(abortTimer);
+      }
+    } catch (error) {
+      state.addDiagnostic({
+        provider,
+        level: "warning",
+        message: `Persisted ${providerLabel} manager identities could not be read safely: ${error instanceof Error ? error.message : String(error)}`,
+      });
     }
-  } catch (error) {
-    state.addDiagnostic({
-      provider: "codex",
-      level: "warning",
-      message: `Persisted Codex manager identities could not be read safely: ${error instanceof Error ? error.message : String(error)}`,
-    });
   }
 
   remoteHosts.start({
@@ -1305,11 +1390,47 @@ export async function createAgentManagerServer(
 
   app.get("/api/v1/sessions", async () => state.snapshot());
 
+  app.get("/api/v1/archived-sessions", {
+    config: { rateLimit: { max: 60, timeWindow: "1 minute" } },
+  }, async (request) => {
+    const query = archivedSessionQuerySchema.parse(request.query);
+    try {
+      const page = archivedSessions.list({
+        query: query.q,
+        cursor: query.cursor ?? null,
+        limit: query.limit,
+      });
+      return {
+        schemaVersion: WIRE_SCHEMA_VERSION,
+        buildId: AGENT_MANAGER_BUILD_ID,
+        query: query.q,
+        ...page,
+      };
+    } catch (error) {
+      if (error instanceof Error && /cursor is invalid/iu.test(error.message)) {
+        throw new ApiError(400, "ARCHIVE_CURSOR_INVALID", "archived-session cursor is invalid");
+      }
+      throw new ApiError(503, "ARCHIVE_UNAVAILABLE", "the archived-session catalog could not be read safely");
+    }
+  });
+
+  app.get("/api/v1/archived-sessions/:id", {
+    config: { rateLimit: { max: 60, timeWindow: "1 minute" } },
+  }, async (request) => {
+    const session = resolveArchivedSession(routeSessionId(request));
+    if (!session) throw new ApiError(404, "SESSION_NOT_FOUND", "archived session was not found");
+    return {
+      schemaVersion: WIRE_SCHEMA_VERSION,
+      buildId: AGENT_MANAGER_BUILD_ID,
+      session,
+    };
+  });
+
   app.get("/api/v1/sessions/:id", {
     config: { rateLimit: { max: 60, timeWindow: "1 minute" } },
   }, async (request) => {
     const id = routeSessionId(request);
-    const session = state.get(id);
+    const session = resolveReadableSession(id);
     if (!session) throw new ApiError(404, "SESSION_NOT_FOUND", "session was not found");
     if (isRemoteSession(session)) {
       return { session: await remoteHosts.session(id) };
@@ -1534,7 +1655,7 @@ export async function createAgentManagerServer(
     config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
   }, async (request) => {
     const sessionId = routeSessionId(request);
-    const session = state.get(sessionId);
+    const session = resolveReadableSession(sessionId);
     if (!session) throw new ApiError(404, "SESSION_NOT_FOUND", "session was not found");
     const query = selectedSessionFactsQuerySchema.parse(request.query);
     if (query.generation !== session.generation) {
@@ -1586,7 +1707,7 @@ export async function createAgentManagerServer(
       }
     }
 
-    const current = state.get(sessionId);
+    const current = resolveReadableSession(sessionId);
     if (
       !current
       || current.generation !== session.generation
@@ -1608,7 +1729,7 @@ export async function createAgentManagerServer(
     config: { rateLimit: { max: 60, timeWindow: "1 minute" } },
   }, async (request) => {
     const id = routeSessionId(request);
-    const session = state.get(id);
+    const session = resolveReadableSession(id);
     if (!session) throw new ApiError(404, "SESSION_NOT_FOUND", "session was not found");
     const query = transcriptSearchQuerySchema.parse(request.query);
     if (isRemoteSession(session)) {
@@ -1635,7 +1756,7 @@ export async function createAgentManagerServer(
     config: { rateLimit: { max: 60, timeWindow: "1 minute" } },
   }, async (request) => {
     const sessionId = routeSessionId(request);
-    const session = state.get(sessionId);
+    const session = resolveReadableSession(sessionId);
     if (!session) throw new ApiError(404, "SESSION_NOT_FOUND", "session was not found");
     if (isRemoteSession(session)) {
       throw new ApiError(409, "PLAN_FILE_UNAVAILABLE", "remote plan-file reads are not available");
@@ -1898,9 +2019,11 @@ export async function createAgentManagerServer(
     let unsubscribe = (): void => undefined;
     let heartbeat: NodeJS.Timeout | null = null;
     let expiry: NodeJS.Timeout | null = null;
+    let writer: OrderedSseWriter | null = null;
     const close = (): void => {
       if (closed) return;
       closed = true;
+      writer?.dispose();
       if (heartbeat) clearInterval(heartbeat);
       if (expiry) clearTimeout(expiry);
       unsubscribe();
@@ -1908,16 +2031,10 @@ export async function createAgentManagerServer(
       scheduleClaudePermissionPresenceCheck();
       if (!reply.raw.destroyed) reply.raw.destroy();
     };
+    writer = new OrderedSseWriter(reply.raw, { onFailure: close });
     const write = (chunk: string): boolean => {
-      if (closed || reply.raw.destroyed || reply.raw.writableEnded) return false;
-      try {
-        const accepted = reply.raw.write(chunk);
-        if (!accepted) close();
-        return accepted;
-      } catch {
-        close();
-        return false;
-      }
+      if (closed) return false;
+      return writer?.writeEvent(chunk) ?? false;
     };
     sseClients.set(reply, {
       authSessionId: authSession.id,
@@ -1959,7 +2076,7 @@ export async function createAgentManagerServer(
 
     if (closed) return;
     unsubscribe = state.subscribe((event) => void write(encodeSse(event)));
-    heartbeat = setInterval(() => void write(": heartbeat\n\n"), 15_000);
+    heartbeat = setInterval(() => void writer?.writeHeartbeat(), 15_000);
     heartbeat.unref();
     expiry = setTimeout(close, Math.max(1, authSession.expiresAt - Date.now()));
     expiry.unref();
@@ -1971,7 +2088,7 @@ export async function createAgentManagerServer(
     config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
   }, async (request, reply) => {
     const id = routeSessionId(request);
-    const session = state.get(id);
+    const session = resolveReadableSession(id);
     if (!session) throw new ApiError(404, "SESSION_NOT_FOUND", "session was not found");
     activityHub.ensureSession(id, session.provider);
     const authSession = requireSession(request);
@@ -2025,23 +2142,6 @@ export async function createAgentManagerServer(
         ? transcriptActivity.acquire(session)
         : () => undefined;
 
-    /*
-      The activity window is volatile, and nothing rehydrates it: a restart
-      leaves a manager-owned session with no history, and neither provider
-      replays one. Fill it from the transcript once, here, where the operator
-      has just asked to look at the session — and if that is not possible, say
-      so rather than let the drawer claim the session has simply been quiet.
-
-      This runs only when the window holds nothing, so it cannot put a second
-      producer on a live session; the seeded turns ended before this process
-      started, and the stream below carries only what comes after.
-    */
-    if (!isRemoteSession(session) && activityHub.isEmpty(id)) {
-      if (!transcriptActivity.seedIfEmpty(session)) {
-        activityHub.markRetentionBoundary(id);
-      }
-    }
-
     reply
       .header("Content-Type", "text/event-stream; charset=utf-8")
       .header("Connection", "keep-alive")
@@ -2057,10 +2157,12 @@ export async function createAgentManagerServer(
     let unsubscribe = (): void => undefined;
     let heartbeat: NodeJS.Timeout | null = null;
     let expiry: NodeJS.Timeout | null = null;
+    let writer: OrderedSseWriter | null = null;
     const pending: ActivityFrame[] = [];
     const close = (): void => {
       if (closed) return;
       closed = true;
+      writer?.dispose();
       if (heartbeat) clearInterval(heartbeat);
       if (expiry) clearTimeout(expiry);
       unsubscribe();
@@ -2070,20 +2172,10 @@ export async function createAgentManagerServer(
       scheduleClaudePermissionPresenceCheck();
       if (!reply.raw.destroyed) reply.raw.destroy();
     };
+    writer = new OrderedSseWriter(reply.raw, { onFailure: close });
     const write = (frame: ActivityFrame): boolean => {
-      if (closed || reply.raw.destroyed || reply.raw.writableEnded) return false;
-      const chunk = encodeActivitySse(frame);
-      if (reply.raw.writableLength + Buffer.byteLength(chunk) > 256 * 1_024) {
-        close();
-        return false;
-      }
-      try {
-        reply.raw.write(chunk);
-        return true;
-      } catch {
-        close();
-        return false;
-      }
+      if (closed) return false;
+      return writer?.writeEvent(encodeActivitySse(frame)) ?? false;
     };
     sseClients.set(reply, {
       authSessionId: authSession.id,
@@ -2122,12 +2214,7 @@ export async function createAgentManagerServer(
     if (closed) return;
     heartbeat = setInterval(() => {
       if (closed || reply.raw.destroyed || reply.raw.writableEnded) return close();
-      if (reply.raw.writableLength + 13 > 256 * 1_024) return close();
-      try {
-        reply.raw.write(": heartbeat\n\n");
-      } catch {
-        close();
-      }
+      writer?.writeHeartbeat();
     }, 15_000);
     heartbeat.unref();
     expiry = setTimeout(close, Math.max(1, authSession.expiresAt - Date.now()));
@@ -2328,6 +2415,8 @@ export async function createAgentManagerServer(
         "end",
         "archive",
         "delete",
+        "take-control",
+        "cancel-take-control",
         "open-editor",
       ].includes(capability)
     )) {
@@ -2569,6 +2658,36 @@ export async function createAgentManagerServer(
           if (action.type === "open-editor" && editorLauncher) {
             await editorLauncher.open(session, action);
             return { status: "succeeded" as const };
+          }
+          if (action.type === "take-control") {
+            try {
+              return {
+                status: "succeeded" as const,
+                result: await cliTakeover.begin(session, action.method),
+              };
+            } catch (error) {
+              return {
+                status: "failed" as const,
+                error: {
+                  code: "TAKEOVER_REJECTED",
+                  message: error instanceof Error ? error.message : String(error),
+                },
+              };
+            }
+          }
+          if (action.type === "cancel-take-control") {
+            try {
+              cliTakeover.cancel(session.id, action.takeoverId);
+              return { status: "succeeded" as const };
+            } catch (error) {
+              return {
+                status: "failed" as const,
+                error: {
+                  code: "TAKEOVER_CANCEL_REJECTED",
+                  message: error instanceof Error ? error.message : String(error),
+                },
+              };
+            }
           }
           if (isRemoteSession(session)) {
             return remoteHosts.performAction(session.id, action);
@@ -2838,6 +2957,7 @@ export async function createAgentManagerServer(
     cleanupPromise = (async () => {
       const errors: unknown[] = [];
       claudeHookBridge.shutdown();
+      cliTakeover.dispose();
       for (const timer of codexHookExpiryTimers.values()) clearTimeout(timer);
       codexHookExpiryTimers.clear();
       for (const handoff of nativeHandoffs.values()) {
@@ -2912,6 +3032,10 @@ export async function createAgentManagerServer(
   app.addHook("preClose", async () => {
     // Release held PermissionRequest POSTs before Fastify waits for routes to drain.
     claudeHookBridge.shutdown();
+    // Hijacked SSE replies are not completed by Fastify's ordinary request
+    // lifecycle. Close them explicitly so an open browser cannot hold service
+    // replacement past the bounded shutdown window.
+    for (const client of [...sseClients.values()]) client.close();
   });
 
   app.addHook("onClose", async () => {

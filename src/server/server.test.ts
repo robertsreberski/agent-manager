@@ -77,6 +77,7 @@ function session(overrides: Partial<SessionView> = {}): SessionView {
     name: "Test session",
     cwd: "/tmp/workspace",
     kind: "interactive",
+    archived: false,
     presence: "live",
     status: "idle",
     providerStatus: "idle",
@@ -133,6 +134,7 @@ function session(overrides: Partial<SessionView> = {}): SessionView {
       authority: "manager",
       capabilities: ["queue", "steer", "interrupt", "respond", "set-profile", "preview", "attach"],
       withheld: [],
+      takeover: null,
     },
     workspaceIdentity: null,
     generation: 0,
@@ -238,6 +240,7 @@ test("hydrates exact current manager attention only through the bounded per-sess
         authority: "manager",
         capabilities: ["respond"],
         withheld: [],
+        takeover: null,
       },
     });
   });
@@ -861,6 +864,7 @@ test("browser resume exposes the guarded manager CLI wrapper without requiring a
       authority: "manager",
       capabilities: ["resume"],
       withheld: [{ capability: "attach", reason: "This provider can resume but not attach" }],
+      takeover: null,
     },
   });
   const backend = await createAgentManagerServer({
@@ -1700,6 +1704,50 @@ test("serves SSE with EventSource-compatible headers over a real HTTP response",
   assert.equal(envelope.buildId, AGENT_MANAGER_BUILD_ID);
   assert.equal(envelope.payload.schemaVersion, WIRE_SCHEMA_VERSION);
   assert.equal(envelope.payload.buildId, AGENT_MANAGER_BUILD_ID);
+});
+
+test("closes live SSE clients before the bounded service shutdown", async (t) => {
+  const backend = await createAgentManagerServer({
+    host: "127.0.0.1",
+    port: 0,
+    allowedHosts: [host],
+    allowedOrigins: [origin],
+    shutdownTimeoutMs: 250,
+    discovery: false,
+    staticDir: false,
+    initialSessions: [session()],
+  });
+  const address = new URL(await backend.listen());
+  const headers = await authenticatedHeaders(backend);
+  const response = await new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
+    const request = httpGet({
+      hostname: address.hostname,
+      port: Number(address.port),
+      path: "/api/v1/events?clientId=shutdown-test",
+      headers: {
+        host,
+        cookie: headers.cookie,
+        accept: "text/event-stream",
+      },
+    }, resolve);
+    request.once("error", reject);
+  });
+  t.after(() => response.destroy());
+  await nextSseChunk(response, "shutdown snapshot");
+  const closed = new Promise<void>((resolve) => {
+    response.once("close", resolve);
+    response.once("aborted", resolve);
+    response.once("error", resolve);
+  });
+
+  await Promise.race([
+    backend.close(),
+    delay(1_000).then(() => { throw new Error("server shutdown remained blocked by SSE"); }),
+  ]);
+  await Promise.race([
+    closed,
+    delay(1_000).then(() => { throw new Error("SSE client remained open after shutdown"); }),
+  ]);
 });
 
 test("replaces a stale SSE stream from the same authenticated browser client", async (t) => {

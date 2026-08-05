@@ -246,6 +246,8 @@ function actionText(action: SessionAction): string {
     case "set-effort": return action.effort;
     case "remove-queued": return action.messageId;
     case "open-editor": return action.relativePath;
+    case "take-control": return action.method;
+    case "cancel-take-control": return action.takeoverId;
     case "interrupt":
     case "end":
     case "archive":
@@ -267,6 +269,8 @@ export function redactedPreview(action: SessionAction): string {
     case "end": return "end";
     case "archive": return "archive";
     case "delete": return "delete";
+    case "take-control": return `take-control:${action.method}`;
+    case "cancel-take-control": return "cancel-take-control:id-omitted";
     case "open-editor": return "open-editor:path-omitted";
   }
 }

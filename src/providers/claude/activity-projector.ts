@@ -634,6 +634,7 @@ export class ClaudeActivityProjector {
           type: "upsert",
           item: {
             id: block.id,
+            correlationId: `tool:${block.toolCallId as string}`,
             kind: "tool",
             toolCallId: block.toolCallId as string,
             name: block.toolName as string,
@@ -659,6 +660,7 @@ export class ClaudeActivityProjector {
           type: "upsert",
           item: {
             id: block.id,
+            correlationId: `tool:${block.toolCallId as string}`,
             kind: "tool",
             toolCallId: block.toolCallId as string,
             name: block.toolName as string,
@@ -722,6 +724,7 @@ export class ClaudeActivityProjector {
         : "complete";
     const phase = message.message.stop_reason === "tool_use" ? "commentary" : "final";
     const matchedPartialIds = new Set<string>();
+    let hasCorrelatedText = false;
 
     for (const [index, rawContent] of message.message.content.entries()) {
       const content = rawContent as unknown as Record<string, unknown>;
@@ -733,6 +736,7 @@ export class ClaudeActivityProjector {
           type: "upsert",
           item: {
             id,
+            correlationId: hasCorrelatedText ? null : `message:${message.message.id}`,
             kind: "message",
             role: "assistant",
             phase,
@@ -745,6 +749,7 @@ export class ClaudeActivityProjector {
             exposure: "provider-exposed",
           },
         });
+        hasCorrelatedText = true;
         this.#linkChild(message.parent_tool_use_id, id, mutations, {
           ...(message.subagent_type ? { name: message.subagent_type } : {}),
           ...(message.task_description
@@ -760,6 +765,7 @@ export class ClaudeActivityProjector {
           type: "upsert",
           item: {
             id,
+            correlationId: `reasoning:${message.message.id}:thinking:${String(index)}`,
             kind: "reasoning",
             reasoningKind: "summary",
             label: "Claude thinking",
@@ -801,6 +807,7 @@ export class ClaudeActivityProjector {
           type: "upsert",
           item: {
             id,
+            correlationId: `tool:${toolCallId}`,
             kind: "tool",
             toolCallId,
             name,
@@ -908,6 +915,7 @@ export class ClaudeActivityProjector {
           type: "upsert",
           item: {
             id,
+            correlationId: `message:${uuid}`,
             kind: "message",
             role: "user",
             phase: null,
@@ -958,6 +966,7 @@ export class ClaudeActivityProjector {
       type: "upsert",
       item: {
         id,
+        correlationId: `tool:${toolCallId}`,
         kind: "tool",
         toolCallId,
         name: known?.name ?? "Tool",
@@ -1086,6 +1095,7 @@ export class ClaudeActivityProjector {
         type: "upsert",
         item: {
           id,
+          correlationId: `tool:${denial.tool_use_id}`,
           kind: "tool",
           toolCallId: denial.tool_use_id,
           name: denial.tool_name,
@@ -1119,6 +1129,7 @@ export class ClaudeActivityProjector {
       type: "upsert",
       item: {
         id: itemId("tool", message.tool_use_id),
+        correlationId: `tool:${message.tool_use_id}`,
         kind: "tool",
         toolCallId: message.tool_use_id,
         name: message.tool_name,
@@ -1490,6 +1501,7 @@ export class ClaudeActivityProjector {
           type: "upsert",
           item: {
             id: itemId("tool", message.tool_use_id),
+            correlationId: `tool:${message.tool_use_id}`,
             kind: "tool",
             toolCallId: message.tool_use_id,
             name: message.tool_name,
@@ -1900,6 +1912,7 @@ export class ClaudeActivityProjector {
     );
     return {
       id: itemId("tool", toolCallId),
+      correlationId: `tool:${toolCallId}`,
       kind: "tool",
       toolCallId,
       name,

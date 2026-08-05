@@ -18,7 +18,7 @@ function session(id: string, capabilities: CockpitSessionView["control"]["capabi
     activity: "idle",
     attention: [],
     updatedAt: "2026-08-04T12:00:00Z",
-    control: { plane: "codex-private", authority: "manager", capabilities, withheld: [] },
+    control: { plane: "codex-private", authority: "manager", capabilities, withheld: [], takeover: null },
     profile: null,
     model: null,
     effort: null,

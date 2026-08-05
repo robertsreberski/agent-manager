@@ -46,6 +46,7 @@ function cockpitSession(overrides: Partial<CockpitSessionView> = {}): CockpitSes
       authority: "manager",
       capabilities: ["queue", "set-profile", "attach"],
       withheld: [{ capability: "set-model", reason: "This provider cannot change models mid-session." }],
+      takeover: null,
     },
     profile: "execute",
     model: "gpt-5.6",
@@ -112,7 +113,7 @@ describe("SessionCapabilityPanel", () => {
 
   it("keeps unknown facts unknown and never calls a zero-dirty worktree dirty", () => {
     const { rerender } = render(<SessionCapabilityPanel
-      session={cockpitSession({ workspaceIdentity: null, cwd: null, profile: null, model: null, effort: null, control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [] } })}
+      session={cockpitSession({ workspaceIdentity: null, cwd: null, profile: null, model: null, effort: null, control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [], takeover: null } })}
       facts={{ sessionId: "local:codex:managed-1", generation: 1, turnUsage: null, account: { available: false, reason: "unsupported-provider" } }}
       factsStatus="loaded"
     />);

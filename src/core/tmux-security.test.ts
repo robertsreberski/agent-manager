@@ -107,6 +107,7 @@ test("local tmux evidence never attaches to a remote session with a colliding pi
     name: "Remote session",
     cwd: "/remote/workspace",
     kind: "interactive",
+    archived: false,
     presence: "live",
     status: "running",
     providerStatus: null,
@@ -132,7 +133,7 @@ test("local tmux evidence never attaches to a remote session with a colliding pi
     effort: { value: null, providerValue: null, source: "inferred", confidence: "heuristic" },
     attention: [],
     terminal: null,
-    control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [] },
+    control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [], takeover: null },
     workspaceIdentity: null,
     generation: 0,
   };

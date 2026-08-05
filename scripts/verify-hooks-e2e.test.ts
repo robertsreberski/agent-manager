@@ -58,6 +58,7 @@ function externalClaudeSession(providerSessionId: string, cwd: string): SessionR
     name: "External Claude permission test",
     cwd,
     kind: "batch",
+    archived: false,
     presence: "live",
     status: "running",
     providerStatus: "running",
@@ -83,7 +84,7 @@ function externalClaudeSession(providerSessionId: string, cwd: string): SessionR
     todoProgress: null,
     attention: [],
     terminal: null,
-    control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [] },
+    control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [], takeover: null },
     workspaceIdentity: null,
     generation: 0,
   };

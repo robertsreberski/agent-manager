@@ -5,10 +5,11 @@ import { hostFilterFromSearch, reconcileSelectedSessionId, searchWithHostFilter,
 const base = { attention: [], status: "idle" } as unknown as SessionView;
 
 describe("board navigation", () => {
-  it("round-trips only the four board scopes", () => {
+  it("round-trips active scopes and the separate archived scope", () => {
     expect(sessionScopeFromSearch("?scope=wants-you")).toBe("wants-you");
     expect(sessionScopeFromSearch("?scope=managed")).toBe("all");
     expect(searchWithSessionScope("?session=x", "working")).toBe("?session=x&scope=working");
+    expect(searchWithSessionScope("?session=x", "archived")).toBe("?session=x&scope=archived");
   });
   it("keeps opaque session ids and sorted host filters", () => {
     expect(searchWithSelectedSession("", "studio:codex:a/b")).toBe("?session=studio%3Acodex%3Aa%2Fb");
@@ -24,5 +25,11 @@ describe("board navigation", () => {
   it("groups failed sessions into the idle operator scope", () => {
     expect(sessionMatchesScope({ ...base, status: "failed" } as SessionView, "idle")).toBe(true);
     expect(sessionMatchesScope({ ...base, attention: [{}] } as SessionView, "idle")).toBe(false);
+  });
+  it("keeps archived records out of every active scope", () => {
+    const archived = { ...base, archived: true } as SessionView;
+    expect(sessionMatchesScope(archived, "all")).toBe(false);
+    expect(sessionMatchesScope(archived, "idle")).toBe(false);
+    expect(sessionMatchesScope(archived, "archived")).toBe(true);
   });
 });

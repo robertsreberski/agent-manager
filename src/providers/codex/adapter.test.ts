@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { ActivityMutation } from "../../activity/index.ts";
+import type { SessionView } from "../../core/types.ts";
 import type { WorkspaceIdentity } from "../../core/worktree.ts";
 import type { ManagedSessionRecoveryRecord } from "../../server/contracts.ts";
 import {
@@ -143,6 +144,73 @@ function threadResultWithIdentity(
   if (treeId !== null) thread.sessionId = treeId;
   if (parentThreadId !== null) thread.parentThreadId = parentThreadId;
   return result;
+}
+
+function externalCodexSession(): SessionView {
+  return {
+    id: "local:codex:takeover-thread",
+    provider: "codex",
+    providerThreadId: "takeover-thread",
+    providerTreeId: "takeover-tree",
+    parentId: null,
+    providerTurnId: null,
+    depth: 0,
+    hostId: "local",
+    hostLabel: "This Mac",
+    name: "Terminal-started thread",
+    cwd: "/workspace",
+    kind: "interactive",
+    archived: false,
+    presence: "live",
+    status: "idle",
+    providerStatus: "idle",
+    pid: 4312,
+    runtimePid: 4312,
+    startedAt: "2026-08-03T09:00:00.000Z",
+    updatedAt: "2026-08-03T12:00:00.000Z",
+    childSummary: {
+      total: 0,
+      running: 0,
+      waiting: 0,
+      idle: 0,
+      completed: 0,
+      failed: 0,
+      interrupted: 0,
+      unknown: 0,
+    },
+    statusSource: "hook",
+    source: "codex-hook",
+    profile: {
+      value: "plan",
+      providerValue: "plan",
+      source: "hook",
+      confidence: "exact",
+    },
+    model: {
+      value: "gpt-5.6",
+      providerValue: "gpt-5.6",
+      source: "hook",
+      confidence: "exact",
+    },
+    effort: {
+      value: "high",
+      providerValue: "high",
+      source: "hook",
+      confidence: "exact",
+    },
+    todoProgress: null,
+    attention: [],
+    terminal: null,
+    control: {
+      plane: "codex-hook-bridge",
+      authority: "foreign",
+      capabilities: [],
+      withheld: [],
+      takeover: null,
+    },
+    workspaceIdentity: null,
+    generation: 7,
+  };
 }
 
 function threadResultWithRawStatus(status?: JsonValue): JsonObject {
@@ -1381,6 +1449,112 @@ test("emits one truthful removal event for acknowledged end, archive, and delete
   ]);
   assert.deepEqual(adapter.listThreadStates(), []);
   unsubscribe();
+  await adapter.dispose();
+});
+
+test("external Codex adoption preserves identity and exposes controls only through the committed view", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  const external = externalCodexSession();
+  const exact = (): JsonObject => ({
+    ...threadResultWithIdentity(
+      external.providerThreadId,
+      external.providerTreeId,
+      null,
+      external.cwd!,
+    ),
+    reasoningEffort: "high",
+  });
+  transport.handlers.set("thread/read", exact);
+  transport.handlers.set("thread/resume", exact);
+  transport.handlers.set("thread/unsubscribe", () => ({}));
+  transport.handlers.set("thread/settings/update", (params) => {
+    transport.notify("thread/settings/updated", {
+      threadId: external.providerThreadId,
+      threadSettings: params,
+    });
+    return {};
+  });
+  const changes: SessionView[] = [];
+  const bridge = new CodexProviderBridge({
+    adapter,
+    resolveWorkspace: () => "/workspace",
+    onSessionChanged: (session) => changes.push(session),
+  });
+  const takeoverContext = {
+    actor: { id: "local", kind: "local" as const, displayName: "Local user" },
+    requestId: "adopt-external-codex",
+    signal: new AbortController().signal,
+    workspace: { id: "workspace", label: "Workspace", path: "/workspace" },
+  };
+
+  const provisional = await bridge.adoptExternalSession(external, "plan", takeoverContext);
+  assert.equal(methodMessages(transport, "thread/read").length, 1);
+  assert.equal(methodMessages(transport, "thread/resume").length, 1);
+  assert.deepEqual(methodMessages(transport, "thread/resume")[0]?.params, {
+    threadId: external.providerThreadId,
+    excludeTurns: true,
+  });
+  assert.equal(provisional.providerThreadId, external.providerThreadId);
+  assert.equal(provisional.providerTreeId, external.providerTreeId);
+  assert.equal(provisional.cwd, external.cwd);
+  assert.equal(provisional.profile.value, "plan");
+  assert.equal(provisional.model.value, "gpt-5.6");
+  assert.equal(provisional.effort.value, "high");
+  assert.ok(provisional.control.capabilities.includes("queue"));
+  assert.deepEqual(changes, [], "the bridge must not publish before durable commit");
+
+  const committed = bridge.commitExternalAdoption(external.providerThreadId);
+  assert.equal(committed.control.authority, "manager");
+  assert.ok(committed.control.capabilities.includes("queue"));
+  await bridge.abortExternalAdoption(external.providerThreadId);
+  assert.ok(bridge.getManagedSession(external.providerThreadId));
+  bridge.dispose();
+  await adapter.dispose();
+});
+
+test("external Codex adoption rejects resume identity drift without publishing controls", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  const external = externalCodexSession();
+  transport.handlers.set("thread/read", () => ({
+    ...threadResultWithIdentity(
+      external.providerThreadId,
+      external.providerTreeId,
+      null,
+      external.cwd!,
+    ),
+    reasoningEffort: "high",
+  }));
+  transport.handlers.set("thread/resume", () => ({
+    ...threadResultWithIdentity(
+      external.providerThreadId,
+      "different-tree",
+      null,
+      external.cwd!,
+    ),
+    reasoningEffort: "high",
+  }));
+  transport.handlers.set("thread/unsubscribe", () => ({}));
+  const changes: SessionView[] = [];
+  const bridge = new CodexProviderBridge({
+    adapter,
+    resolveWorkspace: () => "/workspace",
+    onSessionChanged: (session) => changes.push(session),
+  });
+
+  await assert.rejects(
+    bridge.adoptExternalSession(external, "plan", {
+      actor: { id: "local", kind: "local", displayName: "Local user" },
+      requestId: "reject-external-codex-drift",
+      signal: new AbortController().signal,
+      workspace: { id: "workspace", label: "Workspace", path: "/workspace" },
+    }),
+    /changed the validated managed identity/u,
+  );
+  assert.deepEqual(changes, []);
+  assert.equal(bridge.getManagedSession(external.providerThreadId), null);
+  assert.equal(adapter.getThreadState(external.providerThreadId), null);
+  assert.equal(methodMessages(transport, "thread/resume").length, 1);
+  bridge.dispose();
   await adapter.dispose();
 });
 

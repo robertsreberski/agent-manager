@@ -35,6 +35,7 @@ function session(provider: "claude" | "codex", providerThreadId: string): Sessio
     name: `${provider} external`,
     cwd: "/tmp",
     kind: "interactive",
+    archived: false,
     presence: "live",
     status: "running",
     providerStatus: "running",
@@ -65,6 +66,7 @@ function session(provider: "claude" | "codex", providerThreadId: string): Sessio
       authority: "none",
       capabilities: [],
       withheld: [],
+      takeover: null,
     },
     workspaceIdentity: null,
     generation: 0,
@@ -91,6 +93,7 @@ function claudeTmuxSession(providerThreadId = "claude-external"): SessionRecord 
       authority: "foreign",
       capabilities: ["preview", "attach"],
       withheld: [],
+      takeover: null,
     },
   };
 }
@@ -599,6 +602,7 @@ test("recent Codex hook evidence selects the foreign hook plane and expires to o
     authority: "foreign",
     capabilities: [],
     withheld: [],
+    takeover: null,
   });
   assert.ok(backend.activityHub.snapshot(id)?.items.some(
     (item) => item.kind === "lifecycle" && item.title === "External Codex session started",
@@ -613,6 +617,7 @@ test("recent Codex hook evidence selects the foreign hook plane and expires to o
     authority: "none",
     capabilities: [],
     withheld: [],
+    takeover: null,
   });
 });
 
@@ -627,6 +632,7 @@ test("Codex hook evidence never promotes a manager-owned private session", async
       authority: "manager",
       capabilities: ["queue", "interrupt"],
       withheld: [],
+      takeover: null,
     },
   };
   const backend = await createAgentManagerServer({

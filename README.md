@@ -58,7 +58,7 @@ search snippets use authenticated selected-session routes with `Cache-Control: n
 - Node.js 24
 - pnpm 11
 - Codex CLI `0.146.x`
-- Claude Code `2.1.221` and `@anthropic-ai/claude-agent-sdk` `0.3.220`
+- Claude Code `2.1.222` and `@anthropic-ai/claude-agent-sdk` `0.3.220`
 - tmux 3.6 for pane preview/attach
 - Tailscale only if private HTTPS access is wanted
 

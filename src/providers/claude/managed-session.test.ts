@@ -89,7 +89,7 @@ class FakeQuery implements ClaudeSdkQuery, AsyncIterator<ClaudeSdkMessage> {
 class FakeRuntime implements ClaudeSdkRuntime {
   readonly queries: FakeQuery[] = [];
   sdkVersion = CLAUDE_AGENT_SDK_VERSION;
-  codeVersion = "2.1.221";
+  codeVersion = "2.1.222";
   initMode: ClaudePermissionMode | null = null;
   #uuid = 0;
   #time = Date.parse("2026-08-03T12:00:00.000Z");

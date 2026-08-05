@@ -38,7 +38,7 @@ projection. A token is never included in browser state.
 
 Observed pinned behaviour:
 
-- Claude Code `2.1.221` reloads a newly added local settings handler for later events in an
+- Claude Code `2.1.222` reloads a newly added local settings handler for later events in an
   already-running session. The install edit itself produces no event, hence installed-unseen.
 - The hook `session_id` matches the session registry/`claude agents --json --all`, including a
   disposable `--bg` probe, and is the correlation key.

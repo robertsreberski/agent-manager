@@ -115,6 +115,7 @@ const COMMON_KEYS = [
   "id",
   "sessionId",
   "provider",
+  "correlationId",
   "turnId",
   "parentId",
   "seq",
@@ -135,6 +136,7 @@ function validateCommon(item: Record<string, unknown>, label: string): void {
   string(item.id, `${label}.id`, false);
   string(item.sessionId, `${label}.sessionId`, false);
   enumeration(item.provider, ["codex", "claude"], `${label}.provider`);
+  nullableString(item.correlationId, `${label}.correlationId`);
   nullableString(item.turnId, `${label}.turnId`);
   nullableString(item.parentId, `${label}.parentId`);
   integer(item.seq, `${label}.seq`);

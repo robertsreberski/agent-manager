@@ -19,6 +19,7 @@ function session(updatedAt = "2026-08-04T10:00:00.000Z"): SessionRecord {
     name: "Todo session",
     cwd: "/tmp/workspace",
     kind: "interactive",
+    archived: false,
     presence: "live",
     status: "running",
     providerStatus: "running",
@@ -44,7 +45,7 @@ function session(updatedAt = "2026-08-04T10:00:00.000Z"): SessionRecord {
     effort: { value: null, providerValue: null, source: "provider-api", confidence: "exact" },
     attention: [],
     terminal: null,
-    control: { plane: "claude-hook-bridge", authority: "foreign", capabilities: [], withheld: [] },
+    control: { plane: "claude-hook-bridge", authority: "foreign", capabilities: [], withheld: [], takeover: null },
     workspaceIdentity: null,
     generation: 0,
   };

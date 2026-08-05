@@ -15,7 +15,6 @@ import { BrowserSessionError, establishBrowserSession } from "../lib/auth";
 import { connectCockpitEvents } from "../lib/sse";
 import {
   hostFilterFromSearch,
-  reconcileSelectedSessionId,
   searchWithHostFilter,
   searchWithSelectedSession,
   searchWithSessionScope,
@@ -164,6 +163,24 @@ export async function acquireAutomaticLease(api: Pick<CockpitApi, "acquireLease"
   return api.acquireLease(session.id, clientId, currentToken, 60, takeover);
 }
 
+/** Gives an active-to-archive transition a short provider-index propagation window. */
+export async function resolveArchivedSelection(
+  api: Pick<CockpitApi, "archivedSession">,
+  sessionId: string,
+  options: { attempts?: number; delayMs?: number } = {},
+): Promise<SessionView | null> {
+  const attempts = Math.max(1, Math.min(10, Math.floor(options.attempts ?? 5)));
+  const delayMs = Math.max(0, Math.min(5_000, Math.floor(options.delayMs ?? 250)));
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const archived = await api.archivedSession(sessionId);
+    if (archived) return archived;
+    if (attempt + 1 < attempts && delayMs > 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  return null;
+}
+
 interface PageExitLeaseApi {
   releaseLease(sessionId: string, token: string, keepalive?: boolean): Promise<void>;
 }
@@ -207,6 +224,24 @@ function expectedState(session: SessionView, key = idempotencyKey()) {
 
 export interface OfflineReviewMessage extends OfflineMessage { reason: string }
 
+interface ArchivedCatalogState {
+  items: SessionView[];
+  query: string;
+  nextCursor: string | null;
+  total: number;
+  status: "idle" | "loading" | "loaded" | "error";
+  error: string | null;
+}
+
+const EMPTY_ARCHIVED_CATALOG: ArchivedCatalogState = {
+  items: [],
+  query: "",
+  nextCursor: null,
+  total: 0,
+  status: "idle",
+  error: null,
+};
+
 export function useCockpit() {
   const [auth, setAuth] = useState<AuthSession | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
@@ -226,12 +261,16 @@ export function useCockpit() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [outbox, setOutbox] = useState<readonly OfflineMessage[]>([]);
   const [offlineReview, setOfflineReview] = useState<readonly OfflineReviewMessage[]>([]);
+  const [archivedCatalog, setArchivedCatalog] = useState<ArchivedCatalogState>(EMPTY_ARCHIVED_CATALOG);
+  const [resolvedArchivedSession, setResolvedArchivedSession] = useState<SessionView | null>(null);
   const api = useMemo(() => auth ? new CockpitApi(auth) : null, [auth]);
   const apiRef = useRef(api); apiRef.current = api;
   const snapshotRef = useRef(snapshot); snapshotRef.current = snapshot;
   const leasesRef = useRef<Record<string, ControlLease>>({});
   const leaseOperationsRef = useRef(new Map<string, Promise<ControlLease>>());
   const recoveryRef = useRef<Promise<boolean> | null>(null);
+  const archivedRequestRef = useRef(0);
+  const archivedCatalogRef = useRef(archivedCatalog); archivedCatalogRef.current = archivedCatalog;
 
   const commitSnapshot = useCallback((next: WireStateSnapshot) => { snapshotRef.current = next; setSnapshot(next); }, []);
   const markDisconnected = useCallback(() => commitSnapshot({ ...snapshotRef.current, stale: true }), [commitSnapshot]);
@@ -252,6 +291,7 @@ export function useCockpit() {
   const clearSensitiveState = useCallback(() => {
     commitSnapshot(EMPTY_SNAPSHOT); setWorkspaces([]); setHosts([]); setLeases({}); leasesRef.current = {};
     leaseOperationsRef.current.clear(); setControlConflicts({}); setBusy({}); setOutbox([]); setOfflineReview([]);
+    setArchivedCatalog(EMPTY_ARCHIVED_CATALOG); setResolvedArchivedSession(null);
     setNotice(null); setActionError(null); setHasSuccessfulSnapshot(false); setSelectedId(null);
   }, [commitSnapshot, setSelectedId]);
 
@@ -352,6 +392,53 @@ export function useCockpit() {
     return () => { cancelled = true; window.clearInterval(timer); };
   }, [api]);
 
+  const loadArchived = useCallback(async (query: string, append = false): Promise<void> => {
+    if (!api) throw new Error("The cockpit is offline.");
+    const normalized = query.trim().slice(0, 200);
+    const current = archivedCatalogRef.current;
+    const cursor = append && current.query === normalized ? current.nextCursor : null;
+    if (append && !cursor) return;
+    const request = ++archivedRequestRef.current;
+    setArchivedCatalog((value) => ({
+      ...(append && value.query === normalized ? value : EMPTY_ARCHIVED_CATALOG),
+      query: normalized,
+      status: "loading",
+      error: null,
+    }));
+    try {
+      const page = await api.archivedSessions(normalized, cursor, 50);
+      if (request !== archivedRequestRef.current) return;
+      setArchivedCatalog((value) => {
+        const prior = append && value.query === normalized ? value.items : [];
+        const byId = new Map(prior.map((session) => [session.id, session]));
+        for (const session of page.sessions) byId.set(session.id, session);
+        return {
+          items: sortSessions([...byId.values()]),
+          query: page.query,
+          nextCursor: page.nextCursor,
+          total: page.total,
+          status: "loaded",
+          error: null,
+        };
+      });
+    } catch (error) {
+      if (request !== archivedRequestRef.current) return;
+      if (!handleFailure(error)) {
+        setArchivedCatalog((value) => ({
+          ...value,
+          status: "error",
+          error: error instanceof Error ? error.message : "Archived sessions could not be loaded.",
+        }));
+      }
+    }
+  }, [api, handleFailure]);
+
+  useEffect(() => {
+    if (api && archivedCatalog.status === "idle") {
+      void loadArchived("");
+    }
+  }, [api, archivedCatalog.status, loadArchived]);
+
   useEffect(() => {
     if (!api) return;
     const leaseApi = api;
@@ -371,9 +458,53 @@ export function useCockpit() {
   }, [api]);
 
   const sessions = useMemo(() => sortSessions(snapshot.sessions), [snapshot.sessions]);
-  const reconciledSelectedId = reconcileSelectedSessionId({ sessions, selectedId, hasSuccessfulSnapshot });
-  useEffect(() => { if (reconciledSelectedId !== selectedId) setSelectedId(reconciledSelectedId); }, [reconciledSelectedId, selectedId, setSelectedId]);
-  const selectedSession = sessions.find((session) => session.id === reconciledSelectedId) ?? null;
+  const archivedPageSession = selectedId
+    ? archivedCatalog.items.find((session) => session.id === selectedId) ?? null
+    : null;
+  const activeSelectedSession = selectedId
+    ? sessions.find((session) => session.id === selectedId) ?? null
+    : null;
+  const selectedSession = activeSelectedSession
+    ?? archivedPageSession
+    ?? (resolvedArchivedSession?.id === selectedId ? resolvedArchivedSession : null);
+  useEffect(() => {
+    if (!selectedId) {
+      setResolvedArchivedSession(null);
+      return;
+    }
+    if (activeSelectedSession) {
+      if (resolvedArchivedSession?.id === selectedId) setResolvedArchivedSession(null);
+      return;
+    }
+    const knownArchived = archivedPageSession
+      ?? (resolvedArchivedSession?.id === selectedId ? resolvedArchivedSession : null);
+    if (knownArchived) {
+      if (scope !== "archived") setScope("archived");
+      return;
+    }
+    if (!hasSuccessfulSnapshot || !api) return;
+    let cancelled = false;
+    void (async () => {
+      let archived: SessionView | null;
+      try {
+        archived = await resolveArchivedSelection(api, selectedId);
+      } catch (error) {
+        if (!cancelled && !handleFailure(error)) {
+          setActionError(error instanceof Error ? error.message : "Could not resolve the selected archive.");
+        }
+        return;
+      }
+      if (cancelled) return;
+      if (!archived) {
+        setSelectedId(null);
+        return;
+      }
+      setResolvedArchivedSession(archived);
+      setScope("archived");
+      void loadArchived(archivedCatalogRef.current.query);
+    })();
+    return () => { cancelled = true; };
+  }, [activeSelectedSession, api, archivedPageSession, handleFailure, hasSuccessfulSnapshot, loadArchived, resolvedArchivedSession, scope, selectedId, setScope, setSelectedId]);
   const mutationsReady = mutationsAreReady(auth !== null, connection, snapshot.stale, availability);
 
   const withBusy = useCallback(async <T,>(key: string, operation: () => Promise<T>): Promise<T> => {
@@ -442,6 +573,8 @@ export function useCockpit() {
   const removeQueued = useCallback((session: SessionView, messageId: string) => perform(session, { type: "remove-queued", messageId, ...expectedState(session) }), [perform]);
   const lifecycleAction = useCallback((session: SessionView, type: "archive" | "end" | "delete") => perform(session, { type, ...expectedState(session) }), [perform]);
   const openEditor = useCallback((session: SessionView, relativePath: string) => perform(session, { type: "open-editor", relativePath, ...expectedState(session) }), [perform]);
+  const takeCliControl = useCallback((session: SessionView, method: "guided-exit" | "graceful-stop") => perform(session, { type: "take-control", method, ...expectedState(session) }), [perform]);
+  const cancelCliTakeover = useCallback((session: SessionView, takeoverId: string) => perform(session, { type: "cancel-take-control", takeoverId, ...expectedState(session) }), [perform]);
   const takeOverControl = useCallback(async (session: SessionView) => { await ensureLease(session, true); setNotice("This browser window can now steer the session."); }, [ensureLease]);
 
   useEffect(() => {
@@ -482,7 +615,7 @@ export function useCockpit() {
     const writer = leasesRef.current[sessionId]; forgetLease(sessionId);
     if (api && writer) await api.releaseLease(sessionId, writer.token).catch(() => undefined);
   }, [api, forgetLease]);
-  const closeSelected = useCallback(async () => { const id = reconciledSelectedId; setSelectedId(null); if (id) await releaseSessionWriter(id); }, [reconciledSelectedId, releaseSessionWriter, setSelectedId]);
+  const closeSelected = useCallback(async () => { const id = selectedId; setSelectedId(null); if (id) await releaseSessionWriter(id); }, [releaseSessionWriter, selectedId, setSelectedId]);
   const completeWorkspacePath = useCallback((hostId: string, path: string) => api ? api.completeDirectories(hostId, path) : Promise.resolve([]), [api]);
   const loadPreview = useCallback((session: SessionView): Promise<PanePreview> => { if (!api) throw new Error("The cockpit is offline."); return api.preview(session.id); }, [api]);
   const loadAttach = useCallback((session: SessionView): Promise<AttachInstruction> => { if (!api) throw new Error("The cockpit is offline."); return api.attach(session.id); }, [api]);
@@ -530,12 +663,16 @@ export function useCockpit() {
   }, [api]);
   return {
     ready: auth !== null, actor: auth?.actor ?? null, authError, availability, snapshot, sessions,
-    selectedSession, selectedId: reconciledSelectedId, setSelectedId, closeSelected, scope, setScope,
+    displaySessions: scope === "archived" ? archivedCatalog.items : sessions,
+    archivedCatalog,
+    searchArchived: (query: string) => loadArchived(query),
+    loadMoreArchived: () => loadArchived(archivedCatalogRef.current.query, true),
+    selectedSession, selectedId, setSelectedId, closeSelected, scope, setScope,
     hostFilter, setHostFilter, connection, mutationsReady, hosts, workspaces, busy, notice,
     clearNotice: () => setNotice(null), actionError, clearActionError: () => setActionError(null),
     refresh, retryConnection: recoverBrowserSession, controlConflict: selectedSession ? controlConflicts[selectedSession.id] : undefined,
     takeOverControl, hasBusyAction: Object.values(busy).some(Boolean),
-    sendMessage, respond, interrupt, setProfile, setModel, setEffort, removeQueued, lifecycleAction, openEditor,
+    sendMessage, respond, interrupt, setProfile, setModel, setEffort, removeQueued, lifecycleAction, openEditor, takeCliControl, cancelCliTakeover,
     createSession, completeWorkspacePath, loadPreview, loadAttach, loadAttentionDetails, loadTodoDetail, searchTranscript, loadWorkspaceFiles, loadSettingsOptions, loadProviderSettingsOptions, loadSessionFacts, loadPlanFile, loadSetup, outbox, offlineReview,
     dismissOfflineReview: (id: string) => setOfflineReview((items) => items.filter((item) => item.id !== id)),
   };

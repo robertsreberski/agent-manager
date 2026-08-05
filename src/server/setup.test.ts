@@ -25,6 +25,7 @@ function discoveredSession(path: string): SessionView {
     name: "Observed session",
     cwd: path,
     kind: "interactive",
+    archived: false,
     presence: "live",
     status: "idle",
     providerStatus: "idle",
@@ -41,7 +42,7 @@ function discoveredSession(path: string): SessionView {
     todoProgress: null,
     attention: [],
     terminal: null,
-    control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [] },
+    control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [], takeover: null },
     workspaceIdentity: {
       repoRoot: path,
       repoName: "observed-repo",

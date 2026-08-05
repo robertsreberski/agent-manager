@@ -226,6 +226,7 @@ test("production observe scan attaches an exact official-CLI tmux match and leav
       authority: "foreign",
       capabilities: ["preview", "attach"],
       withheld: [],
+      takeover: null,
     });
     assert.equal(sessions.get(recentThread)?.terminal, null);
     assert.equal(sessions.get(recentThread)?.control.plane, "observe-only");

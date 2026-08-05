@@ -9,7 +9,7 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 
 export const CLAUDE_AGENT_SDK_VERSION = "0.3.220";
-export const CLAUDE_CODE_VERSION = "2.1.221";
+export const CLAUDE_CODE_VERSION = "2.1.222";
 
 export type ClaudePermissionMode = PermissionMode;
 export type ClaudeEffortLevel = EffortLevel;

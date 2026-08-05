@@ -2,6 +2,7 @@ import type {
   ExecutionProfile,
   Provider,
   ReasoningEffort,
+  TakeoverMethod,
 } from "./session.ts";
 
 export type RequestResponse =
@@ -51,6 +52,8 @@ export type SessionAction =
   | (ExpectedSessionState & { type: "end" })
   | (ExpectedSessionState & { type: "archive" })
   | (ExpectedSessionState & { type: "delete" })
+  | (ExpectedSessionState & { type: "take-control"; method: TakeoverMethod })
+  | (ExpectedSessionState & { type: "cancel-take-control"; takeoverId: string })
   | (ExpectedSessionState & {
       type: "open-editor";
       relativePath: string;

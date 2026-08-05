@@ -91,6 +91,7 @@ const FILTERS = [
   ["wants-you", "Wants you"],
   ["working", "Working"],
   ["idle", "Idle"],
+  ["archived", "Archived"],
 ] as const;
 
 function errorText(error: unknown): string {
@@ -371,13 +372,13 @@ export function Header({
   onHelp,
   onNew,
 }: {
-  counts: Record<"all" | "wants-you" | "working" | "failed" | "idle", number>;
-  scope: "all" | "wants-you" | "working" | "idle";
+  counts: Record<"all" | "wants-you" | "working" | "failed" | "idle" | "archived", number>;
+  scope: "all" | "wants-you" | "working" | "idle" | "archived";
   hosts: readonly { id: string; label: string; kind: "local" | "ssh"; status: string; count: number }[];
   hostFilter: ReadonlySet<string>;
   connection: string;
   diagnostics: number;
-  onScope: (scope: "all" | "wants-you" | "working" | "idle") => void;
+  onScope: (scope: "all" | "wants-you" | "working" | "idle" | "archived") => void;
   onToggleHost: (hostId: string) => void;
   onPalette: () => void;
   onHelp: () => void;
@@ -426,6 +427,42 @@ export function Header({
         </div>
       </div>
     </header>
+  );
+}
+
+function ArchivedCatalogBar({
+  query,
+  shown,
+  total,
+  status,
+  error,
+  hasMore,
+  onSearch,
+  onLoadMore,
+}: {
+  query: string;
+  shown: number;
+  total: number;
+  status: "idle" | "loading" | "loaded" | "error";
+  error: string | null;
+  hasMore: boolean;
+  onSearch: (query: string) => Promise<void>;
+  onLoadMore: () => Promise<void>;
+}) {
+  const [value, setValue] = useState(query);
+  useEffect(() => setValue(query), [query]);
+  const loading = status === "loading";
+  return (
+    <section className="shrink-0 border-b border-[var(--rule)] bg-[var(--app)] px-4 py-3 min-[901px]:px-6" aria-label="Archived session catalog">
+      <form className="flex flex-wrap items-center gap-2" onSubmit={(event) => { event.preventDefault(); void onSearch(value); }}>
+        <label className="sr-only" htmlFor="archived-session-search">Search archived sessions</label>
+        <input id="archived-session-search" type="search" value={value} onChange={(event) => setValue(event.target.value)} maxLength={200} placeholder="Search title, provider ID, or workspace" className="min-h-9 min-w-0 flex-1 border border-[var(--border)] bg-[var(--surface-raised)] px-3 text-body-sm outline-none focus:border-[var(--border-strong)]" />
+        <Button variant="secondary" size="sm" disabled={loading} type="submit"><Search size={13} />{loading && shown === 0 ? "Searching…" : "Search"}</Button>
+        <span className="font-mono text-code-xs text-[var(--text-muted)]">{shown} of {total}</span>
+        {hasMore && <Button variant="ghost" size="sm" disabled={loading} type="button" onClick={() => void onLoadMore()}>{loading ? "Loading…" : "Load more"}</Button>}
+      </form>
+      {error && <p className="mt-2 text-code-sm text-[var(--warning)]" role="status">{error}</p>}
+    </section>
   );
 }
 
@@ -536,7 +573,7 @@ export default function App() {
     ...host,
     count: cockpit.sessions.filter((session) => session.hostId === host.id).length,
   })), [cockpit.hosts, cockpit.sessions]);
-  const sessions = useMemo(() => cockpit.sessions.map((session) => {
+  const sessions = useMemo(() => cockpit.displaySessions.map((session) => {
     const projected = toCockpitSessionView(session, {
       remote: remoteHostIds.has(session.hostId),
       ...(todoDetails.has(session.id) ? { todo: todoDetails.get(session.id)! } : {}),
@@ -548,9 +585,9 @@ export default function App() {
     return session.id === activity.sessionId && selectedActivityTodo
       ? { ...projected, todo: selectedActivityTodo }
       : projected;
-  }), [activity.sessionId, cockpit.sessions, phoneAttentionLabels, remoteHostIds, selectedActivityTodo, todoDetails]);
+  }), [activity.sessionId, cockpit.displaySessions, phoneAttentionLabels, remoteHostIds, selectedActivityTodo, todoDetails]);
   const board = useBoardModel(sessions, {
-    scope: cockpit.scope,
+    scope: cockpit.scope === "archived" ? "all" : cockpit.scope,
     hostIds: cockpit.hostFilter,
   });
 
@@ -921,7 +958,9 @@ export default function App() {
     : <LoadingScreen />;
 
   const drawerOpen = Boolean(selected || draft);
-  const contentMode = cockpitContentMode(cockpit.sessions.length, cockpit.workspaces.length);
+  const contentMode = cockpit.scope === "archived"
+    ? "board"
+    : cockpitContentMode(cockpit.sessions.length, cockpit.workspaces.length);
   const draftWorkspace = draft?.workspace;
   const drawerTitle = selected ? selected.name ?? selected.providerThreadId : draftWorkspace ? draftWorkspace.path.split("/").filter(Boolean).at(-1) ?? "New thread" : "New thread";
   const drawerInfo = selected ? drawerFacts(selected, selectedRemote) : draftWorkspace ? [{ label: draftWorkspace.path }] : [];
@@ -929,7 +968,7 @@ export default function App() {
   return (
     <main className="relative flex h-dvh min-h-0 flex-col overflow-hidden bg-[var(--app)] text-[var(--text)]">
       <Header
-        counts={board.counts}
+        counts={{ ...board.counts, archived: cockpit.archivedCatalog.total }}
         scope={cockpit.scope}
         hosts={headerHosts}
         hostFilter={cockpit.hostFilter}
@@ -942,7 +981,7 @@ export default function App() {
         onNew={() => openDraft()}
       />
 
-      <SelectionBar sessions={selectedBoardSessions} onClear={() => setSelectedIds(new Set())} onAction={selectionAction} />
+      {cockpit.scope !== "archived" && <SelectionBar sessions={selectedBoardSessions} onClear={() => setSelectedIds(new Set())} onAction={selectionAction} />}
 
       {(cockpit.snapshot.stale || cockpit.connection !== "open") && <div className="z-20 shrink-0"><OfflineState generatedAt={cockpit.snapshot.generatedAt} /></div>}
       {cockpit.snapshot.diagnostics.length > 0 && (
@@ -960,6 +999,16 @@ export default function App() {
         the whole page and swallow every header control (spec 05 R7).
       */}
       <div className="relative flex min-h-0 flex-1 flex-col" data-board-region>
+        {cockpit.scope === "archived" && <ArchivedCatalogBar
+          query={cockpit.archivedCatalog.query}
+          shown={cockpit.archivedCatalog.items.length}
+          total={cockpit.archivedCatalog.total}
+          status={cockpit.archivedCatalog.status}
+          error={cockpit.archivedCatalog.error}
+          hasMore={cockpit.archivedCatalog.nextCursor !== null}
+          onSearch={cockpit.searchArchived}
+          onLoadMore={cockpit.loadMoreArchived}
+        />}
         {contentMode === "empty" ? (
           <div className="min-h-0 flex-1 overflow-y-auto">
             <EmptyState repositories={cockpit.workspaces.map((workspace) => ({ id: workspace.id, name: workspace.label, path: workspace.path }))} onOpen={(workspaceId) => { const workspace = cockpit.workspaces.find((item) => item.id === workspaceId); if (workspace) openDraft({ hostId: workspace.hostId, path: workspace.path }); }} />
@@ -977,10 +1026,12 @@ export default function App() {
                 : <ConnectingState sources={["discovered repositories", "provider hook settings", "configured remote hosts"]} />}
           </div>
         ) : board.columns.length === 0 && board.bands.length === 0 ? (
-          <section className="grid min-h-0 flex-1 place-content-center p-6 text-center"><Search className="mx-auto text-[var(--text-muted)]" /><h2 className="mt-3 text-title-sm">No sessions match these filters</h2><Button variant="ghost" size="sm" data-compact-control className="mx-auto mt-3 underline [color:var(--accent)]" onClick={() => { cockpit.setScope("all"); cockpit.setHostFilter(new Set()); }}>Clear filters</Button></section>
+          cockpit.scope === "archived"
+            ? <section className="grid min-h-0 flex-1 place-content-center p-6 text-center"><Search className="mx-auto text-[var(--text-muted)]" /><h2 className="mt-3 text-title-sm">{cockpit.archivedCatalog.status === "loading" ? "Loading archived sessions" : "No archived sessions match"}</h2><p className="mt-1 text-meta-sm text-[var(--text-muted)]">Search by title, provider ID, or workspace.</p></section>
+            : <section className="grid min-h-0 flex-1 place-content-center p-6 text-center"><Search className="mx-auto text-[var(--text-muted)]" /><h2 className="mt-3 text-title-sm">No sessions match these filters</h2><Button variant="ghost" size="sm" data-compact-control className="mx-auto mt-3 underline [color:var(--accent)]" onClick={() => { cockpit.setScope("all"); cockpit.setHostFilter(new Set()); }}>Clear filters</Button></section>
         ) : (
           <>
-            <DesktopBoard columns={board.columns} selectedSessionIds={selectedIds} onOpenSession={openSession} onToggleSelection={toggleSelection} onNewThread={(column) => openDraft(workspaceForColumn(column))} />
+            <DesktopBoard columns={board.columns} selectedSessionIds={cockpit.scope === "archived" ? new Set() : selectedIds} onOpenSession={openSession} {...(cockpit.scope === "archived" ? { showNewThread: false } : { onToggleSelection: toggleSelection, onNewThread: (column: BoardColumn) => openDraft(workspaceForColumn(column)) })} />
             <PhoneBoardBands bands={board.bands} onOpenSession={openSession} />
           </>
         )}
@@ -1008,7 +1059,7 @@ export default function App() {
           facts={drawerInfo}
           todo={selected ? selectedPresentation?.todo ?? null : null}
           onClose={closeDrawer}
-          composer={selected ? <SessionThreadComposer
+          composer={selected && !selected.archived ? <SessionThreadComposer
             session={selected}
             activity={activity}
             busy={selectedBusy}
@@ -1021,7 +1072,10 @@ export default function App() {
             modelOptions={selectedModelCatalog.models}
             modelOptionsStatus={selectedModelCatalog.status}
             onOpenSetup={openSetup}
-            {...(selectedRemote ? {} : { onSearchFiles: (query: string) => cockpit.loadWorkspaceFiles(selected.id, query) })}
+            onTakeControl={(method) => cockpit.takeCliControl(selected, method)}
+            onCancelTakeControl={(takeoverId) => cockpit.cancelCliTakeover(selected, takeoverId)}
+            onNativeContinue={() => cockpit.loadAttach(selected)}
+            {...(selectedRemote || selected.archived ? {} : { onSearchFiles: (query: string) => cockpit.loadWorkspaceFiles(selected.id, query) })}
             {...(selectedModelCatalog.effortOptions !== undefined ? { effortOptions: selectedModelCatalog.effortOptions } : {})}
             {...(restoredDraft?.sessionId === selected.id ? { restoredDraft: { key: restoredDraft.key, text: restoredDraft.text } } : {})}
           /> : undefined}

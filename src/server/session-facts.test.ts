@@ -23,6 +23,7 @@ function session(overrides: Partial<SessionView> = {}): SessionView {
     name: "Managed Codex",
     cwd: "/tmp/workspace",
     kind: "interactive",
+    archived: false,
     presence: "live",
     status: "running",
     providerStatus: "running",
@@ -39,7 +40,7 @@ function session(overrides: Partial<SessionView> = {}): SessionView {
     todoProgress: null,
     attention: [],
     terminal: null,
-    control: { plane: "codex-private", authority: "manager", capabilities: ["queue", "attach"], withheld: [] },
+    control: { plane: "codex-private", authority: "manager", capabilities: ["queue", "attach"], withheld: [], takeover: null },
     workspaceIdentity: null,
     generation: 0,
     ...overrides,
@@ -157,8 +158,8 @@ test("reports unknown, remote, foreign, unsupported and failed account facts tru
   let calls = 0;
   const sessions = [
     session({ id: "remote:codex:r", hostId: "remote", providerThreadId: "r" }),
-    session({ id: "local:codex:f", providerThreadId: "f", control: { plane: "resume-only", authority: "foreign", capabilities: ["resume"], withheld: [] } }),
-    session({ id: "local:claude:c", provider: "claude", providerThreadId: "c", control: { plane: "claude-sdk", authority: "manager", capabilities: [], withheld: [] } }),
+    session({ id: "local:codex:f", providerThreadId: "f", control: { plane: "resume-only", authority: "foreign", capabilities: ["resume"], withheld: [], takeover: null } }),
+    session({ id: "local:claude:c", provider: "claude", providerThreadId: "c", control: { plane: "claude-sdk", authority: "manager", capabilities: [], withheld: [], takeover: null } }),
     session({ id: "local:codex:n", providerThreadId: "n" }),
   ];
   const backend = await createAgentManagerServer({

@@ -2,6 +2,10 @@ import { accessSync, constants, existsSync, statSync } from "node:fs";
 import { createServer } from "node:net";
 import { dirname } from "node:path";
 
+import {
+  CLAUDE_AGENT_SDK_VERSION,
+  CLAUDE_CODE_VERSION,
+} from "../providers/claude/types.ts";
 import type { AgentManagerConfig, AgentManagerPaths } from "./config.ts";
 import { defaultConfig, defaultPaths } from "./config.ts";
 import {
@@ -211,8 +215,8 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
             "claude",
             serviceExecutables.claude,
             ["--version"],
-            /\b2\.1\.220\b/u,
-            "Claude Code 2.1.220 / Agent SDK 0.3.220",
+            new RegExp(`\\b${CLAUDE_CODE_VERSION.replaceAll(".", "\\.")}\\b`, "u"),
+            `Claude Code ${CLAUDE_CODE_VERSION} / Agent SDK ${CLAUDE_AGENT_SDK_VERSION}`,
           ),
           versionCheck(
             runner,

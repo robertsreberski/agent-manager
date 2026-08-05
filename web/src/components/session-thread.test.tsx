@@ -2,7 +2,7 @@ import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { SessionActivityView, SessionView } from "../types";
-import { SessionThreadComposer } from "./session-thread";
+import { emptyActivityCopy, SessionThreadComposer } from "./session-thread";
 
 const session = {
   id: "local:codex:thread-1",
@@ -21,6 +21,7 @@ const session = {
       { capability: "set-effort", reason: "The hook exposes no effort control." },
       { capability: "set-profile", reason: "The hook exposes no profile control." },
     ],
+    takeover: null,
   },
 } as SessionView;
 
@@ -30,6 +31,21 @@ const activity = {
     messages: [{ id: "queued-1", text: "Do not duplicate this bubble", status: "queued", enqueuedAt: "2026-08-04T12:00:00.000Z", turnId: "turn-1" }],
   }],
 } as SessionActivityView;
+
+describe("empty activity connection copy", () => {
+  it.each([
+    ["connecting", "Loading activity"],
+    ["retrying", "Reconnecting to activity"],
+    ["open", "Waiting for provider activity"],
+    ["offline", "Activity stream unavailable"],
+  ] as const)("renders %s truthfully", (connection, title) => {
+    expect(emptyActivityCopy(connection, false).title).toBe(title);
+  });
+
+  it("never describes a retention boundary as waiting", () => {
+    expect(emptyActivityCopy("open", true).title).toBe("No retained activity");
+  });
+});
 
 describe("SessionThreadComposer", () => {
   it("shows only a queue count and truthfully disables absent setting controls", () => {
@@ -83,7 +99,7 @@ describe("SessionThreadComposer", () => {
 
     expect(screen.getByText("Read only")).toBeInTheDocument();
     expect(screen.queryByText("This terminal-started session has no hook bridge.")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Enable replies" }));
+    fireEvent.click(screen.getByRole("button", { name: "Enable live activity" }));
     expect(onOpenSetup).toHaveBeenCalledOnce();
   });
 
@@ -103,8 +119,169 @@ describe("SessionThreadComposer", () => {
       onOpenSetup={vi.fn()}
     />);
 
-    expect(screen.queryByRole("button", { name: "Enable replies" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Enable live activity" })).not.toBeInTheDocument();
     expect(screen.queryByText("Read only")).not.toBeInTheDocument();
+  });
+
+  it("offers guided takeover and separately confirms the single graceful stop", () => {
+    const onTakeControl = vi.fn(async () => undefined);
+    const observed = {
+      ...session,
+      control: {
+        ...session.control,
+        capabilities: ["take-control"],
+        takeover: {
+          id: null,
+          state: "available",
+          methods: ["guided-exit", "graceful-stop"],
+          method: null,
+          requestedAt: null,
+          deadlineAt: null,
+          fallbackProfile: "plan",
+          error: null,
+        },
+      },
+    } as SessionView;
+    render(<SessionThreadComposer
+      session={observed}
+      activity={activity}
+      busy={false}
+      mutationsReady
+      onSend={vi.fn(async () => undefined)}
+      onInterrupt={vi.fn(async () => undefined)}
+      onSetProfile={vi.fn(async () => undefined)}
+      onSetModel={vi.fn(async () => undefined)}
+      onSetEffort={vi.fn(async () => undefined)}
+      modelOptions={[]}
+      modelOptionsStatus={null}
+      onTakeControl={onTakeControl}
+    />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Take control" }));
+    expect(screen.getByText(/conservative/iu)).toHaveTextContent("plan");
+    fireEvent.click(screen.getByRole("button", { name: "Stop CLI gracefully…" }));
+    expect(onTakeControl).not.toHaveBeenCalled();
+    expect(screen.getByText(/exactly one SIGTERM/iu)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Confirm graceful stop" }));
+    expect(onTakeControl).toHaveBeenCalledWith("graceful-stop");
+  });
+
+  it("can cancel only the guided takeover while it waits for CLI exit", () => {
+    const onCancelTakeControl = vi.fn(async () => undefined);
+    const observed = {
+      ...session,
+      control: {
+        ...session.control,
+        capabilities: ["cancel-take-control"],
+        takeover: {
+          id: "takeover-1",
+          state: "waiting-for-exit",
+          methods: ["guided-exit", "graceful-stop"],
+          method: "guided-exit",
+          requestedAt: "2026-08-05T10:00:00.000Z",
+          deadlineAt: "2026-08-05T10:05:00.000Z",
+          fallbackProfile: null,
+          error: null,
+        },
+      },
+    } as SessionView;
+    render(<SessionThreadComposer
+      session={observed}
+      activity={activity}
+      busy={false}
+      mutationsReady
+      onSend={vi.fn(async () => undefined)}
+      onInterrupt={vi.fn(async () => undefined)}
+      onSetProfile={vi.fn(async () => undefined)}
+      onSetModel={vi.fn(async () => undefined)}
+      onSetEffort={vi.fn(async () => undefined)}
+      modelOptions={[]}
+      modelOptionsStatus={null}
+      onCancelTakeControl={onCancelTakeControl}
+    />);
+
+    expect(screen.getByText(/Exit the Codex CLI/iu)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel takeover" }));
+    expect(onCancelTakeControl).toHaveBeenCalledWith("takeover-1");
+  });
+
+  it("offers a native continuation when safe takeover is unavailable", async () => {
+    const onNativeContinue = vi.fn(async () => ({
+      available: true as const,
+      kind: "tmux" as const,
+      command: "tmux attach-session -t work",
+      description: "Attach to the existing CLI",
+      requiresHandoff: false,
+      argv: ["tmux", "attach-session", "-t", "work"],
+      cwd: "/workspace",
+    }));
+    const observed = {
+      ...session,
+      control: { ...session.control, capabilities: ["attach"], takeover: null },
+    } as SessionView;
+    render(<SessionThreadComposer
+      session={observed}
+      activity={activity}
+      busy={false}
+      mutationsReady
+      onSend={vi.fn(async () => undefined)}
+      onInterrupt={vi.fn(async () => undefined)}
+      onSetProfile={vi.fn(async () => undefined)}
+      onSetModel={vi.fn(async () => undefined)}
+      onSetEffort={vi.fn(async () => undefined)}
+      modelOptions={[]}
+      modelOptionsStatus={null}
+      onNativeContinue={onNativeContinue}
+    />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Continue in CLI" }));
+    expect(await screen.findByText("tmux attach-session -t work")).toBeInTheDocument();
+  });
+
+  it("keeps native continuation available after a takeover failure", () => {
+    const observed = {
+      ...session,
+      control: {
+        ...session.control,
+        capabilities: ["take-control", "attach"],
+        takeover: {
+          id: "failed-takeover",
+          state: "failed",
+          methods: ["guided-exit", "graceful-stop"],
+          method: "guided-exit",
+          requestedAt: "2026-08-05T10:00:00.000Z",
+          deadlineAt: null,
+          fallbackProfile: null,
+          error: "Provider identity changed",
+        },
+      },
+    } as SessionView;
+    render(<SessionThreadComposer
+      session={observed}
+      activity={activity}
+      busy={false}
+      mutationsReady
+      onSend={vi.fn(async () => undefined)}
+      onInterrupt={vi.fn(async () => undefined)}
+      onSetProfile={vi.fn(async () => undefined)}
+      onSetModel={vi.fn(async () => undefined)}
+      onSetEffort={vi.fn(async () => undefined)}
+      modelOptions={[]}
+      modelOptionsStatus={null}
+      onTakeControl={vi.fn(async () => undefined)}
+      onNativeContinue={vi.fn(async () => ({
+        available: false as const,
+        kind: "none" as const,
+        command: null,
+        description: null,
+        requiresHandoff: false,
+        argv: [],
+        cwd: null,
+      }))}
+    />);
+
+    expect(screen.getByRole("button", { name: "Take control" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Continue in CLI" })).toBeInTheDocument();
   });
 
   it("passes a catalog the session cannot write through as a read-only list", () => {
@@ -148,7 +325,7 @@ describe("SessionThreadComposer", () => {
 describe("the upgrade path off a read-only session", () => {
   const observed = {
     ...session,
-    control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [] },
+    control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [], takeover: null },
   } as unknown as SessionView;
 
   function renderComposer() {
@@ -173,7 +350,7 @@ describe("the upgrade path off a read-only session", () => {
 
     expect(document.querySelector("[data-hook-upgrade]")).toBeNull();
     expect(screen.getAllByText("Read only")).toHaveLength(1);
-    expect(screen.getByRole("button", { name: "Enable replies" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Enable live activity" })).toBeInTheDocument();
     expect(screen.queryByText(/hook|observation-only|read-only session/iu)).not.toBeInTheDocument();
   });
 });

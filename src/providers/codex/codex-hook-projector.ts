@@ -88,6 +88,7 @@ export function projectCodexHook(
       const prompt = text(input.raw.prompt);
       mutations.push(upsert({
         ...common(input, id(input, "prompt", `${turnIdentity}:${hash(prompt ?? input.raw)}`), "complete", receivedAt),
+        correlationId: input.turnId ? `message:${input.turnId}:user` : null,
         kind: "message",
         role: "user",
         phase: null,
@@ -102,6 +103,7 @@ export function projectCodexHook(
       const completed = input.event === "PostToolUse";
       mutations.push(upsert({
         ...common(input, id(input, "tool", toolIdentity), completed ? "complete" : "running", receivedAt),
+        correlationId: `tool:${toolIdentity}`,
         kind: "tool",
         toolCallId: toolIdentity,
         name: input.toolName ?? "Codex tool",
@@ -186,6 +188,7 @@ export function projectCodexHook(
       if (assistantMessage) {
         mutations.push(upsert({
           ...common(input, id(input, "message", `${turnIdentity}:assistant`), "complete", receivedAt),
+          correlationId: `message:${turnIdentity}:assistant`,
           kind: "message",
           role: "assistant",
           phase: "final",

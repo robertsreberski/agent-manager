@@ -54,7 +54,7 @@ const session = {
   model: { value: "sonnet" },
   effort: { value: "high" },
   profile: { value: "ask-first" },
-  control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [] },
+  control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [], takeover: null },
 } as unknown as SessionView;
 
 const items: readonly ActivityItem[] = [

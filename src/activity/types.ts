@@ -100,6 +100,8 @@ export interface ActivityItemBase {
   /** Foreign key to SessionRecord.id; never a provider thread, tree, or turn id. */
   sessionId: string;
   provider: Provider;
+  /** Exact provider-scoped identity used only for cross-source reconciliation. */
+  correlationId?: string | null;
   turnId: string | null;
   parentId: string | null;
   seq: number;
@@ -256,6 +258,8 @@ export type ActivityItem =
 
 interface ActivityItemDraftBase {
   id: string;
+  /** Never synthesize this from text; omit it unless the provider supplied identity. */
+  correlationId?: string | null;
   turnId?: string | null;
   parentId?: string | null;
   state?: ActivityState;

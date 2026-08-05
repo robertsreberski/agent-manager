@@ -215,6 +215,7 @@ export class ClaudeHookActivityProjector {
         mutations.push(upsert({
           ...base,
           id: itemId(input, "message:user", identity),
+          correlationId: input.prompt_id ? `message:${input.prompt_id}` : null,
           kind: "message",
           role: "user",
           text: redactActivityText(input.prompt),
@@ -228,6 +229,7 @@ export class ClaudeHookActivityProjector {
         mutations.push(upsert({
           ...base,
           id: toolItemId,
+          correlationId: `tool:${input.tool_use_id}`,
           kind: "tool",
           toolCallId: input.tool_use_id,
           name: redactActivityText(input.tool_name),
@@ -258,6 +260,7 @@ export class ClaudeHookActivityProjector {
         mutations.push(upsert({
           ...base,
           id: itemId(input, "tool", input.tool_use_id),
+          correlationId: `tool:${input.tool_use_id}`,
           kind: "tool",
           toolCallId: input.tool_use_id,
           name: redactActivityText(input.tool_name),
@@ -272,6 +275,7 @@ export class ClaudeHookActivityProjector {
         mutations.push(upsert({
           ...base,
           id: itemId(input, "tool", input.tool_use_id),
+          correlationId: `tool:${input.tool_use_id}`,
           kind: "tool",
           toolCallId: input.tool_use_id,
           name: redactActivityText(input.tool_name),
@@ -286,6 +290,7 @@ export class ClaudeHookActivityProjector {
         mutations.push(upsert({
           ...base,
           id: itemId(input, "tool", input.tool_use_id),
+          correlationId: `tool:${input.tool_use_id}`,
           kind: "tool",
           toolCallId: input.tool_use_id,
           name: redactActivityText(input.tool_name),
@@ -404,6 +409,7 @@ export class ClaudeHookActivityProjector {
           ...base,
           turnId: input.turn_id,
           id: itemId(input, "message:assistant", input.message_id),
+          correlationId: `message:${input.message_id}`,
           kind: "message",
           role: "assistant",
           text: current.text,

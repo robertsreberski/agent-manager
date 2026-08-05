@@ -9,7 +9,7 @@ import {
   useThreadViewportAutoScroll,
   type ThreadMessageLike,
 } from "@assistant-ui/react";
-import { ArrowDown, LoaderCircle, Sparkles } from "lucide-react";
+import { ArrowDown, Copy, LoaderCircle, Sparkles } from "lucide-react";
 import { Button, Collapsible, CollapsibleContent, CollapsibleTrigger } from "./ui";
 import { DISCLOSURE_SCROLL_LOCK_MS, GroupedActivityParts } from "./thread";
 import { MarkdownText } from "./assistant-ui/markdown-text";
@@ -36,6 +36,7 @@ import type {
   RequestResponse,
   SessionActivityView,
   SessionView,
+  TakeoverMethod,
 } from "../types";
 import { toCockpitSessionView } from "../lib/cockpit-view";
 import type { PlanFileResponse, SelectedSessionFactsResponse } from "../lib/api";
@@ -96,13 +97,36 @@ function AssistantMessage({ controls }: { controls: ActivityDataControls }) {
   );
 }
 
-function EmptyActivity({ connection }: { connection: SessionActivityView["connection"] }) {
+export function emptyActivityCopy(
+  connection: SessionActivityView["connection"],
+  truncated: boolean,
+): { title: string; description: string } {
+  if (truncated) {
+    return {
+      title: "No retained activity",
+      description: "This session's available history begins after the retention boundary.",
+    };
+  }
+  switch (connection) {
+    case "connecting":
+      return { title: "Loading activity", description: "Loading this session's retained history." };
+    case "retrying":
+      return { title: "Reconnecting to activity", description: "The live stream was interrupted; history is preserved while it reconnects." };
+    case "offline":
+      return { title: "Activity stream unavailable", description: "The live activity connection could not be opened." };
+    case "open":
+      return { title: "Waiting for provider activity", description: "Only events the provider exposes will appear here." };
+  }
+}
+
+function EmptyActivity({ connection, truncated }: { connection: SessionActivityView["connection"]; truncated: boolean }) {
+  const copy = emptyActivityCopy(connection, truncated);
   return (
     <section className="grid min-h-56 place-content-center gap-3 text-center text-[var(--text-muted)]">
       {connection === "connecting" || connection === "retrying"
         ? <LoaderCircle size={20} className="mx-auto motion-safe:animate-spin" />
         : <Sparkles size={20} className="mx-auto" />}
-      <div><h3 className="text-title-sm text-[var(--text)]">{connection === "offline" ? "Activity stream unavailable" : "Waiting for provider activity"}</h3><p className="mt-1 text-meta-sm">Only events the harness actually exposes will appear here.</p></div>
+      <div><h3 className="text-title-sm text-[var(--text)]">{copy.title}</h3><p className="mt-1 text-meta-sm">{copy.description}</p></div>
     </section>
   );
 }
@@ -322,11 +346,11 @@ export function SessionThread({
       <div className="flex min-w-0 flex-col gap-5" role="log" aria-label="Provider activity" aria-live="polite" aria-relevant="additions text">
         <SessionDetails session={session} remote={remote} facts={facts} factsStatus={factsStatus} attachInstruction={attachInstruction} attachError={attachError} loadingAttach={loadingAttach} onRevealAttach={() => void revealAttach()} />
         {activity.truncated && <ActivityRetentionBoundary />}
-        <AuiIf condition={(state) => state.thread.isEmpty}><EmptyActivity connection={activity.connection} /></AuiIf>
+        <AuiIf condition={(state) => state.thread.isEmpty}><EmptyActivity connection={activity.connection} truncated={activity.truncated} /></AuiIf>
         <ThreadPrimitive.Messages>
           {({ message }) => message.role === "user" ? <UserMessage /> : message.role === "system" ? <SystemMessage label={systemMessageLabel(message)} /> : <AssistantMessage controls={controls} />}
         </ThreadPrimitive.Messages>
-        {["completed", "failed", "interrupted"].includes(session.status) && <div><SessionEndedState canResume={session.control.capabilities.includes("resume")} resumeCommand={attachInstruction?.available ? attachInstruction.command : null} resumeDescription={attachInstruction?.description ?? null} resumeError={attachError} resumeUnavailableReason={session.control.withheld.find(({ capability }) => capability === "resume")?.reason ?? null} loadingResume={loadingAttach} onResume={() => void revealAttach()} canContinue={Boolean(session.workspaceIdentity?.worktreePath ?? session.cwd)} onContinue={onContinueInWorkspace} /></div>}
+        {!session.archived && ["completed", "failed", "interrupted"].includes(session.status) && <div><SessionEndedState canResume={session.control.capabilities.includes("resume")} resumeCommand={attachInstruction?.available ? attachInstruction.command : null} resumeDescription={attachInstruction?.description ?? null} resumeError={attachError} resumeUnavailableReason={session.control.withheld.find(({ capability }) => capability === "resume")?.reason ?? null} loadingResume={loadingAttach} onResume={() => void revealAttach()} canContinue={Boolean(session.workspaceIdentity?.worktreePath ?? session.cwd)} onContinue={onContinueInWorkspace} /></div>}
         {/*
           Auto-scroll detaches the moment the operator scrolls up, so a long
           turn needs a way back. The primitive renders nothing while the view is
@@ -365,6 +389,9 @@ export function SessionThreadComposer({
   effortOptions,
   restoredDraft,
   onOpenSetup,
+  onTakeControl,
+  onCancelTakeControl,
+  onNativeContinue,
   onSearchFiles,
 }: {
   session: SessionView;
@@ -381,13 +408,29 @@ export function SessionThreadComposer({
   effortOptions?: readonly ReasoningEffort[];
   restoredDraft?: { key: string; text: string } | null;
   onOpenSetup?: () => void;
+  onTakeControl?: (method: TakeoverMethod) => Promise<void>;
+  onCancelTakeControl?: (takeoverId: string) => Promise<void>;
+  onNativeContinue?: () => Promise<AttachInstruction>;
   /** Absent where the workspace is not readable from here, e.g. a remote host. */
   onSearchFiles?: (query: string) => Promise<readonly string[]>;
 }) {
   const [text, setText] = useState("");
+  const [takeoverMenuOpen, setTakeoverMenuOpen] = useState(false);
+  const [confirmGraceful, setConfirmGraceful] = useState(false);
+  const [takeoverBusy, setTakeoverBusy] = useState(false);
+  const [nativeBusy, setNativeBusy] = useState(false);
+  const [nativeInstruction, setNativeInstruction] = useState<AttachInstruction | null>(null);
+  const [nativeError, setNativeError] = useState<string | null>(null);
   useEffect(() => {
     if (restoredDraft) setText(restoredDraft.text);
   }, [restoredDraft]);
+  useEffect(() => {
+    setTakeoverMenuOpen(false);
+    setConfirmGraceful(false);
+    setTakeoverBusy(false);
+    setNativeInstruction(null);
+    setNativeError(null);
+  }, [session.id]);
   const queued = currentQueue(activity);
   const todo = currentTodo(activity);
   const canQueue = session.control.capabilities.includes("queue");
@@ -406,6 +449,58 @@ export function SessionThreadComposer({
   const noWriteReason = !canQueue && !canSteer
     ? session.control.withheld.find((item) => item.capability === "queue")?.reason ?? "Replies are unavailable."
     : null;
+  const takeover = session.control.takeover;
+  const canTakeControl = session.control.capabilities.includes("take-control")
+    && takeover !== null
+    && (takeover.state === "available" || takeover.state === "failed")
+    && onTakeControl !== undefined;
+  const canCancelTakeover = session.control.capabilities.includes("cancel-take-control")
+    && takeover?.state === "waiting-for-exit"
+    && takeover.id !== null
+    && onCancelTakeControl !== undefined;
+  const hookSetupMissing = onOpenSetup !== undefined && (
+    session.control.plane === "observe-only"
+    || session.control.withheld.some((item) => /hook (?:bridge|setup)/iu.test(item.reason))
+  );
+  const canContinueNatively = (!canTakeControl || takeover?.state === "failed")
+    && (session.control.capabilities.includes("attach") || session.control.capabilities.includes("resume"))
+    && onNativeContinue !== undefined;
+  async function beginTakeover(method: TakeoverMethod) {
+    if (!onTakeControl) return;
+    setTakeoverBusy(true);
+    try {
+      await onTakeControl(method);
+      setTakeoverMenuOpen(false);
+      setConfirmGraceful(false);
+    } finally {
+      setTakeoverBusy(false);
+    }
+  }
+  async function cancelTakeover() {
+    if (!canCancelTakeover || !takeover?.id || !onCancelTakeControl) return;
+    setTakeoverBusy(true);
+    try {
+      await onCancelTakeControl(takeover.id);
+    } finally {
+      setTakeoverBusy(false);
+    }
+  }
+  async function revealNativeContinue() {
+    if (!onNativeContinue) return;
+    setNativeBusy(true);
+    setNativeError(null);
+    try {
+      const instruction = await onNativeContinue();
+      setNativeInstruction(instruction);
+      if (!instruction.available) {
+        setNativeError("This session does not expose a guarded native continuation.");
+      }
+    } catch (error) {
+      setNativeError(error instanceof Error ? error.message : "Native continuation is unavailable.");
+    } finally {
+      setNativeBusy(false);
+    }
+  }
   const unavailableReason = (capability: "set-model" | "set-effort" | "set-profile", fallback: string) =>
     session.control.withheld.find((item) => item.capability === capability)?.reason ?? fallback;
   return (
@@ -440,14 +535,26 @@ export function SessionThreadComposer({
         {...(onSearchFiles ? { onSearchFiles } : {})}
       />
       {noWriteReason && (
-        <div className="flex min-h-7 items-center gap-1.5 px-0.5 text-code-sm text-[var(--text-muted)]" role="status" data-read-only-state>
-          <span>Read only</span>
-          {onOpenSetup && (
-            <>
-              <span aria-hidden="true">·</span>
-              <button type="button" data-read-only-explainer data-compact-control="height" className="underline underline-offset-2" onClick={onOpenSetup}>Enable replies</button>
-            </>
+        <div className="grid gap-2 px-0.5 text-code-sm text-[var(--text-muted)]" role="status" data-read-only-state>
+          <div className="flex min-h-7 flex-wrap items-center gap-1.5">
+            <span>Read only</span>
+            {hookSetupMissing && <><span aria-hidden="true">·</span><button type="button" data-read-only-explainer data-compact-control="height" className="underline underline-offset-2" onClick={onOpenSetup}>Enable live activity</button></>}
+            {canTakeControl && <><span aria-hidden="true">·</span><button type="button" data-compact-control="height" className="underline underline-offset-2" disabled={!mutationsReady || busy || takeoverBusy} onClick={() => { setTakeoverMenuOpen((open) => !open); setConfirmGraceful(false); }}>Take control</button></>}
+            {canContinueNatively && <><span aria-hidden="true">·</span><button type="button" data-compact-control="height" className="underline underline-offset-2" disabled={nativeBusy} onClick={() => void revealNativeContinue()}>{nativeBusy ? "Loading continuation…" : "Continue in CLI"}</button></>}
+          </div>
+          {takeover?.state === "waiting-for-exit" && <div className="flex flex-wrap items-center gap-2" data-takeover-state><span>Exit the {session.provider === "claude" ? "Claude Code" : "Codex"} CLI to transfer this exact conversation.</span>{canCancelTakeover && <Button variant="ghost" size="sm" data-compact-control disabled={takeoverBusy} onClick={() => void cancelTakeover()}>Cancel takeover</Button>}</div>}
+          {takeover?.state === "stopping" && <p data-takeover-state>Stopping the validated CLI process gracefully…</p>}
+          {takeover?.state === "adopting" && <p data-takeover-state>Adopting the exact provider conversation…</p>}
+          {takeover?.state === "failed" && takeover.error && <p className="text-[var(--warning)]" data-takeover-error>{takeover.error} Retry takeover or continue in the native CLI.</p>}
+          {takeoverMenuOpen && canTakeControl && (
+            <div className="grid gap-2 border border-[var(--border)] bg-[var(--surface-raised)] p-3" data-takeover-menu>
+              <p>Takeover is exclusive. Agent Manager becomes writable only after the current CLI exits and the provider confirms the same conversation.</p>
+              {takeover.fallbackProfile && <p className="text-[var(--warning)]">The current profile could not be observed. Adoption will use the conservative <strong>{takeover.fallbackProfile}</strong> profile.</p>}
+              {!confirmGraceful ? <div className="flex flex-wrap gap-2"><Button variant="primary" size="sm" disabled={!mutationsReady || takeoverBusy} onClick={() => void beginTakeover("guided-exit")}>{takeoverBusy ? "Starting…" : "Wait for me to exit CLI"}</Button><Button variant="secondary" size="sm" disabled={!mutationsReady || takeoverBusy} onClick={() => setConfirmGraceful(true)}>Stop CLI gracefully…</Button></div> : <div className="grid gap-2"><p>Confirm sending exactly one SIGTERM to the revalidated provider process. Agent Manager waits 15 seconds and never sends SIGKILL.</p><div className="flex flex-wrap gap-2"><Button variant="primary" size="sm" disabled={!mutationsReady || takeoverBusy} onClick={() => void beginTakeover("graceful-stop")}>{takeoverBusy ? "Stopping…" : "Confirm graceful stop"}</Button><Button variant="ghost" size="sm" disabled={takeoverBusy} onClick={() => setConfirmGraceful(false)}>Back</Button></div></div>}
+            </div>
           )}
+          {nativeInstruction?.available && nativeInstruction.command && <div className="flex items-start gap-2" data-native-continuation><pre className="min-w-0 flex-1 overflow-x-auto bg-[var(--surface-raised)] p-2 font-mono text-code-xs text-[var(--text)]">{nativeInstruction.command}</pre><Button variant="secondary" size="sm" data-compact-control aria-label="Copy native continuation command" onClick={() => void navigator.clipboard?.writeText(nativeInstruction.command ?? "")}><Copy size={13} /></Button></div>}
+          {nativeError && <p className="text-[var(--warning)]" data-native-continuation-error>{nativeError}</p>}
         </div>
       )}
       {!mutationsReady && (canQueue || canSteer) && <p className="text-center font-mono text-code-xs text-[var(--warning)]">Offline drafts stay on this device and are sent only if the session state is unchanged.</p>}

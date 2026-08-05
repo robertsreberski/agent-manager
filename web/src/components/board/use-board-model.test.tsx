@@ -17,7 +17,7 @@ function session(id: string, updatedAt: string, activity: CockpitSessionView["ac
     activity,
     attention: [],
     updatedAt,
-    control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [] },
+    control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [], takeover: null },
     profile: null,
     model: null,
     effort: null,

@@ -21,6 +21,7 @@ import {
   setupReadModelSchema,
   type SetupReadModel,
 } from "../../../src/shared/setup.ts";
+import { assertCurrentWireIdentity } from "../../../src/shared/wire.ts";
 import { parseSessionRecord, parseSnapshot } from "./normalize";
 import type {
   AttachInstruction,
@@ -202,6 +203,12 @@ export type PlanFileResponse = z.infer<typeof planFileResponseSchema>;
 export type SessionModelOption = z.infer<typeof sessionModelOptionSchema>;
 export type SessionSettingsOptionsResponse = z.infer<typeof sessionSettingsOptionsResponseSchema>;
 export type ProviderSettingsOptionsResponse = z.infer<typeof providerSettingsOptionsResponseSchema>;
+export interface ArchivedSessionsPage {
+  sessions: SessionRecord[];
+  nextCursor: string | null;
+  total: number;
+  query: string;
+}
 export type { SetupHookOffer, SetupReadModel } from "../../../src/shared/setup.ts";
 export type { SelectedAttentionDetailsResponse } from "../../../src/shared/attention-detail.ts";
 export type { SelectedSessionFactsResponse } from "../../../src/shared/session-facts.ts";
@@ -245,6 +252,52 @@ export class CockpitApi {
 
   async sessions(): Promise<WireStateSnapshot> {
     return parseSnapshot(await this.request<unknown>("/api/v1/sessions"));
+  }
+
+  async archivedSessions(
+    query = "",
+    cursor: string | null = null,
+    limit = 50,
+  ): Promise<ArchivedSessionsPage> {
+    const params = new URLSearchParams({ q: query, limit: String(limit) });
+    if (cursor) params.set("cursor", cursor);
+    const value = await this.request<unknown>(`/api/v1/archived-sessions?${params.toString()}`);
+    assertCurrentWireIdentity(value);
+    const envelope = parseResponse(z.object({
+      schemaVersion: z.number(),
+      buildId: z.string(),
+      query: z.string().max(200),
+      sessions: z.array(z.unknown()).max(50),
+      nextCursor: z.string().min(1).nullable(),
+      total: z.number().int().nonnegative(),
+    }).strict(), value, "archived sessions");
+    const sessions = envelope.sessions.map(parseSessionRecord);
+    if (
+      sessions.some((session) => !session.archived || session.control.capabilities.length > 0)
+      || new Set(sessions.map((session) => session.id)).size !== sessions.length
+    ) invalidResponse("archived session contract", value, new Error("archive records must be unique and read-only"));
+    return { ...envelope, sessions };
+  }
+
+  async archivedSession(id: string): Promise<SessionRecord | null> {
+    let value: unknown;
+    try {
+      value = await this.request<unknown>(`/api/v1/archived-sessions/${encodeURIComponent(id)}`);
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 404) return null;
+      throw error;
+    }
+    assertCurrentWireIdentity(value);
+    const envelope = parseResponse(z.object({
+      schemaVersion: z.number(),
+      buildId: z.string(),
+      session: z.unknown(),
+    }).strict(), value, "archived session");
+    const session = parseSessionRecord(envelope.session);
+    if (session.id !== id || !session.archived || session.control.capabilities.length > 0) {
+      invalidResponse("archived session identity", value, new Error("archive record mismatch"));
+    }
+    return session;
   }
 
   async attentionDetails(
