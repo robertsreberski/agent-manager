@@ -1698,6 +1698,8 @@ test("proxies remote sessions through SSH and reserves takeover for a real write
     remoteWorkspaceId: null,
     createdAt: "2026-08-04T12:00:00.000Z",
     lastOpenedAt: null,
+    repoRoot: null,
+    repoName: null,
     workspaceIdentity: null,
   };
   writeFileSync(fakeSsh, `#!/usr/bin/env node

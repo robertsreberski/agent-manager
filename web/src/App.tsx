@@ -89,6 +89,7 @@ import type { ProviderSettingsOptionsResponse, SessionSettingsOptionsResponse, S
 import type { SessionScope } from "./lib/session-navigation";
 import { isTypingTarget } from "./lib/shortcuts";
 import { coveringModelOption } from "./lib/model-catalog";
+import { recentProjects } from "./lib/projects";
 import type { ActivityItem, HostOption, ReasoningEffort, SessionView } from "./types";
 
 const FILTERS = [
@@ -167,6 +168,19 @@ export function effectiveDraftHostId(
     ?? "local";
 }
 
+/**
+ * The levels every row in a catalog declares. With no model chosen the provider
+ * will pick its own, so the honest offer is what holds whichever it picks —
+ * not one row's levels, and not a provider-wide guess.
+ */
+function sharedCatalogEfforts(
+  models: readonly { efforts?: readonly ReasoningEffort[] | undefined }[],
+): readonly ReasoningEffort[] {
+  const [first, ...rest] = models;
+  if (!first?.efforts?.length) return [];
+  return first.efforts.filter((effort) => rest.every((model) => model.efforts?.includes(effort)));
+}
+
 /** Effort support is model-specific in each provider's live catalog. */
 export function modelCatalogEfforts(
   model: string | null,
@@ -177,6 +191,13 @@ export function modelCatalogEfforts(
   // A live catalog replaces every provider-wide guess. Missing metadata leaves
   // the meter word-only instead of fabricating support the model never declared;
   // the capability-gated vocabulary fallback lives at the composer wiring.
+  //
+  // Choosing nothing is not the same as choosing something the catalog does not
+  // list. With no model chosen the provider picks one, so the levels every row
+  // agrees on hold whichever it picks — which is the only reason a Claude draft
+  // has an effort control at all, its catalog marking no default. A named model
+  // that is simply absent stays unknown, and borrows nothing.
+  if (model === null && !option) return sharedCatalogEfforts(response.models);
   return option?.efforts ?? [];
 }
 
@@ -539,6 +560,14 @@ export default function App() {
     response: ProviderSettingsOptionsResponse | null;
   } | null>(null);
   const draftSettingsRequest = useRef(0);
+  /*
+    The provider and host a catalog has already answered for. A success is
+    reused across drafts because Claude's probe spawns a CLI; a failure is not
+    remembered, so the next draft — or an explicit retry — asks again instead
+    of leaving every future thread without a model list.
+  */
+  const draftCatalogAnswered = useRef<string | null>(null);
+  const [draftCatalogAttempt, setDraftCatalogAttempt] = useState(0);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [notificationSettingsOpen, setNotificationSettingsOpen] = useState(false);
   const [notificationPreferences, setNotificationPreferences] = useState<ClientNotificationPreferences>(loadNotificationPreferences);
@@ -644,8 +673,13 @@ export default function App() {
 
   const dispatchDraft = useCallback((action: DraftAction) => setDraft((current) => current ? draftReducer(current, action) : current), []);
   const remoteHostIds = useMemo(() => new Set(cockpit.hosts.filter((host) => host.kind === "ssh").map((host) => host.id)), [cockpit.hosts]);
+  // The empty state offers repositories, as its own copy says; a worktree is
+  // not a separate one to choose between.
+  const recentWorkspaceProjects = useMemo(() => recentProjects(cockpit.workspaces), [cockpit.workspaces]);
   const draftProvider = draft?.provider ?? null;
   const draftHostId = effectiveDraftHostId(draft, cockpit.hosts);
+  // Each newly opened draft re-reads a catalog that has not answered yet.
+  const draftKey = draft?.key ?? null;
   const headerHosts = useMemo(() => cockpit.hosts.map((host) => ({
     ...host,
     count: cockpit.sessions.filter((session) => session.hostId === host.id).length,
@@ -689,11 +723,14 @@ export default function App() {
       setDraftSettingsOptions(null);
       return;
     }
+    if (draftCatalogAnswered.current === `${draftProvider} ${draftHostId}`) return;
     setDraftSettingsOptions({ provider: draftProvider, hostId: draftHostId, state: "loading", response: null });
     void cockpit.loadProviderSettingsOptions(draftProvider, draftHostId).then((response) => {
-      if (draftSettingsRequest.current === request) {
-        setDraftSettingsOptions({ provider: draftProvider, hostId: draftHostId, state: "loaded", response });
-      }
+      if (draftSettingsRequest.current !== request) return;
+      // Only an answered catalog is remembered. An unavailable one is a
+      // temporary fact about the provider, not a settled answer about it.
+      if (response.available) draftCatalogAnswered.current = `${draftProvider} ${draftHostId}`;
+      setDraftSettingsOptions({ provider: draftProvider, hostId: draftHostId, state: "loaded", response });
     }).catch(() => {
       if (draftSettingsRequest.current === request) {
         setDraftSettingsOptions({ provider: draftProvider, hostId: draftHostId, state: "error", response: null });
@@ -702,7 +739,12 @@ export default function App() {
     return () => {
       if (draftSettingsRequest.current === request) draftSettingsRequest.current += 1;
     };
-  }, [cockpit.loadProviderSettingsOptions, draftHostId, draftProvider]);
+  }, [cockpit.loadProviderSettingsOptions, draftCatalogAttempt, draftHostId, draftKey, draftProvider]);
+
+  const reloadDraftCatalog = useCallback(() => {
+    draftCatalogAnswered.current = null;
+    setDraftCatalogAttempt((attempt) => attempt + 1);
+  }, []);
 
   /*
     Reading a catalog is not writing to it, so nothing here waits on
@@ -1145,7 +1187,7 @@ export default function App() {
         />}
         {contentMode === "empty" ? (
           <div className="min-h-0 flex-1 overflow-y-auto">
-            <EmptyState repositories={cockpit.workspaces.map((workspace) => ({ id: workspace.id, name: workspace.label, path: workspace.path }))} onOpen={(workspaceId) => { const workspace = cockpit.workspaces.find((item) => item.id === workspaceId); if (workspace) openDraft({ hostId: workspace.hostId, path: workspace.path }); }} />
+            <EmptyState repositories={recentWorkspaceProjects.map((project) => ({ id: project.id, name: project.label, path: project.path }))} onOpen={(projectId) => { const project = recentWorkspaceProjects.find((item) => item.id === projectId); if (project) openDraft({ hostId: project.hostId, path: project.path }); }} />
           </div>
         ) : contentMode === "first-run" ? (
           <div className="min-h-0 flex-1 overflow-y-auto">
@@ -1235,7 +1277,7 @@ export default function App() {
             sessionsOnHost={selectedSessionsOnHost}
             onContinueInWorkspace={() => openDraft({ hostId: selected.hostId, path: selected.workspaceIdentity?.worktreePath ?? selected.cwd ?? "" })}
             onRetryActivity={() => setActivityRetryGeneration((generation) => generation + 1)}
-          /> : draft ? <DraftThread draft={draft} hosts={cockpit.hosts} workspaces={cockpit.workspaces} busy={Boolean(cockpit.busy.create)} mutationsReady={cockpit.mutationsReady} modelOptions={draftModelCatalog.models} modelOptionsStatus={draftModelCatalog.status} {...(draftModelCatalog.effortOptions !== undefined ? { effortOptions: draftModelCatalog.effortOptions } : {})} dispatch={dispatchDraft} onFirstSend={firstSend} onCompletePath={cockpit.completeWorkspacePath} onLoadGitContext={cockpit.loadGitContext} /> : null}
+          /> : draft ? <DraftThread draft={draft} hosts={cockpit.hosts} workspaces={cockpit.workspaces} busy={Boolean(cockpit.busy.create)} mutationsReady={cockpit.mutationsReady} modelOptions={draftModelCatalog.models} modelOptionsStatus={draftModelCatalog.status} {...(draftModelCatalog.effortOptions !== undefined ? { effortOptions: draftModelCatalog.effortOptions } : {})} dispatch={dispatchDraft} onFirstSend={firstSend} onCompletePath={cockpit.completeWorkspacePath} onLoadGitContext={cockpit.loadGitContext} onReloadModels={reloadDraftCatalog} /> : null}
         </ThreadDrawer>
         )}</SessionRuntimeProvider>
       </div>

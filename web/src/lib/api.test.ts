@@ -827,6 +827,8 @@ describe("CockpitApi", () => {
           remoteWorkspaceId: "remote-workspace",
           createdAt: "2026-08-04T10:00:00.000Z",
           lastOpenedAt: null,
+          repoRoot: null,
+          repoName: null,
           workspaceIdentity: null,
         },
       }), { status: 200, headers: { "content-type": "application/json" } });
@@ -842,6 +844,9 @@ describe("CockpitApi", () => {
       hostId: "host-studio",
       hostLabel: "Studio Mac",
       hostKind: "ssh",
+      repoRoot: null,
+      repoName: null,
+      lastOpenedAt: null,
       temporary: false,
     });
     expect(fetchMock.mock.calls[0]?.[0]).toBe(

@@ -262,6 +262,9 @@ describe("remote host mutations", () => {
     hostId: remoteHost.id,
     hostLabel: remoteHost.label,
     hostKind: "ssh",
+    repoRoot: null,
+    repoName: null,
+    lastOpenedAt: null,
     temporary: false,
   };
 

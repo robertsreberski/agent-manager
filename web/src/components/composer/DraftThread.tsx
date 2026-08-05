@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { AlertTriangle, FolderGit2 } from "lucide-react";
 import type { ReasoningEffort } from "../../../../src/shared/session.ts";
 import type { WorkspaceGitContext } from "../../../../src/shared/workspace.ts";
@@ -7,6 +7,7 @@ import { Button } from "../ui";
 import { FolderPicker } from "./FolderPicker";
 import { SessionComposer, type ComposerModelOption } from "./SessionComposer";
 import { WorktreePicker } from "./WorktreePicker";
+import { recentProjects } from "../../lib/projects";
 import { draftTargetReady, type DraftAction, type DraftSession } from "./draft";
 import { useGitContext } from "./use-git-context";
 
@@ -23,6 +24,7 @@ export function DraftThread({
   onFirstSend,
   onCompletePath,
   onLoadGitContext,
+  onReloadModels,
 }: {
   draft: DraftSession;
   hosts: readonly HostOption[];
@@ -36,20 +38,40 @@ export function DraftThread({
   onFirstSend: () => Promise<void> | void;
   onCompletePath: (hostId: string, path: string) => Promise<readonly string[]>;
   onLoadGitContext: (hostId: string, path: string) => Promise<WorkspaceGitContext>;
+  onReloadModels?: () => void;
 }) {
   const [path, setPath] = useState(draft.workspace?.path ?? "");
   const selectedHostId = draft.workspace?.hostId ?? hosts.find((host) => host.kind === "local")?.id ?? hosts[0]?.id ?? "local";
-  // Recents arrive in server recency order; the newest few are the offer.
+  // A repository and its worktrees are one project; where in it to run is the
+  // next question this screen asks, not a way to pick the project.
   const recent = useMemo(
-    () => workspaces.filter((workspace) => workspace.hostId === selectedHostId).slice(0, 8),
+    () => recentProjects(workspaces).filter((project) => project.hostId === selectedHostId).slice(0, 8),
     [selectedHostId, workspaces],
   );
+  // Carried until the repository's own worktree list can confirm it still exists.
+  const [preferredWorktree, setPreferredWorktree] = useState<string | null>(null);
   const needsWorkspace = draft.workspace === null;
   const gitContext = useGitContext(selectedHostId, path, onLoadGitContext);
-  const chooseWorkspace = useCallback((hostId: string, value: string) => {
+  const chooseWorkspace = useCallback((hostId: string, value: string, worktreePreference: string | null = null) => {
     setPath(value);
+    setPreferredWorktree(worktreePreference);
     dispatch({ type: "set-workspace", workspace: { hostId, path: value } });
   }, [dispatch]);
+
+  /*
+    Where this project was last worked in is a preference, not a claim that it
+    still exists. Apply it only once the repository's own worktree list confirms
+    the path, and only while the operator has not chosen for themselves — a
+    worktree removed since then quietly leaves the choice open.
+  */
+  const chosenWorktree = draft.workspace?.worktree.kind ?? "none";
+  useEffect(() => {
+    if (preferredWorktree === null || chosenWorktree !== "none") return;
+    if (gitContext.status !== "loaded" || gitContext.context.status !== "repo") return;
+    const match = gitContext.context.worktrees.find((worktree) => worktree.path === preferredWorktree);
+    setPreferredWorktree(null);
+    if (match) dispatch({ type: "set-worktree", worktree: { kind: "existing", path: match.path, branch: match.branch } });
+  }, [chosenWorktree, dispatch, gitContext, preferredWorktree]);
 
   return (
     <div className="grid min-h-full content-between gap-6">
@@ -59,17 +81,17 @@ export function DraftThread({
         {needsWorkspace && <p className="mt-1 text-meta text-[var(--text-muted)]">Choose where this session should run.</p>}
         {recent.length > 0 && (
           <div className="mt-5 flex flex-wrap justify-center gap-2" aria-label="Recent projects">
-            {recent.map((workspace) => (
+            {recent.map((project) => (
               <Button
-                key={workspace.id}
+                key={project.id}
                 variant="secondary"
                 size="sm"
                 data-compact-control
                 className="h-auto min-h-10 flex-col items-start justify-center gap-0 px-3 text-left"
-                onClick={() => chooseWorkspace(workspace.hostId, workspace.path)}
+                onClick={() => chooseWorkspace(project.hostId, project.path, project.lastWorktreePath)}
               >
-                <strong className="block">{workspace.label}</strong>
-                <span className="block max-w-52 truncate font-mono text-code-xs text-[var(--text-muted)]">{workspace.path}</span>
+                <strong className="block">{project.label}</strong>
+                <span className="block max-w-52 truncate font-mono text-code-xs text-[var(--text-muted)]">{project.path}</span>
               </Button>
             ))}
           </div>
@@ -103,6 +125,7 @@ export function DraftThread({
         model={draft.model}
         modelOptions={modelOptions}
         modelOptionsStatus={modelOptionsStatus}
+        {...(onReloadModels ? { onReloadModels } : {})}
         effort={draft.effort}
         effortOptions={effortOptions ?? []}
         profile={draft.profile}

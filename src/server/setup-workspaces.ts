@@ -44,6 +44,8 @@ export function persistDiscoveredWorkspaces(
       label: workspaceLabel(identity),
       path,
       remoteWorkspaceId: null,
+      repoRoot: identity.repoRoot,
+      repoName: identity.repoName,
     }));
   }
   return stored;

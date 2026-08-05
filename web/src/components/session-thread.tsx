@@ -351,6 +351,10 @@ export function SessionThread({
   const [factsStatus, setFactsStatus] = useState<"loading" | "loaded" | "error">("loading");
   const exactRequestIds = useMemo(() => exactCurrentActivityRequestIds(activity.items), [activity.items]);
   const planApprovalRequestIds = useMemo(() => exactPlanApprovalRequestIds(activity.items, exactRequestIds), [activity.items, exactRequestIds]);
+  // Exactly the requests a plan artifact offers controls for. A plan that
+  // cannot offer them — truncated or superseded — keeps its approval card, so
+  // the operator is never left without a way to answer.
+  const planOwnedRequestIds = useMemo(() => new Set(planApprovalRequestIds.values()), [planApprovalRequestIds]);
   useEffect(() => {
     let cancelled = false;
     setFacts(null);
@@ -388,6 +392,7 @@ export function SessionThread({
   const controls: ActivityDataControls = {
     attention: {
       exactRequestIds,
+      planOwnedRequestIds,
       mutationsReady,
       canRespond: session.control.capabilities.includes("respond"),
       busy,

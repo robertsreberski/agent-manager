@@ -34,6 +34,12 @@ type ThreadContentPart = ThreadContent extends readonly (infer Part)[] ? Part : 
 
 export interface ActivityAttentionControls {
   exactRequestIds: ReadonlySet<string>;
+  /**
+   * Requests a plan artifact already owns. A plan approval is answered on the
+   * plan itself — the markdown plus Execute and Send-back-with-notes — so the
+   * generic permission card must not compete with it for the same request.
+   */
+  planOwnedRequestIds: ReadonlySet<string>;
   mutationsReady: boolean;
   canRespond: boolean;
   busy: boolean;
@@ -637,6 +643,9 @@ function FileChanges({ item, controls }: { item: ActivityFileChangeItem & { upse
 
 function Attention({ item, controls }: { item: ActivityAttentionItem; controls: ActivityAttentionControls }) {
   const exact = controls.exactRequestIds.has(item.requestId);
+  // The plan renders this request, and on phone the approval card is a modal
+  // sheet that would cover the plan it is asking about.
+  if (item.requestId !== null && controls.planOwnedRequestIds.has(item.requestId)) return null;
   if ((item.attentionKind === "question" || item.attentionKind === "elicitation") && item.questions.length > 0) {
     return <QuestionRequest request={questionView(item)} disabled={!exact || !controls.mutationsReady || !controls.canRespond || controls.busy} onSubmit={controls.onRespond} />;
   }

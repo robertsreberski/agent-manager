@@ -292,7 +292,7 @@ export function redactedPreview(action: SessionAction): string {
   }
 }
 
-export const DATABASE_SCHEMA_VERSION = 5 as const;
+export const DATABASE_SCHEMA_VERSION = 6 as const;
 
 export class IncompatibleDatabaseError extends Error {
   readonly code = "INCOMPATIBLE_DATABASE";
@@ -369,6 +369,8 @@ export class ManagerDatabase {
         remote_workspace_id TEXT,
         created_at TEXT NOT NULL,
         last_opened_at TEXT,
+        repo_root TEXT,
+        repo_name TEXT,
         UNIQUE (host_id, path)
       ) STRICT;
       CREATE TABLE IF NOT EXISTS managed_sessions (
@@ -517,6 +519,8 @@ export class ManagerDatabase {
     remoteWorkspaceId?: string | null;
     createdAt?: string;
     lastOpenedAt?: string | null;
+    repoRoot?: string | null;
+    repoName?: string | null;
   }): WorkspaceRecord {
     const hostId = input.hostId ?? "local";
     const host = this.getHost(hostId);
@@ -531,14 +535,19 @@ export class ManagerDatabase {
       remoteWorkspaceId: input.remoteWorkspaceId ?? null,
       createdAt: input.createdAt ?? new Date().toISOString(),
       lastOpenedAt: input.lastOpenedAt ?? null,
+      repoRoot: input.repoRoot ?? null,
+      repoName: input.repoName ?? null,
     };
     this.#database.prepare(`
-      INSERT INTO workspaces (id, label, path, host_id, remote_workspace_id, created_at, last_opened_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO workspaces (
+        id, label, path, host_id, remote_workspace_id, created_at, last_opened_at, repo_root, repo_name
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(host_id, path) DO UPDATE SET
         label = excluded.label,
         remote_workspace_id = COALESCE(excluded.remote_workspace_id, workspaces.remote_workspace_id),
-        last_opened_at = COALESCE(excluded.last_opened_at, workspaces.last_opened_at)
+        last_opened_at = COALESCE(excluded.last_opened_at, workspaces.last_opened_at),
+        repo_root = COALESCE(excluded.repo_root, workspaces.repo_root),
+        repo_name = COALESCE(excluded.repo_name, workspaces.repo_name)
     `).run(
       record.id,
       record.label,
@@ -547,6 +556,8 @@ export class ManagerDatabase {
       record.remoteWorkspaceId,
       record.createdAt,
       record.lastOpenedAt,
+      record.repoRoot,
+      record.repoName,
     );
     return this.#workspaceByHostPath(record.hostId, record.path) ?? record;
   }
@@ -582,7 +593,7 @@ export class ManagerDatabase {
 
   #workspaceSelect(): string {
     return `SELECT w.id, w.label, w.path, w.host_id, w.remote_workspace_id, w.created_at, w.last_opened_at,
-                   h.label AS host_label, h.kind AS host_kind
+                   w.repo_root, w.repo_name, h.label AS host_label, h.kind AS host_kind
             FROM workspaces w JOIN hosts h ON h.id = w.host_id`;
   }
 
@@ -599,6 +610,8 @@ export class ManagerDatabase {
       lastOpenedAt: row.last_opened_at === null || row.last_opened_at === undefined
         ? null
         : asString(row.last_opened_at),
+      repoRoot: row.repo_root === null || row.repo_root === undefined ? null : asString(row.repo_root),
+      repoName: row.repo_name === null || row.repo_name === undefined ? null : asString(row.repo_name),
     };
   }
 

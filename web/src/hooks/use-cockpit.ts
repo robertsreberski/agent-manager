@@ -808,55 +808,55 @@ export function useCockpit() {
     setWorkspaces((current) => [workspace, ...current.filter((item) => item.id !== workspace.id)]);
     return workspace;
   }, [api, mutationsReady, withBusy]);
-  const loadPreview = useCallback((session: SessionView): Promise<PanePreview> => { if (!api) throw new Error("The cockpit is offline."); return api.preview(session.id); }, [api]);
-  const loadAttach = useCallback((session: SessionView): Promise<AttachInstruction> => { if (!api) throw new Error("The cockpit is offline."); return api.attach(session.id); }, [api]);
+  const loadPreview = useCallback((session: SessionView): Promise<PanePreview> => { if (!api) return Promise.reject(new Error("The cockpit is offline.")); return api.preview(session.id); }, [api]);
+  const loadAttach = useCallback((session: SessionView): Promise<AttachInstruction> => { if (!api) return Promise.reject(new Error("The cockpit is offline.")); return api.attach(session.id); }, [api]);
   const loadAttentionDetails = useCallback((
     sessionId: string,
     requestIds: readonly string[],
   ): Promise<SelectedAttentionDetailsResponse> => {
-    if (!api) throw new Error("The cockpit is offline.");
+    if (!api) return Promise.reject(new Error("The cockpit is offline."));
     return api.attentionDetails(sessionId, requestIds);
   }, [api]);
   const loadTodoDetail = useCallback((sessionId: string): Promise<SelectedTodoDetailResponse> => {
-    if (!api) throw new Error("The cockpit is offline.");
+    if (!api) return Promise.reject(new Error("The cockpit is offline."));
     return api.todoDetail(sessionId);
   }, [api]);
   const searchTranscript = useCallback((sessionId: string, query: string, limit = 20): Promise<TranscriptSearchResponse> => {
-    if (!api) throw new Error("The cockpit is offline.");
+    if (!api) return Promise.reject(new Error("The cockpit is offline."));
     return api.searchTranscript(sessionId, query, limit);
   }, [api]);
   const loadWorkspaceFiles = useCallback((sessionId: string, query: string, limit = 20): Promise<readonly string[]> => {
-    if (!api) throw new Error("The cockpit is offline.");
+    if (!api) return Promise.reject(new Error("The cockpit is offline."));
     return api.workspaceFiles(sessionId, query, limit);
   }, [api]);
   const loadSettingsOptions = useCallback((sessionId: string): Promise<SessionSettingsOptionsResponse> => {
-    if (!api) throw new Error("The cockpit is offline.");
+    if (!api) return Promise.reject(new Error("The cockpit is offline."));
     return api.settingsOptions(sessionId);
   }, [api]);
   const loadProviderSettingsOptions = useCallback((
     provider: SessionView["provider"],
     hostId: string,
   ): Promise<ProviderSettingsOptionsResponse> => {
-    if (!api) throw new Error("The cockpit is offline.");
+    if (!api) return Promise.reject(new Error("The cockpit is offline."));
     return api.providerSettingsOptions(provider, hostId);
   }, [api]);
   const loadSessionFacts = useCallback((sessionId: string, generation: number): Promise<SelectedSessionFactsResponse> => {
-    if (!api) throw new Error("The cockpit is offline.");
+    if (!api) return Promise.reject(new Error("The cockpit is offline."));
     return api.sessionFacts(sessionId, generation);
   }, [api]);
   const loadPlanFile = useCallback((sessionId: string, itemId: string): Promise<PlanFileResponse> => {
-    if (!api) throw new Error("The cockpit is offline.");
+    if (!api) return Promise.reject(new Error("The cockpit is offline."));
     return api.planFile(sessionId, itemId);
   }, [api]);
   const loadSetup = useCallback((): Promise<SetupReadModel> => {
-    if (!api) throw new Error("The cockpit is offline.");
+    if (!api) return Promise.reject(new Error("The cockpit is offline."));
     return api.setup();
   }, [api]);
   const applySetupHook = useCallback((
     provider: "claude" | "codex",
     previewId: string,
   ): Promise<SetupHookApplyResponse> => {
-    if (!api) throw new Error("The cockpit is offline.");
+    if (!api) return Promise.reject(new Error("The cockpit is offline."));
     return api.applySetupHook(provider, previewId);
   }, [api]);
   return {

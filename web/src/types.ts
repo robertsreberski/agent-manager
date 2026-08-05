@@ -136,6 +136,10 @@ export interface WorkspaceOption {
   hostId: string;
   hostLabel: string;
   hostKind: "local" | "ssh";
+  /** Null when the directory is not a repository, or was never resolved. */
+  repoRoot: string | null;
+  repoName: string | null;
+  lastOpenedAt: string | null;
   temporary: boolean;
 }
 

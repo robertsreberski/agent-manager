@@ -18,6 +18,7 @@ import {
   workspaceListResponseSchema,
   workspaceResolutionResponseSchema,
   worktreeCreationResponseSchema,
+  type WireWorkspaceRecord,
   type WorkspaceGitContext,
 } from "../../../src/shared/workspace.ts";
 import {
@@ -230,6 +231,25 @@ function parseResponse<T>(schema: z.ZodType<T>, value: unknown, label: string): 
   const result = schema.safeParse(value);
   if (!result.success) invalidResponse(label, value, result.error);
   return result.data;
+}
+
+/**
+ * One mapping for every route that returns a workspace row, so a row's project
+ * identity and recency cannot go missing on only one of them.
+ */
+function workspaceOption(workspace: WireWorkspaceRecord): WorkspaceOption {
+  return {
+    id: workspace.id,
+    label: workspace.label,
+    path: workspace.path,
+    hostId: workspace.hostId,
+    hostLabel: workspace.hostLabel,
+    hostKind: workspace.hostKind,
+    repoRoot: workspace.repoRoot,
+    repoName: workspace.repoName,
+    lastOpenedAt: workspace.lastOpenedAt,
+    temporary: false,
+  };
 }
 
 export class CockpitApi {
@@ -447,15 +467,7 @@ export class CockpitApi {
   async workspaces(): Promise<WorkspaceOption[]> {
     const result = await this.request<unknown>("/api/v1/workspaces");
     const { workspaces } = parseResponse(workspaceListResponseSchema, result, "workspaces");
-    return workspaces.map((workspace) => ({
-      id: workspace.id,
-      label: workspace.label,
-      path: workspace.path,
-      hostId: workspace.hostId,
-      hostLabel: workspace.hostLabel,
-      hostKind: workspace.hostKind,
-      temporary: false,
-    }));
+    return workspaces.map(workspaceOption);
   }
 
   async hosts(): Promise<HostOption[]> {
@@ -526,15 +538,7 @@ export class CockpitApi {
       body: JSON.stringify(input),
     });
     const { workspace } = parseResponse(worktreeCreationResponseSchema, result, "worktree");
-    return {
-      id: workspace.id,
-      label: workspace.label,
-      path: workspace.path,
-      hostId: workspace.hostId,
-      hostLabel: workspace.hostLabel,
-      hostKind: workspace.hostKind,
-      temporary: false,
-    };
+    return workspaceOption(workspace);
   }
 
   async resolveWorkspace(hostId: string, path: string): Promise<WorkspaceOption> {
@@ -546,15 +550,7 @@ export class CockpitApi {
     if (workspace.hostId !== hostId) {
       invalidResponse("workspace identity", workspace, new Error("host id mismatch"));
     }
-    return {
-      id: workspace.id,
-      label: workspace.label,
-      path: workspace.path,
-      hostId: workspace.hostId,
-      hostLabel: workspace.hostLabel,
-      hostKind: workspace.hostKind,
-      temporary: false,
-    };
+    return workspaceOption(workspace);
   }
 
   async createSession(input: CreateSessionInput): Promise<SessionRecord> {

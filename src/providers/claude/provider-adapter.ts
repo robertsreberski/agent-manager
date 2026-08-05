@@ -362,13 +362,24 @@ function attentionQuestions(request: ClaudePendingRequest): AttentionQuestion[] 
 function attentionDetails(request: ClaudePendingRequest): AttentionDetails {
   const input = objectValue(request.payload.input);
   const questions = attentionQuestions(request);
+  /*
+    A plan's own input is its markdown, which the activity stream already
+    carries as a plan item and renders as written. Serializing it here would
+    put a thousand characters of JSON-escaped document into a one-line summary,
+    so the summary states what the request is instead.
+  */
+  const planText = [input?.plan, input?.planFilePath]
+    .find((value): value is string => typeof value === "string" && value.trim().length > 0);
+  const hasPlan = request.kind === "plan-approval" && planText !== undefined;
   return {
     title: request.title,
     questions: questions.length > 0 ? questions : null,
     toolName: request.toolName,
-    inputSummary: request.kind !== "question" && input
-      ? boundedInputSummary(input)
-      : null,
+    inputSummary: request.kind === "plan-approval"
+      ? hasPlan ? "The plan is shown in the activity timeline." : null
+      : request.kind !== "question" && input
+        ? boundedInputSummary(input)
+        : null,
     respondable: request.kind !== "elicitation",
   };
 }

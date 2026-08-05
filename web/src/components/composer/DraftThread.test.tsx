@@ -1,7 +1,8 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { WorkspaceGitContext } from "../../../../src/shared/workspace.ts";
+import type { WorkspaceOption } from "../../types";
 import { DraftThread } from "./DraftThread";
 import { newDraftSession, type DraftAction, type DraftSession } from "./draft";
 
@@ -25,13 +26,14 @@ function draftThread(overrides: {
   draft?: DraftSession;
   onCompletePath?: (hostId: string, path: string) => Promise<readonly string[]>;
   onLoadGitContext?: (hostId: string, path: string) => Promise<WorkspaceGitContext>;
+  workspaces?: readonly WorkspaceOption[];
   dispatch?: (action: DraftAction) => void;
 } = {}) {
   const dispatch = overrides.dispatch ?? vi.fn<(action: DraftAction) => void>();
   const view = render(<DraftThread
     draft={overrides.draft ?? newDraftSession({ workspace: { hostId: "local", path: "/work/project" } })}
     hosts={hosts}
-    workspaces={[]}
+    workspaces={overrides.workspaces ?? []}
     busy={false}
     mutationsReady
     modelOptions={[]}
@@ -44,7 +46,97 @@ function draftThread(overrides: {
   return { dispatch, view };
 }
 
+function workspaceRow(overrides: Partial<WorkspaceOption> & { path: string }): WorkspaceOption {
+  return {
+    id: overrides.path,
+    label: overrides.path.split("/").at(-1) ?? overrides.path,
+    hostId: "local",
+    hostLabel: "This Mac",
+    hostKind: "local",
+    repoRoot: null,
+    repoName: null,
+    lastOpenedAt: null,
+    temporary: false,
+    ...overrides,
+  };
+}
+
 describe("DraftThread", () => {
+  it("offers each repository once, not one chip per worktree", () => {
+    draftThread({
+      workspaces: [
+        workspaceRow({ path: "/work/project", repoRoot: "/work/project", repoName: "project" }),
+        workspaceRow({
+          path: "/work/project/.worktrees/fix-auth",
+          label: "project · fix-auth",
+          repoRoot: "/work/project",
+          repoName: "project",
+          lastOpenedAt: "2026-08-04T10:00:00.000Z",
+        }),
+      ],
+    });
+
+    const recents = screen.getByLabelText("Recent projects");
+    expect(within(recents).getAllByRole("button")).toHaveLength(1);
+    expect(within(recents).getByRole("button", { name: /project/u })).toHaveTextContent("/work/project");
+    expect(within(recents).queryByText(/fix-auth/u)).not.toBeInTheDocument();
+  });
+
+  it("returns to the worktree that project was last worked in", async () => {
+    vi.useFakeTimers();
+    try {
+      const { dispatch } = draftThread({
+        draft: newDraftSession(),
+        workspaces: [
+          workspaceRow({ path: "/work/project", repoRoot: "/work/project", repoName: "project" }),
+          workspaceRow({
+            path: "/work/project/.worktrees/fix-auth",
+            repoRoot: "/work/project",
+            repoName: "project",
+            lastOpenedAt: "2026-08-04T10:00:00.000Z",
+          }),
+        ],
+        onLoadGitContext: () => Promise.resolve(repoContext),
+      });
+
+      fireEvent.click(within(screen.getByLabelText("Recent projects")).getByRole("button", { name: /project/u }));
+      // The chip selects the repository; where in it to run is settled only
+      // once the repository's own worktree list confirms the path.
+      expect(dispatch).toHaveBeenCalledWith({ type: "set-workspace", workspace: { hostId: "local", path: "/work/project" } });
+      await act(async () => { await vi.advanceTimersByTimeAsync(400); });
+      expect(dispatch).toHaveBeenCalledWith({
+        type: "set-worktree",
+        worktree: { kind: "existing", path: "/work/project/.worktrees/fix-auth", branch: "fix-auth" },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("leaves the choice open when the last worktree is gone", async () => {
+    vi.useFakeTimers();
+    try {
+      const { dispatch } = draftThread({
+        draft: newDraftSession(),
+        workspaces: [
+          workspaceRow({
+            path: "/work/project/.worktrees/removed",
+            repoRoot: "/work/project",
+            repoName: "project",
+            lastOpenedAt: "2026-08-04T10:00:00.000Z",
+          }),
+        ],
+        onLoadGitContext: () => Promise.resolve(repoContext),
+      });
+
+      fireEvent.click(within(screen.getByLabelText("Recent projects")).getByRole("button", { name: /project/u }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(400); });
+      expect(dispatch).not.toHaveBeenCalledWith(expect.objectContaining({ type: "set-worktree" }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("lists every configured host and clears the path when the host changes", async () => {
     const { dispatch } = draftThread();
 

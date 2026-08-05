@@ -180,6 +180,12 @@ export type ModelSelectorRootProps = {
   effort?: string;
   defaultEffort?: string;
   onEffortChange?: (effort: string) => void;
+  /**
+   * Levels to offer while no model is selected. A catalog that marks no
+   * default leaves nothing selected, and the provider then picks the model
+   * itself — the effort question is still real, so it is still asked.
+   */
+  fallbackEfforts?: readonly ModelSelectorEffortOption[];
   open?: boolean;
   defaultOpen?: boolean;
   onOpenChange?: (open: boolean) => void;
@@ -194,6 +200,7 @@ function ModelSelectorRoot({
   effort: effortProp,
   defaultEffort,
   onEffortChange,
+  fallbackEfforts,
   open: openProp,
   defaultOpen,
   onOpenChange,
@@ -216,7 +223,8 @@ function ModelSelectorRoot({
   });
 
   const selectedModel = models.find((m) => m.id === value);
-  const efforts = getModelEfforts(selectedModel);
+  const efforts = getModelEfforts(selectedModel)
+    ?? (selectedModel === undefined && fallbackEfforts?.length ? fallbackEfforts : undefined);
   const activeEffort = resolveEffort(efforts, effort);
   const contextValue = useMemo(
     () => ({

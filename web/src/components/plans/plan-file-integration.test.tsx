@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { ACTIVITY_SCHEMA_VERSION, type ActivityPlanItem } from "../../types";
+import { ACTIVITY_SCHEMA_VERSION, type ActivityAttentionItem, type ActivityPlanItem } from "../../types";
 import { CockpitApi } from "../../lib/api";
 import { renderActivityData, type ActivityDataControls } from "../session-activity";
 
@@ -43,6 +43,7 @@ describe("plan file activity integration", () => {
     const controls: ActivityDataControls = {
       attention: {
         exactRequestIds: new Set(), mutationsReady: true, canRespond: false, busy: false,
+        planOwnedRequestIds: new Set<string>(),
         workspaceRoot: "/work/app", remoteHost: null, sessionsOnHost: null,
         onRespond: vi.fn(async () => undefined),
       },
@@ -66,5 +67,71 @@ describe("plan file activity integration", () => {
       "/api/v1/sessions/local%3Aclaude%3Athread%2Fone/plans/plan%2Fcurrent",
       expect.objectContaining({ credentials: "include" }),
     );
+  });
+
+  it("answers a plan approval on the plan, not through a second permission card", () => {
+    const attention: ActivityAttentionItem = {
+      schemaVersion: ACTIVITY_SCHEMA_VERSION,
+      id: "attention/plan",
+      sessionId: "local:claude:thread/one",
+      provider: "claude",
+      turnId: "turn-1",
+      parentId: null,
+      seq: 5,
+      revision: 1,
+      state: "waiting",
+      startedAt: "2026-08-04T12:00:00.000Z",
+      updatedAt: "2026-08-04T12:00:01.000Z",
+      completedAt: null,
+      source: "provider-api",
+      confidence: "exact",
+      exposure: "provider-exposed",
+      truncated: false,
+      kind: "attention",
+      requestId: "plan-request",
+      attentionKind: "approval",
+      title: "Claude wants to leave plan mode",
+      summary: null,
+      questions: [],
+      approvalFacts: null,
+      resolved: false,
+      respondable: true,
+      isSecret: false,
+    };
+    const controls: ActivityDataControls = {
+      attention: {
+        exactRequestIds: new Set(["plan-request"]), mutationsReady: true, canRespond: true, busy: false,
+        planOwnedRequestIds: new Set(["plan-request"]),
+        workspaceRoot: "/work/app", remoteHost: null, sessionsOnHost: null,
+        onRespond: vi.fn(async () => undefined),
+      },
+      files: {
+        sessionId: attention.sessionId, canOpenEditor: false, workspaceRoot: "/work/app",
+        readKeys: new Set(), onReadChange: vi.fn(),
+      },
+      plans: {
+        requestIds: new Map(), mutationsReady: true, canRespond: true, busy: false,
+        loadFile: vi.fn(async () => { throw new Error("unused"); }),
+        onRespond: vi.fn(async () => undefined),
+      },
+      queue: { canRemove: false, busy: false, withheldReason: null },
+    };
+
+    const owned = render(<>{renderActivityData("agent-manager.attention", attention, controls)}</>);
+
+    // The plan already asks this question, with the plan itself attached. A
+    // second card would ask it again — and on phone it is a modal sheet that
+    // covers the plan it is asking about.
+    expect(screen.queryByRole("button", { name: /allow once/iu })).not.toBeInTheDocument();
+    expect(screen.queryByText(/not safely representable/u)).not.toBeInTheDocument();
+    owned.unmount();
+
+    // The same request with no plan to answer it on keeps its approval card,
+    // so a plan that cannot render its own controls is never unanswerable.
+    render(<>{renderActivityData("agent-manager.attention", attention, {
+      ...controls,
+      attention: { ...controls.attention, planOwnedRequestIds: new Set<string>() },
+    })}</>);
+    expect(screen.getByRole("button", { name: /allow once/iu })).toBeInTheDocument();
   });
 });

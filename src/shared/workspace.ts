@@ -31,6 +31,14 @@ export const workspaceRecordSchema = z.object({
   createdAt: z.iso.datetime({ offset: true }),
   /** Null until a session has been created here; drives recency ordering. */
   lastOpenedAt: z.iso.datetime({ offset: true }).nullable(),
+  /*
+    The repository this directory belongs to, so a repository and its worktrees
+    are one project rather than several. Null for a directory that is not a
+    repository, and for rows seeded from config where no git resolution ran —
+    such a row is simply its own project.
+  */
+  repoRoot: z.string().min(1).nullable(),
+  repoName: z.string().min(1).nullable(),
 }).strict();
 
 /**

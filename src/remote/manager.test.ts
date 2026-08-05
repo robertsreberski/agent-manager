@@ -173,6 +173,8 @@ function fakeRemote(t: TestContext): string {
     remoteWorkspaceId: null,
     createdAt: AT,
     lastOpenedAt: null,
+    repoRoot: "/remote/repo",
+    repoName: "repo",
     workspaceIdentity: remoteSession().workspaceIdentity,
   };
   const activity = {

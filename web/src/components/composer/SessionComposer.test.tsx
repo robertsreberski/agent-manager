@@ -320,7 +320,11 @@ describe("SessionComposer", () => {
       "aria-description",
       "Model choices stay in the CLI that owns this session.",
     );
-    expect(menu).not.toHaveTextContent("Model choices stay in the CLI that owns this session.");
+    // Stated once, in the menu, where it can be read. A row that is disabled
+    // and silent is indistinguishable from a control that is simply broken.
+    expect(within(menu).getByRole("status")).toHaveTextContent(
+      "Model choices stay in the CLI that owns this session.",
+    );
   });
 
   it("still disables the runtime menu when there is nothing to read or change", () => {
