@@ -409,6 +409,48 @@ test("workspaces are listed most recently opened first, never-opened ones last",
   database.close();
 });
 
+test("a worktree row remembers the repository it belongs to", () => {
+  const database = new ManagerDatabase();
+  const repo = database.addWorkspace({
+    id: "repo",
+    label: "app",
+    path: "/repos/app",
+    repoRoot: "/repos/app",
+    repoName: "app",
+  });
+  const worktree = database.addWorkspace({
+    id: "worktree",
+    label: "app · fix-auth",
+    path: "/repos/app/.worktrees/fix-auth",
+    repoRoot: "/repos/app",
+    repoName: "app",
+  });
+  const plain = database.addWorkspace({ id: "notes", label: "notes", path: "/notes" });
+
+  assert.equal(repo.repoRoot, "/repos/app");
+  assert.equal(worktree.repoRoot, "/repos/app");
+  assert.equal(worktree.repoName, "app");
+  // A directory that is not a repository is its own project, not a nameless one.
+  assert.equal(plain.repoRoot, null);
+  assert.equal(plain.repoName, null);
+
+  // Re-resolving without identity must not forget what the row already proved.
+  database.addWorkspace({ label: "app · fix-auth", path: "/repos/app/.worktrees/fix-auth" });
+  assert.equal(database.getWorkspace("worktree")?.repoRoot, "/repos/app");
+
+  // Resolution that finds no repository is an answer, not an absent one: a
+  // directory that stops being a repository must stop being grouped under it.
+  database.addWorkspace({
+    label: "app",
+    path: "/repos/app",
+    repoRoot: null,
+    repoName: null,
+  });
+  assert.equal(database.getWorkspace("repo")?.repoRoot, null);
+  assert.equal(database.getWorkspace("repo")?.repoName, null);
+  database.close();
+});
+
 test("rejects an incompatible database without migrating or deleting its records", () => {
   const directory = mkdtempSync(join(tmpdir(), "agent-manager-workspace-reject-"));
   const path = join(directory, "state.sqlite");

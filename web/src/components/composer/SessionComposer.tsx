@@ -82,6 +82,8 @@ export interface SessionComposerProps {
   onEffortChange?: (effort: NonNullable<SessionComposerProps["effort"]>) => void;
   onProfileChange?: (profile: ExecutionProfile) => void;
   onSandboxChange?: (sandbox: SandboxPolicy) => void;
+  /** Present when a catalog that failed to load can be asked for again. */
+  onReloadModels?: () => void;
   onResetSettings?: () => void;
   /**
    * Workspace-relative paths matching a query, for `@mention`. Absent where the
@@ -137,7 +139,7 @@ export function SessionComposer(props: SessionComposerProps) {
     sandbox = null,
     settingsIdleOnly = false, draft = false, busy = false,
     onProviderChange, onModelChange, onEffortChange, onProfileChange, onSandboxChange,
-    onResetSettings, onSearchFiles,
+    onReloadModels, onResetSettings, onSearchFiles,
   } = props;
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // The only state the composer still keeps for its menus: which one is open.
@@ -146,7 +148,7 @@ export function SessionComposer(props: SessionComposerProps) {
   // two menus stay mutually exclusive.
   const [openMenu, setOpenMenu] = useState<"runtime" | "profile" | "sandbox" | null>(null);
   const settingsDisabled = !draft && settingsIdleOnly && isRunning;
-  const runtimeHasAction = Boolean(onProviderChange || onModelChange || onEffortChange || onResetSettings);
+  const runtimeHasAction = Boolean(onProviderChange || onModelChange || onEffortChange || onResetSettings || onReloadModels);
   // A catalog the harness will not let this cockpit write is still worth
   // reading. The menu opens with every choice disabled and the exact reason.
   const runtimeIsReadable = modelOptions.length > 0 || Boolean(modelOptionsStatus);
@@ -196,6 +198,14 @@ export function SessionComposer(props: SessionComposerProps) {
         : {}),
     };
   });
+  /*
+    Levels to offer while nothing is selected — and only when nothing is
+    chosen at all. A model that is named but absent from the catalog is
+    unknown, not unspecified, and borrows no levels from rows that are not it.
+  */
+  const fallbackEfforts = model === null && effortOptions.length > 0
+    ? effortOptions.map((level) => ({ id: level, name: effortLabel(level) }))
+    : null;
   const sendDisabled = busy || value.trim().length === 0 || !canQueue;
   const effortIndex = effort === null ? -1 : effortOptions.indexOf(effort);
   const hasEffortScale = effortOptions.length > 0 && effortIndex >= 0;
@@ -390,6 +400,7 @@ export function SessionComposer(props: SessionComposerProps) {
           value={selectedOption?.value ?? model ?? ""}
           onValueChange={(next) => onModelChange?.(next)}
           {...(effort ? { effort } : {})}
+          {...(fallbackEfforts ? { fallbackEfforts } : {})}
           onEffortChange={(next) => onEffortChange?.(next as NonNullable<SessionComposerProps["effort"]>)}
           open={openMenu === "runtime"}
           onOpenChange={(next) => { if (!runtimeDisabled || !next) setOpenMenu(next ? "runtime" : null); }}
@@ -431,7 +442,24 @@ export function SessionComposer(props: SessionComposerProps) {
                 ? { disabledReason: effortChangeUnavailableReason }
                 : {})}
             />
-            {modelOptions.length === 0 && modelOptionsStatus && <p className="px-2.5 py-1.5 text-code-sm text-[var(--text-muted)]" role="status">{modelOptionsStatus}</p>}
+            {modelOptions.length === 0 && modelOptionsStatus && (
+              <p className="px-2.5 py-1.5 text-code-sm text-[var(--text-muted)]" role="status">
+                {modelOptionsStatus}
+                {onReloadModels && (
+                  <Button variant="ghost" size="sm" data-compact-control="height" className="ml-2 px-0 underline" onClick={() => onReloadModels()}>
+                    Try again
+                  </Button>
+                )}
+              </p>
+            )}
+            {/*
+              A row the harness will not let this cockpit write is disabled, and
+              a disabled row that says nothing is indistinguishable from a broken
+              one. The reason belongs where it can be read, not only on hover.
+            */}
+            {modelOptions.length > 0 && !onModelChange && modelChangeUnavailableReason && (
+              <p className="px-2.5 py-1.5 text-code-sm text-[var(--text-muted)]" role="status">{modelChangeUnavailableReason}</p>
+            )}
             {onResetSettings && (
               <div className="border-t border-[var(--rule)] p-1">
                 <Button variant="ghost" size="sm" data-compact-control="height" disabled={settingsDisabled} className="w-full justify-start gap-2 text-meta-sm text-[var(--text-muted)]" onClick={() => onResetSettings()}>

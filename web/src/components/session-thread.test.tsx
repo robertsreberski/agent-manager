@@ -735,7 +735,10 @@ describe("SessionThreadComposer", () => {
     const option = within(menu).getByRole("option", { name: /Live/u });
     expect(option).toHaveAttribute("aria-disabled", "true");
     expect(option).toHaveAttribute("title", "The hook can observe the model but cannot change it.");
-    expect(menu).not.toHaveTextContent("The hook can observe the model but cannot change it.");
+    // The harness's own reason is stated in the menu, not only on hover.
+    expect(within(menu).getByRole("status")).toHaveTextContent(
+      "The hook can observe the model but cannot change it.",
+    );
     expect(document.querySelectorAll("[data-effort-bar]")).toHaveLength(4);
     expect(document.querySelectorAll("[data-effort-bar='active']")).toHaveLength(3);
   });

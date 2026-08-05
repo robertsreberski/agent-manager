@@ -2511,8 +2511,11 @@ export async function createAgentManagerServer(
     }
     const getCreateSettingsOptions = adapter.getCreateSettingsOptions.bind(adapter);
 
+    // Resolved before the catch: an unauthenticated request is an auth failure,
+    // not a temporarily unavailable provider, and saying otherwise sends the
+    // operator looking at the wrong thing.
+    const requestContext = context(request);
     try {
-      const requestContext = context(request);
       const settingsOptions = sessionSettingsOptionsSchema.parse(await boundedProviderLookup(
         (signal) => getCreateSettingsOptions({ ...requestContext, signal }),
         requestContext.signal,
@@ -3037,6 +3040,8 @@ export async function createAgentManagerServer(
       hostId: host.id,
       label: workspaceLabel(created.path),
       path: created.path,
+      repoRoot,
+      repoName: identity.repoName,
     });
     try {
       database.auditOperation({
@@ -3090,6 +3095,8 @@ export async function createAgentManagerServer(
         label: resolved.label,
         path: resolved.path,
         remoteWorkspaceId: resolved.remoteWorkspaceId,
+        repoRoot: resolved.workspaceIdentity?.repoRoot ?? null,
+        repoName: resolved.workspaceIdentity?.repoName ?? null,
       });
       return workspaceResolutionResponse(workspace, resolved.workspaceIdentity);
     } catch (error) {

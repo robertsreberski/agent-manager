@@ -68,7 +68,7 @@ describe("question activity projection", () => {
     };
     const onRemove = vi.fn();
     const controls: ActivityDataControls = {
-      attention: { exactRequestIds: new Set(), mutationsReady: true, canRespond: false, busy: false, workspaceRoot: null, remoteHost: null, sessionsOnHost: null, onRespond: vi.fn(async () => undefined) },
+      attention: { exactRequestIds: new Set(), planOwnedRequestIds: new Set(), mutationsReady: true, canRespond: false, busy: false, workspaceRoot: null, remoteHost: null, sessionsOnHost: null, onRespond: vi.fn(async () => undefined) },
       files: { sessionId: queue.sessionId, canOpenEditor: false, workspaceRoot: null, readKeys: new Set(), onReadChange: vi.fn() },
       plans: { requestIds: new Map(), mutationsReady: true, canRespond: false, busy: false, loadFile: vi.fn(async () => { throw new Error("unused"); }), onRespond: vi.fn(async () => undefined) },
       queue: { canRemove: true, busy: false, withheldReason: null },
@@ -93,7 +93,7 @@ describe("question activity projection", () => {
 */
 function controls(): ActivityDataControls {
   return {
-    attention: { exactRequestIds: new Set(), mutationsReady: true, canRespond: false, busy: false, workspaceRoot: null, remoteHost: null, sessionsOnHost: null, onRespond: vi.fn(async () => undefined) },
+    attention: { exactRequestIds: new Set(), planOwnedRequestIds: new Set(), mutationsReady: true, canRespond: false, busy: false, workspaceRoot: null, remoteHost: null, sessionsOnHost: null, onRespond: vi.fn(async () => undefined) },
     files: { sessionId: "local:codex:thread-1", canOpenEditor: false, workspaceRoot: null, readKeys: new Set(), onReadChange: vi.fn() },
     plans: { requestIds: new Map(), mutationsReady: true, canRespond: false, busy: false, loadFile: vi.fn(async () => { throw new Error("unused"); }), onRespond: vi.fn(async () => undefined) },
     queue: { canRemove: false, busy: false, withheldReason: null },

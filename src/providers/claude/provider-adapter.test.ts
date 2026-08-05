@@ -275,9 +275,11 @@ test("adapter disposal aborts and settles a hanging Claude creation", async () =
 
 test("returns only the live bounded Claude model catalog", async () => {
   const runtime = new BridgeRuntime();
+  const activity: Array<{ sessionId: string; mutation: ActivityMutation }> = [];
   const adapter = new ClaudeProviderControlAdapter({
     runtime,
     resolveWorkspace: () => "/workspace",
+    onActivity: (sessionId, mutation) => activity.push({ sessionId, mutation }),
   });
   const view = await adapter.createSession({
     provider: "claude",
@@ -777,6 +779,165 @@ test("publishes buffered SDK messages and callback attention as activity", async
     && mutation.item.approvedAt === "2026-08-03T12:00:00.000Z"
     && mutation.item.state === "complete"
   ));
+  adapter.dispose();
+});
+
+test("a plan sent back carries the operator's notes to Claude as the denial", async () => {
+  const runtime = new BridgeRuntime();
+  const adapter = new ClaudeProviderControlAdapter({
+    runtime,
+    resolveWorkspace: () => "/workspace",
+  });
+  const view = await adapter.createSession(
+    {
+      provider: "claude",
+      workspaceId: "workspace",
+      initialMessage: "Plan it",
+      profile: "plan",
+      sandbox: null,
+      model: null,
+      effort: null,
+      idempotencyKey: "plan-send-back",
+    },
+    context(),
+  );
+  const query = runtime.queries[0];
+  assert.ok(query);
+  const planApproval = query.params.options.canUseTool(
+    "ExitPlanMode",
+    { plan: "# Draft plan" },
+    {
+      signal: new AbortController().signal,
+      requestId: "plan-notes-request",
+      toolUseID: "plan-notes-tool",
+      title: "Execute exact plan",
+    },
+  );
+  const planView = adapter.getManagedSession(view.providerThreadId);
+  assert.ok(planView);
+
+  const sentBack = await adapter.performAction(planView, {
+    type: "respond",
+    requestId: "plan-notes-request",
+    response: { kind: "decision", decision: "deny", reason: "Split step 2 in half first." },
+    expectedGeneration: planView.generation,
+    idempotencyKey: "send-plan-back",
+  }, context());
+
+  assert.equal(sentBack.status, "succeeded");
+  const settled = await planApproval;
+  assert.equal(settled.behavior, "deny");
+  // The notes are what Claude reads as the reason to revise, so they must
+  // arrive verbatim rather than as a generic refusal.
+  assert.equal(settled.message, "Split step 2 in half first.");
+  assert.equal(settled.interrupt, false);
+  adapter.dispose();
+});
+
+test("a plan approval states no command or path, so it cannot read as leaving the workspace", async () => {
+  const runtime = new BridgeRuntime();
+  const activity: Array<{ sessionId: string; mutation: ActivityMutation }> = [];
+  const adapter = new ClaudeProviderControlAdapter({
+    runtime,
+    resolveWorkspace: () => "/workspace",
+    onActivity: (sessionId, mutation) => activity.push({ sessionId, mutation }),
+  });
+  const view = await adapter.createSession(
+    {
+      provider: "claude",
+      workspaceId: "workspace",
+      initialMessage: "Plan it",
+      profile: "plan",
+      sandbox: null,
+      model: null,
+      effort: null,
+      idempotencyKey: "plan-facts",
+    },
+    context(),
+  );
+  const query = runtime.queries[0];
+  assert.ok(query);
+  void query.params.options.canUseTool(
+    "ExitPlanMode",
+    { plan: "# Plan", planFilePath: "/tmp/plan.md" },
+    {
+      signal: new AbortController().signal,
+      requestId: "plan-facts-request",
+      toolUseID: "plan-facts-tool",
+      title: "Execute exact plan",
+    },
+  );
+
+  await eventually(() => activity.some(({ mutation }) =>
+    mutation.type === "upsert"
+    && mutation.item.kind === "attention"
+    && mutation.item.requestId === "plan-facts-request"
+  ));
+  const attention = activity
+    .flatMap(({ mutation }) => mutation.type === "upsert" ? [mutation.item] : [])
+    .find((item) => item.kind === "attention" && item.requestId === "plan-facts-request");
+  assert.ok(attention?.kind === "attention");
+  // Empty facts tier as "outside the workspace" in the browser, which is the
+  // loudest warning there is; a plan reaches nothing, so it states nothing.
+  assert.equal(attention.approvalFacts, null);
+
+  const planView = adapter.getManagedSession(view.providerThreadId);
+  assert.ok(planView);
+  const pending = planView.attention.find((item) => item.id === "plan-facts-request");
+  assert.ok(pending);
+  assert.equal(pending.details?.inputSummary, "The plan is shown in the activity timeline.");
+  adapter.dispose();
+});
+
+test("a plan whose markdown could not be injected stays answerable through its path", async () => {
+  const runtime = new BridgeRuntime();
+  const activity: Array<{ sessionId: string; mutation: ActivityMutation }> = [];
+  const adapter = new ClaudeProviderControlAdapter({
+    runtime,
+    resolveWorkspace: () => "/workspace",
+    onActivity: (sessionId, mutation) => activity.push({ sessionId, mutation }),
+  });
+  await adapter.createSession(
+    {
+      provider: "claude",
+      workspaceId: "workspace",
+      initialMessage: "Plan it",
+      profile: "plan",
+      sandbox: null,
+      model: null,
+      effort: null,
+      idempotencyKey: "plan-path-only",
+    },
+    context(),
+  );
+  const query = runtime.queries[0];
+  assert.ok(query);
+  // The pinned CLI injects `plan` by reading the file it names; an unreadable
+  // file leaves the path and nothing else.
+  void query.params.options.canUseTool(
+    "ExitPlanMode",
+    { planFilePath: "/tmp/plans/unreadable.md" },
+    {
+      signal: new AbortController().signal,
+      requestId: "plan-path-request",
+      toolUseID: "plan-path-tool",
+      title: "Execute exact plan",
+    },
+  );
+
+  await eventually(() => activity.some(({ mutation }) =>
+    mutation.type === "upsert"
+    && mutation.item.kind === "plan"
+    && mutation.item.approvalRequestId === "plan-path-request"
+  ));
+  const plan = activity
+    .flatMap(({ mutation }) => mutation.type === "upsert" ? [mutation.item] : [])
+    .find((item) => item.kind === "plan" && item.approvalRequestId === "plan-path-request");
+  assert.ok(plan?.kind === "plan");
+  // Dropping the item took Execute and Send-back with it, leaving the operator
+  // an approval they could not answer where the plan should have been.
+  assert.equal(plan.markdown, "");
+  assert.equal(plan.path, "/tmp/plans/unreadable.md");
   adapter.dispose();
 });
 

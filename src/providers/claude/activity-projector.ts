@@ -1841,7 +1841,14 @@ export class ClaudeActivityProjector {
       title: request.title,
       summary: description,
       questions,
-      approvalFacts: request.kind === "permission" || request.kind === "plan-approval"
+      /*
+        A plan approval reaches no path and runs no command, so it has no
+        approval facts. Computing them anyway produced an empty set, which the
+        browser's tiering reads as "outside the workspace" — the loudest tier,
+        headlined for a command that escapes the workspace. Leaving a plan
+        without facts states what is true: there is nothing here to inspect.
+      */
+      approvalFacts: request.kind === "permission"
         ? toolApprovalFacts(request.toolName, request.payload.input, {
             cwd: this.#cwd,
             blockedPath: stringValue(request.payload.blockedPath),
@@ -1993,7 +2000,15 @@ export class ClaudeActivityProjector {
   ): ActivityMutation | null {
     const value = objectValue(input);
     const markdown = stringValue(value?.plan);
-    if (!markdown) return null;
+    const path = stringValue(value?.planFilePath);
+    /*
+      The pinned CLI injects `plan` by reading the file it names, so a plan the
+      manager can see the path to but not the text of is a real state. Keeping
+      the item — empty, with its path — leaves the document reachable through
+      the hardened reader and, more importantly, keeps the approval answerable:
+      dropping it took Execute and Send-back with it.
+    */
+    if (!markdown && !path) return null;
     const rawVersion = value?.version;
     const version = Number.isSafeInteger(rawVersion) && (rawVersion as number) > 0
       ? rawVersion as number
@@ -2008,9 +2023,9 @@ export class ClaudeActivityProjector {
       item: {
         id: itemId("plan", toolCallId),
         kind: "plan",
-        path: stringValue(value?.planFilePath),
+        path,
         version,
-        markdown,
+        markdown: markdown ?? "",
         supersededBy: null,
         approvalRequestId: linkedRequestId,
         approvedAt,

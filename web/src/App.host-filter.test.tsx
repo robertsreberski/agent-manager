@@ -93,6 +93,22 @@ describe("cockpit presentation contracts", () => {
     expect(modelCatalogEfforts("codex-deep", codex)).toEqual(["high", "xhigh", "ultra"]);
     expect(modelCatalogEfforts("opus", claude)).toEqual(["medium", "high", "max"]);
     expect(modelCatalogEfforts("missing", codex)).toEqual([]);
+
+    // A catalog that marks no default leaves nothing covering a null model —
+    // Claude's does not, since its ModelInfo declares none. The levels every
+    // row agrees on hold whichever model the provider then picks, so a fresh
+    // draft still has an effort control rather than none at all.
+    const unmarked = {
+      available: true,
+      source: "provider-api",
+      models: [
+        { value: "sonnet", label: "Sonnet", description: null, efforts: ["low", "medium", "high"] },
+        { value: "opus", label: "Opus", description: null, efforts: ["medium", "high", "max"] },
+      ],
+    } satisfies NonNullable<Parameters<typeof modelCatalogEfforts>[1]>;
+    expect(modelCatalogEfforts(null, unmarked)).toEqual(["medium", "high"]);
+    // A model that is named but absent is unknown, not unspecified.
+    expect(modelCatalogEfforts("haiku", unmarked)).toEqual([]);
   });
 
   it("matches a session's wire model id to the alias row that resolves to it", () => {

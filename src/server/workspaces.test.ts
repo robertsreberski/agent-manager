@@ -39,6 +39,8 @@ test("resolves a local workspace and returns its exact public identity", async (
     remoteWorkspaceId: null,
     createdAt: "2026-08-04T00:00:00.000Z",
     lastOpenedAt: null,
+    repoRoot: resolved.workspaceIdentity?.repoRoot ?? null,
+    repoName: resolved.workspaceIdentity?.repoName ?? null,
   }, resolved.workspaceIdentity);
   assert.deepEqual(response.workspace.workspaceIdentity, resolved.workspaceIdentity);
   assert.deepEqual(Object.keys(response.workspace).sort(), [
@@ -51,6 +53,8 @@ test("resolves a local workspace and returns its exact public identity", async (
     "lastOpenedAt",
     "path",
     "remoteWorkspaceId",
+    "repoName",
+    "repoRoot",
     "workspaceIdentity",
   ]);
 });
