@@ -13,6 +13,7 @@ import {
   toolArgumentFields,
   toolCallDetail,
   toolGroupTiming,
+  toolRunActive,
   type ToolArgumentField,
 } from "./grouping";
 import type { SubagentFrameData } from "./subagent";
@@ -54,15 +55,13 @@ const BLOCK = "min-w-0 max-w-full overflow-x-hidden bg-[var(--surface-raised)] p
  *
  * A run that is still going is held open and cannot be collapsed — a group
  * whose calls are still landing is the one thing the operator is watching.
+ * `ToolGroupRoot` owns that hold, and the scroll lock for the moment it lets go.
  */
-export function ToolGroupShell({ status, count, duration, defaultOpen = false, children }: { status: { type: string }; count: number; duration: string | null; defaultOpen?: boolean; children: React.ReactNode }) {
-  const active = status.type !== "complete";
-  const [chosenOpen, setChosenOpen] = useState(defaultOpen);
-  const open = active || chosenOpen;
+export function ToolGroupShell({ status, active, count, duration, defaultOpen = false, children }: { status: { type: string }; active: boolean; count: number; duration: string | null; defaultOpen?: boolean; children: React.ReactNode }) {
   return (
     <ToolGroupRoot
-      open={open}
-      onOpenChange={(next) => { if (!active) setChosenOpen(next); }}
+      active={active}
+      defaultOpen={defaultOpen}
       className={CONTAINED}
       data-tool-group-status={status.type}
     >
@@ -74,8 +73,24 @@ export function ToolGroupShell({ status, count, duration, defaultOpen = false, c
 
 function ToolGroup({ status, indices, children }: { status: { type: string }; indices: readonly number[]; children: React.ReactNode }) {
   const parts = useAuiState((state) => state.message.parts);
+  /*
+    The turn's own status, not just the group's. Every call in a run reads
+    `complete` in the gap between one result and the next call, so a group that
+    took its cue from the parts alone collapsed and reopened once per tool for
+    the length of the turn. A waiting turn counts as in motion: `messageStatus`
+    maps a permission prompt to `requires-action`, and that turn has not ended.
+  */
+  const turnInMotion = useAuiState((state) => {
+    const type = state.message.status?.type;
+    return type === "running" || type === "requires-action";
+  });
   return (
-    <ToolGroupShell status={status} count={indices.length} duration={displayDuration(toolGroupTiming(parts, indices))}>
+    <ToolGroupShell
+      status={status}
+      active={toolRunActive(status, parts, indices, turnInMotion)}
+      count={indices.length}
+      duration={displayDuration(toolGroupTiming(parts, indices))}
+    >
       {children}
     </ToolGroupShell>
   );
@@ -283,18 +298,18 @@ export function SubagentFrame({ data, renderData }: { data: SubagentFrameData; r
         {nestedCount > 0 && <span className="ml-auto inline-flex shrink-0 items-center gap-1 font-mono text-code-xs text-[var(--remote-dim)]"><GitBranch size={12} />{nestedCount} nested {nestedCount === 1 ? "subagent" : "subagents"}</span>}
       </header>
       {item.description && <p className="max-w-full bg-[var(--surface-raised)] px-[13px] py-[11px] text-meta-sm break-words text-[var(--text-secondary)] [overflow-wrap:anywhere]">{item.description}</p>}
-      {data.steps.length > 0 && <div className={`gap-0.5 ${STACK}`} data-subagent-steps>{subagentStepRuns(data.steps).map((run) => (
-        run.kind === "tools"
-          ? (
-            // Open by default: the subagent frame is already the detail view an
-            // operator opened on purpose, so the shell is here for the count and
-            // the containment, not to hide the work a second time.
-            <ToolGroupShell key={run.key} status={stepRunStatus(run.items)} count={run.items.length} duration={null} defaultOpen>
-              {run.items.map((step) => <SubagentStep key={step.id} item={step} {...(renderData ? { renderData } : {})} />)}
-            </ToolGroupShell>
-          )
-          : <SubagentStep key={run.key} item={run.items[0]!} {...(renderData ? { renderData } : {})} />
-      ))}</div>}
+      {data.steps.length > 0 && <div className={`gap-0.5 ${STACK}`} data-subagent-steps>{subagentStepRuns(data.steps).map((run) => {
+        if (run.kind !== "tools") return <SubagentStep key={run.key} item={run.items[0]!} {...(renderData ? { renderData } : {})} />;
+        const status = stepRunStatus(run.items);
+        return (
+          // Open by default: the subagent frame is already the detail view an
+          // operator opened on purpose, so the shell is here for the count and
+          // the containment, not to hide the work a second time.
+          <ToolGroupShell key={run.key} status={status} active={status.type !== "complete"} count={run.items.length} duration={null} defaultOpen>
+            {run.items.map((step) => <SubagentStep key={step.id} item={step} {...(renderData ? { renderData } : {})} />)}
+          </ToolGroupShell>
+        );
+      })}</div>}
       {item.output && <p className="mt-2 max-w-full whitespace-pre-wrap break-words text-meta-sm [overflow-wrap:anywhere]">{item.output}</p>}
       {(returned || hasFacts) && (
         <footer className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-[var(--remote-rule)] pt-[9px] font-mono text-code-xs text-[var(--remote-dim)]">

@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ChevronDown, LoaderCircle } from "lucide-react";
 import { cva, type VariantProps } from "class-variance-authority";
 import { useScrollLock } from "@assistant-ui/react";
@@ -54,6 +54,13 @@ export type ToolGroupRootProps = Omit<
     open?: boolean;
     onOpenChange?: (open: boolean) => void;
     defaultOpen?: boolean;
+    /**
+     * Held open while the run is still in motion, and not collapsible for as
+     * long as it is: a group whose calls are still landing is the one thing the
+     * operator is watching. `ReasoningRoot` holds its panel open the same way
+     * for the same reason.
+     */
+    active?: boolean;
   };
 
 function ToolGroupRoot({
@@ -62,6 +69,7 @@ function ToolGroupRoot({
   open: controlledOpen,
   onOpenChange: controlledOnOpenChange,
   defaultOpen = false,
+  active = false,
   children,
   ...props
 }: ToolGroupRootProps) {
@@ -70,15 +78,26 @@ function ToolGroupRoot({
   const lockScroll = useScrollLock(collapsibleRef, ANIMATION_DURATION);
 
   const isControlled = controlledOpen !== undefined;
-  const isOpen = isControlled ? controlledOpen : uncontrolledOpen;
+  const isOpen = isControlled ? controlledOpen : active || uncontrolledOpen;
+
+  // Returning to the collapsed state when the run settles is a height change
+  // like any other, so it takes the same scroll lock a toggle does. Without it
+  // the panel's whole run of rows leaves the transcript in one 200ms animation
+  // and drops everything below it out from under the operator.
+  const wasActive = useRef(active);
+  useEffect(() => {
+    if (wasActive.current && !active && !isControlled && !uncontrolledOpen) lockScroll();
+    wasActive.current = active;
+  }, [active, isControlled, uncontrolledOpen, lockScroll]);
 
   const handleOpenChange = useCallback(
     (open: boolean) => {
+      if (active) return;
       lockScroll();
       if (!isControlled) setUncontrolledOpen(open);
       controlledOnOpenChange?.(open);
     },
-    [lockScroll, isControlled, controlledOnOpenChange],
+    [active, lockScroll, isControlled, controlledOnOpenChange],
   );
 
   return (
@@ -106,7 +125,12 @@ function ToolGroupTrigger({
 }: React.ComponentProps<typeof CollapsibleTrigger> & {
   count: number;
   active?: boolean;
-  /** Wall-clock span, only where every call in the group reported one. */
+  /**
+   * Wall-clock span, only where every call in the group reported one — and only
+   * once the run has settled. A span is a fact about a finished run; beside the
+   * `active` chip it blinked in during every gap between calls, because that is
+   * exactly when every call in the group has reported a completion time.
+   */
   duration?: string | null;
 }) {
   const label = `${count} tool ${count === 1 ? "call" : "calls"}`;
@@ -137,7 +161,7 @@ function ToolGroupTrigger({
           </span>
         )}
       </span>
-      {duration && <span className="shrink-0 text-meta-sm tabular-nums text-[var(--text-faint)]">{duration}</span>}
+      {!active && duration && <span className="shrink-0 text-meta-sm tabular-nums text-[var(--text-faint)]">{duration}</span>}
       {active && <span className="shrink-0 font-mono text-code-xs text-[var(--text-faint)]">active</span>}
     </CollapsibleTrigger>
   );

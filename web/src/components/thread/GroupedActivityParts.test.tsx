@@ -133,7 +133,7 @@ describe("tool call containment", () => {
 describe("tool group containment", () => {
   it("constrains the open group body to its container width", () => {
     const { container } = render(
-      <ToolGroupShell status={{ type: "complete" }} count={6} duration="2.5s">
+      <ToolGroupShell status={{ type: "complete" }} active={false} count={6} duration="2.5s">
         <span>call</span>
       </ToolGroupShell>,
     );
@@ -161,7 +161,7 @@ describe("tool group containment", () => {
   */
   it("expands the whole grammar without a single max-content escape hatch", () => {
     const { container } = render(
-      <ToolGroupShell status={{ type: "complete" }} count={1} duration="2.5s">
+      <ToolGroupShell status={{ type: "complete" }} active={false} count={1} duration="2.5s">
         <ToolCall part={{
           toolName: CODEX_TOOL_NAME,
           args: CODEX_ARGS,
@@ -194,12 +194,44 @@ describe("tool group containment", () => {
 
   it("keeps an active group forced open", () => {
     render(
-      <ToolGroupShell status={{ type: "running" }} count={1} duration={null}>
+      <ToolGroupShell status={{ type: "running" }} active count={1} duration={null}>
         <span>call</span>
       </ToolGroupShell>,
     );
     expect(screen.getByRole("button", { expanded: true })).toBeInTheDocument();
     expect(screen.getByText("active")).toBeInTheDocument();
+  });
+
+  /*
+    Every call in a run reads `complete` in the gap between one result and the
+    next call landing. Deriving the hold from the parts alone collapsed the panel
+    in every one of those gaps and reopened it on the next call — once per tool,
+    for the length of the turn. `active` is the caller's answer to "is this run
+    still in motion", and it outranks the settled status.
+  */
+  it("holds a settled run open while its turn is still in motion", () => {
+    render(
+      <ToolGroupShell status={{ type: "complete" }} active count={3} duration="2.5s">
+        <span>call</span>
+      </ToolGroupShell>,
+    );
+
+    expect(screen.getByRole("button", { expanded: true })).toBeInTheDocument();
+    // A span is a fact about a finished run. Printed beside the `active` chip it
+    // blinked in during every gap, because that is exactly when every call in
+    // the group has reported a completion time.
+    expect(screen.queryByText("2.5s")).not.toBeInTheDocument();
+  });
+
+  it("ignores a toggle while the run is held open", () => {
+    render(
+      <ToolGroupShell status={{ type: "complete" }} active count={3} duration={null}>
+        <span>call</span>
+      </ToolGroupShell>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { expanded: true }));
+    expect(screen.getByRole("button", { expanded: true })).toBeInTheDocument();
   });
 });
 
@@ -227,7 +259,7 @@ describe("transcript scroll stability", () => {
     vi.useFakeTimers();
     const transcript = scrollableStage();
     render(
-      <ToolGroupShell status={{ type: "complete" }} count={6} duration="2.5s">
+      <ToolGroupShell status={{ type: "complete" }} active={false} count={6} duration="2.5s">
         <span>call</span>
       </ToolGroupShell>,
       { container: transcript },
