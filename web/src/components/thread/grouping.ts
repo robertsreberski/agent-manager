@@ -99,6 +99,63 @@ export function toolCallDetail(args: unknown): string | null {
   return detailFrom(args, 0);
 }
 
+export interface ToolArgumentField {
+  name: string;
+  value: string;
+  /** The value needs its own block and a clamp, not a single row. */
+  multiline: boolean;
+}
+
+/** A value long enough that printing it whole buries the rest of the turn. */
+const FIELD_CLAMP_CHARS = 240;
+
+function fieldValue(value: unknown): string | null {
+  if (typeof value === "string") {
+    // A provider that hands its arguments over as serialized text is unwrapped
+    // once, the same way `detailFrom` does, so the operator sees fields rather
+    // than an escaped blob.
+    const parsed = parsedObject(value);
+    return parsed ? JSON.stringify(parsed, null, 2) : value;
+  }
+  if (value === null || value === undefined) return null;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The provider's tool arguments as named fields. A tool row used to print
+ * `JSON.stringify(args, null, 2)`, so a single agent call arrived as a wall of
+ * escaped prompt text — the argument names were there, but nothing separated
+ * them from their values and every newline was rendered as `\n`.
+ *
+ * Only what the provider actually sent is shown: no key is renamed, dropped or
+ * reordered, and a value that is not a scalar keeps its serialized form.
+ */
+export function toolArgumentFields(args: unknown): readonly ToolArgumentField[] {
+  const record = plainObject(args);
+  if (!record) {
+    const single = fieldValue(args);
+    return single === null ? [] : [{ name: "", value: single, multiline: isMultiline(single) }];
+  }
+  return Object.entries(record).flatMap(([name, value]) => {
+    const rendered = fieldValue(value);
+    return rendered === null ? [] : [{ name, value: rendered, multiline: isMultiline(rendered) }];
+  });
+}
+
+function isMultiline(value: string): boolean {
+  return value.includes("\n") || value.length > 80;
+}
+
+/** True when a field is long enough to be worth collapsing behind a control. */
+export function fieldIsClamped(value: string): boolean {
+  return value.length > FIELD_CLAMP_CHARS || value.split("\n").length > 6;
+}
+
 export function displayDuration(timing: { startedAt: number; completedAt?: number } | undefined): string | null {
   if (!timing || timing.completedAt === undefined) return null;
   const elapsed = timing.completedAt - timing.startedAt;

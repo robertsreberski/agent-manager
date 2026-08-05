@@ -5,7 +5,15 @@ import { MarkdownText } from "../assistant-ui/markdown-text";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "../ui";
 import { jsonForDisplay } from "../../lib/session-activity";
 import type { ActivityItem, ActivityJsonValue, ActivityState } from "../../types";
-import { displayDuration, groupActivityPart, toolCallDetail, toolGroupTiming } from "./grouping";
+import {
+  displayDuration,
+  fieldIsClamped,
+  groupActivityPart,
+  toolArgumentFields,
+  toolCallDetail,
+  toolGroupTiming,
+  type ToolArgumentField,
+} from "./grouping";
 import type { SubagentFrameData } from "./subagent";
 
 /**
@@ -40,9 +48,9 @@ const CONTAINED = "min-w-0 max-w-full overflow-hidden";
 const STACK = "grid grid-cols-[minmax(0,1fr)] min-w-0 max-w-full";
 const BLOCK = "min-w-0 max-w-full overflow-x-hidden bg-[var(--surface-raised)] px-[13px] py-[11px] font-mono text-code whitespace-pre-wrap break-words [overflow-wrap:anywhere]";
 
-export function ToolGroupShell({ status, count, duration, children }: { status: { type: string }; count: number; duration: string | null; children: React.ReactNode }) {
+export function ToolGroupShell({ status, count, duration, defaultOpen = false, children }: { status: { type: string }; count: number; duration: string | null; defaultOpen?: boolean; children: React.ReactNode }) {
   const forced = status.type !== "complete";
-  const [chosenOpen, setChosenOpen] = useState(false);
+  const [chosenOpen, setChosenOpen] = useState(defaultOpen);
   const shellRef = useRef<HTMLElement>(null);
   const lockScroll = useScrollLock(shellRef, DISCLOSURE_SCROLL_LOCK_MS);
   const open = forced || chosenOpen;
@@ -68,13 +76,50 @@ function ToolGroup({ status, indices, children }: { status: { type: string }; in
   );
 }
 
+/**
+ * One provider-named argument. A long value — an agent prompt, a file body —
+ * is clamped rather than printed whole: expanding a tool row should not bury
+ * every row after it.
+ */
+function ArgumentField({ field }: { field: ToolArgumentField }) {
+  const clamped = fieldIsClamped(field.value);
+  const [expanded, setExpanded] = useState(false);
+  const showAll = expanded || !clamped;
+  if (!field.multiline && field.name) {
+    return (
+      <div className={`flex min-w-0 max-w-full gap-2 ${BLOCK}`} data-tool-argument={field.name}>
+        <span className="shrink-0 text-[var(--text-muted)]">{field.name}</span>
+        <span className="min-w-0 flex-1">{field.value}</span>
+      </div>
+    );
+  }
+  return (
+    <div className={`${STACK} gap-1`} data-tool-argument={field.name || "value"}>
+      {field.name && <span className="font-mono text-code-xs text-[var(--text-muted)]">{field.name}</span>}
+      <pre className={`${BLOCK} ${showAll ? "" : "max-h-32 overflow-hidden"}`}>{field.value}</pre>
+      {clamped && (
+        <button
+          type="button"
+          data-compact-control="height"
+          className="min-h-8 justify-self-start py-1 text-left font-mono text-code-xs text-[var(--text-muted)] underline"
+          aria-expanded={showAll}
+          onClick={() => setExpanded((value) => !value)}
+        >{showAll ? "Show less" : "Show all"}</button>
+      )}
+    </div>
+  );
+}
+
 export function ToolCall({ part }: { part: ToolPart }) {
-  const [open, setOpen] = useState(part.status.type !== "complete" || Boolean(part.isError));
+  // A running call used to force itself open, so an agent call put its whole
+  // prompt on screen for the length of the turn. Only a failure opens itself.
+  const [open, setOpen] = useState(Boolean(part.isError));
   const rowRef = useRef<HTMLElement>(null);
   const lockScroll = useScrollLock(rowRef, DISCLOSURE_SCROLL_LOCK_MS);
   const duration = displayDuration(part.timing);
   if (part.toolUI) return part.toolUI;
   const detail = toolCallDetail(part.args);
+  const fields = toolArgumentFields(part.args);
   return (
     <section ref={rowRef} className={CONTAINED} data-tool-status={part.status.type}>
       <button type="button" data-compact-control className="flex min-h-8 w-full min-w-0 items-center gap-[9px] py-1.5 text-left" aria-expanded={open} onClick={() => { lockScroll(); setOpen((value) => !value); }}>
@@ -86,8 +131,16 @@ export function ToolCall({ part }: { part: ToolPart }) {
       </button>
       {open && (
         <div className={`gap-1.5 pb-2 ${STACK}`}>
-          <pre className={BLOCK} data-tool-arguments>{part.argsText || JSON.stringify(part.args, null, 2)}</pre>
-          {part.result !== undefined && <pre className={`${BLOCK} ${part.isError ? "text-[var(--danger)]" : ""}`} data-tool-result>{typeof part.result === "string" ? part.result : JSON.stringify(part.result, null, 2)}</pre>}
+          <div className={`gap-1.5 ${STACK}`} data-tool-arguments>
+            {fields.length > 0
+              ? fields.map((field) => <ArgumentField key={field.name || "value"} field={field} />)
+              : <pre className={BLOCK}>{part.argsText}</pre>}
+          </div>
+          {part.result !== undefined && (
+            <div className={`${STACK} ${part.isError ? "text-[var(--danger)]" : ""}`} data-tool-result>
+              <ArgumentField field={{ name: "", value: typeof part.result === "string" ? part.result : jsonForDisplay(part.result as ActivityJsonValue), multiline: true }} />
+            </div>
+          )}
         </div>
       )}
     </section>
@@ -100,13 +153,16 @@ export function ToolCall({ part }: { part: ToolPart }) {
   moved to — wires `aria-expanded` and `aria-controls`, and its controlled
   `open` is what lets the reasoning body join the scroll lock above.
 */
-function ReasoningDisclosure({ text }: { text: string }) {
+function ReasoningDisclosure({ text, label }: { text: string; label?: string | undefined }) {
   const [open, setOpen] = useState(false);
   const frameRef = useRef<HTMLDivElement>(null);
   const lockScroll = useScrollLock(frameRef, DISCLOSURE_SCROLL_LOCK_MS);
   return (
     <Collapsible ref={frameRef} open={open} onOpenChange={(next) => { lockScroll(); setOpen(next); }} className={`text-meta-sm text-[var(--text-muted)] ${CONTAINED}`}>
-      <CollapsibleTrigger data-compact-control className="min-h-8 cursor-pointer py-1.5">Reasoning</CollapsibleTrigger>
+      {/* Codex sends a summarised thought and its raw counterpart as two items.
+          Its own labels are what tell them apart; a fixed "Reasoning" made the
+          pair read as one event rendered twice. */}
+      <CollapsibleTrigger data-compact-control="height" className="min-h-8 cursor-pointer py-1.5" data-reasoning-label={label ?? "Reasoning"}>{label ?? "Reasoning"}</CollapsibleTrigger>
       <CollapsibleContent>
         <pre className="min-w-0 max-w-full overflow-x-hidden border-l border-[var(--rule)] pl-3 font-mono text-code-sm whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{text}</pre>
       </CollapsibleContent>
@@ -146,7 +202,7 @@ function SubagentStep({ item, renderData }: { item: ActivityItem; renderData?: (
       ...(itemTiming ? { timing: itemTiming } : {}),
     }} />;
   }
-  if (item.kind === "reasoning") return <ReasoningDisclosure text={item.text} />;
+  if (item.kind === "reasoning") return <ReasoningDisclosure text={item.text} {...(item.label ? { label: item.label } : {})} />;
   if (item.kind === "message") {
     return (
       <div className={`py-1 text-meta-sm ${CONTAINED}`} data-subagent-message-role={item.role}>
@@ -157,6 +213,42 @@ function SubagentStep({ item, renderData }: { item: ActivityItem; renderData?: (
   }
   if (item.kind === "usage" || item.kind === "subagent") return null;
   return renderData?.(`agent-manager.${item.kind}`, item) ?? null;
+}
+
+interface SubagentStepRun {
+  kind: "tools" | "single";
+  key: string;
+  items: readonly ActivityItem[];
+}
+
+/**
+ * Subagent steps render outside `MessagePrimitive.GroupedParts` — they are not
+ * message parts — so a subagent that ran twelve tools listed twelve bare rows
+ * while the parent turn collapsed its own into one shell. Adjacent tool steps
+ * coalesce here on the same rule the primitive uses: provider order is kept,
+ * and anything that is not a tool closes the run.
+ */
+function subagentStepRuns(steps: readonly ActivityItem[]): readonly SubagentStepRun[] {
+  const runs: SubagentStepRun[] = [];
+  for (const step of steps) {
+    const previous = runs.at(-1);
+    if (step.kind !== "tool") {
+      runs.push({ kind: "single", key: step.id, items: [step] });
+      continue;
+    }
+    if (previous?.kind === "tools") {
+      previous.items = [...previous.items, step];
+      continue;
+    }
+    runs.push({ kind: "tools", key: step.id, items: [step] });
+  }
+  return runs;
+}
+
+function stepRunStatus(items: readonly ActivityItem[]): { type: string } {
+  return items.some((item) => ["pending", "running", "waiting"].includes(item.state))
+    ? { type: "running" }
+    : { type: "complete" };
 }
 
 function formatCost(costUsd: number): string {
@@ -178,7 +270,18 @@ export function SubagentFrame({ data, renderData }: { data: SubagentFrameData; r
         {nestedCount > 0 && <span className="ml-auto inline-flex shrink-0 items-center gap-1 font-mono text-code-xs text-[var(--remote-dim)]"><GitBranch size={12} />{nestedCount} nested {nestedCount === 1 ? "subagent" : "subagents"}</span>}
       </header>
       {item.description && <p className="max-w-full bg-[var(--surface-raised)] px-[13px] py-[11px] text-meta-sm break-words text-[var(--text-secondary)] [overflow-wrap:anywhere]">{item.description}</p>}
-      {data.steps.length > 0 && <div className={`gap-0.5 ${STACK}`} data-subagent-steps>{data.steps.map((step) => <SubagentStep key={step.id} item={step} {...(renderData ? { renderData } : {})} />)}</div>}
+      {data.steps.length > 0 && <div className={`gap-0.5 ${STACK}`} data-subagent-steps>{subagentStepRuns(data.steps).map((run) => (
+        run.kind === "tools"
+          ? (
+            // Open by default: the subagent frame is already the detail view an
+            // operator opened on purpose, so the shell is here for the count and
+            // the containment, not to hide the work a second time.
+            <ToolGroupShell key={run.key} status={stepRunStatus(run.items)} count={run.items.length} duration={null} defaultOpen>
+              {run.items.map((step) => <SubagentStep key={step.id} item={step} {...(renderData ? { renderData } : {})} />)}
+            </ToolGroupShell>
+          )
+          : <SubagentStep key={run.key} item={run.items[0]!} {...(renderData ? { renderData } : {})} />
+      ))}</div>}
       {item.output && <p className="mt-2 max-w-full whitespace-pre-wrap break-words text-meta-sm [overflow-wrap:anywhere]">{item.output}</p>}
       {(returned || hasFacts) && (
         <footer className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-[var(--remote-rule)] pt-[9px] font-mono text-code-xs text-[var(--remote-dim)]">
@@ -197,10 +300,21 @@ export interface GroupedActivityPartsProps {
   renderData?: (name: string, data: unknown) => React.ReactNode;
 }
 
+/** The provider's own reasoning label, where it supplied one. */
+function reasoningLabel(part: { providerMetadata?: Record<string, unknown> | undefined }): { label?: string } {
+  const scoped = part.providerMetadata?.["agent-manager"];
+  const label = scoped && typeof scoped === "object" && "label" in scoped
+    ? (scoped as { label?: unknown }).label
+    : undefined;
+  return typeof label === "string" && label.length > 0 ? { label } : {};
+}
+
 export function GroupedActivityParts({ renderData }: GroupedActivityPartsProps) {
   return (
+    // A fresh `groupBy` arrow rebuilt the whole group tree on every token
+    // delta; the module-level function is a stable memo key.
     <MessagePrimitive.GroupedParts<ActivityGroupKey>
-      groupBy={(part) => groupActivityPart(part)}
+      groupBy={groupActivityPart}
       indicator="never"
     >
       {({ part, children }) => {
@@ -209,7 +323,7 @@ export function GroupedActivityParts({ renderData }: GroupedActivityPartsProps) 
           case "group-tools": return <ToolGroup status={part.status} indices={part.indices}>{children}</ToolGroup>;
           case "group-subagent": return <div className={`gap-2 ${STACK}`}>{children}</div>;
           case "text": return <MarkdownText />;
-          case "reasoning": return <ReasoningDisclosure text={part.text} />;
+          case "reasoning": return <ReasoningDisclosure text={part.text} {...reasoningLabel(part)} />;
           case "tool-call": return <ToolCall part={part} />;
           case "data": {
             if (part.dataRendererUI) return part.dataRendererUI;

@@ -132,6 +132,36 @@ describe("turn timeline ordering", () => {
     expect(lifecycleTitles).toEqual(["Turn started", "Turn failed"]);
   });
 
+  it("bands the todo list and the turn diff with the turn facts so a tool run stays whole", () => {
+    // A provider emits one todo and one aggregate diff per turn, and the hub
+    // pins each to the seq of its first upsert — in the middle of a tool run.
+    // Left there, they split the run, because adjacent-prefix grouping closes a
+    // group at the first part that is not a tool call.
+    const items: ActivityItem[] = [
+      ...invertedTurn(),
+      {
+        ...common, id: "tool-2", seq: 32,
+        kind: "tool", toolCallId: "call-2", name: "apply_patch", category: "command",
+        arguments: { path: "a.ts" }, result: "ok", output: "",
+      },
+      {
+        ...common, id: "todo-1", seq: 31.5,
+        kind: "todo", steps: [], added: 0, removed: 0,
+      },
+    ];
+    const parts = activityToThreadMessages(items)[1]!.content as ReadonlyArray<{ type: string; name?: string }>;
+
+    expect(partLabels({ content: parts })).toEqual([
+      "data:agent-manager.lifecycle",
+      "reasoning",
+      "tool-call",
+      "tool-call",
+      "text",
+      "data:agent-manager.todo",
+      "data:agent-manager.turn-marker",
+    ]);
+  });
+
   it("keeps provider order inside the body band", () => {
     const items = invertedTurn().map((item) => (
       item.id === "tool-1" ? { ...item, seq: 29 } : item
@@ -143,5 +173,63 @@ describe("turn timeline ordering", () => {
     expect(parts.map((part) => part.type)).toEqual([
       "data", "tool-call", "reasoning", "text", "data",
     ]);
+  });
+});
+
+/**
+ * The transcript reader has no turn concept — `TranscriptItem` carries none, so
+ * every draft it produces materialises with `turnId: null`. Keying those items
+ * individually put each one in a turn of its own, which produced one assistant
+ * message per item and left the grouping primitive nothing adjacent to
+ * coalesce: every tool call rendered its own "1 tool call" shell.
+ */
+describe("turns a provider never stated", () => {
+  const unassociated = { ...common, turnId: null };
+
+  function tool(id: string, seq: number): ActivityItem {
+    return {
+      ...unassociated, id, seq,
+      kind: "tool", toolCallId: id, name: "read_file", category: "other",
+      arguments: { path: `${id}.ts` }, result: "ok", output: "",
+    };
+  }
+
+  it("gathers adjacent unassociated items into one assistant message", () => {
+    const messages = activityToThreadMessages([
+      { ...unassociated, id: "m-user", seq: 1, kind: "message", role: "user", phase: null, text: "Go", label: null },
+      tool("t-1", 2),
+      tool("t-2", 3),
+      tool("t-3", 4),
+      { ...unassociated, id: "m-final", seq: 5, kind: "message", role: "assistant", phase: "final", text: "Done", label: null },
+    ]);
+
+    expect(messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+    expect(partLabels(messages[1]!)).toEqual(["tool-call", "tool-call", "tool-call", "text"]);
+  });
+
+  it("opens a new turn at an operator message and closes one at a turn end", () => {
+    const messages = activityToThreadMessages([
+      tool("t-1", 1),
+      { ...unassociated, id: "m-user", seq: 2, kind: "message", role: "user", phase: null, text: "Again", label: null },
+      tool("t-2", 3),
+      {
+        ...unassociated, id: "end", seq: 4,
+        kind: "lifecycle", event: "turn-completed", level: "info", title: "Turn completed", details: null,
+      },
+      tool("t-3", 5),
+    ]);
+
+    expect(messages.map((message) => message.role)).toEqual(["assistant", "user", "assistant", "assistant"]);
+    expect(partLabels(messages[0]!)).toEqual(["tool-call"]);
+    expect(partLabels(messages[3]!)).toEqual(["tool-call"]);
+  });
+
+  it("never merges items a provider did assign to different turns", () => {
+    const messages = activityToThreadMessages([
+      { ...common, turnId: "turn-a", id: "a", seq: 1, kind: "tool", toolCallId: "a", name: "read_file", category: "other", arguments: null, result: "ok", output: "" },
+      { ...common, turnId: "turn-b", id: "b", seq: 2, kind: "tool", toolCallId: "b", name: "read_file", category: "other", arguments: null, result: "ok", output: "" },
+    ]);
+
+    expect(messages).toHaveLength(2);
   });
 });

@@ -9,16 +9,20 @@ export type ClaudeHookSourceDecision =
 
 /**
  * One source wins at a time. Manager-owned SDK sessions reject global hooks;
- * external sessions use hooks until the health window expires, then polling may resume.
+ * an external session that has produced a hook event is owned by the bridge for
+ * the rest of its life.
+ *
+ * Ownership used to lapse after a 30s hook silence, which any single long tool
+ * call produced. Polling then resumed alongside the live bridge, and because
+ * the two sources id the same tool call differently (`transcript:claude:tool:…`
+ * against `claude-hook:<sid>:tool:…`) the hub — which dedupes by id — held both.
+ * Every message, thought and tool call in the transcript appeared a second
+ * time. Liveness is still tracked, for callers that report it; it just no
+ * longer hands the same session to two producers.
  */
 export class ClaudeHookSourceArbiter {
   readonly #managerOwned = new Set<string>();
   readonly #lastHookAt = new Map<string, number>();
-  readonly #healthyForMs: number;
-
-  constructor(options: { healthyForMs?: number } = {}) {
-    this.#healthyForMs = options.healthyForMs ?? 30_000;
-  }
 
   markManagerOwned(sessionId: string, owned = true): void {
     if (owned) {
@@ -43,10 +47,13 @@ export class ClaudeHookSourceArbiter {
     return { accepted: true, suppressTranscriptPolling: true };
   }
 
-  shouldPollTranscript(sessionId: string, now = Date.now()): boolean {
-    if (this.#managerOwned.has(sessionId)) return false;
-    const lastHookAt = this.#lastHookAt.get(sessionId);
-    return lastHookAt === undefined || now - lastHookAt > this.#healthyForMs;
+  shouldPollTranscript(sessionId: string): boolean {
+    return !this.#managerOwned.has(sessionId) && !this.#lastHookAt.has(sessionId);
+  }
+
+  /** When the bridge last spoke for this session, for liveness reporting only. */
+  lastHookAt(sessionId: string): number | null {
+    return this.#lastHookAt.get(sessionId) ?? null;
   }
 
   forget(sessionId: string): void {

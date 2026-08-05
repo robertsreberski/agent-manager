@@ -365,18 +365,25 @@ test("folds MessageDisplay deltas without replaying duplicates", () => {
   assert.deepEqual(projector.project(second).mutations, []);
 });
 
-test("source arbitration excludes manager-owned sessions and falls back after silence", () => {
+test("source arbitration excludes manager-owned sessions and never re-opens transcript polling beside a live bridge", () => {
   const hook = parseClaudeHookInput({ ...common("Stop"), stop_hook_active: false });
-  const arbiter = new ClaudeHookSourceArbiter({ healthyForMs: 100 });
+  const arbiter = new ClaudeHookSourceArbiter();
   assert.deepEqual(arbiter.accept(hook, { ownerMarker: CLAUDE_MANAGER_OWNER_VALUE, now: 0 }), {
     accepted: false,
     reason: "manager-owned",
   });
+  assert.equal(arbiter.shouldPollTranscript("session-1"), true);
   assert.equal(arbiter.accept(hook, { now: 10 }).accepted, true);
-  assert.equal(arbiter.shouldPollTranscript("session-1", 50), false);
-  assert.equal(arbiter.shouldPollTranscript("session-1", 111), true);
+  assert.equal(arbiter.shouldPollTranscript("session-1"), false);
+  // A single long tool call used to exceed the old health window and hand the
+  // same session to the poller as well, so every hook item gained a
+  // `transcript:`-prefixed twin. Silence is not evidence the bridge is gone.
+  assert.equal(arbiter.lastHookAt("session-1"), 10);
+  assert.equal(arbiter.shouldPollTranscript("session-1"), false);
   arbiter.markManagerOwned("session-1");
-  assert.equal(arbiter.shouldPollTranscript("session-1", 1_000), false);
+  assert.equal(arbiter.shouldPollTranscript("session-1"), false);
+  arbiter.forget("session-1");
+  assert.equal(arbiter.shouldPollTranscript("session-1"), true);
 });
 
 test("bridge authenticates, projects, holds, answers, and resolves one external permission", async () => {

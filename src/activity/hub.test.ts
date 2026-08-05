@@ -800,3 +800,66 @@ test("isolates subscribers by session and clears sensitive material", () => {
   assert.equal(seenA.at(-1)?.type, "activity.reset");
   assert.equal(hub.snapshot("a"), null);
 });
+
+test("a reset keeps the order it was submitted in rather than the order ids sort in", () => {
+  // Every reset item used to share one seq, so the view's
+  // `seq - seq || id.localeCompare(id)` fell through to the id — and provider
+  // ids are random tokens. The whole timeline re-sorted alphabetically on every
+  // reset (first observation, truncation, replay gap, hook resume), which reads
+  // as events appearing twice in different places.
+  const hub = new ActivityHub();
+  const submitted = ["zeta", "alpha", "mu"];
+  const frame = hub.ingest("session-1", "claude", {
+    type: "reset",
+    reason: "transcript-reset",
+    items: submitted.map((id) => message(id, id, "complete")),
+  });
+
+  assert.equal(frame.type, "activity.reset");
+  assert.deepEqual(
+    frame.type === "activity.reset" ? frame.items.map((item) => item.id) : [],
+    submitted,
+  );
+  assert.deepEqual(
+    hub.snapshot("session-1")?.items.map((item) => item.id) ?? [],
+    submitted,
+  );
+});
+
+test("a later mutation still sequences after every item a reset placed", () => {
+  const hub = new ActivityHub();
+  hub.ingest("session-1", "claude", {
+    type: "reset",
+    reason: "transcript-reset",
+    items: ["zeta", "alpha", "mu"].map((id) => message(id, id, "complete")),
+  });
+  hub.ingest("session-1", "claude", { type: "upsert", item: message("omega", "last", "complete") });
+
+  assert.deepEqual(
+    hub.snapshot("session-1")?.items.map((item) => item.id) ?? [],
+    ["zeta", "alpha", "mu", "omega"],
+  );
+});
+
+test("a source withdraws only its own items when it hands the session over", () => {
+  // A hook bridge and the transcript reader id the same event differently and
+  // the hub dedupes by id, so a producer that falls silent without withdrawing
+  // leaves every item duplicated for the life of the session.
+  const hub = new ActivityHub();
+  hub.ingest("session-1", "claude", {
+    type: "reset",
+    reason: "transcript-reset",
+    items: [
+      message("transcript:one", "polled", "complete"),
+      message("claude-hook:one", "bridged", "complete"),
+      message("transcript:two", "polled", "complete"),
+    ],
+  });
+
+  assert.equal(hub.removeMatching("session-1", (id) => id.startsWith("transcript:")), true);
+  assert.deepEqual(
+    hub.snapshot("session-1")?.items.map((item) => item.id) ?? [],
+    ["claude-hook:one"],
+  );
+  assert.equal(hub.removeMatching("session-1", (id) => id.startsWith("transcript:")), false);
+});

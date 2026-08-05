@@ -46,6 +46,9 @@ export interface SelectedTranscriptActivityObserverOptions {
  * provenance triple below is therefore fixed, and must never be widened to
  * `provider-api` / `exact` / `provider-exposed` for any transcript item.
  */
+/** This observer's id namespace, and the handle it withdraws its items by. */
+export const TRANSCRIPT_ID_PREFIX = "transcript:";
+
 const TRANSCRIPT_PROVENANCE = {
   source: "transcript",
   confidence: "inferred",
@@ -68,7 +71,7 @@ function activityDraft(item: TranscriptItem): ActivityItemDraft {
   if (item.kind === "reasoning") {
     return {
       kind: "reasoning",
-      id: `transcript:${item.id}`,
+      id: `${TRANSCRIPT_ID_PREFIX}${item.id}`,
       reasoningKind: "summary",
       label: item.label,
       text: item.text,
@@ -80,7 +83,7 @@ function activityDraft(item: TranscriptItem): ActivityItemDraft {
   if (item.kind === "tool") {
     return {
       kind: "tool",
-      id: `transcript:${item.id}`,
+      id: `${TRANSCRIPT_ID_PREFIX}${item.id}`,
       toolCallId: item.toolCallId,
       name: item.name,
       // The transcript names a tool but never states which category the
@@ -96,7 +99,7 @@ function activityDraft(item: TranscriptItem): ActivityItemDraft {
   }
   return {
     kind: "message",
-    id: `transcript:${item.id}`,
+    id: `${TRANSCRIPT_ID_PREFIX}${item.id}`,
     role: item.role,
     phase: item.role === "assistant" && complete ? "final" : null,
     text: item.text,
@@ -273,7 +276,23 @@ export class SelectedTranscriptActivityObserver {
     if (!this.#reader || observation.stopped) return;
     const latestSession = this.#resolveSession?.(observation.session.id);
     if (latestSession) observation.session = latestSession;
-    if (this.#eligible && !this.#eligible(observation.session)) return;
+    if (this.#eligible && !this.#eligible(observation.session)) {
+      /*
+        A hook bridge came online for a session this observer had already read.
+        Both producers write the same events under different ids and the hub
+        dedupes by id, so simply falling silent leaves every item duplicated for
+        the life of the session. The `transcript:` prefix is this observer's
+        alone, so withdrawing it is exact.
+      */
+      if (observation.previous !== null) {
+        observation.previous = null;
+        this.#hub.removeMatching(
+          observation.session.id,
+          (id) => id.startsWith(TRANSCRIPT_ID_PREFIX),
+        );
+      }
+      return;
+    }
     let result: TranscriptReadResult;
     try {
       result = this.#reader.read(observation.session);

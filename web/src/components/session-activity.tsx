@@ -25,6 +25,8 @@ import type {
 import type { PlanFileResponse } from "../lib/api";
 
 const DATA_PREFIX = "agent-manager.";
+/** Namespace for cockpit-supplied part metadata, per assistant-ui's convention. */
+export const PART_METADATA_KEY = "agent-manager";
 type ThreadContent = Exclude<ThreadMessageLike["content"], string>;
 type ThreadContentPart = ThreadContent extends readonly (infer Part)[] ? Part : never;
 
@@ -118,7 +120,16 @@ function activityPart(
     return { type: "text", text: item.text, status: partStatus(item.state) };
   }
   if (item.kind === "reasoning") {
-    return { type: "reasoning", text: item.text, status: partStatus(item.state) };
+    // Codex projects one thought twice — a `summary-N` labelled "Thinking" and a
+    // `raw-N` labelled "Provider reasoning". Dropping the label rendered them as
+    // two identical "Reasoning" rows, which reads as a duplicated event. The
+    // label is the provider's own, so it travels in `providerMetadata`.
+    return {
+      type: "reasoning",
+      text: item.text,
+      status: partStatus(item.state),
+      ...(item.label ? { providerMetadata: { [PART_METADATA_KEY]: { label: item.label } } } : {}),
+    };
   }
   if (item.kind === "tool") {
     const hasResult = item.result !== null || item.output.length > 0 || !["pending", "running", "waiting"].includes(item.state);
@@ -280,6 +291,15 @@ function assistantMessage(
  * the turn totals — or reports usage before it reports the turn start — would
  * otherwise render the answer buried under its own footer. Provider order is
  * preserved inside each band, so tool calls never move relative to reasoning.
+ *
+ * The todo list and the turn diff are turn *artifacts*, not steps: a provider
+ * emits one of each per turn (`todoKey = turnId`, and `preferredFileChangeItems`
+ * reduces the rest to a single aggregate), and `ActivityHub` pins them to the
+ * seq of their first upsert — which is wherever the first `TodoWrite` or patch
+ * landed, in the middle of a tool run. Left inline they split that run on every
+ * edit, because adjacent-prefix grouping closes a group at the first part that
+ * is not a tool call. Banding them with the other turn facts is what lets a
+ * run of tool calls stay one group.
  */
 function turnRank(
   item: ActivityItem,
@@ -289,7 +309,8 @@ function turnRank(
   if (initialUserId !== null && item.id === initialUserId) return 0;
   if (item.kind === "lifecycle" && item.event === "turn-started") return 1;
   if (finalIds.has(item.id)) return 3;
-  if (item.kind === "usage" || isTurnEnd(item)) return 4;
+  if (item.kind === "todo" || item.kind === "file-change") return 4;
+  if (item.kind === "usage" || isTurnEnd(item)) return 5;
   return 2;
 }
 
@@ -349,13 +370,48 @@ function messagesForTurn(turnKey: string, source: readonly ActivityItem[]): Thre
   return result;
 }
 
+/**
+ * A turn key per item, in stream order. A stated `turnId` always wins; nothing
+ * here invents one.
+ *
+ * Not every source states a turn. The transcript reader has no turn concept at
+ * all (`TranscriptItem` carries none, so every draft materializes with
+ * `turnId: null`), and keying those items individually put each one in a turn
+ * of its own — one assistant message per item, which left the grouping
+ * primitive nothing adjacent to coalesce and rendered every tool call as its
+ * own "1 tool call" shell. Adjacent unassociated items share a synthetic turn
+ * instead, broken only where a boundary is actually observable: an operator
+ * message opens the next turn, and a turn-end lifecycle event closes the
+ * current one.
+ */
+function turnKeys(ordered: readonly ActivityItem[]): readonly string[] {
+  const keys: string[] = [];
+  let open: string | null = null;
+  let run = 0;
+  for (const item of ordered) {
+    if (item.turnId !== null) {
+      keys.push(item.turnId);
+      open = null;
+      continue;
+    }
+    if (open === null || (item.kind === "message" && item.role === "user")) {
+      run += 1;
+      open = `unassociated:${run}`;
+    }
+    keys.push(open);
+    if (isTurnEnd(item)) open = null;
+  }
+  return keys;
+}
+
 /** Projects only the canonical selected-session activity stream. */
 export function activityToThreadMessages(items: readonly ActivityItem[]): ThreadMessageLike[] {
   const ordered = [...items].sort((left, right) => left.seq - right.seq || left.id.localeCompare(right.id));
+  const keys = turnKeys(ordered);
   const turns = new Map<string, ActivityItem[]>();
   const entries: Array<{ seq: number; order: number; key: string; items: ActivityItem[] }> = [];
   ordered.forEach((item, order) => {
-    const key = item.turnId ?? `unassociated:${item.id}`;
+    const key = keys[order]!;
     const previous = turns.get(key);
     if (previous) previous.push(item);
     else {

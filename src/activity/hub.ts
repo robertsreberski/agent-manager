@@ -273,22 +273,31 @@ export class ActivityHub {
         session.appendOffsets.clear();
         session.appendSources.clear();
         session.truncated = mutation.truncated ?? false;
-        for (const draft of mutation.items ?? []) {
-          const existing = session.items.get(draft.id);
+        /*
+          Every reset item used to share one seq, so `#view`'s
+          `seq - seq || id.localeCompare(id)` fell through to the id — and a
+          provider id is a random token. The whole timeline re-sorted
+          alphabetically on every reset, which reads as events appearing twice
+          in different places. The submitted order is the provider's order, so
+          it is what the seq has to encode.
+        */
+        const drafts = mutation.items ?? [];
+        drafts.forEach((draft, index) => {
           const item = this.#materialize(
             sessionId,
             provider,
             draft,
-            existing,
-            seq,
-            (existing?.revision ?? 0) + 1,
+            undefined,
+            seq + index,
+            1,
             at,
           );
           session.items.set(item.id, item);
           this.#syncAppendOffsets(session, item, draft, true);
-        }
+        });
+        session.seq = seq + Math.max(drafts.length, 1) - 1;
         this.#trimView(session);
-        frame = this.#resetFrame(sessionId, session, seq, at, mutation.reason);
+        frame = this.#resetFrame(sessionId, session, session.seq, at, mutation.reason);
         break;
       }
     }
@@ -378,6 +387,41 @@ export class ActivityHub {
       if (progress) this.#callTodoProgressListener(listener, sessionId, progress);
     }
     return () => this.#todoProgressListeners.delete(listener);
+  }
+
+  /**
+   * Drops every item whose id the predicate matches, as one reset.
+   *
+   * Sources own id prefixes, so this is how a producer that has handed a
+   * session over withdraws what it wrote. Without it, the items a transcript
+   * poller ingested before a hook bridge came online stay in the view forever
+   * beside the bridge's own — the same events under two ids.
+   *
+   * Returns false when nothing matched, so callers can skip the frame.
+   */
+  removeMatching(sessionId: string, matches: (id: string) => boolean): boolean {
+    const session = this.#sessions.get(sessionId);
+    if (!session) return false;
+    const doomed = [...session.items.keys()].filter(matches);
+    if (doomed.length === 0) return false;
+    const previousTodoProgress = clone(session.todoProgress);
+    const seq = ++session.seq;
+    for (const id of doomed) {
+      session.items.delete(id);
+      for (const key of session.appendOffsets.keys()) {
+        if (key.startsWith(`${id}\u0000`)) session.appendOffsets.delete(key);
+      }
+      for (const key of session.appendSources.keys()) {
+        if (key.startsWith(`${id}\u0000`)) session.appendSources.delete(key);
+      }
+    }
+    const at = new Date(this.#now()).toISOString();
+    const frame = this.#resetFrame(sessionId, session, seq, at, "provider-reset");
+    this.#advanceTodoProgress(session, at);
+    this.#record(session, frame);
+    this.#publishTodoProgress(sessionId, previousTodoProgress, clone(session.todoProgress));
+    for (const listener of [...session.listeners]) listener(clone(frame));
+    return true;
   }
 
   clearSession(sessionId: string): void {

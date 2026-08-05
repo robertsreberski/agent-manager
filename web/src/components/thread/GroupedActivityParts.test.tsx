@@ -50,27 +50,80 @@ describe("tool call containment", () => {
     expect(detail?.textContent?.startsWith("{")).toBe(false);
   });
 
-  it("wraps expanded argument and result blocks rather than widening the row", () => {
+  it("expands arguments as the provider's own named fields, not a JSON blob", () => {
     const { container } = render(<ToolCall part={{
       toolName: "exec",
       args: CODEX_ARGS,
+      argsText: JSON.stringify(CODEX_ARGS, null, 2),
+      result: "ok",
+      status: { type: "complete" },
+    }} />);
+
+    fireEvent.click(screen.getByRole("button", { expanded: false }));
+    const fields = [...container.querySelectorAll("[data-tool-arguments] [data-tool-argument]")];
+    expect(fields.map((field) => field.getAttribute("data-tool-argument"))).toEqual([
+      "command",
+      "workdir",
+      "yield_time_ms",
+      "max_output_tokens",
+    ]);
+    // Each value is the provider's, verbatim — no escaping, no re-serialisation.
+    expect(fields[0]?.textContent).toContain(CODEX_TOOL_NAME);
+    expect(fields[2]?.textContent).toContain("10000");
+    expect(container.querySelector("[data-tool-arguments]")?.textContent?.startsWith("{")).toBe(false);
+  });
+
+  it("wraps expanded argument and result blocks rather than widening the row", () => {
+    const { container } = render(<ToolCall part={{
+      toolName: "exec",
+      args: { ...CODEX_ARGS, script: `${CODEX_TOOL_NAME}\n`.repeat(4) },
       argsText: JSON.stringify(CODEX_ARGS, null, 2),
       result: "x".repeat(4_000),
       status: { type: "complete" },
     }} />);
 
     fireEvent.click(screen.getByRole("button", { expanded: false }));
-    const blocks = [...container.querySelectorAll("pre")];
-    expect(blocks).toHaveLength(2);
+    const blocks = [...container.querySelectorAll("[data-tool-argument]")];
+    expect(blocks.length).toBeGreaterThan(1);
     for (const block of blocks) {
-      expect(classesOf(block)).toEqual(expect.arrayContaining([
+      const contained = block.tagName === "PRE" ? block : block.querySelector("pre") ?? block;
+      expect(classesOf(contained), block.getAttribute("data-tool-argument") ?? "").toEqual(expect.arrayContaining([
         "min-w-0",
         "max-w-full",
         "whitespace-pre-wrap",
         "[overflow-wrap:anywhere]",
       ]));
-      expect(classesOf(block)).not.toContain("overflow-x-auto");
+      expect(classesOf(contained)).not.toContain("overflow-x-auto");
     }
+  });
+
+  it("clamps a value long enough to bury the rows under it", () => {
+    const prompt = "Investigate the failure.\n".repeat(40);
+    const { container } = render(<ToolCall part={{
+      toolName: "Agent",
+      args: { subagent_type: "Explore", prompt },
+      argsText: JSON.stringify({ prompt }, null, 2),
+      status: { type: "complete" },
+    }} />);
+
+    fireEvent.click(screen.getByRole("button", { expanded: false }));
+    const field = container.querySelector('[data-tool-argument="prompt"]');
+    expect(classesOf(field?.querySelector("pre") ?? null)).toContain("max-h-32");
+
+    fireEvent.click(screen.getByRole("button", { name: "Show all" }));
+    expect(classesOf(field?.querySelector("pre") ?? null)).not.toContain("max-h-32");
+  });
+
+  it("keeps a running call collapsed so its arguments do not fill the drawer", () => {
+    const { container } = render(<ToolCall part={{
+      toolName: "Agent",
+      args: { prompt: "x".repeat(4_000) },
+      argsText: "",
+      status: { type: "running" },
+    }} />);
+
+    expect(container.querySelector("[data-tool-arguments]")).toBeNull();
+    expect(screen.getByRole("button", { expanded: false })).toBeInTheDocument();
   });
 });
 

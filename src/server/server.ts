@@ -689,6 +689,17 @@ export async function createAgentManagerServer(
       && lastSeenAt <= now
       && now - lastSeenAt <= codexHookFreshnessMs;
   };
+  /*
+    The freshness window above governs the *control plane*: capabilities lapse
+    when the evidence for them does. Source ownership is a different question.
+    A hook and the transcript reader id the same item differently
+    (`codex/item/…` against `transcript:codex:…`), and the hub dedupes by id, so
+    letting the window re-open polling put both producers on one session and
+    printed every item twice. Once the bridge has spoken for a session it owns
+    the stream, even while it is quiet.
+  */
+  const codexHookEverSeen = new Set<string>();
+  const codexBridgeOwnsStream = (sessionId: string): boolean => codexHookEverSeen.has(sessionId);
   const codexHookCapabilities = (
     session: SessionRecord,
   ): SessionRecord["control"]["capabilities"] => session.control.capabilities.filter(
@@ -783,6 +794,7 @@ export async function createAgentManagerServer(
         if (!hasRecentCodexHookEvidence(sessionId, at)) {
           codexHookNeedsReset.add(sessionId);
         }
+        codexHookEverSeen.add(sessionId);
         codexHookLastSeenAt.set(sessionId, at);
         refreshCodexHookSession(sessionId);
         scheduleCodexHookExpiry(sessionId, at);
@@ -927,28 +939,27 @@ export async function createAgentManagerServer(
       remoteSessionIds.delete(remoteState.id);
     }
   };
+  /*
+    Exactly one producer per session. A hook bridge and the transcript reader
+    give the same tool call different ids, and the hub dedupes by id, so any
+    overlap renders the whole transcript twice.
+  */
+  const transcriptMayPoll = (session: SessionView): boolean => {
+    if (session.provider === "claude") {
+      return session.control.authority !== "manager"
+        && claudeHookSourceArbiter.shouldPollTranscript(session.providerThreadId);
+    }
+    if (codexBridgeOwnsStream(session.id)) return false;
+    return session.control.authority !== "manager" || nativeHandoffs.has(session.id);
+  };
   const transcriptActivity = new SelectedTranscriptActivityObserver({
     hub: activityHub,
     ...(transcriptReader ? { reader: transcriptReader } : {}),
     resolveSession: (id) => state.get(id),
-    eligible: (session) => session.provider === "claude"
-      ? session.control.authority !== "manager"
-        && claudeHookSourceArbiter.shouldPollTranscript(session.providerThreadId)
-      : (
-          session.control.authority !== "manager"
-          && !hasRecentCodexHookEvidence(session.id)
-        ) || nativeHandoffs.has(session.id),
+    eligible: transcriptMayPoll,
   });
   const shouldObserveTranscript = (session: SessionView): boolean =>
-    session.hostId === "local"
-      ? session.provider === "claude"
-        ? session.control.authority !== "manager"
-          && claudeHookSourceArbiter.shouldPollTranscript(session.providerThreadId)
-        : (
-            session.control.authority !== "manager"
-            && !hasRecentCodexHookEvidence(session.id)
-          ) || nativeHandoffs.has(session.id)
-      : false;
+    session.hostId === "local" && transcriptMayPoll(session);
   const isRemoteSession = (session: SessionView): boolean =>
     typeof session.hostId === "string" && session.hostId !== "local";
   const localOwnerActor = {
