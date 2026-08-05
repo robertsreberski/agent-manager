@@ -198,6 +198,14 @@ export function SessionComposer(props: SessionComposerProps) {
         : {}),
     };
   });
+  /*
+    Levels to offer while nothing is selected — and only when nothing is
+    chosen at all. A model that is named but absent from the catalog is
+    unknown, not unspecified, and borrows no levels from rows that are not it.
+  */
+  const fallbackEfforts = model === null && effortOptions.length > 0
+    ? effortOptions.map((level) => ({ id: level, name: effortLabel(level) }))
+    : null;
   const sendDisabled = busy || value.trim().length === 0 || !canQueue;
   const effortIndex = effort === null ? -1 : effortOptions.indexOf(effort);
   const hasEffortScale = effortOptions.length > 0 && effortIndex >= 0;
@@ -392,9 +400,7 @@ export function SessionComposer(props: SessionComposerProps) {
           value={selectedOption?.value ?? model ?? ""}
           onValueChange={(next) => onModelChange?.(next)}
           {...(effort ? { effort } : {})}
-          {...(effortOptions.length > 0
-            ? { fallbackEfforts: effortOptions.map((level) => ({ id: level, name: effortLabel(level) })) }
-            : {})}
+          {...(fallbackEfforts ? { fallbackEfforts } : {})}
           onEffortChange={(next) => onEffortChange?.(next as NonNullable<SessionComposerProps["effort"]>)}
           open={openMenu === "runtime"}
           onOpenChange={(next) => { if (!runtimeDisabled || !next) setOpenMenu(next ? "runtime" : null); }}

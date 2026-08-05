@@ -437,6 +437,17 @@ test("a worktree row remembers the repository it belongs to", () => {
   // Re-resolving without identity must not forget what the row already proved.
   database.addWorkspace({ label: "app · fix-auth", path: "/repos/app/.worktrees/fix-auth" });
   assert.equal(database.getWorkspace("worktree")?.repoRoot, "/repos/app");
+
+  // Resolution that finds no repository is an answer, not an absent one: a
+  // directory that stops being a repository must stop being grouped under it.
+  database.addWorkspace({
+    label: "app",
+    path: "/repos/app",
+    repoRoot: null,
+    repoName: null,
+  });
+  assert.equal(database.getWorkspace("repo")?.repoRoot, null);
+  assert.equal(database.getWorkspace("repo")?.repoName, null);
   database.close();
 });
 

@@ -8,7 +8,7 @@ import { FolderPicker } from "./FolderPicker";
 import { SessionComposer, type ComposerModelOption } from "./SessionComposer";
 import { WorktreePicker } from "./WorktreePicker";
 import { recentProjects } from "../../lib/projects";
-import { draftTargetReady, type DraftAction, type DraftSession } from "./draft";
+import { draftTargetReady, type DraftAction, type DraftSession, type WorktreeSelection } from "./draft";
 import { useGitContext } from "./use-git-context";
 
 export function DraftThread({
@@ -25,6 +25,7 @@ export function DraftThread({
   onCompletePath,
   onLoadGitContext,
   onReloadModels,
+  initialWorktreePath = null,
 }: {
   draft: DraftSession;
   hosts: readonly HostOption[];
@@ -39,6 +40,8 @@ export function DraftThread({
   onCompletePath: (hostId: string, path: string) => Promise<readonly string[]>;
   onLoadGitContext: (hostId: string, path: string) => Promise<WorkspaceGitContext>;
   onReloadModels?: () => void;
+  /** Where the project opened from elsewhere was last worked in. */
+  initialWorktreePath?: string | null;
 }) {
   const [path, setPath] = useState(draft.workspace?.path ?? "");
   const selectedHostId = draft.workspace?.hostId ?? hosts.find((host) => host.kind === "local")?.id ?? hosts[0]?.id ?? "local";
@@ -49,7 +52,7 @@ export function DraftThread({
     [selectedHostId, workspaces],
   );
   // Carried until the repository's own worktree list can confirm it still exists.
-  const [preferredWorktree, setPreferredWorktree] = useState<string | null>(null);
+  const [preferredWorktree, setPreferredWorktree] = useState<string | null>(initialWorktreePath);
   const needsWorkspace = draft.workspace === null;
   const gitContext = useGitContext(selectedHostId, path, onLoadGitContext);
   const chooseWorkspace = useCallback((hostId: string, value: string, worktreePreference: string | null = null) => {
@@ -61,17 +64,26 @@ export function DraftThread({
   /*
     Where this project was last worked in is a preference, not a claim that it
     still exists. Apply it only once the repository's own worktree list confirms
-    the path, and only while the operator has not chosen for themselves — a
-    worktree removed since then quietly leaves the choice open.
+    the path — a worktree removed since then quietly leaves the choice open.
   */
-  const chosenWorktree = draft.workspace?.worktree.kind ?? "none";
   useEffect(() => {
-    if (preferredWorktree === null || chosenWorktree !== "none") return;
+    if (preferredWorktree === null) return;
     if (gitContext.status !== "loaded" || gitContext.context.status !== "repo") return;
     const match = gitContext.context.worktrees.find((worktree) => worktree.path === preferredWorktree);
     setPreferredWorktree(null);
     if (match) dispatch({ type: "set-worktree", worktree: { kind: "existing", path: match.path, branch: match.branch } });
-  }, [chosenWorktree, dispatch, gitContext, preferredWorktree]);
+  }, [dispatch, gitContext, preferredWorktree]);
+
+  /*
+    An answered question stays answered. "No worktree" is both the default and a
+    real choice, so a pending preference cannot be told apart from it by the
+    selection alone — dropping the preference the moment the operator selects
+    anything keeps a deferred lookup from undoing them.
+  */
+  const chooseWorktree = useCallback((worktree: WorktreeSelection) => {
+    setPreferredWorktree(null);
+    dispatch({ type: "set-worktree", worktree });
+  }, [dispatch]);
 
   return (
     <div className="grid min-h-full content-between gap-6">
@@ -108,7 +120,7 @@ export function DraftThread({
           state={gitContext}
           selection={draft.workspace?.worktree ?? { kind: "none" }}
           folderPath={path}
-          onSelect={(worktree) => dispatch({ type: "set-worktree", worktree })}
+          onSelect={chooseWorktree}
         />
         {draft.createState === "unknown" && <div className="mx-auto mt-4 max-w-lg border-l-2 border-[var(--warning)] bg-[var(--warning-field)] p-3 text-left"><p className="flex gap-2 text-meta-sm text-[var(--warning)]"><AlertTriangle size={14} />Creation outcome is unknown.</p><p className="mt-1 text-meta-sm text-[var(--text-muted)]">{draft.error} Check the board or native harness before trying anything else. This request will not be replayed.</p></div>}
         {draft.createState === "failed" && <div className="mx-auto mt-4 max-w-lg border-l-2 border-[var(--danger)] bg-[var(--danger-field)] p-3 text-left"><p className="text-meta-sm text-[var(--danger)]">{draft.error}</p><Button variant="ghost" size="sm" data-compact-control className="mt-2 px-0 underline" onClick={() => dispatch({ type: "retry" })}>Try again</Button></div>}

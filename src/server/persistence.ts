@@ -519,6 +519,12 @@ export class ManagerDatabase {
     remoteWorkspaceId?: string | null;
     createdAt?: string;
     lastOpenedAt?: string | null;
+    /*
+      Undefined means the caller did not resolve identity and the stored value
+      stands. Null means resolution succeeded and found no repository, which
+      must clear a root the directory no longer has — otherwise a folder that
+      stops being a repository stays grouped under it forever.
+    */
     repoRoot?: string | null;
     repoName?: string | null;
   }): WorkspaceRecord {
@@ -538,6 +544,9 @@ export class ManagerDatabase {
       repoRoot: input.repoRoot ?? null,
       repoName: input.repoName ?? null,
     };
+    // A caller that resolved identity owns the answer, including a null one.
+    // A caller that did not leaves what the row already proved.
+    const identityResolved = input.repoRoot !== undefined || input.repoName !== undefined;
     this.#database.prepare(`
       INSERT INTO workspaces (
         id, label, path, host_id, remote_workspace_id, created_at, last_opened_at, repo_root, repo_name
@@ -545,9 +554,11 @@ export class ManagerDatabase {
       ON CONFLICT(host_id, path) DO UPDATE SET
         label = excluded.label,
         remote_workspace_id = COALESCE(excluded.remote_workspace_id, workspaces.remote_workspace_id),
-        last_opened_at = COALESCE(excluded.last_opened_at, workspaces.last_opened_at),
-        repo_root = COALESCE(excluded.repo_root, workspaces.repo_root),
-        repo_name = COALESCE(excluded.repo_name, workspaces.repo_name)
+        last_opened_at = COALESCE(excluded.last_opened_at, workspaces.last_opened_at)${identityResolved
+          ? `,
+        repo_root = excluded.repo_root,
+        repo_name = excluded.repo_name`
+          : ""}
     `).run(
       record.id,
       record.label,

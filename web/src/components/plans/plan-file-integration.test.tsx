@@ -4,33 +4,35 @@ import { ACTIVITY_SCHEMA_VERSION, type ActivityAttentionItem, type ActivityPlanI
 import { CockpitApi } from "../../lib/api";
 import { renderActivityData, type ActivityDataControls } from "../session-activity";
 
+const planItem: ActivityPlanItem = {
+  schemaVersion: ACTIVITY_SCHEMA_VERSION,
+  id: "plan/current",
+  sessionId: "local:claude:thread/one",
+  provider: "claude",
+  turnId: "turn-1",
+  parentId: null,
+  seq: 4,
+  revision: 1,
+  state: "complete",
+  startedAt: "2026-08-04T12:00:00.000Z",
+  updatedAt: "2026-08-04T12:00:01.000Z",
+  completedAt: "2026-08-04T12:00:01.000Z",
+  source: "provider-api",
+  confidence: "exact",
+  exposure: "provider-exposed",
+  truncated: false,
+  kind: "plan",
+  path: "/Users/local/.claude/plans/current.md",
+  version: null,
+  markdown: "# Inline callback payload",
+  supersededBy: null,
+  approvalRequestId: null,
+  approvedAt: null,
+};
+
 describe("plan file activity integration", () => {
   it("loads a path-backed artifact only through CockpitApi session and item identities", async () => {
-    const item: ActivityPlanItem = {
-      schemaVersion: ACTIVITY_SCHEMA_VERSION,
-      id: "plan/current",
-      sessionId: "local:claude:thread/one",
-      provider: "claude",
-      turnId: "turn-1",
-      parentId: null,
-      seq: 4,
-      revision: 1,
-      state: "complete",
-      startedAt: "2026-08-04T12:00:00.000Z",
-      updatedAt: "2026-08-04T12:00:01.000Z",
-      completedAt: "2026-08-04T12:00:01.000Z",
-      source: "provider-api",
-      confidence: "exact",
-      exposure: "provider-exposed",
-      truncated: false,
-      kind: "plan",
-      path: "/Users/local/.claude/plans/current.md",
-      version: null,
-      markdown: "# Inline callback payload",
-      supersededBy: null,
-      approvalRequestId: null,
-      approvedAt: null,
-    };
+    const item: ActivityPlanItem = { ...planItem };
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({
       sessionId: item.sessionId,
       itemId: item.id,
@@ -110,28 +112,47 @@ describe("plan file activity integration", () => {
         readKeys: new Set(), onReadChange: vi.fn(),
       },
       plans: {
-        requestIds: new Map(), mutationsReady: true, canRespond: true, busy: false,
+        requestIds: new Map([["plan/owned", "plan-request"]]),
+        mutationsReady: true, canRespond: true, busy: false,
         loadFile: vi.fn(async () => { throw new Error("unused"); }),
         onRespond: vi.fn(async () => undefined),
       },
       queue: { canRemove: false, busy: false, withheldReason: null },
     };
 
-    const owned = render(<>{renderActivityData("agent-manager.attention", attention, controls)}</>);
+    const plan: ActivityPlanItem = {
+      ...planItem,
+      id: "plan/owned",
+      approvalRequestId: "plan-request",
+      approvedAt: null,
+      state: "waiting",
+    };
+    const owned = render(<>
+      {renderActivityData("agent-manager.plan", plan, controls)}
+      {renderActivityData("agent-manager.attention", attention, controls)}
+    </>);
 
-    // The plan already asks this question, with the plan itself attached. A
-    // second card would ask it again — and on phone it is a modal sheet that
-    // covers the plan it is asking about.
+    // Exactly one surface answers the request, and it is the one with the plan
+    // attached. A second card asks the same question again — and on phone it is
+    // a modal sheet that covers the plan it is asking about.
+    expect(screen.getByRole("button", { name: /execute this plan/iu })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /allow once/iu })).not.toBeInTheDocument();
     expect(screen.queryByText(/not safely representable/u)).not.toBeInTheDocument();
     owned.unmount();
 
-    // The same request with no plan to answer it on keeps its approval card,
-    // so a plan that cannot render its own controls is never unanswerable.
-    render(<>{renderActivityData("agent-manager.attention", attention, {
-      ...controls,
-      attention: { ...controls.attention, planOwnedRequestIds: new Set<string>() },
-    })}</>);
+    // A session that cannot respond gets no controls on the plan either, so the
+    // approval card stays: the request must never lose every surface at once.
+    render(<>
+      {renderActivityData("agent-manager.plan", plan, {
+        ...controls,
+        plans: { ...controls.plans, canRespond: false },
+      })}
+      {renderActivityData("agent-manager.attention", attention, {
+        ...controls,
+        attention: { ...controls.attention, canRespond: false },
+      })}
+    </>);
+    expect(screen.queryByRole("button", { name: /execute this plan/iu })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /allow once/iu })).toBeInTheDocument();
   });
 });

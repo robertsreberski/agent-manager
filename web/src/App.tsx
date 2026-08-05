@@ -561,13 +561,20 @@ export default function App() {
   } | null>(null);
   const draftSettingsRequest = useRef(0);
   /*
-    The provider and host a catalog has already answered for. A success is
-    reused across drafts because Claude's probe spawns a CLI; a failure is not
-    remembered, so the next draft — or an explicit retry — asks again instead
-    of leaving every future thread without a model list.
+    Catalogs that have answered, by provider and host. A success is reused
+    across drafts because Claude's probe spawns a CLI; a failure is not kept,
+    so the next draft — or an explicit retry — asks again instead of leaving
+    every future thread without a model list.
+
+    The answer itself is cached, not merely the fact of one: closing a draft
+    clears the live lookup, so remembering only that a catalog answered would
+    skip the refetch and leave the reopened draft loading forever.
   */
-  const draftCatalogAnswered = useRef<string | null>(null);
+  const draftCatalogAnswers = useRef(new Map<string, ProviderSettingsOptionsResponse>());
   const [draftCatalogAttempt, setDraftCatalogAttempt] = useState(0);
+  // Carried from a project opened outside the draft screen, so the empty state
+  // returns to the worktree its chips name just as the draft's own chips do.
+  const [draftWorktreePreference, setDraftWorktreePreference] = useState<string | null>(null);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [notificationSettingsOpen, setNotificationSettingsOpen] = useState(false);
   const [notificationPreferences, setNotificationPreferences] = useState<ClientNotificationPreferences>(loadNotificationPreferences);
@@ -723,13 +730,17 @@ export default function App() {
       setDraftSettingsOptions(null);
       return;
     }
-    if (draftCatalogAnswered.current === `${draftProvider} ${draftHostId}`) return;
+    const answered = draftCatalogAnswers.current.get(`${draftProvider} ${draftHostId}`);
+    if (answered) {
+      setDraftSettingsOptions({ provider: draftProvider, hostId: draftHostId, state: "loaded", response: answered });
+      return;
+    }
     setDraftSettingsOptions({ provider: draftProvider, hostId: draftHostId, state: "loading", response: null });
     void cockpit.loadProviderSettingsOptions(draftProvider, draftHostId).then((response) => {
       if (draftSettingsRequest.current !== request) return;
-      // Only an answered catalog is remembered. An unavailable one is a
-      // temporary fact about the provider, not a settled answer about it.
-      if (response.available) draftCatalogAnswered.current = `${draftProvider} ${draftHostId}`;
+      // Only an answered catalog is kept. An unavailable one is a temporary
+      // fact about the provider, not a settled answer about it.
+      if (response.available) draftCatalogAnswers.current.set(`${draftProvider} ${draftHostId}`, response);
       setDraftSettingsOptions({ provider: draftProvider, hostId: draftHostId, state: "loaded", response });
     }).catch(() => {
       if (draftSettingsRequest.current === request) {
@@ -742,7 +753,7 @@ export default function App() {
   }, [cockpit.loadProviderSettingsOptions, draftCatalogAttempt, draftHostId, draftKey, draftProvider]);
 
   const reloadDraftCatalog = useCallback(() => {
-    draftCatalogAnswered.current = null;
+    draftCatalogAnswers.current.clear();
     setDraftCatalogAttempt((attempt) => attempt + 1);
   }, []);
 
@@ -833,22 +844,29 @@ export default function App() {
       : { models: [], status: settingsUnavailableMessage(response.reason), effortOptions: undefined };
   }, [selected?.id, selected?.model.value, selected?.provider, settingsOptions]);
   const draftModelCatalog = useMemo(() => {
-    if (draftProvider === null) return { models: [], status: null, effortOptions: undefined };
+    if (draftProvider === null) return { models: [], status: null, effortOptions: undefined, retryable: false };
     if (draftHostId === null) {
-      return { models: [], status: "Choose a host to load its provider model catalog.", effortOptions: undefined };
+      return { models: [], status: "Choose a host to load its provider model catalog.", effortOptions: undefined, retryable: false };
     }
     if (!draftSettingsOptions
       || draftSettingsOptions.provider !== draftProvider
       || draftSettingsOptions.hostId !== draftHostId) {
-      return { models: [], status: "Loading the provider model catalog…", effortOptions: undefined };
+      return { models: [], status: "Loading the provider model catalog…", effortOptions: undefined, retryable: false };
     }
-    if (draftSettingsOptions.state === "loading") return { models: [], status: "Loading the provider model catalog…", effortOptions: undefined };
-    if (draftSettingsOptions.state === "error") return { models: [], status: "The provider model catalog could not be loaded.", effortOptions: undefined };
+    if (draftSettingsOptions.state === "loading") return { models: [], status: "Loading the provider model catalog…", effortOptions: undefined, retryable: false };
+    if (draftSettingsOptions.state === "error") return { models: [], status: "The provider model catalog could not be loaded.", effortOptions: undefined, retryable: true };
     const response = draftSettingsOptions.response;
-    if (!response) return { models: [], status: "The provider model catalog could not be loaded.", effortOptions: undefined };
+    if (!response) return { models: [], status: "The provider model catalog could not be loaded.", effortOptions: undefined, retryable: true };
     return response.available
       ? { models: response.models, status: null, effortOptions: modelCatalogEfforts(draft?.model ?? null, response) }
-      : { models: [], status: settingsUnavailableMessage(response.reason), effortOptions: undefined };
+      : {
+        models: [],
+        status: settingsUnavailableMessage(response.reason),
+        effortOptions: undefined,
+        // A provider that is momentarily unreachable is worth asking again; a
+        // remote host or an unsupported provider will answer the same way.
+        retryable: response.reason === "provider-unavailable",
+      };
   }, [draft?.model, draftHostId, draftProvider, draftSettingsOptions]);
 
   useEffect(() => {
@@ -889,6 +907,7 @@ export default function App() {
     cockpit.setSelectedId(session.id);
   }, [cockpit]);
   const openDraft = useCallback((workspace?: DraftWorkspaceInput) => {
+    if (!workspace) setDraftWorktreePreference(null);
     void cockpit.closeSelected();
     setDraft(newDraftSession(workspace ? { workspace } : {}));
   }, [cockpit]);
@@ -1187,7 +1206,7 @@ export default function App() {
         />}
         {contentMode === "empty" ? (
           <div className="min-h-0 flex-1 overflow-y-auto">
-            <EmptyState repositories={recentWorkspaceProjects.map((project) => ({ id: project.id, name: project.label, path: project.path }))} onOpen={(projectId) => { const project = recentWorkspaceProjects.find((item) => item.id === projectId); if (project) openDraft({ hostId: project.hostId, path: project.path }); }} />
+            <EmptyState repositories={recentWorkspaceProjects.map((project) => ({ id: project.id, name: project.label, path: project.path }))} onOpen={(projectId) => { const project = recentWorkspaceProjects.find((item) => item.id === projectId); if (project) { setDraftWorktreePreference(project.lastWorktreePath); openDraft({ hostId: project.hostId, path: project.path }); } }} />
           </div>
         ) : contentMode === "first-run" ? (
           <div className="min-h-0 flex-1 overflow-y-auto">
@@ -1277,7 +1296,7 @@ export default function App() {
             sessionsOnHost={selectedSessionsOnHost}
             onContinueInWorkspace={() => openDraft({ hostId: selected.hostId, path: selected.workspaceIdentity?.worktreePath ?? selected.cwd ?? "" })}
             onRetryActivity={() => setActivityRetryGeneration((generation) => generation + 1)}
-          /> : draft ? <DraftThread draft={draft} hosts={cockpit.hosts} workspaces={cockpit.workspaces} busy={Boolean(cockpit.busy.create)} mutationsReady={cockpit.mutationsReady} modelOptions={draftModelCatalog.models} modelOptionsStatus={draftModelCatalog.status} {...(draftModelCatalog.effortOptions !== undefined ? { effortOptions: draftModelCatalog.effortOptions } : {})} dispatch={dispatchDraft} onFirstSend={firstSend} onCompletePath={cockpit.completeWorkspacePath} onLoadGitContext={cockpit.loadGitContext} onReloadModels={reloadDraftCatalog} /> : null}
+          /> : draft ? <DraftThread draft={draft} hosts={cockpit.hosts} workspaces={cockpit.workspaces} busy={Boolean(cockpit.busy.create)} mutationsReady={cockpit.mutationsReady} modelOptions={draftModelCatalog.models} modelOptionsStatus={draftModelCatalog.status} {...(draftModelCatalog.effortOptions !== undefined ? { effortOptions: draftModelCatalog.effortOptions } : {})} dispatch={dispatchDraft} onFirstSend={firstSend} onCompletePath={cockpit.completeWorkspacePath} onLoadGitContext={cockpit.loadGitContext} {...(draftModelCatalog.retryable ? { onReloadModels: reloadDraftCatalog } : {})} initialWorktreePath={draftWorktreePreference} /> : null}
         </ThreadDrawer>
         )}</SessionRuntimeProvider>
       </div>

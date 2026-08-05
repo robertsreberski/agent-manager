@@ -643,9 +643,18 @@ function FileChanges({ item, controls }: { item: ActivityFileChangeItem & { upse
 
 function Attention({ item, controls }: { item: ActivityAttentionItem; controls: ActivityAttentionControls }) {
   const exact = controls.exactRequestIds.has(item.requestId);
-  // The plan renders this request, and on phone the approval card is a modal
-  // sheet that would cover the plan it is asking about.
-  if (item.requestId !== null && controls.planOwnedRequestIds.has(item.requestId)) return null;
+  /*
+    The plan renders this request, and on phone the approval card is a modal
+    sheet that would cover the plan it is asking about. Only where the plan can
+    actually answer it: a session that cannot respond gets no controls on the
+    plan either, and suppressing the card as well would leave the request with
+    no surface at all.
+  */
+  if (
+    item.requestId !== null
+    && controls.canRespond
+    && controls.planOwnedRequestIds.has(item.requestId)
+  ) return null;
   if ((item.attentionKind === "question" || item.attentionKind === "elicitation") && item.questions.length > 0) {
     return <QuestionRequest request={questionView(item)} disabled={!exact || !controls.mutationsReady || !controls.canRespond || controls.busy} onSubmit={controls.onRespond} />;
   }
