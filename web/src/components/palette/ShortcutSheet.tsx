@@ -1,18 +1,55 @@
-import { useRef } from "react";
-import { X } from "lucide-react";
-import { useModalFocus } from "../../hooks/use-modal-focus";
+import { Fragment, useRef } from "react";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, Separator } from "../ui";
 import { SHORTCUT_GROUPS } from "../../lib/shortcuts";
 
+/** Frame 13b prints each chord as its own key cap, split on the separators. */
+function keyCaps(keys: string): readonly string[] {
+  return keys.split(" ").filter((part) => part.length > 0);
+}
+
 export function ShortcutSheet({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const closeRef = useRef<HTMLButtonElement>(null);
-  const dialogRef = useModalFocus<HTMLElement>({ active: open, initialFocusRef: closeRef, onEscape: onClose, priority: 65 });
-  if (!open) return null;
+  // `?` opens this sheet, so there is no `DialogTrigger` for Radix to return
+  // focus to. Remember the opener before the focus scope takes over.
+  const openerRef = useRef<HTMLElement | null>(null);
   return (
-    <div className="fixed inset-0 z-[65] bg-black/70" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-      <section ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="shortcuts-title" tabIndex={-1} className="mx-auto mt-[80px] w-[min(700px,calc(100%-24px))] border border-[var(--border-frame)] bg-[var(--menu)] p-5 shadow-[var(--shadow-frame)]">
-        <header className="flex items-center"><h2 id="shortcuts-title" className="text-[17px] font-semibold">Keyboard shortcuts</h2><button ref={closeRef} type="button" data-compact-control className="ml-auto grid size-10 place-items-center" aria-label="Close shortcuts" onClick={onClose}><X size={16} /></button></header>
-        <div className="mt-4 grid gap-6 sm:grid-cols-2">{SHORTCUT_GROUPS.map((group) => <section key={group.label}><h3 className="font-mono text-[10px] uppercase tracking-[0.14em] text-[var(--text-faint)]">{group.label}</h3><dl className="mt-2 grid gap-1.5">{group.rows.map(([key, label]) => <div key={key} className="flex items-start gap-3"><dt className="w-20 shrink-0 font-mono text-[11.5px] text-[var(--text)]">{key}</dt><dd className="m-0 text-[12.5px] leading-5 text-[var(--text-muted)]">{label}</dd></div>)}</dl></section>)}</div>
-      </section>
-    </div>
+    <Dialog open={open} onOpenChange={(next) => { if (!next) onClose(); }}>
+      <DialogContent
+        aria-describedby={undefined}
+        className="max-h-[calc(100dvh-5rem)] max-w-[700px] overflow-y-auto px-[30px] pt-[26px] pb-6"
+        onOpenAutoFocus={() => { openerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null; }}
+        onCloseAutoFocus={(event) => { event.preventDefault(); openerRef.current?.focus(); }}
+      >
+        <DialogHeader className="gap-0 pb-1.5">
+          {/* The frame prints "Keys"; assistive tech gets the full name. */}
+          <DialogTitle className="sr-only">Keyboard shortcuts</DialogTitle>
+          <p className="flex items-baseline gap-2.5 pr-8">
+            <span aria-hidden="true" className="text-title-md text-[var(--text)]">Keys</span>
+            <span className="font-mono text-code-sm text-[var(--text-faint)]">? closes this</span>
+          </p>
+        </DialogHeader>
+        <div className="grid grid-cols-1 gap-x-[34px] gap-y-0 sm:grid-cols-2">
+          {SHORTCUT_GROUPS.map((group) => (
+            <section key={group.label} className="flex flex-col pb-1.5">
+              <h3 className="block pt-2.5 pb-[7px] font-mono text-eyebrow text-[var(--text-faint)] uppercase">{group.label}</h3>
+              <dl className="m-0 grid">
+                {group.rows.map(([keys, label]) => (
+                  <Fragment key={keys}>
+                    <div className="flex items-center gap-[11px] py-1.5">
+                      <dt className="flex min-w-[62px] shrink-0 gap-[3px]">
+                        {keyCaps(keys).map((cap, index) => cap === "/"
+                          ? <span key={`${cap}:${index}`} className="text-[var(--text-faint)]">/</span>
+                          : <kbd key={`${cap}:${index}`} className="inline-flex h-[19px] min-w-[19px] items-center justify-center bg-[var(--surface-selected)] px-[5px] font-mono text-code-xs text-[var(--text-secondary)]">{cap}</kbd>)}
+                      </dt>
+                      <dd className="m-0 min-w-0 flex-1 text-meta-sm text-[var(--text-secondary)]">{label}</dd>
+                    </div>
+                    <Separator />
+                  </Fragment>
+                ))}
+              </dl>
+            </section>
+          ))}
+        </div>
+      </DialogContent>
+    </Dialog>
   );
 }

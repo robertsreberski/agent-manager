@@ -1,0 +1,67 @@
+# Spec parity record
+
+**Method:** each row was checked against the implementation, and where possible against a running
+instance (`dist/cli/index.js serve --port 43127`) with Playwright and direct API reads. Rows marked
+*verified* were confirmed by running something, not by reading alone. This file records what was
+actually checked — it is not a claim that every criterion in every spec has been audited.
+
+## Independently verified — passing
+
+| Spec | Criterion | Result | How it was checked |
+| --- | --- | --- | --- |
+| 07 | AC5/AC6 — an approval whose paths are unresolvable renders tier 2, and tier 2/3 ignore `↵` | pass | `approvalTier()` (`web/src/components/requests/model.ts`) returns `outside` whenever `workspaceRoot`, `paths` are missing/empty or any path is non-absolute; the `⌘↵` listener in `ApprovalRequest.tsx` returns early unless `tier === "workspace"` |
+| 07 | AC7 — the fact row omits `deletes` when the provider gave no such fact | pass | `toolApprovalFacts()` (`src/providers/approval-facts.ts`) reads only a pinned allowlist of Claude built-in tool fields and never tokenizes commands, expands globs, or touches the filesystem |
+| 07 | AC2/AC3 — atomic multi-question submit; secrets never echoed | pass | `QuestionRequest.tsx` gates submit on `complete` (every question answered) and emits one `{kind:"answers"}`; `summarizedAnswer()` returns `••••••` for `question.secret` |
+| 07 | R2 — described options never truncate into pills | pass | `described` switches the container to `grid gap-2` and each option to a full-width row with `[text-wrap:pretty]` |
+| 08 | AC8 — the word "task" appears in no todo surface | pass, verified | `grep -rniE "\btasks?\b"` over `web/src/components/plans/` and `TodoProgressMeter.tsx` returns nothing |
+| 08 | R9 — always `n of m`, never a percentage | pass, verified | no percentage formatting in `TodoList.tsx` / `TodoProgressMeter.tsx` (the only `%` is a modulo) |
+| 09 | R7/AC8 — diff lines wrap rather than scroll; no page-level horizontal scroll | pass | `DiffViewer.tsx` uses `grid-cols-[30px_13px_minmax(0,1fr)]`, `min-w-0`, `max-w-full`, `whitespace-pre-wrap break-words [overflow-wrap:anywhere]`, and `overflow-hidden` on the article; the raw fallback `<pre>` is contained the same way |
+| 10 | AC7 — a selection containing a running session offers no delete, and says why | pass | `SelectionBar.tsx` filters `!(action === "delete" && session.activity === "running")` and renders the visible line `N running (cannot delete)` |
+| 10 | AC8/AC11 — mixed selections report per-action outcomes, bounded concurrency | pass | `SelectionBar` renders `Archived n · m not supported · k failed`; `selectionAction` in `App.tsx` uses a 3-worker cursor pool and counts every outcome |
+| 05 | R5 — heuristic attention is visually distinct and non-actionable | pass | `SessionCard.tsx` renders `border-l-2 border-dashed border-[var(--accent)]` and `data-attention-confidence="heuristic"` when `boardState === "wants-you" && !attentionExact` |
+| 12 | Responsive — board at 320px | pass, verified | at 320×844 `document.documentElement.scrollWidth === 320`; the only elements crossing the viewport edge live inside the header filter row, which is a deliberate `overflow-x: auto` scroller |
+| 01 | Wire epoch — a build/schema mismatch fails closed with a typed upgrade error | pass, verified | pointing a `development`-build client at the deployed `am-fb0945e6…` server produced the error screen "Agent Manager build mismatch; expected wire 3 / development, received 3 / am-fb0945e6…" instead of degrading into a partially-working cockpit |
+| 13 | Removals — no global stop/sentinel, `set-mode`/`set-access`, sidebar, launch dialog, duplicate `session.messages` timeline, migration aliases | pass, verified | repository greps return no matches. `ClaudeManagedSession.setMode()` is the internal SDK permission-mode call reached through the atomic `set-profile` mapping (`profileMode(action.profile)`), which is what spec 01 requires — not the forbidden public action |
+
+## Found and fixed during this pass
+
+| Spec | Criterion | Was | Fix |
+| --- | --- | --- | --- |
+| 12 | The four-tier text ladder (`0.95 / 0.72 / muted / faint`) | Spec 12 specifies `text muted oklch(0.56→0.50)` and `text faint oklch(0.44→0.40)`. The app shipped `#999999` (≈0.665) and `#8d8d8d` (≈0.625) — the only two tokens not in oklch, measured 7.12 and 6.12 against `--app`, i.e. barely one contrast step apart, collapsing four tiers into three. A contrast test forced it by requiring hex notation and AA against `--surface-selected-active` (`#222`), the lightest surface in the theme, which muted/faint text is almost never rendered on. | Restored the ladder: `--text-muted: oklch(0.58 0 0)` (the darkest value clearing AA on both surfaces it is actually read on — 4.74:1 on `--app`, 4.62:1 on `--surface-raised`) and `--text-faint: oklch(0.44 0 0)` exactly per spec. `theme-contrast.test.ts` now parses oklch, checks each tier against the surfaces it is rendered on, holds faint to a 2.5:1 legibility floor as documented incidental metadata, and asserts each adjacent tier stays ≥1.35:1 apart so the ladder cannot silently flatten again. |
+| 09 | AC1–AC3 — correct gutters and `+n −m` counts per file | A blank context line that had lost its leading space (routine after trailing-whitespace stripping) hit the parser's `else` branch and returned `{kind:"raw", reason:"malformed"}`, discarding the whole file's gutters, tinting and counts. AC4's raw fallback is for genuinely malformed input, not for a blank line. | `parseUnifiedDiff` now reads `""` as a blank context line while the hunk still owes lines, and only treats it as the terminating empty tail once `seenOld`/`seenNew` are satisfied. Covered by two tests, including a guard that a trailing empty line is still not counted as context. |
+
+## Design fidelity against the vendored frames
+
+A frame-by-frame pass was run against `docs/design/cockpit/` (the prototype for the board, drawer,
+composer and question frames; the redesign file for turns 8 and above). The structural finding:
+
+| Was | Impact | Fix |
+| --- | --- | --- |
+| The global reset in `web/src/styles.css` was written **unlayered**, so `* { border-color: var(--border) }` outranked every `border-[var(--…)]` utility Tailwind emits into `@layer utilities` — unlayered CSS beats layered CSS regardless of specificity. | **Every border colour in the app was dead.** Verified in a live browser: a synthetic `border-[var(--accent)]` element computed `oklch(0.24 0 0)`. Every hairline, frame, chip outline and dashed edge rendered as the same flat grey no matter what the component asked for — including the spec 05 R5 heuristic-attention edge, whose entire job is to look *visibly inferred*. | The resets moved into `@layer base`, with a comment requiring new global element rules to stay there. `.sr-only` and the `.safe-area-*` helpers stay unlayered on purpose so they keep beating utilities. |
+
+Tokens added, each traceable to a frame or spec line rather than invented: `--board-rule`,
+`--selected-field`, `--danger-text` (spec 05 R3), `--danger-pill-field`, `--border-loud`,
+`--remote-rule`, `--remote-field`, `--remote-pill-field`, `--added-line-text`,
+`--removed-line-text`. The last two exist because frame 10a colours diff *line text* far lighter
+and less saturated than the `+`/`−` markers, so a fully-changed line reads as prose rather than
+glowing; a test now asserts both halves and that neither carries the other's token.
+
+### Deliberate departures from the frames
+
+These are recorded so a later pass does not "correct" them back:
+
+| Frame | What it shows | What ships, and why |
+| --- | --- | --- |
+| `5a`, `9a-2`, `9b` | The composer's harness tile and active effort bars filled with lime | Neutral fill, with the frame's `CodeXml` glyph adopted. The handoff's own `NOTES.md` states the accent "carries the 'wants you' state and must mean exactly one thing"; a lime harness tile makes "this session wants you" and "this session is Codex" look identical. The frames contradict the handoff's stated rule, not the implementation. |
+| `9b`, `13c` | Capability ticks in lime, a present harness in green | `--text`. Same accent rule, plus spec 12 reserves green for added lines. |
+| `7a` | A lime connection status dot | Neutral. Same accent rule. |
+| `8a` | The tier-1 approval hint reads `⏎ allow` | `⌘↵ allow`. The implementation requires ⌘↵ (`isCommandEnter`); printing `⏎` would document a shortcut that does not exist. |
+| `11b` | Tool-call step indent 24px; tool name `flex-shrink: 0` | 22px (prototype `4b` and spec 05 R10 both say 22px, so two sources beat one) and a truncating name — `shrink-0` is what caused tool rows to reach 2551px inside a 390px viewport. |
+| `9a-3` | Headline "Allow this command to delete your cache directory?" | Omitted. No provider payload yields that sentence, and spec 07 R7 forbids inventing a delete count. |
+| `5a` | Placeholder "@mention files, run /commands" | "Message the agent…". Neither affordance exists. |
+
+## Not audited
+
+Specs 01–04 (control planes, Codex daemon adoption, hook bridge, workspace model), 06, 11, and the
+remaining criteria of 05 and 07–10 were not walked criterion by criterion in this pass. The defects
+that were found and fixed against them are recorded in the branch history rather than here.

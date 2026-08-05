@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { SetupHookOffer, SetupHostProbe } from "../../../../src/shared/setup.ts";
 import type { SelectedSessionFactsResponse } from "../../../../src/shared/session-facts.ts";
@@ -156,6 +156,42 @@ describe("first-run setup", () => {
     expect(onContinue).toHaveBeenCalledOnce();
   });
 
+  it("names the region the settings-diff disclosure controls and collapses it", () => {
+    render(<HookSetupStep hooks={{ claude: hook("claude"), codex: hook("codex") }} standalone />);
+    const [disclosure] = screen.getAllByRole("button", { name: "Exact redacted settings diff" });
+    if (!disclosure) throw new Error("Missing settings diff disclosure");
+
+    expect(disclosure).toHaveAttribute("aria-expanded", "true");
+    const controls = disclosure.getAttribute("aria-controls");
+    expect(controls).toBeTruthy();
+    expect(document.getElementById(controls!)?.textContent).toContain("Bearer [REDACTED]");
+
+    fireEvent.click(disclosure);
+    expect(disclosure).toHaveAttribute("aria-expanded", "false");
+    expect(disclosure).not.toHaveAttribute("aria-controls");
+    expect(screen.getAllByText(/Bearer \[REDACTED\]/u)).toHaveLength(1);
+  });
+
+  it("drops the wizard framing when reached outside first run, keeping the same read-only facts", () => {
+    render(<HookSetupStep hooks={{ claude: hook("claude"), codex: hook("codex") }} standalone />);
+
+    expect(screen.queryByText("Optional setup · 2 of 3")).not.toBeInTheDocument();
+    expect(screen.getByText("Provider hooks")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Continue without changing settings" })).not.toBeInTheDocument();
+    expect(screen.getByText("agent-manager hooks install --provider claude --scope user")).toBeInTheDocument();
+    expect(screen.getByText(/This browser never changes provider settings/u)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /apply|install/u })).not.toBeInTheDocument();
+  });
+
+  it("drops the wizard framing on the standalone host step", () => {
+    render(<HostSetupStep hosts={[]} standalone />);
+
+    expect(screen.queryByText("Optional setup · 3 of 3")).not.toBeInTheDocument();
+    expect(screen.getByText("Remote hosts")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Continue to new thread" })).not.toBeInTheDocument();
+    expect(screen.getByText(/No remote hosts are configured/u)).toBeInTheDocument();
+  });
+
   it("reports current hooks without an install action", () => {
     render(<HookSetupStep
       hooks={{
@@ -180,8 +216,14 @@ describe("first-run setup", () => {
       onChooseFolder={onChooseFolder}
     />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Browse another folder…" }));
-    fireEvent.change(screen.getByRole("combobox", { name: "Browse host" }), { target: { value: "studio" } });
+    // Frame 13c keeps the folder field on screen; there is no disclosure to open.
+    const host = screen.getByRole("combobox", { name: "Browse host" });
+    expect(host).toHaveTextContent("This Mac");
+    fireEvent.keyDown(host, { key: "ArrowDown" });
+    expect((await screen.findAllByRole("option")).map((option) => option.textContent)).toEqual(["This Mac", "Studio"]);
+    fireEvent.click(screen.getByRole("option", { name: "Studio" }));
+    await waitFor(() => expect(host).toHaveTextContent("Studio"));
+
     fireEvent.change(screen.getByRole("textbox", { name: "Browse folder path" }), { target: { value: "/srv/pro" } });
     fireEvent.click(screen.getByRole("button", { name: "Find" }));
 

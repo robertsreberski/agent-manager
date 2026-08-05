@@ -3,7 +3,8 @@ import { ActivityHub } from "../activity/index.ts";
 import type { SessionView } from "../core/types.ts";
 import type {
   SessionTranscriptReader,
-  TranscriptMessage,
+  TranscriptItem,
+  TranscriptItemStatus,
   TranscriptReadResult,
   TranscriptUnavailableReason,
 } from "./transcript.ts";
@@ -12,7 +13,7 @@ interface AvailableTranscriptObservation {
   state: "available";
   source: TranscriptReadResult["transcript"]["source"];
   truncated: boolean;
-  messages: TranscriptMessage[];
+  items: TranscriptItem[];
 }
 
 interface UnavailableTranscriptObservation {
@@ -39,35 +40,101 @@ export interface SelectedTranscriptActivityObserverOptions {
   idlePollMs?: number;
 }
 
-function activityMessage(message: TranscriptMessage): ActivityItemDraft {
-  const complete = message.status === "complete";
+/**
+ * Every transcript-derived item is inferred by definition: it was reconstructed
+ * from a file the provider owns rather than handed over by a provider API. The
+ * provenance triple below is therefore fixed, and must never be widened to
+ * `provider-api` / `exact` / `provider-exposed` for any transcript item.
+ */
+const TRANSCRIPT_PROVENANCE = {
+  source: "transcript",
+  confidence: "inferred",
+  exposure: "transcript-derived",
+} as const;
+
+function transcriptState(status: TranscriptItemStatus) {
+  return status === "running" ? "running" as const
+    : status === "complete" ? "complete" as const
+    : "interrupted" as const;
+}
+
+function activityDraft(item: TranscriptItem): ActivityItemDraft {
+  const complete = item.status === "complete";
+  const timing = {
+    startedAt: item.createdAt,
+    updatedAt: item.createdAt,
+    completedAt: complete ? item.createdAt : null,
+  };
+  if (item.kind === "reasoning") {
+    return {
+      kind: "reasoning",
+      id: `transcript:${item.id}`,
+      reasoningKind: "summary",
+      label: item.label,
+      text: item.text,
+      state: transcriptState(item.status),
+      ...timing,
+      ...TRANSCRIPT_PROVENANCE,
+    };
+  }
+  if (item.kind === "tool") {
+    return {
+      kind: "tool",
+      id: `transcript:${item.id}`,
+      toolCallId: item.toolCallId,
+      name: item.name,
+      // The transcript names a tool but never states which category the
+      // provider assigned it, so the category stays unclassified.
+      category: "other",
+      arguments: item.arguments,
+      result: item.result,
+      output: "",
+      state: item.isError ? "failed" : transcriptState(item.status),
+      ...timing,
+      ...TRANSCRIPT_PROVENANCE,
+    };
+  }
   return {
     kind: "message",
-    id: `transcript:${message.id}`,
-    role: message.role,
-    phase: message.role === "assistant" && complete ? "final" : null,
-    text: message.text,
-    label: message.label,
-    state: message.status === "running"
-      ? "running"
-      : complete
-      ? "complete"
-      : "interrupted",
-    startedAt: message.createdAt,
-    updatedAt: message.createdAt,
-    completedAt: complete ? message.createdAt : null,
-    source: "transcript",
-    confidence: "inferred",
-    exposure: "transcript-derived",
+    id: `transcript:${item.id}`,
+    role: item.role,
+    phase: item.role === "assistant" && complete ? "final" : null,
+    text: item.text,
+    label: item.label,
+    state: transcriptState(item.status),
+    ...timing,
+    ...TRANSCRIPT_PROVENANCE,
   };
 }
 
-function changed(previous: TranscriptMessage, next: TranscriptMessage): boolean {
-  return previous.role !== next.role
-    || previous.text !== next.text
+function sameArguments(previous: TranscriptItem, next: TranscriptItem): boolean {
+  if (previous.kind !== "tool" || next.kind !== "tool") return true;
+  return JSON.stringify(previous.arguments ?? null) === JSON.stringify(next.arguments ?? null);
+}
+
+function changed(previous: TranscriptItem, next: TranscriptItem): boolean {
+  if (
+    previous.kind !== next.kind
+    || previous.id !== next.id
     || previous.createdAt !== next.createdAt
     || previous.status !== next.status
-    || previous.label !== next.label;
+  ) return true;
+  if (previous.kind === "tool" && next.kind === "tool") {
+    return previous.toolCallId !== next.toolCallId
+      || previous.name !== next.name
+      || previous.result !== next.result
+      || previous.isError !== next.isError
+      || !sameArguments(previous, next);
+  }
+  if (previous.kind === "message" && next.kind === "message") {
+    return previous.role !== next.role
+      || previous.text !== next.text
+      || previous.label !== next.label;
+  }
+  if (previous.kind === "reasoning" && next.kind === "reasoning") {
+    return previous.text !== next.text || previous.label !== next.label;
+  }
+  return true;
 }
 
 function replacementReason(
@@ -76,9 +143,11 @@ function replacementReason(
 ): ActivityResetReason | null {
   if (previous.source !== next.source) return "transcript-reset";
   if (previous.truncated !== next.truncated) return "truncation";
-  if (next.messages.length < previous.messages.length) return "transcript-reset";
-  for (let index = 0; index < previous.messages.length; index += 1) {
-    if (previous.messages[index]?.id !== next.messages[index]?.id) return "branch-change";
+  if (next.items.length < previous.items.length) return "transcript-reset";
+  for (let index = 0; index < previous.items.length; index += 1) {
+    const before = previous.items[index];
+    const after = next.items[index];
+    if (before?.id !== after?.id || before?.kind !== after?.kind) return "branch-change";
   }
   return null;
 }
@@ -210,12 +279,12 @@ export class SelectedTranscriptActivityObserver {
       result = this.#reader.read(observation.session);
     } catch {
       result = {
-        messages: [],
+        items: [],
         transcript: {
           state: "unavailable",
           truncated: false,
           source: null,
-          messageCount: 0,
+          itemCount: 0,
           reason: "unreadable",
         },
       };
@@ -225,7 +294,7 @@ export class SelectedTranscriptActivityObserver {
           state: "available",
           source: result.transcript.source,
           truncated: result.transcript.truncated,
-          messages: result.messages,
+          items: result.items,
         }
       : {
           state: "unavailable",
@@ -246,7 +315,7 @@ export class SelectedTranscriptActivityObserver {
       this.#hub.ingest(observation.session.id, observation.session.provider, {
         type: "reset",
         reason: next.truncated ? "truncation" : "transcript-reset",
-        items: next.messages.map(activityMessage),
+        items: next.items.map(activityDraft),
       });
       observation.previous = structuredClone(next);
       return;
@@ -255,7 +324,7 @@ export class SelectedTranscriptActivityObserver {
       this.#hub.ingest(observation.session.id, observation.session.provider, {
         type: "reset",
         reason: "transcript-reset",
-        items: next.messages.map(activityMessage),
+        items: next.items.map(activityDraft),
       });
       observation.previous = structuredClone(next);
       return;
@@ -265,18 +334,18 @@ export class SelectedTranscriptActivityObserver {
       this.#hub.ingest(observation.session.id, observation.session.provider, {
         type: "reset",
         reason: reset,
-        items: next.messages.map(activityMessage),
+        items: next.items.map(activityDraft),
       });
       observation.previous = structuredClone(next);
       return;
     }
-    for (let index = 0; index < next.messages.length; index += 1) {
-      const nextMessage = next.messages[index]!;
-      const previousMessage = previous.messages[index];
-      if (!previousMessage || changed(previousMessage, nextMessage)) {
+    for (let index = 0; index < next.items.length; index += 1) {
+      const nextItem = next.items[index]!;
+      const previousItem = previous.items[index];
+      if (!previousItem || changed(previousItem, nextItem)) {
         this.#hub.ingest(observation.session.id, observation.session.provider, {
           type: "upsert",
-          item: activityMessage(nextMessage),
+          item: activityDraft(nextItem),
         });
       }
     }

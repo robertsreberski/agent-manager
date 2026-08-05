@@ -1,5 +1,6 @@
-import { ChevronRight, Server } from "lucide-react";
+import { CircleX, LoaderCircle, Server } from "lucide-react";
 import type { BoardSession, PhoneBoardBand } from "./model";
+import { relativeTime } from "./SessionCard";
 import { TodoProgressMeter } from "./TodoProgressMeter";
 
 export interface PhoneBoardBandsProps {
@@ -7,45 +8,79 @@ export interface PhoneBoardBandsProps {
   onOpenSession: (session: BoardSession) => void;
 }
 
+function workspaceLine(session: BoardSession): string | null {
+  const identity = session.workspaceIdentity;
+  if (!identity) return null;
+  const branch = identity.detached ? "detached" : identity.branch;
+  return [identity.repoName, branch].filter(Boolean).join(" · ") || null;
+}
+
+/**
+ * Frame 9a-1: wants-you rows are full cards carrying the question itself,
+ * working rows carry the step, and idle rows compress to a name and an age.
+ */
 export function PhoneBoardBands({ bands, onOpenSession }: PhoneBoardBandsProps) {
   return (
-    <section className="min-h-0 flex-1 overflow-y-auto bg-[var(--app)] min-[901px]:hidden" aria-label="Agent sessions" data-phone-board>
-      {bands.map((band) => (
+    <section className="min-h-0 flex-1 overflow-y-auto bg-[var(--app)] pb-5 min-[901px]:hidden" aria-label="Agent sessions" data-phone-board>
+      {bands.map((band, bandIndex) => (
         <section key={band.state} aria-labelledby={`band-${band.state}`}>
           <h2
             id={`band-${band.state}`}
-            className="sticky top-0 z-10 flex items-center justify-between border-y border-[var(--rule)] bg-[var(--app)] px-4 py-2 font-mono text-[10px] font-medium uppercase tracking-[0.14em] text-[var(--text-muted)]"
+            className={`px-5 pb-1.5 font-mono text-eyebrow uppercase leading-none ${bandIndex === 0 ? "pt-1" : "pt-4"} ${band.state === "wants-you" ? "text-[var(--accent-quiet)]" : "text-[var(--text-faint)]"}`}
           >
-            <span>{band.label}</span><span>{band.sessions.length}</span>
+            {band.label} · {band.sessions.length}
           </h2>
-          <ul className="m-0 list-none p-0">
+          <ul className="m-0 list-none px-5 py-0">
             {band.sessions.map((session) => {
               const heuristic = session.boardState === "wants-you" && !session.attentionExact;
+              const wantsYou = session.boardState === "wants-you";
+              const working = session.boardState === "working";
+              const workspace = workspaceLine(session);
               return (
                 <li
                   key={session.id}
+                  className="mb-[7px]"
                   data-board-state={session.boardState}
                   data-attention-confidence={heuristic ? "heuristic" : session.attentionExact ? "exact" : undefined}
                 >
                   <button
                     type="button"
-                    className="relative grid min-h-[64px] w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 border-b border-[var(--rule)] px-4 py-3 text-left focus-visible:z-10"
+                    className={`relative block min-h-[52px] w-full text-left focus-visible:z-10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--accent)] ${wantsYou ? "bg-[var(--wants-field)] py-3.5 pl-4 pr-[15px]" : "bg-[var(--surface-raised)] px-[15px] py-3"}`}
                     onClick={() => onOpenSession(session)}
                   >
-                    {heuristic && <span aria-hidden="true" className="absolute inset-y-2 left-0 border-l-2 border-dashed border-[var(--accent)]" data-attention-edge="inferred" />}
-                    <span className="min-w-0">
-                      <span className="flex items-center gap-1.5 truncate text-sm font-semibold">
-                        {session.remote && <Server size={12} strokeWidth={1.75} className="shrink-0 text-[var(--remote)]" aria-hidden="true" />}
-                        <span className="truncate">{session.name}</span>
+                    {wantsYou && (
+                      heuristic
+                        ? <span aria-hidden="true" className="absolute inset-y-0 left-0 w-0.5 border-l-2 border-dashed border-[var(--accent)]" data-attention-edge="inferred" />
+                        : <span aria-hidden="true" className="absolute inset-y-0 left-0 w-0.5 bg-[var(--accent)]" />
+                    )}
+                    <span className="flex items-center gap-2">
+                      {working && <LoaderCircle size={13} strokeWidth={1.75} aria-hidden="true" className="shrink-0 text-[var(--text-muted)] motion-safe:animate-spin" />}
+                      {session.boardState === "failed" && <CircleX size={13} strokeWidth={1.75} aria-hidden="true" className="shrink-0 text-[var(--danger)]" />}
+                      <span className={`min-w-0 flex-1 truncate leading-[1.3] ${wantsYou ? "text-title-sm text-[var(--text)]" : working ? "text-body-sm font-medium text-[var(--text)]" : "text-body-sm font-medium text-[var(--text-secondary)]"}`}>
+                        {session.name}
                       </span>
-                      <span className={`mt-0.5 line-clamp-2 text-[12.5px] leading-[18px] ${heuristic ? "text-[var(--text-muted)]" : session.boardState === "wants-you" ? "text-[var(--wants-text)]" : "text-[var(--text-muted)]"}`}>
-                        {session.stateLine}
-                      </span>
-                      {session.todo && session.todo.total > 0 && (
-                        <TodoProgressMeter todo={session.todo} className="mt-2" />
+                      {session.remote && (
+                        <span className="flex shrink-0 items-center gap-1.5 font-mono text-code-xs leading-none text-[var(--remote)]">
+                          <Server size={11} strokeWidth={1.75} aria-hidden="true" />{session.hostLabel}
+                        </span>
                       )}
+                      <time className={`shrink-0 font-mono text-code-xs leading-none ${wantsYou ? "text-[var(--accent-quiet)]" : "text-[var(--text-faint)]"}`} dateTime={session.updatedAt ?? undefined}>
+                        {relativeTime(session.updatedAt)}
+                      </time>
                     </span>
-                    <ChevronRight size={16} strokeWidth={1.75} className="text-[var(--text-faint)]" aria-hidden="true" />
+                    {/*
+                      Heuristic attention stays muted so an inferred line never
+                      reads as an answerable one (spec 05 R5).
+                    */}
+                    <span className={`line-clamp-3 ${wantsYou ? "mt-[7px] text-meta" : "mt-1.5 text-meta-sm"} ${heuristic ? "text-[var(--text-muted)]" : wantsYou ? "text-[var(--wants-text)]" : "text-[var(--text-muted)]"}`}>
+                      {session.stateLine}
+                    </span>
+                    {session.todo && session.todo.total > 0 && (
+                      <TodoProgressMeter todo={session.todo} className="mt-2" />
+                    )}
+                    {wantsYou && workspace && (
+                      <span className="mt-[9px] block truncate font-mono text-code-xs leading-none text-[var(--accent-quiet)]">{workspace}</span>
+                    )}
                   </button>
                 </li>
               );

@@ -100,6 +100,21 @@ describe("PlanArtifact", () => {
     expect(screen.getByRole("button", { name: "Execute v2" })).toBeDisabled();
   });
 
+  it("names the region its disclosure controls and hides the plan body when collapsed", () => {
+    render(<PlanArtifact plan={plan} />);
+    const disclosure = screen.getByRole("button", { name: /Wrote a plan/u });
+
+    expect(disclosure).toHaveAttribute("aria-expanded", "true");
+    const controls = disclosure.getAttribute("aria-controls");
+    expect(controls).toBeTruthy();
+    expect(document.getElementById(controls!)).toContainElement(screen.getByRole("heading", { name: "Exact plan" }));
+
+    fireEvent.click(disclosure);
+    expect(disclosure).toHaveAttribute("aria-expanded", "false");
+    expect(disclosure).not.toHaveAttribute("aria-controls");
+    expect(screen.queryByRole("heading", { name: "Exact plan" })).not.toBeInTheDocument();
+  });
+
   it("does not offer a file view when the provider supplied no path", () => {
     render(<PlanArtifact plan={{ ...plan, path: null, version: null }} loadFile={vi.fn()} />);
     expect(screen.queryByRole("button", { name: "Open plan document" })).not.toBeInTheDocument();

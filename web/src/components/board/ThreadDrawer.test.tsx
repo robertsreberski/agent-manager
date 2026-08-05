@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { ThreadDrawer } from "./ThreadDrawer";
 
@@ -48,6 +48,60 @@ describe("ThreadDrawer", () => {
     expect(container.querySelector("[data-thread-header]")).toHaveClass("shrink-0", "bg-inherit");
     expect(container.querySelector("[data-thread-content]")).toHaveClass("min-h-0", "flex-1", "bg-inherit");
     expect(container.querySelector("[data-thread-composer]")).toHaveClass("shrink-0", "bg-inherit");
+  });
+
+  it("stays in the tree it was rendered into rather than portalling to the page root", () => {
+    // Spec 05 R7: the drawer overlays the board region only. A portalled sheet
+    // would become a sibling of the header and swallow every header control.
+    const { container } = render(
+      <div data-board-region className="relative">
+        <ThreadDrawer open title="Session" onClose={vi.fn()}>Thread activity</ThreadDrawer>
+      </div>,
+    );
+    const drawer = screen.getByRole("dialog", { name: "Session" });
+    expect(drawer.parentElement).toBe(container.querySelector("[data-board-region]"));
+  });
+
+  it("leaves the board behind it reachable instead of blocking it with a scrim", () => {
+    render(
+      <>
+        <button type="button">Board card</button>
+        <ThreadDrawer open title="Session" onClose={vi.fn()}>Thread activity</ThreadDrawer>
+      </>,
+    );
+    // No scrim, and the board is not hidden from assistive tech: on desktop the
+    // board stays clickable while the drawer is open.
+    expect(document.querySelector('[data-slot="dialog-overlay"]')).toBeNull();
+    expect(screen.getByRole("button", { name: "Board card" })).toBeInTheDocument();
+  });
+
+  it("closes on Escape and hands focus back to the control that opened it", async () => {
+    function Harness() {
+      const [open, setOpen] = useState(false);
+      return <>
+        <button type="button" onClick={() => setOpen(true)}>Open session</button>
+        <ThreadDrawer open={open} title="Session" onClose={() => setOpen(false)}>Thread activity</ThreadDrawer>
+      </>;
+    }
+
+    render(<Harness />);
+    const opener = screen.getByRole("button", { name: "Open session" });
+    opener.focus();
+    fireEvent.click(opener);
+
+    const drawer = await screen.findByRole("dialog", { name: "Session" });
+    await waitFor(() => expect(drawer.contains(document.activeElement)).toBe(true));
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Session" })).not.toBeInTheDocument());
+    await waitFor(() => expect(opener).toHaveFocus());
+  });
+
+  it("closes from its own close control", async () => {
+    const onClose = vi.fn();
+    render(<ThreadDrawer open title="Session" onClose={onClose}>Thread activity</ThreadDrawer>);
+    fireEvent.click(screen.getByRole("button", { name: "Close thread" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalledOnce());
   });
 
   it("does not leave an inert phone surface behind when closed", () => {

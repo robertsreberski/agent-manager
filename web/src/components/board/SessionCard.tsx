@@ -1,4 +1,4 @@
-import { GitBranch, Server } from "lucide-react";
+import { Check, Server } from "lucide-react";
 import type { BoardSession } from "./model";
 import { TodoProgressMeter } from "./TodoProgressMeter";
 
@@ -10,7 +10,7 @@ export interface SessionCardProps {
   onToggleSelection?: (session: BoardSession) => void;
 }
 
-function relativeTime(value: string | null): string {
+export function relativeTime(value: string | null): string {
   if (!value) return "";
   const elapsed = Math.max(0, Date.now() - Date.parse(value));
   if (!Number.isFinite(elapsed)) return "";
@@ -28,15 +28,17 @@ export function SessionCard({
   onToggleSelection,
 }: SessionCardProps) {
   const heuristic = session.boardState === "wants-you" && !session.attentionExact;
-  const stateClasses = heuristic
-    ? "bg-[var(--surface-raised)] text-[var(--text-muted)]"
-    : session.boardState === "wants-you"
-      ? "bg-[var(--wants-field)] text-[var(--accent)]"
-      : session.boardState === "working"
-        ? "bg-[var(--surface-raised)] text-[var(--text-secondary)]"
+  // Frame 7a fills the card from its state and 12a replaces that fill on a
+  // selected card, so the two are resolved together rather than layered.
+  const fillClass = selected
+    ? "bg-[var(--selected-field)]"
+    : heuristic
+      ? "bg-[var(--surface-raised)]"
+      : session.boardState === "wants-you"
+        ? "bg-[var(--wants-field)]"
         : session.boardState === "failed"
-          ? "bg-[var(--danger-field)] text-[var(--danger)]"
-          : "bg-[var(--surface-raised)] text-[var(--text-muted)]";
+          ? "bg-[var(--danger-field)]"
+          : "bg-[var(--surface-raised)]";
   const tickClass = session.boardState === "wants-you"
     ? "bg-[var(--accent)]"
     : session.boardState === "failed"
@@ -51,8 +53,11 @@ export function SessionCard({
       : session.boardState === "working"
         ? "text-[var(--text-secondary)]"
         : session.boardState === "failed"
-          ? "text-[var(--danger)]"
+          ? "text-[var(--danger-text)]"
           : "text-[var(--text-muted)]";
+  const edgeClass = selected
+    ? "[outline:1px_solid_var(--wants-outline)]"
+    : "hover:[outline:1px_solid_var(--border)]";
   function activate(event: React.MouseEvent<HTMLButtonElement>) {
     if (event.shiftKey || event.metaKey || event.ctrlKey || selectionActive) {
       event.preventDefault();
@@ -64,39 +69,53 @@ export function SessionCard({
   return (
     <button
       type="button"
-      className={`group relative grid w-full grid-cols-[minmax(0,1fr)_auto] gap-x-3 gap-y-1 border-0 px-3.5 py-3 text-left outline-none hover:bg-[var(--surface-selected)] focus-visible:ring-2 focus-visible:ring-[var(--accent)] ${stateClasses}`}
+      className={`group relative mb-1.5 block w-full border-0 py-3 pl-[15px] pr-3.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] ${fillClass} ${edgeClass}`}
       data-board-state={session.boardState}
       data-attention-confidence={heuristic ? "heuristic" : session.attentionExact ? "exact" : undefined}
       aria-pressed={selectionActive ? selected : undefined}
       onClick={activate}
     >
+      {/*
+        Inferred attention is a dashed lime edge rather than the solid tick, so
+        a card that cannot be answered never reads as one that can (spec 05 R5).
+      */}
       <span
         aria-hidden="true"
         className={`absolute inset-y-0 left-0 w-0.5 ${heuristic ? "border-l-2 border-dashed border-[var(--accent)]" : tickClass}`}
       />
-      {selectionActive && (
-        <span aria-hidden="true" className={`absolute right-2 top-2 size-3 border ${selected ? "border-[var(--accent)] bg-[var(--accent)]" : "border-[var(--text-faint)]"}`} />
-      )}
-      <span className={`truncate text-[13.5px] font-semibold tracking-[-0.01em] ${session.boardState === "idle" ? "text-[var(--text-secondary)]" : "text-[var(--text)]"}`}>{session.name}</span>
-      <time className="font-mono text-[10.5px] text-[var(--text-muted)]" dateTime={session.updatedAt ?? undefined}>
-        {relativeTime(session.updatedAt)}
-      </time>
-      <span className={`col-span-2 line-clamp-2 text-[12.5px] leading-[18px] ${stateLineClass}`}>
-        {session.stateLine}
+      <span className="flex items-start gap-2.5">
+        {selectionActive && (
+          <span
+            aria-hidden="true"
+            className={`mt-0.5 grid size-4 shrink-0 place-items-center ${selected ? "bg-[var(--accent)] text-[var(--accent-ink)]" : "border border-[var(--border-loud)]"}`}
+          >
+            {selected && <Check size={11} strokeWidth={2} />}
+          </span>
+        )}
+        <span className="min-w-0 flex-1">
+          <span className="flex items-baseline gap-2">
+            <span className={`min-w-0 flex-1 truncate text-card leading-[1.35] ${session.boardState === "idle" ? "text-[var(--text-secondary)]" : "text-[var(--text)]"}`}>{session.name}</span>
+            <time className="shrink-0 font-mono text-code-xs leading-none text-[var(--text-faint)]" dateTime={session.updatedAt ?? undefined}>
+              {relativeTime(session.updatedAt)}
+            </time>
+          </span>
+          {/*
+            Heuristic attention keeps the muted body: an inferred state line
+            must never read like an answerable one (spec 05 R5).
+          */}
+          <span className={`mt-1.5 line-clamp-2 text-meta-sm ${stateLineClass}`}>
+            {session.stateLine}
+          </span>
+          {session.todo && session.todo.total > 0 && (
+            <TodoProgressMeter todo={session.todo} className="mt-2" />
+          )}
+          {session.remote && (
+            <span className={`mt-[9px] flex items-center gap-1.5 font-mono text-code-xs leading-none ${session.boardState === "idle" ? "text-[var(--remote-dim)]" : "text-[var(--remote)]"}`}>
+              <Server size={11} strokeWidth={1.75} />{session.hostLabel}
+            </span>
+          )}
+        </span>
       </span>
-      {session.todo && session.todo.total > 0 && (
-        <TodoProgressMeter todo={session.todo} className="col-span-2" />
-      )}
-      {session.remote && (
-        <span className="col-span-2 flex items-center gap-1 font-mono text-[10px] text-[var(--remote)]">
-          <Server size={11} strokeWidth={1.75} />{session.hostLabel}
-        </span>
-      )}
-      {session.workspaceIdentity?.linked && (
-        <span className="col-span-2 flex items-center gap-1 font-mono text-[10px] text-[var(--text-faint)]">
-          <GitBranch size={11} strokeWidth={1.75} />linked worktree
-        </span>
-      )}
     </button>
   );
 }

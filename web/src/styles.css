@@ -38,23 +38,43 @@
   --surface-selected-hover: oklch(0.22 0 0);
   --surface-selected-active: oklch(0.25 0 0);
   --rule: oklch(0.165 0 0);
+  /* The 1px board gap is the column rule in frame 7a, one step above --rule. */
+  --board-rule: oklch(0.2 0 0);
   --border-hairline: oklch(0.19 0 0);
   --border-frame: oklch(0.22 0 0);
   --border: oklch(0.24 0 0);
   --border-strong: oklch(0.26 0 0);
+  /*
+    Frame 12a's loudest hairline, for a control whose whole job is to announce
+    a mode: the selection checkbox and the open-card outline. One step above
+    --border-strong so it reads as deliberate rather than as a heavier border.
+  */
+  --border-loud: oklch(0.32 0 0);
 
   --text: oklch(0.95 0 0);
   --text-secondary: oklch(0.72 0 0);
-  /* Both subdued text tiers remain AA-readable on the lightest dark surface. */
-  --text-muted: #999999;
-  --text-faint: #8d8d8d;
+  /*
+    The four-tier ladder from the handoff: 0.95 / 0.72 / muted / faint. Muted is
+    nudged from the mock's 0.56 to 0.58, the darkest value that still clears
+    WCAG AA on both surfaces it is read on (4.74:1 on --app, 4.62:1 on
+    --surface-raised), without collapsing the ladder. Faint keeps the mock's
+    0.44 and is deliberately below AA: it carries only incidental metadata
+    (timestamps, key hints, counts) that is never the sole source of a fact.
+  */
+  --text-muted: oklch(0.58 0 0);
+  --text-faint: oklch(0.44 0 0);
 
   --accent: oklch(0.85 0.16 118);
+  /* Explicit interaction states so components stop deriving them with color-mix. */
+  --accent-hover: oklch(0.89 0.15 118);
+  --accent-active: oklch(0.79 0.16 118);
   --accent-ink: oklch(0.16 0.03 118);
   --accent-quiet: oklch(0.62 0.1 118);
   --wants-field: oklch(0.185 0.022 118);
   --wants-outline: oklch(0.4 0.09 118);
   --wants-text: oklch(0.9 0.14 118);
+  /* Frame 12a's selected-card fill: quieter and less saturated than wants-you. */
+  --selected-field: oklch(0.2 0.018 118);
   --warning: oklch(0.78 0.13 70);
   --warning-field: oklch(0.17 0.022 70);
   --dirty: oklch(0.72 0.12 75);
@@ -62,12 +82,31 @@
   --access-field: oklch(0.2 0.05 40);
   --danger: oklch(0.62 0.16 25);
   --danger-field: oklch(0.155 0.014 25);
+  /* Spec 05 R3's failed-card body text: lighter and less saturated than the tick. */
+  --danger-text: oklch(0.75 0.1 25);
+  /*
+    The escalated allow pill sits ON --danger-field, so it needs its own lighter
+    fill or it disappears into the field it is meant to stand out from.
+  */
+  --danger-pill-field: oklch(0.24 0.06 25);
   --remote: oklch(0.72 0.11 290);
   --remote-dim: oklch(0.58 0.04 290);
+  /* Frame 11b's subagent footer rule: a violet-tinted hairline. */
+  --remote-rule: oklch(0.2 0.02 290);
+  /* The remote tier's field tint, and the allow pill that sits on top of it. */
+  --remote-field: oklch(0.17 0.02 290);
+  --remote-pill-field: oklch(0.24 0.05 290);
   --added: oklch(0.78 0.14 145);
   --added-field: oklch(0.26 0.09 145 / 0.28);
   --removed: oklch(0.72 0.13 25);
   --removed-field: oklch(0.3 0.11 25 / 0.24);
+  /*
+    Frame 10a sets diff line TEXT lighter and far less saturated than the
+    +/- marker colours above, so a full changed line stays readable as prose
+    rather than glowing. Marker vs line text are deliberately separate.
+  */
+  --added-line-text: oklch(0.9 0.06 145);
+  --removed-line-text: oklch(0.86 0.07 25);
   --worktree-linked: var(--accent);
 
   /* shadcn-compatible aliases backed only by the cockpit tokens. */
@@ -89,7 +128,9 @@
   --ring: var(--accent-quiet);
 
   --shadow-frame: 0 30px 100px rgb(0 0 0 / 0.7);
+  /* Directional: --shadow-drawer casts left, for a sheet entering from the right. */
   --shadow-drawer: -50px 0 120px rgb(0 0 0 / 0.8);
+  --shadow-sheet-bottom: 0 -30px 70px rgb(0 0 0 / 0.65);
   --shadow-menu: 0 24px 60px rgb(0 0 0 / 0.65);
   --shadow-toast: 0 12px 34px rgb(0 0 0 / 0.55);
   --control-height: 2rem;
@@ -114,68 +155,147 @@
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
-  --radius-sm: 2px;
-  --radius-md: 4px;
+  /*
+    Spec 12 R5. Square by default is a deliberate character choice, so `sm` is 0
+    rather than a small radius. `md`/`lg` are the 6px frame radius so a shadcn
+    component's default `rounded-md` already lands on the handoff value.
+  */
+  --radius-sm: 0px;
+  --radius-md: 6px;
   --radius-lg: 6px;
-  --radius-xl: 10px;
+  --radius-xl: 16px;
+  --radius-frame: 6px;
+  --radius-composer: 16px;
+  --radius-bubble: 12px;
+  /* The phone bottom sheet's top corners; above the ladder's 16px ceiling. */
+  --radius-sheet: 20px;
+
+  /*
+    Spec 12 R6, the whole ladder. Named so components stop inventing
+    `text-[12.5px]` one-offs. Deliberately NOT called `secondary`/`muted` —
+    those names are already taken by colour tokens above and `@theme` emits
+    custom properties into the same `:root` namespace.
+  */
+  --text-display: 26px;
+  --text-display--line-height: 1.12;
+  --text-display--letter-spacing: -0.02em;
+  --text-display--font-weight: 600;
+  --text-display-md: 24px;
+  --text-display-md--line-height: 1.14;
+  --text-display-md--letter-spacing: -0.02em;
+  --text-display-md--font-weight: 600;
+  --text-display-sm: 20px;
+  --text-display-sm--line-height: 1.2;
+  --text-display-sm--letter-spacing: -0.02em;
+  --text-display-sm--font-weight: 600;
+
+  --text-title: 17px;
+  --text-title--line-height: 1.3;
+  --text-title--letter-spacing: -0.015em;
+  --text-title--font-weight: 600;
+  --text-title-md: 16px;
+  --text-title-md--line-height: 1.3;
+  --text-title-md--letter-spacing: -0.015em;
+  --text-title-md--font-weight: 600;
+  --text-title-sm: 15px;
+  --text-title-sm--line-height: 1.33;
+  --text-title-sm--letter-spacing: -0.015em;
+  --text-title-sm--font-weight: 600;
+
+  --text-card: 13.5px;
+  --text-card--line-height: 1.3;
+  --text-card--letter-spacing: -0.01em;
+  --text-card--font-weight: 600;
+
+  --text-body: 15px;
+  --text-body--line-height: 22px;
+  --text-body-sm: 14px;
+  --text-body-sm--line-height: 22px;
+
+  --text-meta: 13px;
+  --text-meta--line-height: 20px;
+  --text-meta-sm: 12.5px;
+  --text-meta-sm--line-height: 18px;
+
+  --text-code: 12.5px;
+  --text-code--line-height: 19px;
+  --text-code-sm: 11.5px;
+  --text-code-sm--line-height: 18px;
+  --text-code-xs: 11px;
+  --text-code-xs--line-height: 16px;
+
+  --text-eyebrow: 10px;
+  --text-eyebrow--line-height: 1.2;
+  --text-eyebrow--letter-spacing: 0.14em;
+  --text-eyebrow--font-weight: 500;
+
   --font-sans: "Instrument Sans", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, monospace;
 }
 
-* {
-  box-sizing: border-box;
-  border-color: var(--border);
-  scrollbar-color: color-mix(in oklab, var(--text-faint) 60%, transparent) transparent;
-  scrollbar-width: thin;
-}
+/*
+  These resets must live in `base`. Unlayered CSS outranks every layered rule
+  regardless of specificity, so an unlayered `* { border-color }` silently beats
+  each `border-[var(--…)]` utility Tailwind emits into `layer utilities` — which
+  flattened every hairline, dashed edge and accent border in the app to
+  `--border`. Keep new global element rules inside this block.
+*/
+@layer base {
+  * {
+    box-sizing: border-box;
+    border-color: var(--border);
+    scrollbar-color: color-mix(in oklab, var(--text-faint) 60%, transparent) transparent;
+    scrollbar-width: thin;
+  }
 
-html,
-body,
-#root {
-  width: 100%;
-  min-width: 320px;
-  min-height: 100%;
-  height: 100%;
-  -webkit-text-size-adjust: 100%;
-  text-size-adjust: 100%;
-}
+  html,
+  body,
+  #root {
+    width: 100%;
+    min-width: 320px;
+    min-height: 100%;
+    height: 100%;
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+  }
 
-body {
-  margin: 0;
-  overflow: hidden;
-  overscroll-behavior: none;
-  background: var(--ground);
-  color: var(--text);
-  font-family: var(--font-sans);
-  font-synthesis: none;
-  -webkit-font-smoothing: antialiased;
-  text-rendering: optimizeLegibility;
-}
+  body {
+    margin: 0;
+    overflow: hidden;
+    overscroll-behavior: none;
+    background: var(--ground);
+    color: var(--text);
+    font-family: var(--font-sans);
+    font-synthesis: none;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
 
-button,
-input,
-textarea,
-select {
-  font: inherit;
-}
+  button,
+  input,
+  textarea,
+  select {
+    font: inherit;
+  }
 
-button,
-[role="button"],
-a,
-input,
-textarea,
-select,
-summary {
-  -webkit-tap-highlight-color: transparent;
-}
+  button,
+  [role="button"],
+  a,
+  input,
+  textarea,
+  select,
+  summary {
+    -webkit-tap-highlight-color: transparent;
+  }
 
-:focus-visible {
-  outline: 2px solid var(--ring);
-  outline-offset: 2px;
-}
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
 
-::selection {
-  background: color-mix(in oklab, var(--accent) 28%, transparent);
+  ::selection {
+    background: color-mix(in oklab, var(--accent) 28%, transparent);
+  }
 }
 
 .sr-only {
@@ -230,47 +350,46 @@ summary {
   50% { opacity: 1; }
 }
 
+/*
+  Radix drives enter/exit through `data-state`, and holds a closing element in the
+  DOM only while an animation is running. Without an exit keyframe every overlay
+  vanishes instantly. `tailwindcss-animate` is deliberately not a dependency, so
+  the handoff's own 160ms `p-in` timing is expressed directly here.
+*/
+@keyframes cockpit-fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes cockpit-fade-out { from { opacity: 1; } to { opacity: 0; } }
+@keyframes cockpit-p-out {
+  from { opacity: 1; transform: translateY(0); }
+  to { opacity: 0; transform: translateY(5px); }
+}
+
 .motion-p-in { animation: p-in 160ms ease-out; }
 .motion-spin { animation: cockpit-spin 900ms linear infinite; }
 .motion-pulse { animation: cockpit-pulse 1700ms ease-in-out infinite; }
 
-.approval-request__phone-backdrop,
-.approval-request__phone-handle,
+/* Scrims cross-fade; a translating scrim reads as a moving object. */
+[data-slot="dialog-overlay"][data-state="open"],
+[data-slot="sheet-overlay"][data-state="open"] { animation: cockpit-fade-in 160ms ease-out; }
+[data-slot="dialog-overlay"][data-state="closed"],
+[data-slot="sheet-overlay"][data-state="closed"] { animation: cockpit-fade-out 120ms ease-in; }
+
+/* Panels and popovers use the handoff's fade-and-rise, reversed on exit. */
+[data-slot="dialog-content"][data-state="open"],
+[data-slot="dropdown-menu-content"][data-state="open"],
+[data-slot="select-content"][data-state="open"],
+[data-slot="tooltip-content"][data-state="open"],
+[data-slot="popover-content"][data-state="open"] { animation: p-in 160ms ease-out; }
+[data-slot="dialog-content"][data-state="closed"],
+[data-slot="dropdown-menu-content"][data-state="closed"],
+[data-slot="select-content"][data-state="closed"],
+[data-slot="tooltip-content"][data-state="closed"],
+[data-slot="popover-content"][data-state="closed"] { animation: cockpit-p-out 120ms ease-in; }
+
 .question-request__phone-footer {
   display: none;
 }
 
 @media (max-width: 900px) {
-  .approval-request__phone-backdrop {
-    position: fixed;
-    inset: 0;
-    z-index: 59;
-    display: block;
-    background: rgb(0 0 0 / 0.72);
-  }
-
-  .approval-request {
-    position: fixed;
-    right: 0;
-    bottom: 0;
-    z-index: 60;
-    width: min(100%, 760px);
-    max-height: min(82dvh, 720px);
-    overflow-y: auto;
-    border-radius: 20px 20px 0 0;
-    padding: 10px 20px calc(20px + env(safe-area-inset-bottom));
-    box-shadow: 0 -30px 70px rgb(0 0 0 / 0.65);
-  }
-
-  .approval-request__phone-handle {
-    display: block;
-    width: 36px;
-    height: 4px;
-    margin: 0 auto 14px;
-    border-radius: 9999px;
-    background: color-mix(in oklab, currentcolor 24%, transparent);
-  }
-
   .approval-request__actions {
     flex-direction: column-reverse;
   }

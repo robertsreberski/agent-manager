@@ -58,6 +58,8 @@ const SUPPORTED_VERSION = "0.146.x" as const;
 const MAX_MODEL_OPTIONS = 64;
 const MAX_MODEL_LIST_PAGES = 8;
 const MAX_PENDING_ADOPTION_EVENTS = 512;
+const MAX_DETACHED_THREADS = 128;
+const MAX_THREAD_NAME_CODE_POINTS = 80;
 const ALL_CONTROLS: readonly CodexControlCapability[] = [
   "thread.start",
   "thread.resume",
@@ -89,6 +91,12 @@ interface InternalThreadState {
   profile: CodexExecutionProfile | null;
   status: CodexThreadStatus;
   activeTurnId: string | null;
+  /**
+   * The turn a provider-authoritative `idle` status retired before its
+   * `turn/completed` notification arrived. It keeps a late completion from
+   * being misread as a superseded-turn anomaly.
+   */
+  retiredTurnId: string | null;
   lastTurnStatus: CodexTurnStatus | null;
   pendingRequests: Map<string, CodexPendingRequest>;
   queue: CodexQueuedMessage[];
@@ -99,6 +107,18 @@ interface InternalThreadState {
   nextTurnOverrides: JsonObject | null;
   generation: number;
   dispatchPromise: Promise<void> | null;
+}
+
+/**
+ * Facts that belong to the provider thread rather than to one selected-detail
+ * attachment. Detaching is not "end": it must not destroy the operator's queue
+ * or forget a provider-confirmed profile that `thread/resume` cannot restate.
+ */
+interface DetachedThreadFacts {
+  queue: CodexQueuedMessage[];
+  profile: CodexExecutionProfile | null;
+  pendingSettings: CodexPendingSettings | null;
+  nextTurnOverrides: JsonObject | null;
 }
 
 type PendingAdoptionEvent =
@@ -190,6 +210,22 @@ function sourceKind(value: unknown): string | null {
   if (typeof value === "string") return value;
   if (!isObject(value)) return null;
   return stringField(value, "type") ?? stringField(value, "kind");
+}
+
+/**
+ * A bounded single-line title derived from the operator's own text. It is only
+ * ever sent to `thread/name/set`; nothing is displayed until the provider
+ * accepts it.
+ */
+function codexThreadName(source: string | undefined): string | null {
+  if (source === undefined) return null;
+  const firstLine = source.split(/\r?\n/u).map((line) => line.trim()).find(Boolean);
+  if (!firstLine) return null;
+  const collapsed = firstLine.replaceAll(/\s+/gu, " ");
+  const points = Array.from(collapsed);
+  return points.length <= MAX_THREAD_NAME_CODE_POINTS
+    ? collapsed
+    : `${points.slice(0, MAX_THREAD_NAME_CODE_POINTS - 1).join("").trimEnd()}…`;
 }
 
 function profileSettings(
@@ -407,6 +443,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
   #settingsDelivery: CodexSettingsDelivery = "unavailable";
   #enabledControls = new Set<CodexControlCapability>();
   #threads = new Map<string, InternalThreadState>();
+  #detachedThreads = new Map<string, DetachedThreadFacts>();
   #adoptedThreadIds = new Set<string>();
   #pendingAdoptions = new Map<string, PendingAdoption>();
   #ownedEnvironmentIds: ReadonlySet<string>;
@@ -566,6 +603,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
         });
       }
     }
+    await this.#nameManagedThread(thread, options);
     if (options.initialMessage !== undefined) {
       // New App Server versions may omit or extend the creation status. Only
       // the managed thread's initial input may bypass that unknown-status gate.
@@ -606,11 +644,38 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     return this.#snapshot(thread);
   }
 
+  /**
+   * A raw UUID is not a usable card or drawer title, but the thread-name RPC is
+   * version/capability gated: it is attempted only while advertised, a
+   * rejection withdraws the control, and the name stays honestly unset rather
+   * than being faked locally. It never blocks the initial message.
+   */
+  async #nameManagedThread(
+    state: InternalThreadState,
+    options: StartCodexThreadOptions,
+  ): Promise<void> {
+    if (state.name) return;
+    const name = codexThreadName(options.name ?? options.initialMessage);
+    if (!name || !this.#enabledControls.has("thread.rename")) return;
+    try {
+      await this.renameThread(state.threadId, name);
+    } catch (error) {
+      this.#emit({
+        type: "diagnostic",
+        level: "warning",
+        code: "codex.thread.name_unavailable",
+        message: `Codex thread ${state.threadId} could not be named: ${errorMessage(error)}`,
+        threadId: state.threadId,
+      });
+    }
+  }
+
   async resumeThread(
     threadId: string,
     options: ResumeCodexThreadOptions = {},
   ): Promise<CodexThreadState> {
-    return this.#resumeThread(threadId, options, null);
+    await this.#resumeThread(threadId, options, null);
+    return this.#reattachThread(threadId);
   }
 
   async #resumeThread(
@@ -831,7 +896,9 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
       const adopted = this.getThreadState(threadId);
       if (!adopted) throw new Error("Codex thread disappeared during adoption");
       this.#assertAdoptedIdentity(adopted, expectedIdentity);
-      return adopted;
+      // Retained facts are restored only after the provider identity validates,
+      // so a mismatched thread can never inherit another thread's queue.
+      return this.#reattachThread(threadId);
     } catch (error) {
       this.#pendingAdoptions.delete(threadId);
       if (this.#adoptedThreadIds.has(threadId)) {
@@ -853,12 +920,85 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     }
     await this.#call("thread.unsubscribe", "thread/unsubscribe", { threadId });
     this.#adoptedThreadIds.delete(threadId);
+    this.#detachThread(threadId);
+  }
+
+  /**
+   * Releasing the selected-detail plane detaches this client from the thread.
+   * It is not "end", so the manager queue and the provider-confirmed settings
+   * survive against the exact thread identity instead of being discarded — the
+   * queue activity item stays truthful and the message is still delivered when
+   * selection re-adopts the thread.
+   */
+  #detachThread(threadId: string): void {
     const state = this.#threads.get(threadId);
-    if (state) {
-      state.pendingRequests.clear();
-      state.queue.length = 0;
-      this.#threads.delete(threadId);
+    this.#threads.delete(threadId);
+    if (!state) return;
+    state.pendingRequests.clear();
+    const retained = state.queue.filter((item) => item.status === "queued");
+    if (retained.length !== state.queue.length) {
+      // A dispatch was in flight. Its provider outcome is unknown, so it is
+      // never re-queued: replaying it could start a second turn for one
+      // message. The operator sees the removal instead of a silent drop.
+      this.#commitQueue(state, (queue) => {
+        queue.splice(0, queue.length, ...retained);
+      });
+      this.#emit({
+        type: "diagnostic",
+        level: "warning",
+        code: "codex.queue.dispatch_unresolved",
+        message: `A Codex message was dispatching when thread ${threadId} was released and was not re-queued`,
+        threadId,
+      });
     }
+    if (
+      retained.length === 0 && state.profile === null
+      && state.pendingSettings === null && state.nextTurnOverrides === null
+    ) return;
+    this.#detachedThreads.delete(threadId);
+    this.#detachedThreads.set(threadId, {
+      queue: retained.map(cloneQueueItem),
+      profile: state.profile,
+      pendingSettings: state.pendingSettings,
+      nextTurnOverrides: state.nextTurnOverrides,
+    });
+    for (const oldest of this.#detachedThreads.keys()) {
+      if (this.#detachedThreads.size <= MAX_DETACHED_THREADS) break;
+      this.#detachedThreads.delete(oldest);
+      this.#emit({
+        type: "diagnostic",
+        level: "warning",
+        code: "codex.queue.detached_evicted",
+        message: `Retained detached state for Codex thread ${oldest} was evicted at the bounded limit`,
+        threadId: oldest,
+      });
+    }
+  }
+
+  /** Restore the detached facts of a re-adopted thread and release its queue. */
+  #reattachThread(threadId: string): CodexThreadState {
+    const state = this.#requireThread(threadId);
+    const detached = this.#detachedThreads.get(threadId);
+    if (detached) {
+      this.#detachedThreads.delete(threadId);
+      state.profile ??= detached.profile;
+      state.pendingSettings ??= detached.pendingSettings;
+      if (detached.nextTurnOverrides) {
+        state.nextTurnOverrides = {
+          ...detached.nextTurnOverrides,
+          ...(state.nextTurnOverrides ?? {}),
+        };
+      }
+      if (detached.queue.length > 0) {
+        this.#commitQueue(state, (queue) => queue.unshift(...detached.queue));
+      } else {
+        this.#touch(state);
+      }
+    }
+    void this.#drainQueue(state).catch((error) =>
+      this.#diagnostic("codex.queue.dispatch_failed", error, threadId)
+    );
+    return this.#snapshot(state);
   }
 
   async queueMessage(
@@ -884,8 +1024,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
       enqueuedAt: this.#now().toISOString(),
       turnId: null,
     };
-    state.queue.push(queued);
-    this.#touch(state, true);
+    this.#commitQueue(state, (queue) => queue.push(queued));
     const dispatchAlreadyInProgress = state.dispatchPromise !== null;
     const dispatch = this.#drainQueue(state, dispatchWhenStatusUnknown);
     if (dispatchAlreadyInProgress) return cloneQueueItem(queued);
@@ -1012,8 +1151,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     if (state.queue[index]?.status === "dispatching") {
       throw new Error("A dispatching Codex message cannot be removed");
     }
-    state.queue.splice(index, 1);
-    this.#touch(state, true);
+    this.#commitQueue(state, (queue) => queue.splice(index, 1));
   }
 
   async renameThread(threadId: string, name: string): Promise<void> {
@@ -1053,9 +1191,13 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     const state = this.#requireThread(threadId);
     this.#assertThreadWritable(state);
     if (state.activeTurnId) await this.interrupt(threadId, state.activeTurnId);
-    state.queue.length = 0;
-    this.#touch(state, true);
+    this.#commitQueue(state, (queue) => {
+      queue.length = 0;
+    });
     await this.releaseThread(threadId);
+    // "End" is the one lifecycle action that really does discard the manager
+    // queue, so nothing may be retained for a later re-adoption.
+    this.#detachedThreads.delete(threadId);
     this.#activityOffsets.delete(threadId);
     this.#activityTodos.delete(threadId);
     this.#emit({ type: "thread.removed", threadId, reason: "ended" });
@@ -1097,13 +1239,15 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     for (const state of this.#threads.values()) {
       const pending = [...state.pendingRequests.values()];
       state.pendingRequests.clear();
-      for (const item of state.queue) {
-        if (item.status === "dispatching") item.status = "queued";
-      }
       if (state.activeTurnId) state.lastTurnStatus = "failed";
       state.activeTurnId = null;
+      state.retiredTurnId = null;
       state.status = "system-error";
-      this.#touch(state, state.queue.length > 0);
+      this.#commitQueue(state, (queue) => {
+        for (const item of queue) {
+          if (item.status === "dispatching") item.status = "queued";
+        }
+      });
       for (const request of pending) {
         this.#emit({
           type: "request.resolved",
@@ -1139,6 +1283,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     await this.rpc.close();
     this.#listeners.clear();
     this.#pendingAdoptions.clear();
+    this.#detachedThreads.clear();
     this.#activityOffsets.clear();
     this.#activityTodos.clear();
   }
@@ -1271,6 +1416,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     const known = this.#adoptedThreadIds.has(threadId) || this.#threads.has(threadId);
     this.#adoptedThreadIds.delete(threadId);
     this.#threads.delete(threadId);
+    this.#detachedThreads.delete(threadId);
     this.#activityOffsets.delete(threadId);
     this.#activityTodos.delete(threadId);
     if (known) this.#emit({ type: "thread.removed", threadId, reason });
@@ -1316,6 +1462,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
         profile: null,
         status: "unknown",
         activeTurnId: null,
+        retiredTurnId: null,
         lastTurnStatus: null,
         pendingRequests: new Map(),
         queue: [],
@@ -1367,8 +1514,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     // A failed or ambiguous initial dispatch must never remain in the ordinary
     // FIFO: adding a later message could otherwise replay the original prompt
     // without an explicit recovery decision.
-    state.queue.shift();
-    this.#touch(state, true);
+    this.#commitQueue(state, (queue) => queue.shift());
   }
 
   #managedCreationError(
@@ -1403,7 +1549,15 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     state.cwd = stringField(response, "cwd") ?? stringField(thread, "cwd") ?? state.cwd;
     state.name = stringField(thread, "name") ?? state.name;
     state.preview = stringField(thread, "preview") ?? state.preview;
-    state.source = sourceKind(thread.source) ?? state.source;
+    // `Thread.source` is the environment-derived source kind (`cli`, `vscode`,
+    // `appServer`, …) of whatever launched the private App Server, so it
+    // misreports a manager-created thread as the editor that started the
+    // manager. `Thread.threadSource` is the exact client-supplied
+    // classification the provider stores and echoes back, so prefer it when the
+    // provider has one.
+    state.source = sourceKind(thread.threadSource)
+      ?? sourceKind(thread.source)
+      ?? state.source;
     state.model = stringField(response, "model") ?? state.model;
     state.effort = stringField(response, "reasoningEffort") ?? state.effort;
     state.status = normalizedThreadStatus(thread.status);
@@ -1469,6 +1623,21 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     }
   }
 
+  /**
+   * The only place `state.queue` may change. The `queue.changed` event, the
+   * projected queue activity item, and the array `remove-queued` is derived
+   * from all come from the same snapshot here, so the operator can never see a
+   * queued bubble the adapter has already forgotten — or lose one it still
+   * holds.
+   */
+  #commitQueue(
+    state: InternalThreadState,
+    mutate: (queue: CodexQueuedMessage[]) => void,
+  ): void {
+    mutate(state.queue);
+    this.#touch(state, true);
+  }
+
   async #drainQueue(
     state: InternalThreadState,
     dispatchWhenStatusUnknown = false,
@@ -1489,8 +1658,9 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
   async #dispatchNext(state: InternalThreadState): Promise<void> {
     const queued = state.queue[0];
     if (!queued) return;
-    queued.status = "dispatching";
-    this.#touch(state, true);
+    this.#commitQueue(state, () => {
+      queued.status = "dispatching";
+    });
     try {
       const result = asJsonObject(await this.#call(
         "turn.queue",
@@ -1505,17 +1675,19 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
       const turn = asJsonObject(result.turn, "turn/start turn");
       const turnId = stringField(turn, "id");
       if (!turnId) throw new Error("Codex turn/start response omitted the turn ID");
-      queued.status = "dispatched";
-      queued.turnId = turnId;
       state.activeTurnId = turnId;
       state.status = "running";
       state.lastTurnStatus = "inProgress";
       state.nextTurnOverrides = null;
-      state.queue.shift();
-      this.#touch(state, true);
+      this.#commitQueue(state, (queue) => {
+        queued.status = "dispatched";
+        queued.turnId = turnId;
+        queue.shift();
+      });
     } catch (error) {
-      queued.status = "queued";
-      this.#touch(state, true);
+      this.#commitQueue(state, () => {
+        queued.status = "queued";
+      });
       throw error;
     }
   }
@@ -1578,8 +1750,16 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     if (!state || !this.#adoptedThreadIds.has(threadId)) return;
 
     switch (notification.method) {
-      case "thread/status/changed":
+      case "thread/status/changed": {
         state.status = normalizedThreadStatus(params.status);
+        if (state.status === "idle" && state.activeTurnId) {
+          // Codex 0.146 emits `idle` immediately before `turn/completed`.
+          // `idle` is exact provider state — no turn is running — so retire the
+          // active turn here too. A late, reordered, or dropped `turn/completed`
+          // can then never strand the manager queue behind a finished turn.
+          state.retiredTurnId = state.activeTurnId;
+          state.activeTurnId = null;
+        }
         this.#touch(state);
         if (state.status === "idle" && !state.activeTurnId) {
           void this.#drainQueue(state).catch((error) =>
@@ -1587,6 +1767,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
           );
         }
         break;
+      }
       case "thread/settings/updated": {
         if (!isObject(params.threadSettings)) return;
         const settings = params.threadSettings;
@@ -1652,9 +1833,20 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
         this.#touch(state);
         break;
       }
+      // Codex 0.146 has no `turn/failed` or `turn/interrupted` notification:
+      // completed, interrupted, and failed all arrive here as `turn/completed`
+      // carrying the exact `Turn.status`, so this one path covers every real
+      // turn-completion outcome.
       case "turn/completed": {
         if (!isObject(params.turn)) return;
         const completedTurnId = stringField(params.turn, "id");
+        if (completedTurnId && completedTurnId === state.retiredTurnId
+            && state.activeTurnId && state.activeTurnId !== completedTurnId) {
+          // The idle status already retired this turn and the queue has since
+          // started the next one. That completion is expected, not superseded.
+          state.retiredTurnId = null;
+          return;
+        }
         if (state.activeTurnId && completedTurnId &&
             state.activeTurnId !== completedTurnId) {
           this.#emit({
@@ -1667,6 +1859,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
           return;
         }
         state.activeTurnId = null;
+        state.retiredTurnId = null;
         state.lastTurnStatus = normalizedTurnStatus(params.turn.status);
         state.status = "idle";
         this.#touch(state);

@@ -1,15 +1,17 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AuiIf,
   AssistantRuntimeProvider,
   MessagePrimitive,
   ThreadPrimitive,
   useExternalStoreRuntime,
+  useScrollLock,
   type ThreadMessageLike,
 } from "@assistant-ui/react";
-import { Bot, LoaderCircle, Sparkles } from "lucide-react";
+import { LoaderCircle, Sparkles } from "lucide-react";
 import { reasoningEffortsForProvider } from "../../../src/shared/session.ts";
-import { GroupedActivityParts } from "./thread";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "./ui";
+import { DISCLOSURE_SCROLL_LOCK_MS, GroupedActivityParts } from "./thread";
 import { QueuedMessageCount, SessionComposer, type ComposerDelivery, type ComposerModelOption } from "./composer";
 import { TodoList } from "./plans";
 import { SessionCapabilityPanel, SessionEndedState } from "./system";
@@ -38,7 +40,10 @@ import type { PlanFileResponse, SelectedSessionFactsResponse } from "../lib/api"
 
 function UserMessage() {
   return (
-    <MessagePrimitive.Root className="ml-auto my-3 max-w-[88%] rounded-[14px_14px_4px_14px] bg-[var(--surface-selected-active)] px-3.5 py-2.5 text-[14px] leading-[21px] text-[var(--text)] sm:max-w-[78%]" data-user-message>
+    // `rounded-br-[4px]` is the one radius off the named ladder: the bubble's
+    // 12px corners are `rounded-bubble`, and the tucked tail that points the
+    // bubble at its author is a deliberate 4px, not a scale step.
+    <MessagePrimitive.Root className="ml-auto max-w-[86%] rounded-bubble rounded-br-[4px] bg-[var(--surface-selected-hover)] px-4 py-2 text-body-sm text-[var(--text)] sm:max-w-[78%]" data-user-message>
       <MessagePrimitive.Parts />
     </MessagePrimitive.Root>
   );
@@ -46,19 +51,21 @@ function UserMessage() {
 
 function SystemMessage() {
   return (
-    <MessagePrimitive.Root className="my-3 border-l-2 border-[var(--border)] bg-[var(--surface-raised)] px-3 py-2 text-[12.5px] leading-5 text-[var(--text-muted)]" aria-label="System message">
+    <MessagePrimitive.Root className="border-l-2 border-[var(--border)] bg-[var(--surface-raised)] px-3 py-2 text-meta-sm text-[var(--text-muted)]" aria-label="System message">
       <MessagePrimitive.Parts />
     </MessagePrimitive.Root>
   );
 }
 
+/**
+ * Frames 4a/4b and 9a-2 give assistant turns the full drawer width — there is no
+ * avatar gutter. The turn's own grammar (tool group, subagent spine, turn marker)
+ * carries the authorship, and the reclaimed 36px matters most at 390px.
+ */
 function AssistantMessage({ controls }: { controls: ActivityDataControls }) {
   return (
-    <MessagePrimitive.Root className="my-3 grid grid-cols-[24px_minmax(0,1fr)] items-start gap-3" data-assistant-message>
-      <span className="mt-0.5 grid size-6 place-items-center bg-[var(--surface-raised)] text-[var(--text-muted)]"><Bot size={13} /></span>
-      <div className="min-w-0 text-[14px] leading-[22px]">
-        <GroupedActivityParts renderData={(name, data) => renderActivityData(name, data, controls)} />
-      </div>
+    <MessagePrimitive.Root className="grid grid-cols-[minmax(0,1fr)] min-w-0 max-w-full text-body-sm" data-assistant-message>
+      <GroupedActivityParts renderData={(name, data) => renderActivityData(name, data, controls)} />
     </MessagePrimitive.Root>
   );
 }
@@ -69,21 +76,35 @@ function EmptyActivity({ connection }: { connection: SessionActivityView["connec
       {connection === "connecting" || connection === "retrying"
         ? <LoaderCircle size={20} className="mx-auto motion-safe:animate-spin" />
         : <Sparkles size={20} className="mx-auto" />}
-      <div><h3 className="text-[14px] font-semibold text-[var(--text)]">{connection === "offline" ? "Activity stream unavailable" : "Waiting for provider activity"}</h3><p className="mt-1 text-[12.5px]">Only events the harness actually exposes will appear here.</p></div>
+      <div><h3 className="text-title-sm text-[var(--text)]">{connection === "offline" ? "Activity stream unavailable" : "Waiting for provider activity"}</h3><p className="mt-1 text-meta-sm">Only events the harness actually exposes will appear here.</p></div>
     </section>
   );
 }
 
+/*
+  This panel sits above the whole transcript, so collapsing it used to shove
+  every turn below it upward. It is now the same Radix Collapsible the rest of
+  the cockpit uses — which also gives the trigger the `aria-expanded` and
+  `aria-controls` a bare `<summary>` never had — and it joins the thread's
+  scroll lock so the toggle no longer moves what the operator is reading.
+*/
 function SessionDetails({ session, remote, facts, factsStatus, attachInstruction, attachError, loadingAttach, onRevealAttach }: { session: SessionView; remote: boolean; facts: SelectedSessionFactsResponse | null; factsStatus: "loading" | "loaded" | "error"; attachInstruction: AttachInstruction | null; attachError: string | null; loadingAttach: boolean; onRevealAttach: () => void }) {
   const view = toCockpitSessionView(session, { remote });
   const attachCommand = attachInstruction?.available ? attachInstruction.command : null;
+  const [open, setOpen] = useState(false);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const lockScroll = useScrollLock(panelRef, DISCLOSURE_SCROLL_LOCK_MS);
   return (
-    <details className="mb-4 border border-[var(--border)] bg-[var(--surface-raised)]">
-      <summary className="flex min-h-10 cursor-pointer items-center px-3 text-[12.5px] font-medium">Session facts and capabilities</summary>
-      <div className="grid gap-4 border-t border-[var(--rule)] p-3">
-        <SessionCapabilityPanel session={view} facts={facts} factsStatus={factsStatus} attachCommand={attachCommand} attachError={attachError} loadingAttach={loadingAttach} onRevealAttach={onRevealAttach} />
-      </div>
-    </details>
+    <Collapsible ref={panelRef} open={open} onOpenChange={(next) => { lockScroll(); setOpen(next); }} className="border border-[var(--border)] bg-[var(--surface-raised)]">
+      <CollapsibleTrigger data-compact-control className="flex min-h-10 w-full cursor-pointer items-center px-3 text-meta-sm font-medium">Session facts and capabilities</CollapsibleTrigger>
+      <CollapsibleContent>
+        {/* minmax(0,1fr): an implicit `auto` track sizes to max-content, which let
+            long mono fact values push the panel past a 390px viewport and get clipped. */}
+        <div className="grid grid-cols-[minmax(0,1fr)] gap-4 border-t border-[var(--rule)] p-3">
+          <SessionCapabilityPanel session={view} facts={facts} factsStatus={factsStatus} attachCommand={attachCommand} attachError={attachError} loadingAttach={loadingAttach} onRevealAttach={onRevealAttach} />
+        </div>
+      </CollapsibleContent>
+    </Collapsible>
   );
 }
 
@@ -197,14 +218,15 @@ export function SessionThread({
   return (
     <AssistantRuntimeProvider runtime={runtime}>
       <ThreadPrimitive.Root>
-        <div role="log" aria-label="Provider activity" aria-live="polite" aria-relevant="additions text">
+        {/* Drawer body: 20px between turn parts (spec 05 R7, frame 4a). */}
+        <div className="flex min-w-0 flex-col gap-5" role="log" aria-label="Provider activity" aria-live="polite" aria-relevant="additions text">
           <SessionDetails session={session} remote={remote} facts={facts} factsStatus={factsStatus} attachInstruction={attachInstruction} attachError={attachError} loadingAttach={loadingAttach} onRevealAttach={() => void revealAttach()} />
           {activity.truncated && <ActivityRetentionBoundary />}
           <AuiIf condition={(state) => state.thread.isEmpty}><EmptyActivity connection={activity.connection} /></AuiIf>
           <ThreadPrimitive.Messages>
             {({ message }) => message.role === "user" ? <UserMessage /> : message.role === "system" ? <SystemMessage /> : <AssistantMessage controls={controls} />}
           </ThreadPrimitive.Messages>
-          {["completed", "failed", "interrupted"].includes(session.status) && <div className="mt-5"><SessionEndedState canResume={session.control.capabilities.includes("resume")} resumeCommand={attachInstruction?.available ? attachInstruction.command : null} resumeDescription={attachInstruction?.description ?? null} resumeError={attachError} resumeUnavailableReason={session.control.withheld.find(({ capability }) => capability === "resume")?.reason ?? null} loadingResume={loadingAttach} onResume={() => void revealAttach()} canContinue={Boolean(session.workspaceIdentity?.worktreePath ?? session.cwd)} onContinue={onContinueInWorkspace} /></div>}
+          {["completed", "failed", "interrupted"].includes(session.status) && <div><SessionEndedState canResume={session.control.capabilities.includes("resume")} resumeCommand={attachInstruction?.available ? attachInstruction.command : null} resumeDescription={attachInstruction?.description ?? null} resumeError={attachError} resumeUnavailableReason={session.control.withheld.find(({ capability }) => capability === "resume")?.reason ?? null} loadingResume={loadingAttach} onResume={() => void revealAttach()} canContinue={Boolean(session.workspaceIdentity?.worktreePath ?? session.cwd)} onContinue={onContinueInWorkspace} /></div>}
         </div>
       </ThreadPrimitive.Root>
     </AssistantRuntimeProvider>
@@ -227,6 +249,7 @@ export function SessionThreadComposer({
   modelOptionsStatus,
   effortOptions,
   restoredDraft,
+  onOpenSetup,
 }: {
   session: SessionView;
   activity: SessionActivityView;
@@ -241,6 +264,7 @@ export function SessionThreadComposer({
   modelOptionsStatus: string | null;
   effortOptions?: readonly ReasoningEffort[];
   restoredDraft?: { key: string; text: string } | null;
+  onOpenSetup?: () => void;
 }) {
   const [text, setText] = useState("");
   useEffect(() => {
@@ -284,8 +308,8 @@ export function SessionThreadComposer({
         model={session.model.value}
         effort={session.effort.value}
         profile={session.profile.value}
-        modelOptions={canSetModel ? modelOptions : []}
-        modelOptionsStatus={canSetModel ? modelOptionsStatus : null}
+        modelOptions={modelOptions}
+        modelOptionsStatus={modelOptionsStatus}
         modelChangeUnavailableReason={canSetModel ? null : unavailableReason("set-model", "This harness does not expose live model changes.")}
         effortChangeUnavailableReason={canSetEffort ? null : unavailableReason("set-effort", "This harness does not expose live effort changes.")}
         profileChangeUnavailableReason={canSetProfile ? null : unavailableReason("set-profile", "This harness does not expose live execution-profile changes.")}
@@ -296,7 +320,10 @@ export function SessionThreadComposer({
         {...(canSetEffort ? { onEffortChange: (effort: ReasoningEffort) => void onSetEffort(effort) } : {})}
         {...(canSetProfile ? { onProfileChange: (profile: ExecutionProfile) => void onSetProfile(profile) } : {})}
       />
-      {!mutationsReady && (canQueue || canSteer) && <p className="text-center font-mono text-[10.5px] text-[var(--warning)]">Offline drafts stay on this device and are sent only if the session state is unchanged.</p>}
+      {noWriteReason && onOpenSetup && (
+        <button type="button" className="min-h-9 justify-self-start text-code-sm text-[var(--text-muted)] underline" onClick={onOpenSetup}>Why is this read-only?</button>
+      )}
+      {!mutationsReady && (canQueue || canSteer) && <p className="text-center font-mono text-code-xs text-[var(--warning)]">Offline drafts stay on this device and are sent only if the session state is unchanged.</p>}
     </div>
   );
 }

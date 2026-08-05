@@ -1,13 +1,14 @@
 import { useEffect, useState } from "react";
-import { Check, Circle, LoaderCircle, Minus, Plus } from "lucide-react";
+import { Check, LoaderCircle, Minus, Plus } from "lucide-react";
+import { Button, Separator } from "../ui";
 import { todoCounts, todoStallMinutes, type TodoListView } from "./model";
 
 export function TodoTickBar({ list }: { list: TodoListView }) {
   const counts = todoCounts(list);
   return (
-    <span className="flex gap-1" aria-label={`${counts.completed} of ${counts.total} todos completed`}>
+    <span className="flex shrink-0 gap-[3px]" aria-label={`${counts.completed} of ${counts.total} todos completed`}>
       {list.steps.filter((step) => step.status !== "removed").map((step) => (
-        <span key={step.id} className={`h-[3px] w-4 ${step.status === "completed" ? "bg-[var(--accent)]" : step.status === "in-progress" ? "bg-[var(--accent-quiet)]" : "bg-[var(--border)]"}`} />
+        <span key={step.id} className={`h-[3px] w-4 ${step.status === "completed" ? "bg-[var(--accent)]" : step.status === "in-progress" ? "bg-[var(--accent-quiet)]" : "bg-[var(--border-strong)]"}`} />
       ))}
     </span>
   );
@@ -43,39 +44,44 @@ export function TodoList({
   const stalled = stalledFor !== null && stalledFor >= 9;
   if (!list.running) {
     return (
-      <div className="flex min-h-10 items-center gap-3 border border-[var(--border)] px-3 text-[12.5px]">
-        <Check size={14} className="text-[var(--text-muted)]" /><span>Todos · {counts.completed} of {counts.total}</span><TodoTickBar list={list} />
-        {list.duration && <span className="ml-auto font-mono text-[10.5px] text-[var(--text-muted)]">{list.duration}</span>}
+      <div className="flex min-h-10 items-center gap-2.5 py-1.5 text-body-sm text-[var(--text-muted)]">
+        <Check size={15} strokeWidth={1.75} className="shrink-0" /><span className="shrink-0 text-meta-sm font-medium text-[var(--text)]">Todos</span><span className="shrink-0 font-mono text-code-sm">{counts.completed} of {counts.total}</span><TodoTickBar list={list} />
+        {list.duration && <span className="ml-auto shrink-0 font-mono text-code-sm text-[var(--text-faint)]">{list.duration}</span>}
       </div>
     );
   }
   return (
-    <section className="border border-[var(--border)] bg-[var(--surface-raised)]" aria-label={`Todos, ${counts.completed} of ${counts.total}`}>
-      <header className="flex items-center gap-3 border-b border-[var(--rule)] px-3 py-2.5">
-        <strong className="text-[13px]">Todos · {counts.completed} of {counts.total}</strong><TodoTickBar list={list} />
+    <section className="min-w-0 max-w-full border border-[var(--border-frame)] bg-[var(--surface-raised)]" aria-label={`Todos, ${counts.completed} of ${counts.total}`}>
+      <header className="flex min-w-0 items-center gap-2.5 px-3.5 py-2.5">
+        <strong className="shrink-0 text-meta-sm font-medium">Todos</strong><span className="shrink-0 font-mono text-code-sm text-[var(--text-secondary)]">{counts.completed} of {counts.total}</span><TodoTickBar list={list} />
       </header>
-      <ol className="grid gap-1 p-3">
+      <Separator className="bg-[var(--border-hairline)]" />
+      <ol className="grid grid-cols-[minmax(0,1fr)] px-3.5 pt-1.5 pb-2.5">
         {list.steps.map((step) => (
           <li
             key={step.id}
             data-todo-churn={step.status === "removed" ? "removed" : step.addedAfterStart ? "added" : undefined}
-            className={`grid grid-cols-[18px_minmax(0,1fr)] items-start gap-2 py-1 text-[13px] ${step.status === "removed" ? "text-[var(--text-faint)]" : ""}`}
+            className={`grid grid-cols-[15px_minmax(0,1fr)] items-start gap-[11px] py-[7px] text-[13.5px] leading-5 ${step.status === "removed" ? "text-[var(--text-faint)]" : ""}`}
           >
-            {step.status === "completed" ? <Check size={14} className="mt-0.5 text-[var(--accent)]" /> : step.status === "in-progress" ? <LoaderCircle size={14} className="mt-0.5 motion-safe:animate-spin text-[var(--accent-quiet)]" /> : step.status === "removed" ? <Minus size={14} className="mt-0.5 text-[var(--removed)]" /> : step.addedAfterStart ? <Plus size={14} className="mt-0.5 text-[var(--added)]" /> : <Circle size={10} className="mt-1 text-[var(--text-faint)]" />}
-            <span className={step.status === "completed" ? "line-through text-[var(--text-muted)]" : step.status === "in-progress" ? "font-semibold text-[var(--text)]" : step.status === "removed" ? "text-[var(--text-faint)]" : "text-[var(--text-muted)]"}>
+            {step.status === "completed" ? <Check size={15} strokeWidth={1.75} className="mt-[3px] text-[var(--text-faint)]" /> : step.status === "in-progress" ? <LoaderCircle size={15} strokeWidth={1.75} className="mt-[3px] motion-safe:animate-spin text-[var(--accent)]" /> : step.status === "removed" ? <Minus size={15} strokeWidth={1.75} className="mt-[3px] text-[var(--removed)]" /> : step.addedAfterStart ? <Plus size={15} strokeWidth={1.75} className="mt-[3px] text-[var(--added)]" /> : <span className="mt-[3px] grid size-[15px] place-items-center"><span className="size-[9px] rounded-full border border-[var(--border-loud)]" /></span>}
+            <span className={`min-w-0 [overflow-wrap:anywhere] [text-wrap:pretty] ${step.status === "completed" ? "text-[var(--text-secondary)] line-through decoration-[var(--text-faint)]" : step.status === "in-progress" ? "font-semibold text-[var(--text)]" : step.status === "removed" ? "text-[var(--text-faint)]" : "text-[var(--text-secondary)]"}`}>
               {step.text}
-              {step.detail && step.status === "in-progress" && <span className="mt-0.5 block text-[12px] font-normal leading-[18px] text-[var(--text-muted)]">{step.detail}</span>}
-              {step.removedReason && step.status === "removed" && <span className="mt-0.5 block text-[11px]">{step.removedReason}</span>}
+              {step.detail && step.status === "in-progress" && <span className="mt-0.5 block font-mono text-code-sm leading-[17px] font-normal text-[var(--text-muted)]">{step.detail}</span>}
+              {step.removedReason && step.status === "removed" && <span className="mt-0.5 block font-mono text-code-sm leading-[17px]">{step.removedReason}</span>}
             </span>
           </li>
         ))}
       </ol>
-      {(list.added > 0 || list.removed > 0) && <footer className="border-t border-[var(--rule)] px-3 py-2 font-mono text-[10.5px] text-[var(--text-muted)]">+{list.added} −{list.removed} since it started</footer>}
+      {(list.added > 0 || list.removed > 0) && <>
+        <Separator className="bg-[var(--border-hairline)]" />
+        <footer className="px-3.5 py-2 font-mono text-code-sm text-[var(--text-faint)]">+{list.added} −{list.removed} since it started</footer>
+      </>}
       {stalled && (
         <div className="m-3 border-l-2 border-[var(--warning)] bg-[var(--warning-field)] p-3">
-          <strong className="text-[12.5px] text-[var(--warning)]">No todo has moved in {stalledFor} minutes</strong>
-          <p className="mt-1 text-[12px] text-[var(--text-muted)]">It is not blocked on you.</p>
-          {(canMessage || canStop) && <div className="mt-2 flex gap-2">{canMessage && <button type="button" className="min-h-9 border border-[var(--border)] px-3 text-[12px]" onClick={onAsk}>Ask what is happening</button>}{canStop && <button type="button" className="min-h-9 border border-[var(--border)] px-3 text-[12px]" onClick={onStop}>Stop the turn</button>}</div>}
+          <strong className="text-meta-sm text-[var(--warning)]">No todo has moved in {stalledFor} minutes</strong>
+          <p className="mt-1 text-meta-sm text-[var(--text-muted)]">It is not blocked on you.</p>
+          {/* A stall is not an attention request: these stay secondary, never lime. */}
+          {(canMessage || canStop) && <div className="mt-2 flex gap-2">{canMessage && <Button variant="secondary" size="touch" className="border-[var(--border)] px-3" onClick={onAsk}>Ask what is happening</Button>}{canStop && <Button variant="secondary" size="touch" className="border-[var(--border)] px-3" onClick={onStop}>Stop the turn</Button>}</div>}
         </div>
       )}
     </section>

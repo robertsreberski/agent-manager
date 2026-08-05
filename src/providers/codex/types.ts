@@ -149,6 +149,11 @@ export interface CodexModelOption {
 
 export interface StartCodexThreadOptions {
   cwd: string;
+  /**
+   * Requested thread title. Sent only through the advertised `thread/name/set`
+   * RPC; when omitted the initial message supplies the candidate name.
+   */
+  name?: string;
   model?: string;
   effort?: CodexReasoningEffort;
   approvalPolicy?: "untrusted" | "on-request" | "never";

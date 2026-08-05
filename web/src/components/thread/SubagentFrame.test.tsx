@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { ACTIVITY_SCHEMA_VERSION, type ActivityItem, type ActivitySubagentItem } from "../../types";
 import { SubagentFrame } from "./GroupedActivityParts";
@@ -55,7 +55,7 @@ describe("SubagentFrame", () => {
     expect(screen.getByRole("button", { name: /read_file/u })).toHaveAttribute("data-compact-control");
   });
 
-  it("marks compact reasoning disclosures for coarse-pointer expansion", () => {
+  it("announces the reasoning disclosure's state and reveals the text on demand", () => {
     const item: ActivitySubagentItem = {
       ...common, id: "sub", parentId: "spawn", seq: 1,
       kind: "subagent", taskId: "reviewer", name: "reasoner",
@@ -73,6 +73,18 @@ describe("SubagentFrame", () => {
     };
 
     render(<SubagentFrame data={data} />);
-    expect(screen.getByText("Reasoning")).toHaveAttribute("data-compact-control");
+
+    const disclosure = screen.getByRole("button", { name: "Reasoning" });
+    expect(disclosure).toHaveAttribute("data-compact-control");
+    expect(disclosure).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("Compare the exact provider facts.")).not.toBeInTheDocument();
+
+    fireEvent.click(disclosure);
+    expect(disclosure).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("Compare the exact provider facts.")).toBeInTheDocument();
+    // The disclosure names the region it controls, which a bare `<details>` never did.
+    expect(document.getElementById(disclosure.getAttribute("aria-controls")!)).toContainElement(
+      screen.getByText("Compare the exact provider facts."),
+    );
   });
 });

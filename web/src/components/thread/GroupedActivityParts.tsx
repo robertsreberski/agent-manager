@@ -1,11 +1,23 @@
-import { useState } from "react";
-import { MessagePrimitive, useAuiState } from "@assistant-ui/react";
-import { Bot, Check, ChevronDown, Circle, GitBranch, LoaderCircle } from "lucide-react";
+import { useRef, useState } from "react";
+import { MessagePrimitive, useAuiState, useScrollLock } from "@assistant-ui/react";
+import { Check, ChevronDown, Circle, GitBranch, LoaderCircle } from "lucide-react";
 import { MarkdownText } from "../assistant-ui/markdown-text";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "../ui";
 import { jsonForDisplay } from "../../lib/session-activity";
 import type { ActivityItem, ActivityJsonValue, ActivityState } from "../../types";
-import { displayDuration, groupActivityPart, toolGroupTiming } from "./grouping";
+import { displayDuration, groupActivityPart, toolCallDetail, toolGroupTiming } from "./grouping";
 import type { SubagentFrameData } from "./subagent";
+
+/**
+ * Collapsing a disclosure halfway down a long turn drops every row below it by
+ * the height of what was hidden, so the line the operator was reading jumps out
+ * from under the cursor. `useScrollLock` walks up to the nearest scrollable
+ * ancestor — the drawer's own `[data-thread-content]`, which this file does not
+ * own — and pins its offset across the toggle. The transcript has no height
+ * transition, so the lock only has to outlive the reflow and any scroll
+ * anchoring the browser applies in the same beat.
+ */
+export const DISCLOSURE_SCROLL_LOCK_MS = 120;
 
 interface ToolPart {
   toolName: string;
@@ -18,48 +30,87 @@ interface ToolPart {
   toolUI?: React.ReactNode;
 }
 
-function ToolGroup({ status, indices, children }: { status: { type: string }; indices: readonly number[]; children: React.ReactNode }) {
+/**
+ * Containment grammar shared with `DiffViewer`: a `minmax(0,1fr)` track stops
+ * grid children from sizing to max-content, and `[overflow-wrap:anywhere]`
+ * breaks the unbroken shell commands, paths and JSON blobs a tool row carries.
+ * Without both, one 2.5k-pixel Codex command widens the whole drawer.
+ */
+const CONTAINED = "min-w-0 max-w-full overflow-hidden";
+const STACK = "grid grid-cols-[minmax(0,1fr)] min-w-0 max-w-full";
+const BLOCK = "min-w-0 max-w-full overflow-x-hidden bg-[var(--surface-raised)] px-[13px] py-[11px] font-mono text-code whitespace-pre-wrap break-words [overflow-wrap:anywhere]";
+
+export function ToolGroupShell({ status, count, duration, children }: { status: { type: string }; count: number; duration: string | null; children: React.ReactNode }) {
   const forced = status.type !== "complete";
   const [chosenOpen, setChosenOpen] = useState(false);
+  const shellRef = useRef<HTMLElement>(null);
+  const lockScroll = useScrollLock(shellRef, DISCLOSURE_SCROLL_LOCK_MS);
   const open = forced || chosenOpen;
-  const parts = useAuiState((state) => state.message.parts);
-  const duration = displayDuration(toolGroupTiming(parts, indices));
   return (
-    <section className="my-2" data-tool-group-status={status.type}>
-      <button type="button" data-compact-control className="flex min-h-9 w-full items-center gap-2 text-left text-[12px] font-medium" aria-expanded={open} onClick={() => !forced && setChosenOpen((value) => !value)}>
-        <ChevronDown size={13} className={open ? "rotate-180" : "-rotate-90"} />
-        <span>{indices.length} tool {indices.length === 1 ? "call" : "calls"}</span>
-        {duration && <span className="font-mono text-[11px] font-normal text-[var(--text-muted)]">{duration}</span>}
-        {forced && <span className="font-mono text-[10.5px] text-[var(--text-muted)]">active</span>}
+    <section ref={shellRef} className={`my-2 ${CONTAINED}`} data-tool-group-status={status.type}>
+      <button type="button" data-compact-control className="flex min-h-9 w-full min-w-0 items-center gap-2 py-1.5 text-left text-[var(--text-muted)]" aria-expanded={open} onClick={() => { if (forced) return; lockScroll(); setChosenOpen((value) => !value); }}>
+        <ChevronDown size={16} strokeWidth={1.75} className={`shrink-0 ${open ? "" : "-rotate-90"}`} />
+        <span className="min-w-0 flex-1 truncate text-meta-sm font-medium">{count} tool {count === 1 ? "call" : "calls"}</span>
+        {duration && <span className="shrink-0 text-meta-sm tabular-nums text-[var(--text-faint)]">{duration}</span>}
+        {forced && <span className="shrink-0 font-mono text-code-xs text-[var(--text-faint)]">active</span>}
       </button>
-      {open && <div className="ml-[22px] grid gap-1.5">{children}</div>}
+      {open && <div className={`ml-[22px] gap-0.5 ${STACK}`} data-tool-group-body>{children}</div>}
     </section>
   );
 }
 
-function ToolCall({ part }: { part: ToolPart }) {
+function ToolGroup({ status, indices, children }: { status: { type: string }; indices: readonly number[]; children: React.ReactNode }) {
+  const parts = useAuiState((state) => state.message.parts);
+  return (
+    <ToolGroupShell status={status} count={indices.length} duration={displayDuration(toolGroupTiming(parts, indices))}>
+      {children}
+    </ToolGroupShell>
+  );
+}
+
+export function ToolCall({ part }: { part: ToolPart }) {
   const [open, setOpen] = useState(part.status.type !== "complete" || Boolean(part.isError));
+  const rowRef = useRef<HTMLElement>(null);
+  const lockScroll = useScrollLock(rowRef, DISCLOSURE_SCROLL_LOCK_MS);
   const duration = displayDuration(part.timing);
   if (part.toolUI) return part.toolUI;
-  const detail = typeof part.args === "object" && part.args !== null
-    ? Object.values(part.args as Record<string, unknown>).find((value) => typeof value === "string")
-    : null;
+  const detail = toolCallDetail(part.args);
   return (
-    <section className="border-l border-[var(--rule)] pl-2.5" data-tool-status={part.status.type}>
-      <button type="button" data-compact-control className="flex min-h-8 w-full min-w-0 items-center gap-2 text-left" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
-        {part.status.type === "running" ? <LoaderCircle size={12} className="motion-safe:animate-spin" /> : part.isError ? <Circle size={10} className="text-[var(--danger)]" /> : <Check size={12} className="text-[var(--text-muted)]" />}
-        <strong className="shrink-0 font-mono text-[11.5px]">{part.toolName}</strong>
-        {typeof detail === "string" && <span className="min-w-0 flex-1 truncate text-[11px] text-[var(--text-muted)]">{detail}</span>}
-        {duration && <span className="font-mono text-[10px] text-[var(--text-faint)]">{duration}</span>}
-        <ChevronDown size={11} className={open ? "rotate-180" : ""} />
+    <section ref={rowRef} className={CONTAINED} data-tool-status={part.status.type}>
+      <button type="button" data-compact-control className="flex min-h-8 w-full min-w-0 items-center gap-[9px] py-1.5 text-left" aria-expanded={open} onClick={() => { lockScroll(); setOpen((value) => !value); }}>
+        {part.status.type === "running" ? <LoaderCircle size={15} strokeWidth={1.75} className="shrink-0 text-[var(--text-muted)] motion-safe:animate-spin" /> : part.isError ? <Circle size={12} className="shrink-0 text-[var(--danger)]" /> : <Check size={15} strokeWidth={1.75} className="shrink-0 text-[var(--text-muted)]" />}
+        <strong className="min-w-0 truncate font-mono text-code-sm font-medium text-[var(--text)]" data-tool-name>{part.toolName}</strong>
+        {detail !== null && <span className="min-w-0 flex-1 truncate font-mono text-code-sm text-[var(--text-faint)]" data-tool-detail>{detail}</span>}
+        {duration && <span className="shrink-0 font-mono text-code-xs text-[var(--text-faint)]">{duration}</span>}
+        <ChevronDown size={12} className={`shrink-0 text-[var(--text-faint)] ${open ? "rotate-180" : ""}`} />
       </button>
       {open && (
-        <div className="grid gap-1.5 pb-2">
-          <pre className="overflow-x-auto bg-[var(--surface-raised)] p-2 font-mono text-[11.5px] leading-[18px] whitespace-pre-wrap break-words">{part.argsText || JSON.stringify(part.args, null, 2)}</pre>
-          {part.result !== undefined && <pre className={`overflow-x-auto bg-[var(--surface-raised)] p-2 font-mono text-[11.5px] leading-[18px] whitespace-pre-wrap break-words ${part.isError ? "text-[var(--danger)]" : ""}`}>{typeof part.result === "string" ? part.result : JSON.stringify(part.result, null, 2)}</pre>}
+        <div className={`gap-1.5 pb-2 ${STACK}`}>
+          <pre className={BLOCK} data-tool-arguments>{part.argsText || JSON.stringify(part.args, null, 2)}</pre>
+          {part.result !== undefined && <pre className={`${BLOCK} ${part.isError ? "text-[var(--danger)]" : ""}`} data-tool-result>{typeof part.result === "string" ? part.result : JSON.stringify(part.result, null, 2)}</pre>}
         </div>
       )}
     </section>
+  );
+}
+
+/*
+  A bare `<details>`/`<summary>` announces no expanded state and controls no
+  named region. Radix's Collapsible — the same one the rest of the cockpit was
+  moved to — wires `aria-expanded` and `aria-controls`, and its controlled
+  `open` is what lets the reasoning body join the scroll lock above.
+*/
+function ReasoningDisclosure({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  const frameRef = useRef<HTMLDivElement>(null);
+  const lockScroll = useScrollLock(frameRef, DISCLOSURE_SCROLL_LOCK_MS);
+  return (
+    <Collapsible ref={frameRef} open={open} onOpenChange={(next) => { lockScroll(); setOpen(next); }} className={`text-meta-sm text-[var(--text-muted)] ${CONTAINED}`}>
+      <CollapsibleTrigger data-compact-control className="min-h-8 cursor-pointer py-1.5">Reasoning</CollapsibleTrigger>
+      <CollapsibleContent>
+        <pre className="min-w-0 max-w-full overflow-x-hidden border-l border-[var(--rule)] pl-3 font-mono text-code-sm whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{text}</pre>
+      </CollapsibleContent>
+    </Collapsible>
   );
 }
 
@@ -95,14 +146,12 @@ function SubagentStep({ item, renderData }: { item: ActivityItem; renderData?: (
       ...(itemTiming ? { timing: itemTiming } : {}),
     }} />;
   }
-  if (item.kind === "reasoning") {
-    return <details className="text-[12px] text-[var(--text-muted)]"><summary data-compact-control className="min-h-8 cursor-pointer py-1.5">Reasoning</summary><pre className="border-l border-[var(--rule)] pl-3 font-mono text-[11.5px] leading-[18px] whitespace-pre-wrap break-words">{item.text}</pre></details>;
-  }
+  if (item.kind === "reasoning") return <ReasoningDisclosure text={item.text} />;
   if (item.kind === "message") {
     return (
-      <div className="py-1 text-[12.5px] leading-5" data-subagent-message-role={item.role}>
-        {item.role !== "assistant" && <span className="mb-1 block font-mono text-[10px] uppercase tracking-[0.12em] text-[var(--text-faint)]">{item.role}</span>}
-        <p className="whitespace-pre-wrap">{item.text}</p>
+      <div className={`py-1 text-meta-sm ${CONTAINED}`} data-subagent-message-role={item.role}>
+        {item.role !== "assistant" && <span className="mb-1 block font-mono text-eyebrow uppercase text-[var(--text-faint)]">{item.role}</span>}
+        <p className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{item.text}</p>
       </div>
     );
   }
@@ -122,19 +171,19 @@ export function SubagentFrame({ data, renderData }: { data: SubagentFrameData; r
     || returnFacts.tokens !== null
     || returnFacts.costUsd !== null;
   return (
-    <section className="relative my-3 border-l-2 border-[var(--remote)] pl-[15px]" data-subagent-id={item.id}>
-      <header className="flex min-h-8 min-w-0 items-center gap-2">
-        <Bot size={14} className="shrink-0 text-[var(--remote)]" />
-        <span className="shrink-0 text-[13px]">Subagent <strong className="text-[var(--remote)]">{item.name}</strong></span>
-        {nestedCount > 0 && <span className="ml-auto inline-flex shrink-0 items-center gap-1 font-mono text-[10.5px] text-[var(--remote-dim)]"><GitBranch size={12} />{nestedCount} nested {nestedCount === 1 ? "subagent" : "subagents"}</span>}
+    <section className={`relative my-1.5 mb-2 border-l-2 border-[var(--remote)] pl-[15px] ${CONTAINED}`} data-subagent-id={item.id}>
+      <header className="flex min-h-8 min-w-0 max-w-full items-center gap-[9px] pt-0.5 pb-2">
+        <GitBranch size={15} strokeWidth={1.75} className="shrink-0 text-[var(--remote)]" />
+        <span className="min-w-0 flex-1 truncate text-meta">Subagent <strong className="font-semibold text-[var(--remote)]">{item.name}</strong></span>
+        {nestedCount > 0 && <span className="ml-auto inline-flex shrink-0 items-center gap-1 font-mono text-code-xs text-[var(--remote-dim)]"><GitBranch size={12} />{nestedCount} nested {nestedCount === 1 ? "subagent" : "subagents"}</span>}
       </header>
-      {item.description && <p className="mt-2 bg-[var(--surface-raised)] p-2.5 text-[12.5px] leading-5 text-[var(--text-muted)]">{item.description}</p>}
-      {data.steps.length > 0 && <div className="mt-2 grid gap-1" data-subagent-steps>{data.steps.map((step) => <SubagentStep key={step.id} item={step} {...(renderData ? { renderData } : {})} />)}</div>}
-      {item.output && <p className="mt-2 whitespace-pre-wrap text-[12.5px] leading-5">{item.output}</p>}
+      {item.description && <p className="max-w-full bg-[var(--surface-raised)] px-[13px] py-[11px] text-meta-sm break-words text-[var(--text-secondary)] [overflow-wrap:anywhere]">{item.description}</p>}
+      {data.steps.length > 0 && <div className={`gap-0.5 ${STACK}`} data-subagent-steps>{data.steps.map((step) => <SubagentStep key={step.id} item={step} {...(renderData ? { renderData } : {})} />)}</div>}
+      {item.output && <p className="mt-2 max-w-full whitespace-pre-wrap break-words text-meta-sm [overflow-wrap:anywhere]">{item.output}</p>}
       {(returned || hasFacts) && (
-        <footer className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-[color-mix(in_oklab,var(--remote)_30%,transparent)] pt-2 font-mono text-[11px] text-[var(--remote-dim)]">
+        <footer className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-[var(--remote-rule)] pt-[9px] font-mono text-code-xs text-[var(--remote-dim)]">
           <span>{item.state === "complete" ? "returned to parent" : item.state === "failed" ? "failed" : item.state === "interrupted" ? "interrupted" : "current totals"}</span>
-          {(returnFacts.additions !== null || returnFacts.removals !== null) && <span className="inline-flex gap-2">{returnFacts.additions !== null && <span className="text-[var(--added)]">+{returnFacts.additions}</span>}{returnFacts.removals !== null && <span className="text-[var(--removed)]">−{returnFacts.removals}</span>}</span>}
+          {(returnFacts.additions !== null || returnFacts.removals !== null) && <span className="inline-flex gap-[7px]">{returnFacts.additions !== null && <span className="text-[var(--added)]">+{returnFacts.additions}</span>}{returnFacts.removals !== null && <span className="text-[var(--removed)]">−{returnFacts.removals}</span>}</span>}
           <span className="min-w-0 flex-1" />
           {returnFacts.tokens !== null && <span>{returnFacts.tokens.toLocaleString()} tokens</span>}
           {returnFacts.costUsd !== null && <span>{formatCost(returnFacts.costUsd)}</span>}
@@ -156,11 +205,11 @@ export function GroupedActivityParts({ renderData }: GroupedActivityPartsProps) 
     >
       {({ part, children }) => {
         switch (part.type) {
-          case "group-thought": return <div className="grid gap-1">{children}</div>;
+          case "group-thought": return <div className={`gap-1 ${STACK}`}>{children}</div>;
           case "group-tools": return <ToolGroup status={part.status} indices={part.indices}>{children}</ToolGroup>;
-          case "group-subagent": return <div className="grid gap-2">{children}</div>;
+          case "group-subagent": return <div className={`gap-2 ${STACK}`}>{children}</div>;
           case "text": return <MarkdownText />;
-          case "reasoning": return <details className="text-[12px] text-[var(--text-muted)]"><summary data-compact-control className="min-h-8 cursor-pointer py-1.5">Reasoning</summary><pre className="border-l border-[var(--rule)] pl-3 font-mono text-[11.5px] leading-[18px] whitespace-pre-wrap break-words">{part.text}</pre></details>;
+          case "reasoning": return <ReasoningDisclosure text={part.text} />;
           case "tool-call": return <ToolCall part={part} />;
           case "data": {
             if (part.dataRendererUI) return part.dataRendererUI;
@@ -168,9 +217,9 @@ export function GroupedActivityParts({ renderData }: GroupedActivityPartsProps) 
             return renderData?.(part.name, part.data) ?? null;
           }
           case "source": return <a className="text-[var(--accent-quiet)] underline" href={part.sourceType === "url" ? part.url : undefined} target="_blank" rel="noreferrer">{part.title}</a>;
-          case "file": return <span className="font-mono text-[11.5px] text-[var(--text-muted)]">{part.filename ?? "Attached file"}</span>;
+          case "file": return <span className="font-mono text-code-sm text-[var(--text-muted)]">{part.filename ?? "Attached file"}</span>;
           case "image": return <img src={part.image} alt={part.filename ?? "Message image"} className="max-w-full" />;
-          case "audio": return <span className="text-[12px] text-[var(--text-muted)]">Audio attachment</span>;
+          case "audio": return <span className="text-meta-sm text-[var(--text-muted)]">Audio attachment</span>;
           case "generative-ui": return null;
           case "indicator": return null;
           default: return null;

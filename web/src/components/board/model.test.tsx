@@ -39,6 +39,50 @@ describe("buildBoard", () => {
     expect(model.columns[0]!.worktrees.map((group) => group.label)).toEqual(["main", "feature"]);
   });
 
+  it("keeps a repository in one column when a session arrives without git facts", () => {
+    const model = buildBoard([
+      session({
+        id: "codex:scanned",
+        cwd: "/Users/me/agents/paola-bot",
+        workspaceIdentity: { repoRoot: "/Users/me/agents/paola-bot", repoName: "paola-bot", worktreePath: "/Users/me/agents/paola-bot", linked: false, branch: "master", detached: false, dirtyCount: 25, ahead: null, behind: null },
+      }),
+      session({ id: "codex:managed", cwd: "/Users/me/agents/paola-bot", workspaceIdentity: null }),
+    ]);
+    expect(model.columns).toHaveLength(1);
+    expect(model.columns[0]!.repoName).toBe("paola-bot");
+    expect(model.columns[0]!.worktrees).toHaveLength(1);
+    expect(model.columns[0]!.worktrees[0]!.label).toBe("master");
+    expect(desktopSessionIds(model)).toEqual(["codex:managed", "codex:scanned"]);
+  });
+
+  it("adopts repository facts for a column first created by an identity-less session", () => {
+    const model = buildBoard([
+      session({ id: "codex:managed", cwd: "/Users/me/agents/paola-bot", workspaceIdentity: null }),
+      session({
+        id: "codex:scanned",
+        cwd: "/Users/me/agents/paola-bot",
+        workspaceIdentity: { repoRoot: "/Users/me/agents/paola-bot", repoName: "paola-bot", worktreePath: "/Users/me/agents/paola-bot", linked: false, branch: "master", detached: false, dirtyCount: 25, ahead: null, behind: null },
+      }),
+    ]);
+    expect(model.columns).toHaveLength(1);
+    expect(model.columns[0]!.key).toBe("local:repo:/Users/me/agents/paola-bot");
+    expect(model.columns[0]!.worktrees[0]!.identity?.branch).toBe("master");
+    expect(model.columns[0]!.worktrees[0]!.label).toBe("master");
+  });
+
+  it("keeps identity-less sessions in different repositories apart", () => {
+    const model = buildBoard([
+      session({ id: "codex:one", cwd: "/work/one", workspaceIdentity: null }),
+      session({ id: "codex:two", cwd: "/work/two", workspaceIdentity: null }),
+      session({ id: "codex:remote-same-path", hostId: "remote", hostLabel: "Studio", remote: true, cwd: "/work/one", workspaceIdentity: null }),
+    ]);
+    expect(model.columns.map((column) => column.key).sort()).toEqual([
+      "local:path:/work/one",
+      "local:path:/work/two",
+      "remote:path:/work/one",
+    ]);
+  });
+
   it("keeps desktop cards and phone cards still when only updatedAt facts change", () => {
     const initial = buildBoard([
       session({ id: "codex:newer", updatedAt: "2026-08-04T13:00:00Z" }),

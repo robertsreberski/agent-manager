@@ -566,7 +566,7 @@ export class ClaudeManagedSession {
         prompt: inbox,
         options: {
           cwd: this.#config.cwd,
-          persistSession: true,
+          persistSession: this.#config.persistSession ?? true,
           includePartialMessages: true,
           includeHookEvents: true,
           forwardSubagentText: true,

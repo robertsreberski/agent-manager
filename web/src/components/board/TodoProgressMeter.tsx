@@ -10,7 +10,7 @@ export function TodoProgressMeter({
   if (todo.total <= 0) return null;
   return (
     <span
-      className={`inline-flex min-w-0 items-center gap-2 text-[11px] text-[var(--text-muted)] ${className}`}
+      className={`inline-flex min-w-0 items-center gap-2 text-code-xs text-[var(--text-muted)] ${className}`}
       aria-label={`${todo.completed} of ${todo.total} todos completed`}
       data-todo-progress
     >

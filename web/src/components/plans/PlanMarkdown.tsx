@@ -10,9 +10,10 @@ export function PlanMarkdown({ markdown, className }: { markdown: string; classN
   return (
     <div
       className={cn(
-        "min-w-0 border-l-2 border-[var(--border)] pl-3 font-mono text-[13px] leading-[21px] whitespace-pre-wrap break-words text-[var(--text)]",
-        "[&_h1]:mb-3 [&_h1]:mt-5 [&_h1]:text-[17px] [&_h1]:font-semibold [&_h1:first-child]:mt-0",
-        "[&_h2]:mb-2 [&_h2]:mt-5 [&_h2]:text-[15px] [&_h2]:font-semibold [&_h2:first-child]:mt-0",
+        // Frame 14a rails the plan body with a 2px --border-frame edge, 16px in.
+        "min-w-0 border-l-2 border-[var(--border-frame)] pl-4 font-mono text-meta leading-[21px] whitespace-pre-wrap break-words text-[var(--text)]",
+        "[&_h1]:mb-3 [&_h1]:mt-5 [&_h1]:text-title [&_h1:first-child]:mt-0",
+        "[&_h2]:mb-2 [&_h2]:mt-5 [&_h2]:text-title-sm [&_h2:first-child]:mt-0",
         "[&_h3]:mb-2 [&_h3]:mt-4 [&_h3]:font-semibold [&_h3:first-child]:mt-0",
         "[&_h4]:mb-1.5 [&_h4]:mt-3 [&_h4]:font-semibold [&_h5]:font-semibold [&_h6]:font-semibold",
         "[&_p]:my-2 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0",

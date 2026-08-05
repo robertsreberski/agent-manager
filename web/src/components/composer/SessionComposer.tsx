@@ -1,8 +1,28 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronDown, Mic, Paperclip, RotateCcw, Send, Shield, Square } from "lucide-react";
+import { ArrowUp, ChevronDown, CodeXml, Mic, Paperclip, RotateCcw, Shield, Square } from "lucide-react";
 import type { ReasoningEffort } from "@shared/session";
 import type { CockpitProvider, ExecutionProfile } from "../../lib/cockpit-view";
 import { isTypingTarget } from "../../lib/shortcuts";
+import {
+  Button,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
+  DropdownMenuShortcut,
+  DropdownMenuTrigger,
+} from "../ui";
+
+/*
+  A withheld control still has to say why. `Button` disables pointer events so a
+  disabled control cannot be hovered at all, which would swallow the native
+  `title`; these two composer triggers opt back in. The reason is also printed
+  as visible text in `data-withheld-reasons`, so the tooltip is the secondary
+  channel, never the only one.
+*/
+const KEEPS_ITS_TOOLTIP = "disabled:pointer-events-auto disabled:cursor-default";
 
 export type ComposerDelivery = "queue" | "steer";
 
@@ -74,13 +94,17 @@ export function SessionComposer(props: SessionComposerProps) {
     onProviderChange, onModelChange, onEffortChange, onProfileChange, onResetSettings,
   } = props;
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const runtimeTriggerRef = useRef<HTMLButtonElement>(null);
-  const profileTriggerRef = useRef<HTMLButtonElement>(null);
-  const menuRef = useRef<HTMLDivElement>(null);
-  const [menu, setMenu] = useState<"runtime" | "profile" | null>(null);
+  // The only state the composer still keeps for its menus: which one is open.
+  // Radix owns focus, dismissal, roving tabindex and positioning; this exists
+  // solely so ⌘⇧M and M can drive the same menus the triggers do, and so the
+  // two menus stay mutually exclusive.
+  const [openMenu, setOpenMenu] = useState<"runtime" | "profile" | null>(null);
   const settingsDisabled = !draft && settingsIdleOnly && isRunning;
   const runtimeHasAction = Boolean(onProviderChange || onModelChange || onEffortChange || onResetSettings);
-  const runtimeDisabled = settingsDisabled || !runtimeHasAction;
+  // A catalog the harness will not let this cockpit write is still worth
+  // reading. The menu opens with every choice disabled and the exact reason.
+  const runtimeIsReadable = modelOptions.length > 0 || Boolean(modelOptionsStatus);
+  const runtimeDisabled = settingsDisabled || (!runtimeHasAction && !runtimeIsReadable);
   const profileDisabled = settingsDisabled || !onProfileChange;
   const runtimeDisabledReason = settingsDisabled
     ? "Available when this turn finishes"
@@ -88,6 +112,12 @@ export function SessionComposer(props: SessionComposerProps) {
   const profileDisabledReason = settingsDisabled
     ? "Available when this turn finishes"
     : profileChangeUnavailableReason ?? "This harness does not expose live execution-profile changes.";
+  // A native tooltip is invisible on touch and to screen readers, so every
+  // withheld control states its reason as plain text in the composer itself.
+  const withheldReasons = [...new Set([
+    runtimeDisabled ? runtimeDisabledReason : null,
+    profileDisabled ? profileDisabledReason : null,
+  ].flatMap((reason) => reason && reason !== readOnlyReason ? [reason] : []))];
   const sendDisabled = busy || value.trim().length === 0 || !canQueue;
   useEffect(() => {
     const element = textareaRef.current;
@@ -95,11 +125,6 @@ export function SessionComposer(props: SessionComposerProps) {
     element.style.height = "0px";
     element.style.height = `${Math.min(120, Math.max(52, element.scrollHeight))}px`;
   }, [value]);
-  useEffect(() => {
-    if (menu === null) return;
-    const first = menuRef.current?.querySelector<HTMLElement>("button:not(:disabled), [tabindex='0']");
-    (first ?? menuRef.current)?.focus();
-  }, [menu]);
   useEffect(() => {
     function shortcut(event: KeyboardEvent) {
       if ((event.metaKey || event.ctrlKey) && !event.shiftKey && event.key.toLowerCase() === "l") {
@@ -111,11 +136,11 @@ export function SessionComposer(props: SessionComposerProps) {
       if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "m") {
         if (runtimeDisabled) return;
         event.preventDefault();
-        setMenu((current) => current === "runtime" ? null : "runtime");
+        setOpenMenu((current) => current === "runtime" ? null : "runtime");
       } else if (!event.metaKey && !event.ctrlKey && !event.altKey && event.key.toLowerCase() === "m") {
         if (profileDisabled) return;
         event.preventDefault();
-        setMenu((current) => current === "profile" ? null : "profile");
+        setOpenMenu((current) => current === "profile" ? null : "profile");
       } else if ((event.metaKey || event.ctrlKey) && !event.shiftKey && event.key === "." && isRunning && canStop) {
         event.preventDefault();
         void onStop?.();
@@ -124,16 +149,6 @@ export function SessionComposer(props: SessionComposerProps) {
     window.addEventListener("keydown", shortcut);
     return () => window.removeEventListener("keydown", shortcut);
   }, [canStop, isRunning, onStop, profileDisabled, runtimeDisabled]);
-
-  function composerKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
-    if (event.key !== "Escape" || menu === null) return;
-    const trigger = menu === "runtime" ? runtimeTriggerRef.current : profileTriggerRef.current;
-    event.preventDefault();
-    event.stopPropagation();
-    event.nativeEvent.stopImmediatePropagation();
-    setMenu(null);
-    trigger?.focus();
-  }
 
   async function send(delivery: ComposerDelivery) {
     if (!value.trim() || busy) return;
@@ -158,9 +173,12 @@ export function SessionComposer(props: SessionComposerProps) {
   }
 
   return (
-    <div className="relative rounded-2xl border border-[var(--border)] bg-[var(--surface-raised)] p-3.5" data-session-composer onKeyDownCapture={composerKeyDown}>
+    <div className="rounded-composer border border-[var(--border-hairline)] bg-[var(--surface-raised-hover)] px-3.5 pt-3.5 pb-2.5" data-session-composer>
       {readOnlyReason && (
-        <p className="mb-2 text-[12.5px] leading-5 text-[var(--text-muted)]" role="status">{readOnlyReason}</p>
+        <p className="mb-2 text-meta-sm text-[var(--text-muted)]" role="status">{readOnlyReason}</p>
+      )}
+      {withheldReasons.length > 0 && (
+        <p className="mb-2 text-code-sm text-[var(--text-muted)]" role="status" data-withheld-reasons>{withheldReasons.join(" · ")}</p>
       )}
       <textarea
         ref={textareaRef}
@@ -168,83 +186,126 @@ export function SessionComposer(props: SessionComposerProps) {
         onChange={(event) => onChange(event.target.value)}
         onKeyDown={keyDown}
         disabled={Boolean(readOnlyReason) || busy}
-        className="block min-h-[52px] max-h-[120px] w-full resize-none overflow-y-auto border-0 bg-transparent p-0 text-[15px] leading-[22px] text-[var(--text)] outline-none placeholder:text-[var(--text-faint)]"
+        className="block min-h-[52px] max-h-[120px] w-full resize-none overflow-y-auto border-0 bg-transparent px-0.5 pt-0 pb-2.5 text-body text-[var(--text)] outline-none placeholder:text-[var(--text-faint)]"
         aria-label="Message"
         placeholder={readOnlyReason ? "This session is read-only" : isRunning ? "Queue a message…" : "Message the agent…"}
       />
-      <div className="mt-2 flex min-w-0 items-center gap-2 sm:gap-3.5">
-        <button
-          ref={runtimeTriggerRef}
-          type="button"
-          data-compact-control
-          disabled={runtimeDisabled}
-          className="flex min-h-8 min-w-0 items-center gap-1.5 rounded-full px-1.5 text-left text-[13px] data-[open=true]:bg-[var(--surface-selected)] sm:px-2"
-          data-open={menu === "runtime"}
-          aria-haspopup="menu"
-          aria-expanded={menu === "runtime"}
-          title={runtimeDisabled ? runtimeDisabledReason : undefined}
-          onClick={() => setMenu((current) => current === "runtime" ? null : "runtime")}
-        >
-          <span className="grid size-[17px] shrink-0 place-items-center bg-[var(--surface-selected-active)] font-mono text-[9px] font-semibold uppercase text-[var(--text-muted)]" data-provider-mark>
-            {provider.slice(0, 1)}
-          </span>
-          <span className="truncate font-medium capitalize">{provider}</span>
-          {model && <span className="hidden max-w-28 truncate text-[var(--text-muted)] sm:inline">{model}</span>}
-          <span className="flex items-end gap-0.5" aria-label={`${effort ?? "unknown"} effort`}>
-            {[1, 2, 3].map((bar) => <span key={bar} data-effort-bar={bar <= effortBars(effort) ? "active" : "inactive"} className={`w-[3px] ${bar <= effortBars(effort) ? "h-[11px] bg-[var(--text-muted)]" : "h-[7px] bg-[var(--text-faint)]"}`} />)}
-          </span>
-          <ChevronDown size={12} strokeWidth={1.75} />
-        </button>
+      <div className="flex min-w-0 items-center gap-2.5 sm:gap-3.5">
+        <DropdownMenu open={openMenu === "runtime"} onOpenChange={(next) => setOpenMenu(next ? "runtime" : null)}>
+          <DropdownMenuTrigger asChild disabled={runtimeDisabled}>
+            <Button
+              variant="ghost"
+              size="sm"
+              data-compact-control
+              className={`h-auto min-h-8 min-w-0 justify-start rounded-full px-1.5 text-left text-meta data-[state=open]:bg-[var(--surface-selected)] sm:px-2 ${KEEPS_ITS_TOOLTIP}`}
+              title={runtimeDisabled ? runtimeDisabledReason : undefined}
+            >
+              {/* Frame 5a fills this tile lime. Spec 12 R3 reserves lime for wants-you and
+                  the operator's own primary action, so the tile keeps the frame's glyph and
+                  a neutral fill — see the "provider identity and effort neutral" test. */}
+              <span className="grid size-[17px] shrink-0 place-items-center bg-[var(--surface-selected-active)] text-[var(--text-muted)]" data-provider-mark>
+                <CodeXml size={11} strokeWidth={2} />
+              </span>
+              <span className="shrink-0 font-medium capitalize">{provider}</span>
+              {model && <span className="hidden min-w-0 max-w-28 truncate text-[var(--text-muted)] sm:inline">{model}</span>}
+            </Button>
+          </DropdownMenuTrigger>
+          {/* Radix names a menu after its trigger; "codex gpt-5" is a worse
+              label for this menu than what it actually contains. */}
+          <DropdownMenuContent side="top" align="start" aria-labelledby={undefined} aria-label="Harness, model, and effort" className="max-w-[22rem] min-w-64">
+            {draft && providerOptions.length > 0 && (
+              <>
+                <DropdownMenuRadioGroup value={provider} onValueChange={(next) => onProviderChange?.(next as CockpitProvider)}>
+                  {providerOptions.map((option) => (
+                    <DropdownMenuRadioItem key={option} value={option} disabled={!onProviderChange} className="capitalize">{option}</DropdownMenuRadioItem>
+                  ))}
+                </DropdownMenuRadioGroup>
+                <DropdownMenuSeparator />
+              </>
+            )}
+            <DropdownMenuRadioGroup value={model ?? ""} onValueChange={(next) => onModelChange?.(next)}>
+              {modelOptions.map((option) => (
+                <DropdownMenuRadioItem
+                  key={option.value}
+                  value={option.value}
+                  disabled={settingsDisabled || !onModelChange}
+                  title={!onModelChange ? modelChangeUnavailableReason ?? undefined : undefined}
+                  className="flex-col items-start gap-0.5 py-2"
+                >
+                  <span className="font-medium">{option.label}</span>
+                  <span className="font-mono text-code-xs text-[var(--text-muted)]">{option.value}</span>
+                  {option.description && <span className="text-code-xs text-[var(--text-faint)]">{option.description}</span>}
+                </DropdownMenuRadioItem>
+              ))}
+            </DropdownMenuRadioGroup>
+            {modelOptions.length === 0 && modelOptionsStatus && <p className="px-2.5 py-1.5 text-code-sm text-[var(--text-muted)]" role="status">{modelOptionsStatus}</p>}
+            {!onModelChange && modelChangeUnavailableReason && <p className="px-2.5 py-1.5 text-code-sm text-[var(--text-muted)]">{modelChangeUnavailableReason}</p>}
+            {/* No rule unless the model section actually said something. */}
+            {(modelOptions.length > 0 || modelOptionsStatus || (!onModelChange && modelChangeUnavailableReason)) && <DropdownMenuSeparator />}
+            <DropdownMenuRadioGroup value={effort ?? ""} onValueChange={(next) => onEffortChange?.(next as NonNullable<SessionComposerProps["effort"]>)}>
+              {effortOptions.map((option) => (
+                <DropdownMenuRadioItem
+                  key={option}
+                  value={option}
+                  disabled={settingsDisabled || !onEffortChange}
+                  title={!onEffortChange ? effortChangeUnavailableReason ?? undefined : undefined}
+                  className="capitalize"
+                >{option} effort</DropdownMenuRadioItem>
+              ))}
+            </DropdownMenuRadioGroup>
+            {!onEffortChange && effortChangeUnavailableReason && <p className="px-2.5 py-1.5 text-code-sm text-[var(--text-muted)]">{effortChangeUnavailableReason}</p>}
+            {onResetSettings && (
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem disabled={settingsDisabled} className="text-[var(--text-muted)]" onSelect={() => onResetSettings()}>
+                  <RotateCcw size={12} aria-hidden="true" />Reset to configured defaults
+                </DropdownMenuItem>
+              </>
+            )}
+          </DropdownMenuContent>
+        </DropdownMenu>
+        <span className="flex shrink-0 items-end gap-0.5" role="img" aria-label={`${effort ?? "unknown"} effort`}>
+          {[1, 2, 3].map((bar) => <span key={bar} data-effort-bar={bar <= effortBars(effort) ? "active" : "inactive"} className={`w-[3px] ${bar <= effortBars(effort) ? "h-[11px] bg-[var(--text-muted)]" : "h-[7px] bg-[var(--border-strong)]"}`} />)}
+        </span>
         <span className="h-3.5 w-px shrink-0 bg-[var(--border)]" />
-        <button
-          ref={profileTriggerRef}
-          type="button"
-          data-compact-control
-          disabled={profileDisabled}
-          className="flex min-h-8 items-center gap-1 rounded-full px-2 text-[13px] data-[open=true]:bg-[var(--surface-selected)] disabled:opacity-45"
-          data-open={menu === "profile"}
-          aria-haspopup="menu"
-          aria-expanded={menu === "profile"}
-          title={profileDisabled ? profileDisabledReason : undefined}
-          onClick={() => setMenu((current) => current === "profile" ? null : "profile")}
-        >
-          <span className={profile === "full-access" ? "text-[var(--access)]" : ""}>{profileLabel(profile)}</span>
-          <ChevronDown size={12} strokeWidth={1.75} />
-        </button>
+        <DropdownMenu open={openMenu === "profile"} onOpenChange={(next) => setOpenMenu(next ? "profile" : null)}>
+          <DropdownMenuTrigger asChild disabled={profileDisabled}>
+            <Button
+              variant="ghost"
+              size="sm"
+              data-compact-control
+              className={`h-auto min-h-8 gap-1.5 rounded-full px-2 text-meta data-[state=open]:bg-[var(--surface-selected)] ${KEEPS_ITS_TOOLTIP}`}
+              title={profileDisabled ? profileDisabledReason : undefined}
+            >
+              <span className={profile === "full-access" ? "text-[var(--access)]" : "text-[var(--text-secondary)]"}>{profileLabel(profile)}</span>
+              <ChevronDown size={12} strokeWidth={1.75} className="text-[var(--text-faint)]" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent side="top" align="start" aria-labelledby={undefined} aria-label="Execution profile" className="min-w-48">
+            <DropdownMenuRadioGroup value={profile ?? ""} onValueChange={(next) => onProfileChange?.(next as ExecutionProfile)}>
+              {profileOptions.map((option, index) => (
+                <DropdownMenuRadioItem key={option} value={option} className={option === "full-access" ? "text-[var(--access)]" : ""}>
+                  {PROFILE_LABEL[option]}
+                  <DropdownMenuShortcut>{index + 1}</DropdownMenuShortcut>
+                </DropdownMenuRadioItem>
+              ))}
+            </DropdownMenuRadioGroup>
+          </DropdownMenuContent>
+        </DropdownMenu>
         {profile === "full-access" && (
-          <span className="hidden items-center gap-1 bg-[var(--access-field)] px-2 py-1 text-[11px] text-[var(--access)] sm:flex"><Shield size={11} />Full access</span>
+          <span className="hidden shrink-0 items-center gap-1 bg-[var(--access-field)] px-2 py-1 text-code-xs whitespace-nowrap text-[var(--access)] lg:flex"><Shield size={11} />Full access</span>
         )}
-        <span className="flex-1" />
-        <span className="hidden font-mono text-[10px] text-[var(--text-faint)] md:inline">{isRunning ? "queues while running" : "↵ sends"}</span>
-        <button type="button" disabled aria-label="Attach files unavailable" title="Attachments are not supported by this harness" className="hidden size-8 place-items-center text-[var(--text-faint)] disabled:opacity-40 sm:grid"><Paperclip size={16} strokeWidth={1.75} /></button>
-        <button type="button" disabled aria-label="Dictation unavailable" title="Dictation is not configured" className="hidden size-8 place-items-center text-[var(--text-faint)] disabled:opacity-40 sm:grid"><Mic size={16} strokeWidth={1.75} /></button>
+        <span className="min-w-0 flex-1" />
+        <span className="hidden shrink-0 font-mono text-code-sm whitespace-nowrap text-[var(--text-faint)] md:inline">{isRunning ? "queues while running" : "↵ sends"}</span>
+        {/* Both are withheld capabilities, not decoration: they stay visible, disabled, and say why. */}
+        <Button variant="ghost" size="icon" disabled aria-label="Attach files unavailable" title="Attachments are not supported by this harness" className={`hidden size-8 text-[var(--text-faint)] sm:inline-flex ${KEEPS_ITS_TOOLTIP}`}><Paperclip size={16} strokeWidth={1.75} /></Button>
+        <Button variant="ghost" size="icon" disabled aria-label="Dictation unavailable" title="Dictation is not configured" className={`hidden size-8 text-[var(--text-faint)] sm:inline-flex ${KEEPS_ITS_TOOLTIP}`}><Mic size={16} strokeWidth={1.75} /></Button>
         {isRunning && canStop ? (
-          <button type="button" data-compact-control className="grid size-[30px] shrink-0 place-items-center rounded-full bg-[var(--text)] text-[var(--app)]" aria-label="Stop turn" onClick={() => void onStop?.()}><Square size={11} fill="currentColor" /></button>
+          <Button variant="ghost" size="icon" data-compact-control className="size-[30px] rounded-full bg-[var(--text)] text-[var(--app)] hover:bg-[var(--text-secondary)] hover:text-[var(--app)]" aria-label="Stop turn" onClick={() => void onStop?.()}><Square size={11} strokeWidth={2} /></Button>
         ) : (
-          <button type="button" data-compact-control disabled={sendDisabled} className="grid size-[30px] shrink-0 place-items-center rounded-full bg-[var(--accent)] text-[var(--accent-ink)] disabled:opacity-35" aria-label={isRunning ? "Queue message" : "Send message"} onClick={() => void send("queue")}><Send size={14} strokeWidth={2} /></button>
+          <Button variant="primary" size="icon" data-compact-control disabled={sendDisabled} className="size-[30px]" aria-label={isRunning ? "Queue message" : "Send message"} onClick={() => void send("queue")}><ArrowUp size={15} strokeWidth={2} /></Button>
         )}
       </div>
-      {menu === "runtime" && (
-        <div ref={menuRef} tabIndex={-1} role="menu" aria-label="Harness, model, and effort" className="absolute bottom-[54px] left-3 z-20 grid min-w-64 gap-px border border-[var(--border)] bg-[var(--menu)] p-1 shadow-[0_24px_60px_rgb(0_0_0/0.65)]">
-          {draft && providerOptions.map((option) => <button key={option} role="menuitemradio" aria-checked={provider === option} disabled={!onProviderChange} className="px-3 py-2 text-left text-[12.5px] capitalize hover:bg-[var(--surface-selected)] disabled:opacity-45" onClick={() => onProviderChange?.(option)}>{option}</button>)}
-          {modelOptions.map((option) => <button key={option.value} role="menuitemradio" aria-checked={model === option.value} disabled={settingsDisabled || !onModelChange} title={!onModelChange ? modelChangeUnavailableReason ?? undefined : undefined} className="px-3 py-2 text-left hover:bg-[var(--surface-selected)] disabled:opacity-45" onClick={() => { if (!onModelChange) return; onModelChange(option.value); setMenu(null); }}><span className="block text-[12px] font-medium">{option.label}</span><span className="block font-mono text-[10.5px] text-[var(--text-muted)]">{option.value}</span>{option.description && <span className="mt-0.5 block max-w-72 text-[10.5px] leading-4 text-[var(--text-faint)]">{option.description}</span>}</button>)}
-          {modelOptions.length === 0 && modelOptionsStatus && <p className="px-3 py-2 text-[11.5px] leading-4 text-[var(--text-muted)]" role="status">{modelOptionsStatus}</p>}
-          {!onModelChange && modelChangeUnavailableReason && <p className="px-3 py-2 text-[11.5px] leading-4 text-[var(--text-muted)]">{modelChangeUnavailableReason}</p>}
-          <div className="h-px bg-[var(--rule)]" />
-          {effortOptions.map((option) => <button key={option} role="menuitemradio" aria-checked={effort === option} disabled={settingsDisabled || !onEffortChange} title={!onEffortChange ? effortChangeUnavailableReason ?? undefined : undefined} className="px-3 py-2 text-left text-[12.5px] capitalize hover:bg-[var(--surface-selected)] disabled:opacity-45" onClick={() => onEffortChange?.(option)}>{option} effort</button>)}
-          {!onEffortChange && effortChangeUnavailableReason && <p className="px-3 py-2 text-[11.5px] leading-4 text-[var(--text-muted)]">{effortChangeUnavailableReason}</p>}
-          {onResetSettings && <><div className="h-px bg-[var(--rule)]" /><button type="button" role="menuitem" disabled={settingsDisabled} className="flex min-h-9 items-center gap-2 px-3 text-left text-[12.5px] text-[var(--text-muted)] hover:bg-[var(--surface-selected)] disabled:opacity-45" onClick={() => { onResetSettings(); setMenu(null); }}><RotateCcw size={12} />Reset to configured defaults</button></>}
-        </div>
-      )}
-      {menu === "profile" && (
-        <div ref={menuRef} tabIndex={-1} role="menu" aria-label="Execution profile" className="absolute bottom-[54px] left-28 z-20 grid min-w-48 gap-px border border-[var(--border)] bg-[var(--menu)] p-1 shadow-[0_24px_60px_rgb(0_0_0/0.65)]">
-          {profileOptions.map((option, index) => (
-            <button key={option} role="menuitemradio" aria-checked={profile === option} className={`flex justify-between px-3 py-2 text-left text-[12.5px] hover:bg-[var(--surface-selected)] ${option === "full-access" ? "text-[var(--access)]" : ""}`} onClick={() => { onProfileChange?.(option); setMenu(null); }}>
-              <span>{PROFILE_LABEL[option]}</span><kbd className="font-mono text-[10px] text-[var(--text-faint)]">{index + 1}</kbd>
-            </button>
-          ))}
-        </div>
-      )}
     </div>
   );
 }

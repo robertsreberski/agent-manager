@@ -21,6 +21,7 @@ import {
   sep,
 } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import type { ActivityJsonValue } from "../activity/types.ts";
 import { redactActivityText } from "../activity/redaction.ts";
 import type {
   Provider,
@@ -46,12 +47,12 @@ export interface TranscriptAvailability {
   state: "available" | "unavailable";
   truncated: boolean;
   source: TranscriptSource | null;
-  messageCount: number;
+  itemCount: number;
   reason: TranscriptUnavailableReason | null;
 }
 
 export interface TranscriptReadResult {
-  messages: TranscriptMessage[];
+  items: TranscriptItem[];
   transcript: TranscriptAvailability;
 }
 
@@ -69,15 +70,48 @@ export interface TranscriptSearchResult {
   truncated: boolean;
 }
 
-/** Internal reader output. Conversation history is projected into ActivityItem. */
-export interface TranscriptMessage {
+export type TranscriptItemStatus = "running" | "complete" | "incomplete";
+
+interface TranscriptItemBase {
   id: string;
+  createdAt: string | null;
+  status: TranscriptItemStatus;
+}
+
+/** Internal reader output. Conversation history is projected into ActivityItem. */
+export interface TranscriptMessage extends TranscriptItemBase {
+  kind: "message";
   role: "user" | "assistant" | "system" | "tool";
   text: string;
-  createdAt: string | null;
-  status: "running" | "complete" | "incomplete";
   label: string | null;
 }
+
+/**
+ * A provider-written reasoning summary. Encrypted or opaque reasoning payloads
+ * are never surfaced — only text the provider itself wrote in the clear.
+ */
+export interface TranscriptReasoning extends TranscriptItemBase {
+  kind: "reasoning";
+  text: string;
+  label: string | null;
+}
+
+/**
+ * One provider tool call, paired with its own result when the transcript
+ * recorded one. `result === null` means the transcript has not paired an output
+ * yet, never that the call returned nothing.
+ */
+export interface TranscriptToolCall extends TranscriptItemBase {
+  kind: "tool";
+  toolCallId: string;
+  name: string;
+  /** Exact provider argument spelling; an object only when the provider wrote one. */
+  arguments: ActivityJsonValue | string | null;
+  result: string | null;
+  isError: boolean;
+}
+
+export type TranscriptItem = TranscriptMessage | TranscriptReasoning | TranscriptToolCall;
 
 export interface SessionTranscriptReader {
   read(session: SessionIdentity): TranscriptReadResult;
@@ -123,8 +157,8 @@ interface FileWalkResult {
   exhausted: boolean;
 }
 
-interface ParsedMessages {
-  messages: TranscriptMessage[];
+interface ParsedItems {
+  items: TranscriptItem[];
   truncated: boolean;
 }
 
@@ -172,12 +206,12 @@ function providerSource(provider: Provider): "codex-rollout" | "claude-transcrip
 
 function unavailable(reason: TranscriptUnavailableReason): TranscriptReadResult {
   return {
-    messages: [],
+    items: [],
     transcript: {
       state: "unavailable",
       truncated: false,
       source: null,
-      messageCount: 0,
+      itemCount: 0,
       reason,
     },
   };
@@ -185,16 +219,16 @@ function unavailable(reason: TranscriptUnavailableReason): TranscriptReadResult 
 
 function available(
   provider: Provider,
-  messages: TranscriptMessage[],
+  items: TranscriptItem[],
   truncated: boolean,
 ): TranscriptReadResult {
   return {
-    messages,
+    items,
     transcript: {
       state: "available",
       truncated,
       source: providerSource(provider),
-      messageCount: messages.length,
+      itemCount: items.length,
       reason: null,
     },
   };
@@ -381,20 +415,60 @@ function utf8Prefix(text: string, limit: number): { text: string; truncated: boo
   return { text: "", truncated: true };
 }
 
-function capMessages(input: TranscriptMessage[]): ParsedMessages {
+function argumentsText(value: ActivityJsonValue | string | null): string {
+  if (value === null) return "";
+  return typeof value === "string" ? value : JSON.stringify(value) ?? "";
+}
+
+function capArguments(
+  value: ActivityJsonValue | string | null,
+): { value: ActivityJsonValue | string | null; truncated: boolean } {
+  if (value === null) return { value: null, truncated: false };
+  if (typeof value === "string") {
+    const capped = utf8Prefix(value, TRANSCRIPT_LIMITS.messageBytes);
+    return { value: capped.text, truncated: capped.truncated };
+  }
+  const serialized = argumentsText(value);
+  if (Buffer.byteLength(serialized, "utf8") <= TRANSCRIPT_LIMITS.messageBytes) {
+    return { value, truncated: false };
+  }
+  // A structure too large to carry degrades to its own bounded serialization
+  // rather than being silently dropped or re-shaped into something smaller.
+  return { value: utf8Prefix(serialized, TRANSCRIPT_LIMITS.messageBytes).text, truncated: true };
+}
+
+function itemBytes(item: TranscriptItem): number {
+  return item.kind === "tool"
+    ? Buffer.byteLength(argumentsText(item.arguments), "utf8")
+      + Buffer.byteLength(item.result ?? "", "utf8")
+    : Buffer.byteLength(item.text, "utf8");
+}
+
+function capItems(input: TranscriptItem[]): ParsedItems {
   let truncated = false;
-  const perMessage = input.flatMap((message) => {
-    const capped = utf8Prefix(message.text, TRANSCRIPT_LIMITS.messageBytes);
+  const perItem = input.flatMap((item): TranscriptItem[] => {
+    if (item.kind === "tool") {
+      const args = capArguments(item.arguments);
+      const result = item.result === null
+        ? null
+        : utf8Prefix(item.result, TRANSCRIPT_LIMITS.messageBytes);
+      truncated ||= args.truncated || (result?.truncated ?? false);
+      return [{ ...item, arguments: args.value, result: result?.text ?? null }];
+    }
+    const capped = utf8Prefix(item.text, TRANSCRIPT_LIMITS.messageBytes);
     truncated ||= capped.truncated;
-    return capped.text.length > 0 ? [{ ...message, text: capped.text }] : [];
+    if (capped.text.length === 0) return [];
+    return [item.kind === "message"
+      ? { ...item, text: capped.text }
+      : { ...item, text: capped.text }];
   });
 
-  const retained: TranscriptMessage[] = [];
+  const retained: TranscriptItem[] = [];
   let totalBytes = 0;
-  for (let index = perMessage.length - 1; index >= 0; index -= 1) {
-    const message = perMessage[index];
-    if (!message) continue;
-    const bytes = Buffer.byteLength(message.text, "utf8");
+  for (let index = perItem.length - 1; index >= 0; index -= 1) {
+    const item = perItem[index];
+    if (!item) continue;
+    const bytes = itemBytes(item);
     if (
       retained.length >= TRANSCRIPT_LIMITS.messages ||
       totalBytes + bytes > TRANSCRIPT_LIMITS.totalBytes
@@ -403,22 +477,38 @@ function capMessages(input: TranscriptMessage[]): ParsedMessages {
       continue;
     }
     totalBytes += bytes;
-    retained.push(message);
+    retained.push(item);
   }
   retained.reverse();
-  if (retained.length !== perMessage.length) truncated = true;
-  return { messages: retained, truncated };
+  if (retained.length !== perItem.length) truncated = true;
+  return { items: retained, truncated };
 }
 
-function stableMessageId(
+/**
+ * A tool call that never received its output is only genuinely in flight when
+ * it is the newest thing the transcript recorded. Anything older was abandoned,
+ * and claiming otherwise would leave a dead session rendering as active.
+ */
+function settleToolCalls(items: TranscriptItem[]): TranscriptItem[] {
+  const last = items.length - 1;
+  return items.map((item, index) => (
+    item.kind === "tool" && item.result === null && index !== last
+      ? { ...item, status: "incomplete" as const }
+      : item
+  ));
+}
+
+function stableItemId(
   provider: Provider,
   providerId: string | null,
   fileIdentity: string,
   offset: number,
+  namespace?: string,
 ): string {
+  const prefix = namespace ? `${provider}:${namespace}` : provider;
   return providerId
-    ? `${provider}:${providerId}`
-    : `${provider}:file:${fileIdentity}:${String(offset)}`;
+    ? `${prefix}:${providerId}`
+    : `${prefix}:file:${fileIdentity}:${String(offset)}`;
 }
 
 function syntheticCodexUserContext(text: string): boolean {
@@ -426,10 +516,61 @@ function syntheticCodexUserContext(text: string): boolean {
   return SYNTHETIC_CODEX_USER_ENVELOPES.some((pattern) => pattern.test(candidate));
 }
 
-function codexMessages(tail: JsonlTail, fileIdentity: string): ParsedMessages {
-  const messages: TranscriptMessage[] = [];
+/**
+ * Codex writes the visible reasoning summary into `summary[].text`. The raw
+ * chain of thought is only ever present as `encrypted_content`, which this
+ * reader never touches — an opaque blob is not a fact about the session.
+ */
+function codexReasoningText(payload: Record<string, unknown>): string {
+  if (!Array.isArray(payload.summary)) return "";
+  return payload.summary
+    .flatMap((value) => {
+      const block = objectValue(value);
+      return typeof block?.text === "string" ? [block.text] : [];
+    })
+    .join("\n\n")
+    .trim();
+}
+
+function codexArguments(payload: Record<string, unknown>): ActivityJsonValue | string | null {
+  const encoded = payload.arguments;
+  if (typeof encoded === "string") {
+    try {
+      const parsed: unknown = JSON.parse(encoded);
+      if (typeof parsed === "object" && parsed !== null) return parsed as ActivityJsonValue;
+    } catch {
+      // A non-JSON argument string is still the provider's exact spelling.
+    }
+    return encoded;
+  }
+  // Custom tools carry a free-form script, which is never JSON to begin with.
+  return typeof payload.input === "string" ? payload.input : null;
+}
+
+function codexOutputText(output: unknown): string {
+  if (typeof output === "string") return output;
+  if (Array.isArray(output)) {
+    return output
+      .flatMap((value) => {
+        const block = objectValue(value);
+        return typeof block?.text === "string" ? [block.text] : [];
+      })
+      .join("");
+  }
+  const record = objectValue(output);
+  if (!record) return "";
+  for (const key of ["output", "content", "text"]) {
+    const value = record[key];
+    if (typeof value === "string") return value;
+  }
+  return JSON.stringify(record) ?? "";
+}
+
+function codexItems(tail: JsonlTail, fileIdentity: string): ParsedItems {
+  const items: TranscriptItem[] = [];
   const seenIds = new Set<string>();
   const seenAdjacent = new Set<string>();
+  const toolIndex = new Map<string, number>();
   let previousKey: string | null = null;
   let truncated = tail.truncated;
 
@@ -437,7 +578,50 @@ function codexMessages(tail: JsonlTail, fileIdentity: string): ParsedMessages {
     const outer = record.object;
     if (outer.type !== "response_item") continue;
     const payload = objectValue(outer.payload);
-    if (payload?.type !== "message") continue;
+    if (!payload) continue;
+    const createdAt = timestamp(outer.timestamp);
+
+    if (payload.type === "reasoning") {
+      const text = codexReasoningText(payload);
+      if (!text) continue;
+      const id = stableItemId("codex", stringValue(payload.id), fileIdentity, record.offset, "reasoning");
+      if (seenIds.has(id)) continue;
+      seenIds.add(id);
+      items.push({ kind: "reasoning", id, text, createdAt, status: "complete", label: null });
+      continue;
+    }
+
+    if (payload.type === "function_call" || payload.type === "custom_tool_call") {
+      const name = stringValue(payload.name);
+      const callId = stringValue(payload.call_id) ?? stringValue(payload.id);
+      if (!name || !callId || toolIndex.has(callId)) continue;
+      toolIndex.set(callId, items.length);
+      items.push({
+        kind: "tool",
+        id: stableItemId("codex", callId, fileIdentity, record.offset, "tool"),
+        toolCallId: callId,
+        name,
+        arguments: codexArguments(payload),
+        result: null,
+        isError: false,
+        createdAt,
+        status: "running",
+      });
+      continue;
+    }
+
+    if (payload.type === "function_call_output" || payload.type === "custom_tool_call_output") {
+      const callId = stringValue(payload.call_id);
+      const index = callId === null ? undefined : toolIndex.get(callId);
+      const target = index === undefined ? undefined : items[index];
+      if (target?.kind !== "tool") continue;
+      target.result = codexOutputText(payload.output);
+      target.isError = objectValue(payload.output)?.success === false;
+      target.status = "complete";
+      continue;
+    }
+
+    if (payload.type !== "message") continue;
     const role = payload.role;
     if (role !== "user" && role !== "assistant") continue;
     if (!Array.isArray(payload.content)) continue;
@@ -454,26 +638,19 @@ function codexMessages(tail: JsonlTail, fileIdentity: string): ParsedMessages {
     const text = parts.join("\n\n").trim();
     if (!text) continue;
     const providerId = stringValue(payload.id) ?? stringValue(outer.id);
-    const id = stableMessageId("codex", providerId, fileIdentity, record.offset);
+    const id = stableItemId("codex", providerId, fileIdentity, record.offset);
     if (seenIds.has(id)) continue;
-    const adjacentKey = `${role}\u0000${timestamp(outer.timestamp) ?? ""}\u0000${text}`;
+    const adjacentKey = `${role}\u0000${createdAt ?? ""}\u0000${text}`;
     if (previousKey === adjacentKey && seenAdjacent.has(adjacentKey)) continue;
     seenIds.add(id);
     seenAdjacent.clear();
     seenAdjacent.add(adjacentKey);
     previousKey = adjacentKey;
-    messages.push({
-      id,
-      role,
-      text,
-      createdAt: timestamp(outer.timestamp),
-      status: "complete",
-      label: null,
-    });
+    items.push({ kind: "message", id, role, text, createdAt, status: "complete", label: null });
   }
-  const capped = capMessages(messages);
+  const capped = capItems(settleToolCalls(items));
   truncated ||= capped.truncated;
-  return { messages: capped.messages, truncated };
+  return { items: capped.items, truncated };
 }
 
 function claudeAgentId(value: string): string {
@@ -553,8 +730,25 @@ function textBlocks(content: unknown): string[] {
   });
 }
 
+function contentBlocks(content: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(content)) return [];
+  return content.flatMap((value) => {
+    const block = objectValue(value);
+    return block ? [block] : [];
+  });
+}
+
 function hasToolResult(content: unknown): boolean {
   return Array.isArray(content) && content.some((value) => objectValue(value)?.type === "tool_result");
+}
+
+/** Flattens one `tool_result` block into the text a human would read. */
+function claudeResultText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return contentBlocks(content)
+    .flatMap((block) => (block.type === "text" && typeof block.text === "string" ? [block.text] : []))
+    .join("\n\n");
 }
 
 function machineClaudeUser(object: Record<string, unknown>, text: string): boolean {
@@ -566,15 +760,75 @@ function machineClaudeUser(object: Record<string, unknown>, text: string): boole
     MACHINE_USER_PREFIX.test(text.trimStart());
 }
 
-function claudeMessages(
+/**
+ * Walks one Claude assistant record's content blocks in the order the provider
+ * wrote them, so a `thinking` block, a tool call and the answer keep their
+ * recorded sequence. Streaming rewrites the same `message.id` repeatedly, so
+ * text fragments merge and tool calls de-duplicate on their own `tool_use` id.
+ */
+function claudeAssistantBlocks(
+  outer: Record<string, unknown>,
+  message: Record<string, unknown>,
+  messageKey: string,
+  items: TranscriptItem[],
+  byId: Map<string, { index: number; fragments: Set<string> }>,
+  toolIndex: Map<string, number>,
+): void {
+  const createdAt = timestamp(outer.timestamp);
+  const status = outer.isApiErrorMessage === true ? "incomplete" as const : "complete" as const;
+  contentBlocks(message.content).forEach((block, index) => {
+    if (block.type === "thinking" && typeof block.thinking === "string") {
+      const text = block.thinking.trim();
+      const id = `${messageKey}:thinking:${String(index)}`;
+      if (!text || items.some((item) => item.id === id)) return;
+      items.push({ kind: "reasoning", id, text, createdAt, status: "complete", label: null });
+      return;
+    }
+    if (block.type === "tool_use") {
+      const name = stringValue(block.name);
+      if (!name) return;
+      const callId = stringValue(block.id) ?? `${messageKey}:${String(index)}`;
+      if (toolIndex.has(callId)) return;
+      toolIndex.set(callId, items.length);
+      items.push({
+        kind: "tool",
+        id: `claude:tool:${callId}`,
+        toolCallId: callId,
+        name,
+        arguments: (block.input ?? null) as ActivityJsonValue | null,
+        result: null,
+        isError: false,
+        createdAt,
+        status: "running",
+      });
+      return;
+    }
+    if (block.type !== "text" || typeof block.text !== "string") return;
+    const text = block.text.trim();
+    if (!text) return;
+    const existing = byId.get(messageKey);
+    if (existing) {
+      const target = items[existing.index];
+      if (target?.kind !== "message" || existing.fragments.has(text)) return;
+      existing.fragments.add(text);
+      target.text = `${target.text}\n\n${text}`;
+      return;
+    }
+    byId.set(messageKey, { index: items.length, fragments: new Set([text]) });
+    items.push({ kind: "message", id: messageKey, role: "assistant", text, createdAt, status, label: null });
+  });
+}
+
+function claudeItems(
   tail: JsonlTail,
   fileIdentity: string,
   session: SessionIdentity,
   isChild: boolean,
-): ParsedMessages {
+): ParsedItems {
   const chain = claudeChain(tail, session, isChild);
-  const messages: TranscriptMessage[] = [];
+  const items: TranscriptItem[] = [];
   const byId = new Map<string, { index: number; fragments: Set<string> }>();
+  const toolIndex = new Map<string, number>();
   let truncated = chain.truncated;
 
   for (const record of chain.records) {
@@ -583,14 +837,26 @@ function claudeMessages(
     const message = objectValue(outer.message);
     if (!message) continue;
     if (outer.type === "user" && message.role === "user") {
-      if (hasToolResult(message.content)) continue;
+      if (hasToolResult(message.content)) {
+        for (const block of contentBlocks(message.content)) {
+          const callId = block.type === "tool_result" ? stringValue(block.tool_use_id) : null;
+          const index = callId === null ? undefined : toolIndex.get(callId);
+          const target = index === undefined ? undefined : items[index];
+          if (target?.kind !== "tool") continue;
+          target.result = claudeResultText(block.content);
+          target.isError = block.is_error === true;
+          target.status = "complete";
+        }
+        continue;
+      }
       const text = textBlocks(message.content).join("\n\n").trim();
       if (!text || machineClaudeUser(outer, text)) continue;
       const providerId = stringValue(outer.uuid);
-      const id = stableMessageId("claude", providerId, fileIdentity, record.offset);
+      const id = stableItemId("claude", providerId, fileIdentity, record.offset);
       if (byId.has(id)) continue;
-      byId.set(id, { index: messages.length, fragments: new Set([text]) });
-      messages.push({
+      byId.set(id, { index: items.length, fragments: new Set([text]) });
+      items.push({
+        kind: "message",
         id,
         role: "user",
         text,
@@ -601,36 +867,13 @@ function claudeMessages(
       continue;
     }
     if (outer.type !== "assistant" || message.role !== "assistant") continue;
-    const parts = textBlocks(message.content).map((part) => part.trim()).filter(Boolean);
-    if (parts.length === 0) continue;
     const providerId = stringValue(message.id) ?? stringValue(outer.uuid);
-    const id = stableMessageId("claude", providerId, fileIdentity, record.offset);
-    const existing = byId.get(id);
-    if (existing) {
-      const target = messages[existing.index];
-      if (!target) continue;
-      const additions = parts.filter((part) => {
-        if (existing.fragments.has(part)) return false;
-        existing.fragments.add(part);
-        return true;
-      });
-      if (additions.length > 0) target.text = `${target.text}\n\n${additions.join("\n\n")}`;
-      continue;
-    }
-    const text = [...new Set(parts)].join("\n\n");
-    byId.set(id, { index: messages.length, fragments: new Set(parts) });
-    messages.push({
-      id,
-      role: "assistant",
-      text,
-      createdAt: timestamp(outer.timestamp),
-      status: outer.isApiErrorMessage === true ? "incomplete" : "complete",
-      label: null,
-    });
+    const messageKey = stableItemId("claude", providerId, fileIdentity, record.offset);
+    claudeAssistantBlocks(outer, message, messageKey, items, byId, toolIndex);
   }
-  const capped = capMessages(messages);
+  const capped = capItems(settleToolCalls(items));
   truncated ||= capped.truncated;
-  return { messages: capped.messages, truncated };
+  return { items: capped.items, truncated };
 }
 
 function stateDatabaseCandidates(codexHome: RootInfo, uid: number): string[] {
@@ -837,18 +1080,18 @@ export class LocalSessionTranscriptReader implements SessionTranscriptReader {
     try {
       if (session.provider === "codex") {
         file = codexFile(this.#codexHome, session.providerThreadId, this.#uid).file;
-        const parsed = codexMessages(readJsonlTail(file), file.identity);
-        return available("codex", parsed.messages, parsed.truncated);
+        const parsed = codexItems(readJsonlTail(file), file.identity);
+        return available("codex", parsed.items, parsed.truncated);
       }
       const claude = claudeFile(this.#claudeHome, session, this.#uid);
       file = claude.file;
-      const parsed = claudeMessages(
+      const parsed = claudeItems(
         readJsonlTail(file),
         file.identity,
         session,
         claude.isChild,
       );
-      return available("claude", parsed.messages, parsed.truncated);
+      return available("claude", parsed.items, parsed.truncated);
     } catch (error) {
       return unavailable(
         error instanceof TranscriptReadFailure ? error.reason : "unreadable",
@@ -877,7 +1120,10 @@ export class LocalSessionTranscriptReader implements SessionTranscriptReader {
     const loweredNeedle = needle.toLocaleLowerCase("en-US");
     const matches: TranscriptSearchMatch[] = [];
     let exhausted = false;
-    for (const message of transcript.messages) {
+    // Search stays a conversation search. Tool arguments and results are
+    // rendered in the thread but are not part of this route's contract.
+    for (const message of transcript.items) {
+      if (message.kind !== "message") continue;
       const safeText = redactActivityText(message.text);
       const lowered = safeText.toLocaleLowerCase("en-US");
       let offset = 0;

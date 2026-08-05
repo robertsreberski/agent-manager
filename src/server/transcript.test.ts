@@ -13,7 +13,23 @@ import test, { afterEach } from "node:test";
 import {
   LocalSessionTranscriptReader,
   TRANSCRIPT_LIMITS,
+  type TranscriptItem,
+  type TranscriptReadResult,
 } from "./transcript.ts";
+
+function messagesOf(result: TranscriptReadResult): Array<{ role: string; text: string }> {
+  return result.items.flatMap((item) =>
+    item.kind === "message" ? [{ role: item.role, text: item.text }] : []
+  );
+}
+
+function textsOf(result: TranscriptReadResult): string[] {
+  return result.items.flatMap((item) => (item.kind === "tool" ? [] : [item.text]));
+}
+
+function toolsOf(result: TranscriptReadResult): Extract<TranscriptItem, { kind: "tool" }>[] {
+  return result.items.flatMap((item) => (item.kind === "tool" ? [item] : []));
+}
 
 const roots: string[] = [];
 const CODEX_ID = "11111111-1111-1111-1111-111111111111";
@@ -149,15 +165,15 @@ test("Codex reads ordered user/assistant response items and ignores provider int
 
   assert.equal(result.transcript.state, "available");
   assert.equal(result.transcript.source, "codex-rollout");
-  assert.equal(result.transcript.messageCount, 2);
+  assert.equal(result.transcript.itemCount, 2);
   assert.equal(result.transcript.truncated, false);
-  assert.deepEqual(result.messages.map(({ role, text }) => ({ role, text })), [
+  assert.deepEqual(messagesOf(result), [
     { role: "user", text: "Hello" },
     { role: "assistant", text: "Hi there" },
   ]);
-  assert.equal(result.messages[0]?.id, "codex:user-provider-id");
-  assert.match(result.messages[1]?.id ?? "", /^codex:file:\d+:\d+:\d+$/);
-  assert.equal(result.messages[0]?.createdAt, "2026-08-03T10:00:01.000Z");
+  assert.equal(result.items[0]?.id, "codex:user-provider-id");
+  assert.match(result.items[1]?.id ?? "", /^codex:file:\d+:\d+:\d+$/);
+  assert.equal(result.items[0]?.createdAt, "2026-08-03T10:00:01.000Z");
 });
 
 test("Codex excludes injected context envelopes while preserving the actual user prompt", () => {
@@ -182,7 +198,7 @@ test("Codex excludes injected context envelopes while preserving the actual user
   ]);
 
   const result = new LocalSessionTranscriptReader({ codexHome: fixture.home }).read(codexSession());
-  assert.deepEqual(result.messages.map(({ role, text }) => ({ role, text })), [
+  assert.deepEqual(messagesOf(result), [
     { role: "user", text: "The actual prompt" },
     { role: "user", text: "What does <environment_context> mean in this protocol?" },
     { role: "assistant", text: "Answer" },
@@ -224,19 +240,19 @@ test("Codex tolerates malformed and partial JSONL while reporting omitted conten
   const result = new LocalSessionTranscriptReader({ codexHome: home }).read(codexSession());
   assert.equal(result.transcript.state, "available");
   assert.equal(result.transcript.truncated, true);
-  assert.deepEqual(result.messages.map((message) => message.text), ["complete"]);
+  assert.deepEqual(textsOf(result), ["complete"]);
 });
 
 test("Codex verifies the selected UUID against session metadata", () => {
   const fixture = codexFixture([codexMeta("99999999-9999-9999-9999-999999999999")]);
   const result = new LocalSessionTranscriptReader({ codexHome: fixture.home }).read(codexSession());
   assert.deepEqual(result, {
-    messages: [],
+    items: [],
     transcript: {
       state: "unavailable",
       truncated: false,
       source: null,
-      messageCount: 0,
+      itemCount: 0,
       reason: "unsupported",
     },
   });
@@ -264,12 +280,15 @@ test("Claude follows the latest parentUuid branch and renders only human-visible
   const result = new LocalSessionTranscriptReader({ claudeHome: fixture.home }).read(claudeRootSession());
   assert.equal(result.transcript.state, "available");
   assert.equal(result.transcript.source, "claude-transcript");
-  assert.deepEqual(result.messages.map(({ id, role, text }) => ({ id, role, text })), [
-    { id: "claude:u1", role: "user", text: "Hello" },
-    { id: "claude:msg-one", role: "assistant", text: "Visible answer" },
-    { id: "claude:u2", role: "user", text: "Continue" },
-    { id: "claude:msg-two", role: "assistant", text: "Done" },
-  ]);
+  assert.deepEqual(
+    result.items.flatMap((item) => (item.kind === "message" ? [{ id: item.id, role: item.role, text: item.text }] : [])),
+    [
+      { id: "claude:u1", role: "user", text: "Hello" },
+      { id: "claude:msg-one", role: "assistant", text: "Visible answer" },
+      { id: "claude:u2", role: "user", text: "Continue" },
+      { id: "claude:msg-two", role: "assistant", text: "Done" },
+    ],
+  );
 });
 
 test("Claude resolves a nested individual subagent transcript and rejects parent hydration", () => {
@@ -293,10 +312,159 @@ test("Claude resolves a nested individual subagent transcript and rejects parent
     parentId: `local:claude:${CLAUDE_ID}`,
     providerTreeId: CLAUDE_ID,
   });
-  assert.deepEqual(child.messages.map((message) => message.text), ["Child task", "Child result"]);
+  assert.deepEqual(textsOf(child), ["Child task", "Child result"]);
 
   const parent = reader.read(claudeRootSession());
-  assert.deepEqual(parent.messages.map((message) => message.text), ["Parent message"]);
+  assert.deepEqual(textsOf(parent), ["Parent message"]);
+});
+
+test("Claude exposes thinking blocks and paired tool_use/tool_result as transcript items", () => {
+  const fixture = claudeHome();
+  const project = join(fixture.projects, "-fixture-project");
+  mkdirSync(project);
+  writeFileSync(join(project, `${CLAUDE_ID}.jsonl`), jsonl([
+    claudeRow({ uuid: "u1", type: "user", content: "Audit the reader" }),
+    claudeRow({
+      uuid: "a1",
+      parentUuid: "u1",
+      type: "assistant",
+      messageId: "msg-one",
+      content: [
+        { type: "thinking", thinking: "Read the transcript reader first.", signature: "sig" },
+        { type: "text", text: "Reading it now." },
+        { type: "tool_use", id: "toolu_01", name: "Read", input: { file_path: "/repo/src/server/transcript.ts", limit: 200 } },
+      ],
+    }),
+    claudeRow({
+      uuid: "r1",
+      parentUuid: "a1",
+      type: "user",
+      content: [{ type: "tool_result", tool_use_id: "toolu_01", is_error: false, content: [{ type: "text", text: "export const TRANSCRIPT_LIMITS" }] }],
+    }),
+    claudeRow({
+      uuid: "a2",
+      parentUuid: "r1",
+      type: "assistant",
+      messageId: "msg-two",
+      content: [
+        { type: "tool_use", id: "toolu_02", name: "Bash", input: { command: "rg -n TRANSCRIPT_LIMITS" } },
+      ],
+    }),
+    claudeRow({
+      uuid: "r2",
+      parentUuid: "a2",
+      type: "user",
+      content: [{ type: "tool_result", tool_use_id: "toolu_02", is_error: true, content: "rg: command not found" }],
+    }),
+    claudeRow({ uuid: "a3", parentUuid: "r2", type: "assistant", messageId: "msg-three", content: [{ type: "text", text: "The limits are frozen." }] }),
+  ]));
+
+  const result = new LocalSessionTranscriptReader({ claudeHome: fixture.home }).read(claudeRootSession());
+  assert.equal(result.transcript.state, "available");
+  assert.deepEqual(result.items.map((item) => [item.kind, item.id]), [
+    ["message", "claude:u1"],
+    ["reasoning", "claude:msg-one:thinking:0"],
+    ["message", "claude:msg-one"],
+    ["tool", "claude:tool:toolu_01"],
+    ["tool", "claude:tool:toolu_02"],
+    ["message", "claude:msg-three"],
+  ]);
+
+  const reasoning = result.items[1];
+  assert.equal(reasoning?.kind === "reasoning" ? reasoning.text : null, "Read the transcript reader first.");
+
+  const tools = toolsOf(result);
+  assert.deepEqual(tools.map((tool) => [tool.name, tool.toolCallId, tool.status, tool.isError]), [
+    ["Read", "toolu_01", "complete", false],
+    ["Bash", "toolu_02", "complete", true],
+  ]);
+  assert.deepEqual(tools[0]?.arguments, { file_path: "/repo/src/server/transcript.ts", limit: 200 });
+  assert.equal(tools[0]?.result, "export const TRANSCRIPT_LIMITS");
+  assert.equal(tools[1]?.result, "rg: command not found");
+});
+
+test("an unanswered Claude tool call is only in flight while it is the newest record", () => {
+  const fixture = claudeHome();
+  const project = join(fixture.projects, "-fixture-project");
+  mkdirSync(project);
+  writeFileSync(join(project, `${CLAUDE_ID}.jsonl`), jsonl([
+    claudeRow({ uuid: "u1", type: "user", content: "Go" }),
+    claudeRow({ uuid: "a1", parentUuid: "u1", type: "assistant", messageId: "msg-one", content: [{ type: "tool_use", id: "toolu_abandoned", name: "Bash", input: { command: "sleep 1" } }] }),
+    claudeRow({ uuid: "a2", parentUuid: "a1", type: "assistant", messageId: "msg-two", content: [{ type: "text", text: "Moving on." }] }),
+    claudeRow({ uuid: "a3", parentUuid: "a2", type: "assistant", messageId: "msg-three", content: [{ type: "tool_use", id: "toolu_live", name: "Bash", input: { command: "pnpm test" } }] }),
+  ]));
+
+  const result = new LocalSessionTranscriptReader({ claudeHome: fixture.home }).read(claudeRootSession());
+  assert.deepEqual(toolsOf(result).map((tool) => [tool.toolCallId, tool.status, tool.result]), [
+    ["toolu_abandoned", "incomplete", null],
+    ["toolu_live", "running", null],
+  ]);
+});
+
+test("Codex exposes reasoning summaries and paired tool calls without leaking encrypted content", () => {
+  const fixture = codexFixture([
+    codexMeta(),
+    codexMessage("user", "Look around"),
+    {
+      type: "response_item",
+      timestamp: "2026-08-03T10:00:02Z",
+      payload: { type: "reasoning", id: "rs_encrypted", summary: [], encrypted_content: "gAAAAABsecretblob" },
+    },
+    {
+      type: "response_item",
+      timestamp: "2026-08-03T10:00:03Z",
+      payload: { type: "reasoning", id: "rs_visible", summary: [{ type: "summary_text", text: "Listing the workspace." }], encrypted_content: "gAAAAABsecretblob" },
+    },
+    {
+      type: "response_item",
+      timestamp: "2026-08-03T10:00:04Z",
+      payload: { type: "custom_tool_call", id: "ctc_1", status: "completed", call_id: "call_shell", name: "exec", input: "await tools.exec_command({ cmd: \"ls -la\" })" },
+    },
+    {
+      type: "response_item",
+      timestamp: "2026-08-03T10:00:05Z",
+      payload: { type: "custom_tool_call_output", id: "ctco_1", call_id: "call_shell", output: [{ type: "input_text", text: "Script completed\n" }, { type: "input_text", text: "README.md\n" }] },
+    },
+    {
+      type: "response_item",
+      timestamp: "2026-08-03T10:00:06Z",
+      payload: { type: "function_call", id: "fc_1", name: "list_agents", namespace: "collaboration", arguments: "{\"scope\":\"root\"}", call_id: "call_fn" },
+    },
+    {
+      type: "response_item",
+      timestamp: "2026-08-03T10:00:07Z",
+      payload: { type: "function_call_output", call_id: "call_fn", output: "{\"agents\":[]}" },
+    },
+    codexMessage("assistant", "One repository, no agents."),
+  ]);
+
+  const result = new LocalSessionTranscriptReader({ codexHome: fixture.home }).read(codexSession());
+  assert.deepEqual(result.items.map((item) => item.kind), [
+    "message",
+    "reasoning",
+    "tool",
+    "tool",
+    "message",
+  ]);
+  assert.deepEqual(result.items.slice(1, 4).map((item) => item.id), [
+    "codex:reasoning:rs_visible",
+    "codex:tool:call_shell",
+    "codex:tool:call_fn",
+  ]);
+  assert.equal(JSON.stringify(result).includes("gAAAAAB"), false);
+
+  const reasoning = result.items[1];
+  assert.equal(reasoning?.kind === "reasoning" ? reasoning.text : null, "Listing the workspace.");
+
+  const tools = toolsOf(result);
+  assert.deepEqual(tools.map((tool) => [tool.name, tool.status, tool.isError]), [
+    ["exec", "complete", false],
+    ["list_agents", "complete", false],
+  ]);
+  assert.equal(tools[0]?.arguments, 'await tools.exec_command({ cmd: "ls -la" })');
+  assert.equal(tools[0]?.result, "Script completed\nREADME.md\n");
+  assert.deepEqual(tools[1]?.arguments, { scope: "root" });
+  assert.equal(tools[1]?.result, '{"agents":[]}');
 });
 
 test("message count, per-message UTF-8, and aggregate byte caps retain the newest content", () => {
@@ -306,9 +474,9 @@ test("message count, per-message UTF-8, and aggregate byte caps retain the newes
   }
   const countFixture = codexFixture(countValues);
   const countResult = new LocalSessionTranscriptReader({ codexHome: countFixture.home }).read(codexSession());
-  assert.equal(countResult.messages.length, TRANSCRIPT_LIMITS.messages);
-  assert.equal(countResult.messages[0]?.text, "message-5");
-  assert.equal(countResult.messages.at(-1)?.text, "message-124");
+  assert.equal(countResult.items.length, TRANSCRIPT_LIMITS.messages);
+  assert.equal(textsOf(countResult)[0], "message-5");
+  assert.equal(textsOf(countResult).at(-1), "message-124");
   assert.equal(countResult.transcript.truncated, true);
 
   const longText = `${"x".repeat(TRANSCRIPT_LIMITS.messageBytes - 1)}🙂suffix`;
@@ -321,15 +489,16 @@ test("message count, per-message UTF-8, and aggregate byte caps retain the newes
   ]);
   const byteResult = new LocalSessionTranscriptReader({ codexHome: byteFixture.home }).read(codexSession());
   assert.equal(byteResult.transcript.truncated, true);
-  assert.ok(byteResult.messages.length < 10);
-  assert.ok(byteResult.messages.every((message) =>
-    Buffer.byteLength(message.text, "utf8") <= TRANSCRIPT_LIMITS.messageBytes
+  assert.ok(byteResult.items.length < 10);
+  assert.ok(textsOf(byteResult).every((text) =>
+    Buffer.byteLength(text, "utf8") <= TRANSCRIPT_LIMITS.messageBytes
   ));
-  const cappedLong = byteResult.messages.find((message) => message.id === "codex:long");
-  assert.equal(Buffer.byteLength(cappedLong?.text ?? "", "utf8"), TRANSCRIPT_LIMITS.messageBytes - 1);
-  assert.equal(cappedLong?.text.endsWith("suffix"), false);
-  assert.ok(byteResult.messages.reduce((sum, message) => sum + Buffer.byteLength(message.text, "utf8"), 0) <= TRANSCRIPT_LIMITS.totalBytes);
-  assert.ok(byteResult.messages.every((message) => !message.text.includes("�")));
+  const cappedLong = byteResult.items.find((item) => item.id === "codex:long");
+  const cappedLongText = cappedLong?.kind === "message" ? cappedLong.text : "";
+  assert.equal(Buffer.byteLength(cappedLongText, "utf8"), TRANSCRIPT_LIMITS.messageBytes - 1);
+  assert.equal(cappedLongText.endsWith("suffix"), false);
+  assert.ok(textsOf(byteResult).reduce((sum, text) => sum + Buffer.byteLength(text, "utf8"), 0) <= TRANSCRIPT_LIMITS.totalBytes);
+  assert.ok(textsOf(byteResult).every((text) => !text.includes("�")));
 });
 
 test("physical source tail is bounded and discards a leading partial UTF-8 line safely", () => {
@@ -344,7 +513,7 @@ test("physical source tail is bounded and discards a leading partial UTF-8 line 
   );
   const result = new LocalSessionTranscriptReader({ codexHome: fixture.home }).read(codexSession());
   assert.equal(result.transcript.truncated, true);
-  assert.deepEqual(result.messages.map((message) => message.text), ["Newest 🙂"]);
+  assert.deepEqual(textsOf(result), ["Newest 🙂"]);
 });
 
 test("symlinks, rollout path escapes, ownership mismatch, and ambiguous Claude ids fail closed", () => {

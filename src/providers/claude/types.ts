@@ -71,7 +71,12 @@ export type ClaudeElicitationResult =
 
 export interface ClaudeSdkQueryOptions {
   cwd: string;
-  persistSession: true;
+  /**
+   * Managed sessions persist so they stay resumable. A bounded draft catalog
+   * probe sets this false: it must never leave a phantom resumable session
+   * behind for discovery to surface.
+   */
+  persistSession: boolean;
   includePartialMessages: true;
   includeHookEvents: true;
   forwardSubagentText: true;
@@ -128,6 +133,8 @@ export interface ClaudeSdkRuntime {
 export interface ClaudeManagedSessionConfig {
   cwd: string;
   mode: ClaudePermissionMode;
+  /** Defaults to true; only a disposable read probe turns persistence off. */
+  persistSession?: boolean;
   initialMessage?: string;
   model?: string;
   effort?: ClaudeEffortLevel;

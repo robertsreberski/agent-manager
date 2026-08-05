@@ -4,6 +4,10 @@ import type {
   SessionView,
 } from "../../core/types.ts";
 import type { ActivityMutation } from "../../activity/index.ts";
+import {
+  WorkspaceIdentityResolver,
+  type WorkspaceIdentity,
+} from "../../core/worktree.ts";
 import { providerEffort, sessionRecordId } from "../../shared/session.ts";
 import { sessionSettingsOptionsSchema } from "../../server/contracts.ts";
 import type {
@@ -55,6 +59,14 @@ export interface CodexProviderBridgeOptions {
     workspaceId: string,
     context: RequestContext,
   ): Promise<string | null> | string | null;
+  /**
+   * Bridge-published sessions never pass through the discovery scan, so they
+   * resolve their repository facts through the same bounded resolver discovery
+   * uses. Injectable for tests; production shares its cache semantics.
+   */
+  workspaceIdentityResolver?: Pick<WorkspaceIdentityResolver, "resolveMany">;
+  /** Bounds the git work one publish may spend; exhaustion yields a null identity. */
+  workspaceIdentityBudgetMs?: number;
   now?: () => Date;
   onSessionChanged?: (session: SessionView) => void;
   onSessionRemoved?: (
@@ -67,6 +79,7 @@ export interface CodexProviderBridgeOptions {
 const MAX_BUFFERED_ACTIVITY_MUTATIONS = 4_096;
 const MAX_RECOVERY_RECORDS = 100;
 const RECOVERY_CONCURRENCY = 4;
+const WORKSPACE_IDENTITY_BUDGET_MS = 2_500;
 const UNLOADED_CAPABILITIES: SessionView["control"]["withheld"][number]["capability"][] = [
   "queue",
   "steer",
@@ -466,6 +479,9 @@ export function codexRequestResponse(
 export class CodexProviderBridge implements ProviderControlAdapter {
   readonly adapter: CodexManagedAdapter;
   #resolveWorkspace: CodexProviderBridgeOptions["resolveWorkspace"];
+  #workspaceIdentityResolver: Pick<WorkspaceIdentityResolver, "resolveMany">;
+  #workspaceIdentityBudgetMs: number;
+  #workspaceIdentities = new Map<string, WorkspaceIdentity | null>();
   #now: () => Date;
   #onActivity: CodexProviderBridgeOptions["onActivity"];
   #onSessionChanged: CodexProviderBridgeOptions["onSessionChanged"];
@@ -482,6 +498,12 @@ export class CodexProviderBridge implements ProviderControlAdapter {
   constructor(options: CodexProviderBridgeOptions) {
     this.adapter = options.adapter;
     this.#resolveWorkspace = options.resolveWorkspace;
+    this.#workspaceIdentityBudgetMs = Math.max(
+      1,
+      options.workspaceIdentityBudgetMs ?? WORKSPACE_IDENTITY_BUDGET_MS,
+    );
+    this.#workspaceIdentityResolver = options.workspaceIdentityResolver
+      ?? new WorkspaceIdentityResolver({ totalBudgetMs: this.#workspaceIdentityBudgetMs });
     this.#now = options.now ?? (() => new Date());
     this.#onActivity = options.onActivity;
     this.#onSessionChanged = options.onSessionChanged;
@@ -512,12 +534,18 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     const cwd = await this.#resolveWorkspace(input.workspaceId, context);
     if (!cwd) throw new Error(`Unknown or unauthorized workspace ${input.workspaceId}`);
     context.signal.throwIfAborted();
+    // Resolved before `thread/start` so the very first published view already
+    // groups under its repository instead of opening a second board column.
+    // The resolver's own budget bounds this; it cannot stall creation.
+    await this.#resolveWorkspaceIdentity(cwd);
+    context.signal.throwIfAborted();
     let state: CodexThreadState;
     let creationIssue: CodexManagedCreationIssue | null = null;
     try {
       state = await this.adapter.startThread({
         cwd,
         profile: input.profile,
+        ...(input.name ? { name: input.name } : {}),
         ...(input.model ? { model: input.model } : {}),
         ...(input.effort ? { effort: input.effort } : {}),
         initialMessage: input.initialMessage,
@@ -615,6 +643,8 @@ export class CodexProviderBridge implements ProviderControlAdapter {
           const read = await this.adapter.readThread(record.providerThreadId);
           assertActive();
           this.#assertRecoveredIdentity(read, record);
+          await this.#resolveWorkspaceIdentity(read.cwd ?? record.workspacePath);
+          assertActive();
           this.#knownStates.set(record.providerThreadId, read);
           // `thread/read` is an exact, bounded validation step, not adoption.
           // Drop its local detail state immediately so startup cannot retain a
@@ -710,6 +740,7 @@ export class CodexProviderBridge implements ProviderControlAdapter {
           cwd: expected.cwd,
         });
         this.#assertSelectedIdentity(adopted, expected, metadata);
+        await this.#resolveWorkspaceIdentity(adopted.cwd ?? metadata.workspacePath);
         if (this.#selectedThreads.get(threadId) !== lease) {
           throw new Error("Codex selection was superseded");
         }
@@ -930,6 +961,7 @@ export class CodexProviderBridge implements ProviderControlAdapter {
       workspaceId: "",
       workspacePath: state.cwd ?? "",
     };
+    const cwd = state.cwd ?? metadata.workspacePath;
     const updatedAt = this.#now().toISOString();
     const recoveryAttention: SessionView["attention"] = metadata.creationIssue
       ? [{
@@ -980,7 +1012,7 @@ export class CodexProviderBridge implements ProviderControlAdapter {
       hostId: "local",
       hostLabel: "This Mac",
       name: metadata.name ?? state.name,
-      cwd: state.cwd ?? metadata.workspacePath,
+      cwd,
       kind: "interactive",
       presence: liveDetail ? "live" : "recent",
       status: normalizedStatus,
@@ -1021,7 +1053,7 @@ export class CodexProviderBridge implements ProviderControlAdapter {
               reason: "Select this session to load exact Codex controls",
             })),
       },
-      workspaceIdentity: null,
+      workspaceIdentity: structuredClone(this.#workspaceIdentities.get(cwd) ?? null),
       generation: state.generation,
     };
   }
@@ -1040,6 +1072,24 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     this.#creationHandoffs.clear();
     this.#bufferedActivity.clear();
     this.#overflowedActivity.clear();
+    this.#workspaceIdentities.clear();
+  }
+
+  /**
+   * Repository facts are decoration, never a creation precondition: an error or
+   * an exhausted budget records a null identity rather than guessing a
+   * repository the git probe never confirmed.
+   */
+  async #resolveWorkspaceIdentity(cwd: string | null): Promise<void> {
+    if (!cwd) return;
+    try {
+      const identities = await this.#workspaceIdentityResolver.resolveMany([cwd], {
+        budgetMs: this.#workspaceIdentityBudgetMs,
+      });
+      this.#workspaceIdentities.set(cwd, identities.get(cwd) ?? null);
+    } catch {
+      if (!this.#workspaceIdentities.has(cwd)) this.#workspaceIdentities.set(cwd, null);
+    }
   }
 
   #acceptsLiveEvents(threadId: string): boolean {
@@ -1079,9 +1129,13 @@ export class CodexProviderBridge implements ProviderControlAdapter {
   #forwardOrBufferActivity(threadId: string, mutation: ActivityMutation): void {
     if (!this.#onActivity) return;
     if (this.#metadata.has(threadId)) {
+      const phase = this.#selectedThreads.get(threadId)?.phase;
       if (!this.#recovering.has(threadId) && this.#acceptsLiveEvents(threadId)) {
         this.#publishActivity(threadId, mutation);
-      } else if (this.#selectedThreads.get(threadId)?.phase === "acquiring") {
+      } else if (phase === "acquiring" || phase === "releasing") {
+        // Teardown still produces truthful state (an unresolved dispatch, for
+        // example). Dropping it here is what leaves a stale queue bubble on
+        // screen, so it is buffered for the next acquisition instead.
         this.#bufferActivity(threadId, mutation);
       }
       return;

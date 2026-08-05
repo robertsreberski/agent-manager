@@ -53,4 +53,16 @@ describe("SelectionBar", () => {
     fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
     expect(screen.queryByLabelText("Selected sessions")).not.toBeInTheDocument();
   });
+
+  it("names what each action will skip instead of silently narrowing the selection", () => {
+    const running = { ...session("running", ["archive", "delete"]), activity: "running" as const, boardState: "working" as const };
+    const idle = session("idle", ["archive", "delete"]);
+
+    render(<SelectionBar sessions={[running, idle]} onClear={vi.fn()} onAction={vi.fn(() => ({ succeeded: 0, unsupported: 0, failed: 0 }))} />);
+
+    expect(screen.getByLabelText("Selected sessions")).toHaveTextContent("1 running (cannot delete)");
+    expect(screen.getByRole("button", { name: "archive" })).not.toHaveAttribute("title");
+    expect(screen.getByRole("button", { name: "delete 1" }))
+      .toHaveAttribute("title", "1 not supported; running sessions cannot be deleted");
+  });
 });

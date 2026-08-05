@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -6,14 +6,13 @@ import {
   cockpitContentMode,
   codexCatalogEfforts,
   effectiveDraftHostId,
-  handleCockpitEscape,
-  handleOpenDrawerMenuEscape,
   Header,
   hostSelectionSummary,
   CockpitToast,
   NotificationSettings,
   notificationAwaySince,
   settingsUnavailableMessage,
+  SetupDialog,
 } from "./App";
 
 describe("hostSelectionSummary", () => {
@@ -98,45 +97,7 @@ describe("cockpit presentation contracts", () => {
     expect(boardScrollBehavior(true)).toBe("auto");
   });
 
-  it("consumes one Escape at the top layer without closing the draft drawer underneath", () => {
-    const event = {
-      key: "Escape",
-      preventDefault: vi.fn(),
-      stopImmediatePropagation: vi.fn(),
-    } as unknown as KeyboardEvent;
-    const actions = {
-      closePalette: vi.fn(),
-      closeShortcuts: vi.fn(),
-      closeReview: vi.fn(),
-      closeDrawer: vi.fn(),
-    };
-
-    expect(handleCockpitEscape(event, {
-      paletteOpen: true,
-      shortcutsOpen: false,
-      reviewOpen: false,
-      drawerOpen: true,
-    }, actions)).toBe(true);
-
-    expect(actions.closePalette).toHaveBeenCalledOnce();
-    expect(actions.closeDrawer).not.toHaveBeenCalled();
-    expect(event.preventDefault).toHaveBeenCalledOnce();
-    expect(event.stopImmediatePropagation).toHaveBeenCalledOnce();
-  });
-
-  it("closes an open drawer menu through its own trigger instead of closing the drawer", () => {
-    const root = document.createElement("div");
-    root.innerHTML = '<aside data-thread-drawer><button aria-haspopup="menu" aria-expanded="true">Runtime</button><div role="menu"></div></aside>';
-    const trigger = root.querySelector("button")!;
-    const click = vi.spyOn(trigger, "click");
-    const event = { key: "Escape", preventDefault: vi.fn(), stopImmediatePropagation: vi.fn() } as unknown as KeyboardEvent;
-
-    expect(handleOpenDrawerMenuEscape(event, root)).toBe(true);
-    expect(click).toHaveBeenCalledOnce();
-    expect(event.stopImmediatePropagation).toHaveBeenCalledOnce();
-  });
-
-  it("contains notification settings focus, closes through the modal hook, and restores its opener", () => {
+  it("contains notification settings focus, closes on Escape, and restores its opener", async () => {
     function Harness() {
       const [open, setOpen] = useState(false);
       return <>
@@ -153,12 +114,90 @@ describe("cockpit presentation contracts", () => {
     const opener = screen.getByRole("button", { name: "Open notifications" });
     opener.focus();
     fireEvent.click(opener);
-    const close = screen.getByRole("button", { name: "Close notification settings" });
-    expect(close).toHaveFocus();
+
+    const dialog = await screen.findByRole("dialog", { name: "Notifications" });
+    const close = within(dialog).getByRole("button", { name: "Close notification settings" });
+    await waitFor(() => expect(close).toHaveFocus());
     expect(close).toHaveAttribute("data-compact-control");
-    fireEvent.keyDown(window, { key: "Escape" });
-    expect(screen.queryByRole("dialog", { name: "Notifications" })).not.toBeInTheDocument();
-    expect(opener).toHaveFocus();
+
+    // The permission line and the local-only explanation are the honest part of
+    // this surface, so they are stated on the panel rather than implied.
+    expect(dialog).toHaveTextContent(/permission:/u);
+    expect(dialog).toHaveAccessibleDescription(/Local browser notifications only\./u);
+    expect(dialog).toHaveTextContent(/There is no push service/u);
+
+    // Focus stays inside the panel while it is up.
+    opener.focus();
+    expect(dialog.contains(document.activeElement)).toBe(true);
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Notifications" })).not.toBeInTheDocument());
+    await waitFor(() => expect(opener).toHaveFocus());
+  });
+
+  it("reports every notification class with its current delivery and never writes one silently", async () => {
+    const onChange = vi.fn();
+    render(<NotificationSettings
+      preferences={{ browser: true, blocked: true, finished: false, stalled: true, includeSessionName: false, quiet: false }}
+      onChange={onChange}
+      onClose={vi.fn()}
+    />);
+
+    const dialog = await screen.findByRole("dialog", { name: "Notifications" });
+    const preferences = within(dialog).getAllByRole("checkbox");
+    expect(preferences).toHaveLength(6);
+    expect(dialog).toHaveTextContent("A session finished");
+    expect(dialog).toHaveTextContent("Only after five continuous minutes away");
+
+    // Each class states its real current delivery, so the control and the word
+    // beside it can never disagree.
+    expect(preferences.map((preference) => preference.getAttribute("aria-checked")))
+      .toEqual(["true", "true", "false", "true", "false", "false"]);
+    expect(within(dialog).getAllByText("Always")).toHaveLength(3);
+    expect(within(dialog).getAllByText("Never")).toHaveLength(3);
+
+    // Clicking the row is clicking the checkbox, and it reports rather than writes.
+    fireEvent.click(within(dialog).getByText("A session finished"));
+    expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ finished: true }));
+    expect(preferences[2]).toHaveAttribute("aria-checked", "false");
+
+    fireEvent.click(within(dialog).getByRole("checkbox", { name: /Quiet delivery/u }));
+    expect(onChange).toHaveBeenLastCalledWith(expect.objectContaining({ quiet: true }));
+  });
+
+  it("contains setup focus and offers one retry when the setup facts cannot be read", async () => {
+    const onRetry = vi.fn();
+    function Harness() {
+      const [open, setOpen] = useState(false);
+      return <>
+        <button type="button" onClick={() => setOpen(true)}>Open setup</button>
+        {open && <SetupDialog
+          setup={{ state: "error", value: null, error: "The cockpit is offline." }}
+          onRetry={onRetry}
+          onClose={() => setOpen(false)}
+        />}
+      </>;
+    }
+
+    render(<Harness />);
+    const opener = screen.getByRole("button", { name: "Open setup" });
+    opener.focus();
+    fireEvent.click(opener);
+
+    const dialog = await screen.findByRole("dialog", { name: "Setup and integrations" });
+    const close = within(dialog).getByRole("button", { name: "Close setup and integrations" });
+    await waitFor(() => expect(close).toHaveFocus());
+    expect(dialog).toHaveTextContent("The cockpit is offline.");
+    // The copy-the-command posture: the browser never writes provider settings.
+    expect(dialog).toHaveTextContent("This browser never changes provider settings. Run the commands yourself.");
+    expect(within(dialog).queryByRole("button", { name: /install|apply|write/iu })).not.toBeInTheDocument();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Try again" }));
+    expect(onRetry).toHaveBeenCalledOnce();
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Setup and integrations" })).not.toBeInTheDocument());
+    await waitFor(() => expect(opener).toHaveFocus());
   });
 });
 
@@ -209,7 +248,8 @@ describe("Header", () => {
     const search = within(primary).getByRole("button", { name: "Search sessions and commands" });
     const help = within(primary).getByRole("button", { name: "Open help and keyboard shortcuts" });
     const newThread = within(primary).getByRole("button", { name: "New thread" });
-    expect(search).toHaveClass("h-7", "border-[var(--border-hairline)]");
+    // Frame 7a draws both header controls with the 0.22 frame hairline.
+    expect(search).toHaveClass("h-7", "border-[var(--border-frame)]");
     expect(help).toHaveTextContent("?");
     expect(newThread).toHaveClass("h-8", "rounded-full");
     expect(newThread).toHaveTextContent("New thread");

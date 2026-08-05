@@ -1,67 +1,99 @@
 import { useRef } from "react";
+import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { X } from "lucide-react";
-import { useModalFocus } from "../../hooks/use-modal-focus";
 import type { TodoProgressView } from "../../lib/cockpit-view";
+import { Badge, Button, Separator } from "../ui";
 import { TodoProgressMeter } from "./TodoProgressMeter";
+
+type FactTone = "default" | "dirty" | "remote";
+
+/*
+  Spec 12 R4 — the drawer's fact chips are read by meaning, not by colour.
+  A dirty worktree is amber because uncommitted work is a warning, never an
+  error; a remote host is violet because violet is what "not this machine"
+  means everywhere else in the cockpit.
+*/
+const FACT_TONE = { default: "neutral", dirty: "warning", remote: "remote" } as const satisfies Record<FactTone, "neutral" | "warning" | "remote">;
 
 export interface ThreadDrawerProps {
   open: boolean;
   title: string;
-  facts?: readonly { label: string; tone?: "default" | "dirty" | "remote" }[];
+  facts?: readonly { label: string; tone?: FactTone }[];
   todo?: TodoProgressView | null;
   onClose: () => void;
   children: React.ReactNode;
   composer?: React.ReactNode;
 }
 
+/*
+  The one shadcn surface in the cockpit that is deliberately NOT portalled.
+  Spec 05 R7: the drawer overlays the board region only, so it must stay a child
+  of `[data-board-region]` — `SheetContent` portals to `document.body`, which
+  would make it a sibling of the header and swallow every header control. Radix
+  is used for what it is here for: Escape ownership through DismissableLayer,
+  and mount focus through FocusScope.
+
+  `modal={false}` is the other deliberate choice. The board behind the drawer
+  stays clickable on desktop — that click is how a session is switched — so the
+  drawer takes no scrim, no outside-pointer blocking, and `onInteractOutside` is
+  prevented so a board click selects instead of dismissing.
+*/
 export function ThreadDrawer({ open, title, facts = [], todo = null, onClose, children, composer }: ThreadDrawerProps) {
-  const closeRef = useRef<HTMLButtonElement>(null);
-  const drawerRef = useModalFocus<HTMLDivElement>({
-    active: open,
-    initialFocusRef: closeRef,
-    onEscape: onClose,
-    priority: 40,
-  });
-  if (!open) return null;
+  // There is no `DialogTrigger` to hand focus back to — the drawer is opened by
+  // a board card, a shortcut or the palette — so it remembers its own opener.
+  const openerRef = useRef<HTMLElement | null>(null);
   return (
-    <div
-      ref={drawerRef}
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="thread-drawer-title"
-      className="fixed inset-0 z-50 isolate flex w-full max-w-none flex-col overflow-hidden border-l-0 bg-[var(--ground)] shadow-none min-[901px]:absolute min-[901px]:inset-y-0 min-[901px]:right-0 min-[901px]:left-auto min-[901px]:z-40 min-[901px]:max-w-[760px] min-[901px]:border-l min-[901px]:border-[var(--border-frame)] min-[901px]:bg-[var(--drawer,var(--ground))] min-[901px]:shadow-[-50px_0_120px_rgb(0_0_0/0.8)] min-[901px]:motion-safe:animate-[p-in_160ms_ease-out]"
-      data-thread-drawer
-      data-phone-surface="fullscreen"
-      data-desktop-surface="drawer"
-    >
-      <header className="flex min-h-[56px] shrink-0 items-center gap-3 border-b border-[var(--rule)] bg-inherit px-4 py-3 sm:px-[22px]" data-thread-header>
-        <div className="min-w-0 flex-1">
-          <div className="flex min-w-0 items-center gap-2">
-            <h2 id="thread-drawer-title" className="min-w-0 flex-1 truncate text-[15px] font-semibold tracking-[-0.015em]">{title}</h2>
-            {todo && todo.total > 0 && (
-              <TodoProgressMeter todo={todo} className="shrink-0 bg-[var(--surface-raised)] px-2 py-1" />
+    <DialogPrimitive.Root open={open} modal={false} onOpenChange={(next) => { if (!next) onClose(); }}>
+      <DialogPrimitive.Content
+        onOpenAutoFocus={() => { openerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null; }}
+        onCloseAutoFocus={(event) => { event.preventDefault(); if (openerRef.current?.isConnected) openerRef.current.focus({ preventScroll: true }); }}
+        className="fixed inset-0 z-50 isolate flex w-full max-w-none flex-col overflow-hidden border-l-0 bg-[var(--ground)] shadow-none focus-visible:outline-none min-[901px]:absolute min-[901px]:inset-y-0 min-[901px]:right-0 min-[901px]:left-auto min-[901px]:z-40 min-[901px]:max-w-[760px] min-[901px]:border-l min-[901px]:border-[var(--border-strong)] min-[901px]:bg-[var(--drawer,var(--ground))] min-[901px]:shadow-[var(--shadow-drawer)] min-[901px]:motion-safe:animate-[p-in_160ms_ease-out]"
+        data-thread-drawer
+        data-phone-surface="fullscreen"
+        data-desktop-surface="drawer"
+        onInteractOutside={(event) => event.preventDefault()}
+      >
+        <header
+          className="flex shrink-0 items-center gap-2 bg-inherit px-4 pt-1 pb-3 min-[901px]:px-[22px] min-[901px]:pt-4 min-[901px]:pb-3"
+          data-thread-header
+        >
+          <div className="min-w-0 flex-1 min-[901px]:flex min-[901px]:items-center min-[901px]:gap-2">
+            <DialogPrimitive.Title className="truncate text-title-sm min-[901px]:min-w-0 min-[901px]:shrink">{title}</DialogPrimitive.Title>
+            {facts.length > 0 && (
+              <>
+                {/* Phone (9a-2) states the same facts as one mono subtitle; the drawer (4a) chips them. */}
+                <p className="truncate font-mono text-code-xs text-[var(--text-faint)] min-[901px]:hidden">
+                  {facts.map((fact) => fact.label).join(" · ")}
+                </p>
+                <div className="hidden min-w-0 shrink-0 gap-1.5 min-[901px]:flex">
+                  {facts.map((fact, index) => (
+                    <Badge
+                      key={`${fact.label}:${index}`}
+                      tone={FACT_TONE[fact.tone ?? "default"]}
+                      className="px-[9px] py-1 leading-none"
+                      data-tone={fact.tone ?? "default"}
+                    >
+                      {fact.label}
+                    </Badge>
+                  ))}
+                </div>
+              </>
             )}
           </div>
-          {facts.length > 0 && (
-            <div className="mt-1 flex flex-wrap gap-1.5">
-              {facts.map((fact, index) => (
-                <span
-                  key={`${fact.label}:${index}`}
-                  className="bg-[var(--surface-raised)] px-2 py-1 font-mono text-[11.5px] text-[var(--text-muted)] data-[tone=dirty]:text-[var(--dirty)] data-[tone=remote]:text-[var(--remote)]"
-                  data-tone={fact.tone ?? "default"}
-                >
-                  {fact.label}
-                </span>
-              ))}
-            </div>
+          {todo && todo.total > 0 && (
+            <TodoProgressMeter todo={todo} className="shrink-0 bg-[var(--surface-raised)] px-2 py-1" />
           )}
-        </div>
-        <button ref={closeRef} type="button" className="grid size-11 place-items-center text-[var(--text-muted)] sm:size-8" aria-label="Close thread" onClick={onClose}>
-          <X size={18} strokeWidth={1.75} />
-        </button>
-      </header>
-      <div className="min-h-0 flex-1 overflow-y-auto bg-inherit px-4 py-5 sm:px-6" data-thread-content>{children}</div>
-      {composer && <footer className="safe-area-bottom shrink-0 border-t border-[var(--rule)] bg-inherit p-3 sm:p-4" data-thread-composer>{composer}</footer>}
-    </div>
+          <DialogPrimitive.Close asChild>
+            <Button variant="ghost" size="icon" className="size-11 shrink-0 min-[901px]:size-7" aria-label="Close thread">
+              <X size={16} strokeWidth={1.75} />
+            </Button>
+          </DialogPrimitive.Close>
+        </header>
+        {/* The phone surface rules the header off; the desktop drawer does not. */}
+        <Separator className="shrink-0 bg-[var(--border-hairline)] min-[901px]:hidden" />
+        <div className="min-h-0 flex-1 overflow-y-auto bg-inherit px-4 pt-4 pb-2 min-[901px]:px-6 min-[901px]:pt-2 min-[901px]:pb-3" data-thread-content>{children}</div>
+        {composer && <footer className="safe-area-bottom shrink-0 bg-inherit px-4 pt-2 pb-2 min-[901px]:px-6 min-[901px]:pt-0 min-[901px]:pb-[18px]" data-thread-composer>{composer}</footer>}
+      </DialogPrimitive.Content>
+    </DialogPrimitive.Root>
   );
 }

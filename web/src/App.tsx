@@ -1,12 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
+  BellOff,
+  Check,
   Command,
   Laptop,
+  ListTodo,
   Plus,
   RefreshCw,
   Search,
   Server,
+  Tag,
   TriangleAlert,
   WifiOff,
   X,
@@ -61,7 +65,18 @@ import { useCockpit } from "./hooks/use-cockpit";
 import { usePhoneAttentionLabels } from "./hooks/use-phone-attention-labels";
 import { useSessionActivity } from "./hooks/use-session-activity";
 import { useTodoDetails } from "./hooks/use-todo-details";
-import { hasActiveModalLayer, useModalFocus } from "./hooks/use-modal-focus";
+import {
+  Button,
+  Checkbox,
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogTitle,
+} from "./components/ui";
 import { toCockpitSessionView } from "./lib/cockpit-view";
 import type { ProviderSettingsOptionsResponse, SessionSettingsOptionsResponse, SetupReadModel, TranscriptSearchMatch } from "./lib/api";
 import { isTypingTarget } from "./lib/shortcuts";
@@ -186,71 +201,89 @@ export function boardScrollBehavior(prefersReducedMotion: boolean): ScrollBehavi
   return prefersReducedMotion ? "auto" : "smooth";
 }
 
-export interface CockpitEscapeState {
-  paletteOpen: boolean;
-  shortcutsOpen: boolean;
-  reviewOpen: boolean;
-  drawerOpen: boolean;
-}
-
-export function handleCockpitEscape(
-  event: KeyboardEvent,
-  state: CockpitEscapeState,
-  actions: {
-    closePalette: () => void;
-    closeShortcuts: () => void;
-    closeReview: () => void;
-    closeDrawer: () => void;
-  },
-): boolean {
-  if (event.key !== "Escape") return false;
-  const close = state.paletteOpen ? actions.closePalette
-    : state.shortcutsOpen ? actions.closeShortcuts
-      : state.reviewOpen ? actions.closeReview
-        : state.drawerOpen ? actions.closeDrawer
-          : null;
-  if (!close) return false;
-  event.preventDefault();
-  // This listener runs in capture so a lower global listener (notably the
-  // drawer focus trap) cannot consume the same Escape and discard a draft.
-  event.stopImmediatePropagation();
-  close();
-  return true;
-}
-
-export function handleOpenDrawerMenuEscape(event: KeyboardEvent, root: ParentNode = document): boolean {
-  if (event.key !== "Escape") return false;
-  const trigger = root.querySelector<HTMLButtonElement>('[data-thread-drawer] button[aria-haspopup="menu"][aria-expanded="true"]');
-  if (!trigger) return false;
-  event.preventDefault();
-  event.stopImmediatePropagation();
-  trigger.click();
-  return true;
+/*
+  Radix hands focus back to a `DialogTrigger`. Both cockpit dialogs are opened
+  from the command palette instead, so there is no trigger to hand it back to:
+  each remembers the control that was focused when it opened and restores that.
+*/
+function rememberOpener(openerRef: { current: HTMLElement | null }) {
+  return {
+    onOpenAutoFocus: () => { openerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null; },
+    onCloseAutoFocus: (event: Event) => {
+      event.preventDefault();
+      if (openerRef.current?.isConnected) openerRef.current.focus({ preventScroll: true });
+    },
+  };
 }
 
 export function NotificationSettings({ preferences, onChange, onClose }: { preferences: ClientNotificationPreferences; onChange: (next: ClientNotificationPreferences) => void; onClose: () => void }) {
   const permission = typeof Notification === "undefined" ? "unavailable" : Notification.permission;
-  const closeRef = useRef<HTMLButtonElement>(null);
-  const dialogRef = useModalFocus<HTMLElement>({ active: true, initialFocusRef: closeRef, onEscape: onClose, priority: 75 });
+  const openerRef = useRef<HTMLElement | null>(null);
   function toggle(key: keyof ClientNotificationPreferences) { onChange({ ...preferences, [key]: !preferences[key] }); }
   return (
-    <div className="fixed inset-0 z-[75] bg-black/70" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-      <section ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="notification-settings-title" tabIndex={-1} className="mx-auto mt-[80px] w-[min(520px,calc(100%-24px))] border border-[var(--border-frame)] bg-[var(--menu)] p-5 shadow-[var(--shadow-frame)]">
-        <header className="flex items-center"><h2 id="notification-settings-title" className="text-[17px] font-semibold">Notifications</h2><button ref={closeRef} type="button" data-compact-control className="ml-auto grid size-10 place-items-center" aria-label="Close notification settings" onClick={onClose}><X size={16} /></button></header>
-        <p className="mt-2 text-[12.5px] leading-5 text-[var(--text-muted)]">Local browser notifications only. There is no push service: alerts arrive only while Agent Manager is open and running. Lock-screen content is generic unless you opt in to session names.</p>
-        <div className="mt-4 grid gap-2">
-          {([
-            ["browser", "This browser", "Use the page Notification API"],
-            ["blocked", "Needs a response", "Exact provider-exposed request IDs only"],
-            ["finished", "Turn finished", "Only after five continuous minutes away"],
-            ["stalled", "Todo stalled", "After an observed todo transition has not moved for nine minutes"],
-            ["quiet", "Quiet delivery", "Mute notification sounds"],
-            ["includeSessionName", "Include session name", "Off by default for lock-screen privacy"],
-          ] as const).map(([key, label, detail]) => <label key={key} className="flex min-h-11 cursor-pointer items-start gap-3 border-b border-[var(--rule)] py-2"><input type="checkbox" checked={preferences[key]} onChange={() => toggle(key)} /><span><strong className="block text-[13px]">{label}</strong><span className="text-[11.5px] text-[var(--text-muted)]">{detail}</span></span></label>)}
+    <Dialog open onOpenChange={(next) => { if (!next) onClose(); }}>
+      <DialogContent {...rememberOpener(openerRef)} showCloseButton={false} className="max-w-[520px]">
+        <header className="flex items-center">
+          <DialogTitle className="pr-0">Notifications</DialogTitle>
+          <DialogClose asChild>
+            <Button variant="ghost" size="icon" data-compact-control className="ml-auto size-10" aria-label="Close notification settings"><X size={16} /></Button>
+          </DialogClose>
+        </header>
+        <div className="flex items-center gap-[11px] bg-[var(--surface-raised-hover)] px-[13px] py-[11px]">
+          <BellOff size={15} strokeWidth={1.75} className="shrink-0 text-[var(--text-muted)]" />
+          <DialogDescription className="min-w-0 flex-1 text-meta-sm text-[var(--text-secondary)]">Local browser notifications only. There is no push service: alerts arrive only while Agent Manager is open and running. Lock-screen content is generic unless you opt in to session names.</DialogDescription>
         </div>
-        <div className="mt-4 flex items-center justify-between gap-3"><span className="font-mono text-[10.5px] text-[var(--text-faint)]">permission: {permission}</span>{permission === "default" && <button type="button" data-compact-control className="min-h-10 rounded-full bg-[var(--accent)] px-4 text-[12px] font-medium text-[var(--accent-ink)]" onClick={() => void Notification.requestPermission()}>Allow notifications</button>}</div>
-      </section>
-    </div>
+        {/* Frame 12b states each class as a sentence with its rule underneath and the current delivery on the right. */}
+        <div>
+          {([
+            ["browser", "This browser", "Use the page Notification API", Laptop],
+            ["blocked", "A question or approval", "The agent is stopped until you answer", AlertCircle],
+            ["finished", "A session finished", "Only after five continuous minutes away", Check],
+            ["stalled", "A todo stalled", "An observed todo has not moved for nine minutes", ListTodo],
+            ["quiet", "Quiet delivery", "Questions still light the board, they just do not ring", BellOff],
+            ["includeSessionName", "Include session name", "Off by default for lock-screen privacy", Tag],
+          ] as const).map(([key, label, detail, Icon]) => <label key={key} className="flex min-h-11 cursor-pointer items-center gap-3 border-b border-[var(--rule)] py-[11px]"><Icon size={15} strokeWidth={1.75} aria-hidden="true" className="shrink-0 text-[var(--text-muted)]" /><Checkbox checked={preferences[key]} onCheckedChange={() => toggle(key)} /><span className="min-w-0 flex-1"><span className="block text-[13.5px] leading-[1.4]">{label}</span><span className="block font-mono text-code-sm text-[var(--text-faint)]">{detail}</span></span><span aria-hidden="true" className={`shrink-0 px-2.5 py-[5px] text-meta-sm leading-none ${preferences[key] ? "bg-[var(--menu)] text-[var(--text)]" : "bg-transparent text-[var(--text-faint)]"}`}>{preferences[key] ? "Always" : "Never"}</span></label>)}
+        </div>
+        <div className="flex items-center justify-between gap-3"><span className="font-mono text-code-xs text-[var(--text-faint)]">permission: {permission}</span>{permission === "default" && <Button variant="primary" data-compact-control onClick={() => void Notification.requestPermission()}>Allow notifications</Button>}</div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+export type SetupFactsState =
+  | { state: "loading"; value: null; error: null }
+  | { state: "loaded"; value: SetupReadModel; error: null }
+  | { state: "error"; value: null; error: string }
+  | null;
+
+/**
+ * The one standalone surface for hook and host integration facts. It reads the
+ * same bounded `/setup` model first run uses and, like first run, only ever
+ * shows the exact CLI command and redacted diff for the operator to run.
+ */
+export function SetupDialog({ setup, onRetry, onClose }: { setup: SetupFactsState; onRetry: () => void; onClose: () => void }) {
+  const openerRef = useRef<HTMLElement | null>(null);
+  return (
+    <Dialog open onOpenChange={(next) => { if (!next) onClose(); }}>
+      <DialogContent {...rememberOpener(openerRef)} showCloseButton={false} data-setup-dialog className="flex max-h-[min(760px,calc(100dvh-88px))] max-w-[880px] flex-col gap-0 p-0">
+        <header className="flex shrink-0 items-center gap-3 border-b border-[var(--rule)] px-5 py-3">
+          <div className="min-w-0">
+            <DialogTitle className="pr-0">Setup and integrations</DialogTitle>
+            <DialogDescription className="mt-0.5 text-meta-sm text-[var(--text-muted)]">This browser never changes provider settings. Run the commands yourself.</DialogDescription>
+          </div>
+          <DialogClose asChild>
+            <Button variant="ghost" size="icon" data-compact-control className="ml-auto size-10 shrink-0" aria-label="Close setup and integrations"><X size={16} /></Button>
+          </DialogClose>
+        </header>
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          {setup?.state === "loaded"
+            ? <><HookSetupStep hooks={setup.value.hooks} standalone /><HostSetupStep hosts={setup.value.hosts} standalone /></>
+            : setup?.state === "error"
+              ? <section className="grid place-items-center p-10 text-center"><AlertCircle className="text-[var(--warning)]" /><h3 className="mt-3 text-title-sm">Setup facts are unavailable</h3><p className="mt-1 text-meta-sm text-[var(--text-muted)]">{setup.error}</p><Button variant="primary" size="touch" className="mt-4" onClick={onRetry}>Try again</Button></section>
+              : <ConnectingState sources={["provider hook settings", "configured remote hosts"]} />}
+        </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -270,10 +303,10 @@ export function CockpitToast({
   const message = actionError ?? notice;
   if (!message) return null;
   return (
-    <aside className="fixed bottom-4 right-4 z-[80] flex max-w-[min(440px,calc(100%-32px))] items-start gap-2 border border-[var(--border-frame)] bg-[var(--menu)] p-3 text-[12.5px] shadow-[var(--shadow-toast)]">
+    <aside className="fixed bottom-4 right-4 z-[80] flex max-w-[min(440px,calc(100%-32px))] items-start gap-2 border border-[var(--border-frame)] bg-[var(--menu)] p-3 text-meta-sm shadow-[var(--shadow-toast)]">
       <span className="min-w-0 flex-1">{message}</span>
-      {actionError && canTakeOver && <button type="button" data-compact-control className="min-h-9 shrink-0 px-2 font-medium text-[var(--accent)]" onClick={onTakeOver}>Use here</button>}
-      <button type="button" data-compact-control className="grid size-6 shrink-0 place-items-center" aria-label="Dismiss" onClick={onDismiss}><X size={14} /></button>
+      {actionError && canTakeOver && <Button variant="ghost" size="sm" data-compact-control className="px-2 [color:var(--accent)]" onClick={onTakeOver}>Use here</Button>}
+      <Button variant="ghost" size="icon" data-compact-control className="size-6" aria-label="Dismiss" onClick={onDismiss}><X size={14} /></Button>
     </aside>
   );
 }
@@ -285,8 +318,8 @@ function LoadingScreen() {
 function ErrorScreen({ message, onRetry }: { message: string; onRetry: () => void }) {
   return (
     <main className="grid min-h-dvh place-content-center px-5 text-center">
-      <AlertCircle className="mx-auto text-[var(--danger)]" /><h1 className="mt-3 text-[16px] font-semibold">Agent Manager could not open</h1><p className="mt-1 max-w-md text-[13px] text-[var(--text-muted)]">{message}</p>
-      <button type="button" className="mx-auto mt-4 flex min-h-10 items-center gap-2 rounded-full bg-[var(--accent)] px-4 text-[12.5px] font-medium text-[var(--accent-ink)]" onClick={onRetry}><RefreshCw size={14} />Try again</button>
+      <AlertCircle className="mx-auto text-[var(--danger)]" /><h1 className="mt-3 text-title-md">Agent Manager could not open</h1><p className="mt-1 max-w-md text-meta text-[var(--text-muted)]">{message}</p>
+      <Button variant="primary" size="touch" className="mx-auto mt-4" onClick={onRetry}><RefreshCw size={14} />Try again</Button>
     </main>
   );
 }
@@ -330,23 +363,26 @@ export function Header({
   const hostSelectionLabel = hostSelectionSummary(hosts.map((host) => host.id), hostFilter);
   const connectionLabel = `${connection}${diagnostics ? ` · ${diagnostics} diagnostics` : ""}`;
   return (
-    <header className="safe-area-top z-30 shrink-0 border-b border-[var(--rule)] bg-[var(--app)]">
+    <header className="safe-area-top z-30 shrink-0 bg-[var(--app)]">
       <div className="safe-area-inline">
         <div className="flex h-[46px] items-center gap-3 px-4 min-[901px]:gap-3.5 min-[901px]:px-6" data-header-primary>
           <span className={`size-[9px] shrink-0 rounded-full ${connection === "open" ? "bg-[var(--text-muted)]" : "bg-[var(--warning)]"}`} data-connection-indicator={connection} aria-hidden="true" title={connectionLabel} />
           <h1 className="truncate font-mono text-[11px] font-medium uppercase leading-none tracking-[0.14em] text-[var(--text-muted)]">Agent Manager</h1>
           <span className="sr-only" role="status">Connection {connectionLabel}</span>
           <span className="flex-1" />
-          <button type="button" data-compact-control className="flex h-7 shrink-0 items-center gap-2 border border-[var(--border-hairline)] px-2.5 font-mono text-[11.5px] leading-none text-[var(--text-muted)]" aria-label="Search sessions and commands" onClick={onPalette}><Search size={13} aria-hidden="true" /><span className="hidden min-[520px]:inline">Search</span><kbd className="hidden text-[var(--text-faint)] min-[901px]:inline">⌘K</kbd></button>
-          <button type="button" data-compact-control className="grid size-7 shrink-0 place-items-center border border-[var(--border-hairline)] font-mono text-[12px] leading-none text-[var(--text-muted)]" aria-label="Open help and keyboard shortcuts" onClick={onHelp}>?</button>
-          <button type="button" data-compact-control className="flex h-8 shrink-0 items-center justify-center gap-2 rounded-full bg-[var(--accent)] px-2.5 text-[13px] font-semibold leading-none text-[var(--accent-ink)] min-[520px]:px-3.5" aria-label="New thread" onClick={onNew}><Plus size={15} aria-hidden="true" /><span className="hidden min-[520px]:inline">New thread</span></button>
+          <Button variant="secondary" size="sm" data-compact-control className="h-7 gap-2 px-[11px] font-mono text-code-sm leading-none [color:var(--text-muted)]" aria-label="Search sessions and commands" onClick={onPalette}><Search size={13} aria-hidden="true" /><span className="hidden min-[520px]:inline">Search</span><kbd className="hidden text-[var(--text-faint)] min-[901px]:inline">⌘K</kbd></Button>
+          <Button variant="secondary" size="icon" data-compact-control className="size-7 font-mono text-meta-sm leading-none [color:var(--text-muted)]" aria-label="Open help and keyboard shortcuts" onClick={onHelp}>?</Button>
+          <Button variant="primary" size="sm" data-compact-control className="h-8 gap-2 px-2.5 text-meta font-semibold leading-none min-[520px]:px-3.5" aria-label="New thread" onClick={onNew}><Plus size={15} aria-hidden="true" /><span className="hidden min-[520px]:inline">New thread</span></Button>
         </div>
-        <div className="flex min-w-0 items-center gap-5 overflow-x-auto px-4 pb-3 min-[901px]:gap-[22px] min-[901px]:px-6 min-[901px]:pb-[18px]" data-header-filters>
-          <nav className="flex shrink-0 items-baseline gap-4" aria-label="Session filters">
+        <div className="flex min-w-0 items-center gap-5 overflow-x-auto px-4 pb-3 pt-0.5 min-[901px]:gap-[22px] min-[901px]:px-6 min-[901px]:pb-[18px]" data-header-filters>
+          <nav className="flex shrink-0 items-baseline gap-[17px]" aria-label="Session filters">
             {FILTERS.map(([value, label]) => {
               const active = scope === value;
               const wantsYou = value === "wants-you";
-              return <button key={value} type="button" data-compact-control aria-current={active ? "page" : undefined} aria-label={`${label}, ${counts[value]} ${counts[value] === 1 ? "session" : "sessions"}`} className={`shrink-0 border-0 bg-transparent p-0 text-[13.5px] leading-none ${active ? "font-semibold" : "font-normal"} ${wantsYou ? "text-[var(--accent)]" : active ? "text-[var(--text)]" : "text-[var(--text-muted)]"}`} onClick={() => onScope(value)}><span>{label}</span><span className={`ml-1.5 font-mono text-[11.5px] font-normal ${wantsYou ? "text-[var(--accent-quiet)]" : "text-[var(--text-faint)]"}`}>{counts[value]}</span></button>;
+              // Wants you stays lime whether or not it is the active scope
+              // (spec 05 R1); frame 7a quietens the inactive lime rather than
+              // dropping it to grey.
+              return <button key={value} type="button" data-compact-control aria-current={active ? "page" : undefined} aria-label={`${label}, ${counts[value]} ${counts[value] === 1 ? "session" : "sessions"}`} className={`shrink-0 border-0 bg-transparent p-0 text-[13.5px] leading-none ${active ? "font-semibold" : "font-normal"} ${wantsYou ? (active ? "text-[var(--accent)]" : "text-[var(--accent-quiet)]") : active ? "text-[var(--text)]" : "text-[var(--text-muted)]"}`} onClick={() => onScope(value)}><span>{label}</span><span className={`ml-[5px] font-mono text-[11.5px] font-normal ${wantsYou ? "text-[var(--accent)]" : "text-[var(--text-faint)]"}`}>{counts[value]}</span></button>;
             })}
           </nav>
           <span className="h-4 w-px shrink-0 bg-[var(--border-hairline)]" aria-hidden="true" />
@@ -354,10 +390,10 @@ export function Header({
             {hosts.map((host) => {
               const selected = hostFilter.size === 0 || hostFilter.has(host.id);
               const tone = selected
-                ? host.kind === "ssh" ? "text-[var(--remote)]" : "text-[var(--text-secondary)]"
+                ? host.kind === "ssh" ? "text-[var(--remote)]" : "text-[var(--text)]"
                 : host.kind === "ssh" ? "text-[var(--remote-dim)] opacity-50" : "text-[var(--text-faint)] opacity-50";
               const HostIcon = host.kind === "ssh" ? Server : Laptop;
-              return <button key={host.id} type="button" data-compact-control aria-pressed={selected} aria-label={`${host.label}, ${host.count} ${host.count === 1 ? "session" : "sessions"}`} title={`${host.label} · ${host.status}`} className={`flex shrink-0 items-center gap-1.5 border-0 bg-transparent p-0 ${tone}`} onClick={() => onToggleHost(host.id)}><HostIcon size={12} strokeWidth={1.75} aria-hidden="true" /><span>{host.label}</span><span className="text-[var(--text-faint)]">{host.count}</span></button>;
+              return <button key={host.id} type="button" data-compact-control aria-pressed={selected} aria-label={`${host.label}, ${host.count} ${host.count === 1 ? "session" : "sessions"}`} title={`${host.label} · ${host.status}`} className={`flex shrink-0 items-center gap-1.5 border-0 bg-transparent p-0 ${tone}`} onClick={() => onToggleHost(host.id)}><HostIcon size={13} strokeWidth={1.75} aria-hidden="true" /><span>{host.label}</span><span className={host.kind === "ssh" ? "text-[var(--remote-dim)]" : "text-[var(--text-faint)]"}>{host.count}</span></button>;
             })}
             {hosts.length === 0 && <span className="text-[var(--text-faint)]">No hosts</span>}
           </nav>
@@ -394,13 +430,10 @@ export default function App() {
   const [notificationPreferences, setNotificationPreferences] = useState<ClientNotificationPreferences>(loadNotificationPreferences);
   const [firstRunStep, setFirstRunStep] = useState<"folder" | "hooks" | "ssh">("folder");
   const [pendingFirstWorkspace, setPendingFirstWorkspace] = useState<DraftWorkspace | null>(null);
-  const [firstRunSetup, setFirstRunSetup] = useState<
-    | { state: "loading"; value: null; error: null }
-    | { state: "loaded"; value: SetupReadModel; error: null }
-    | { state: "error"; value: null; error: string }
-    | null
-  >(null);
+  const [setupFacts, setSetupFacts] = useState<SetupFactsState>(null);
+  const [setupOpen, setSetupOpen] = useState(false);
   const setupLoadStarted = useRef(false);
+  const setupRequest = useRef(0);
   const [selectedIds, setSelectedIds] = useState<ReadonlySet<string>>(() => new Set());
   const [reviewOpen, setReviewOpen] = useState(false);
   const [readKeys, setReadKeys] = useState<ReadonlySet<string>>(() => new Set());
@@ -421,18 +454,24 @@ export default function App() {
     try { localStorage.setItem(NOTIFICATION_SETTINGS_KEY, JSON.stringify(notificationPreferences)); } catch { /* ephemeral preference fallback */ }
   }, [notificationPreferences]);
 
+  const refreshSetup = useCallback(() => {
+    const request = ++setupRequest.current;
+    setupLoadStarted.current = true;
+    setSetupFacts({ state: "loading", value: null, error: null });
+    void cockpit.loadSetup().then((value) => {
+      if (setupRequest.current === request) setSetupFacts({ state: "loaded", value, error: null });
+    }).catch((error: unknown) => {
+      if (setupRequest.current === request) setSetupFacts({ state: "error", value: null, error: errorText(error) });
+    });
+  }, [cockpit.loadSetup]);
+  // Hook and host facts change outside this browser, so every explicit open
+  // re-reads them instead of trusting a first-run snapshot.
+  const openSetup = useCallback(() => { setSetupOpen(true); refreshSetup(); }, [refreshSetup]);
+
   useEffect(() => {
     if (!cockpit.ready || !cockpit.mutationsReady || cockpitContentMode(cockpit.sessions.length, cockpit.workspaces.length) !== "first-run" || setupLoadStarted.current) return;
-    setupLoadStarted.current = true;
-    let cancelled = false;
-    setFirstRunSetup({ state: "loading", value: null, error: null });
-    void cockpit.loadSetup().then((value) => {
-      if (!cancelled) setFirstRunSetup({ state: "loaded", value, error: null });
-    }).catch((error: unknown) => {
-      if (!cancelled) setFirstRunSetup({ state: "error", value: null, error: errorText(error) });
-    });
-    return () => { cancelled = true; };
-  }, [cockpit.loadSetup, cockpit.mutationsReady, cockpit.ready, cockpit.sessions.length, cockpit.workspaces.length]);
+    refreshSetup();
+  }, [cockpit.mutationsReady, cockpit.ready, cockpit.sessions.length, cockpit.workspaces.length, refreshSetup]);
 
   const phoneAttentionLabels = usePhoneAttentionLabels(
     cockpit.sessions,
@@ -714,6 +753,7 @@ export default function App() {
       { id: "command:review", kind: "command" as const, label: "Review this turn's changes", detail: changedFiles.length ? `${changedFiles.length} files` : null, keywords: ["diff", "files"], disabledReason: changedFiles.length ? null : "No file changes in the selected turn", payload: { type: "review" } },
       { id: "command:shortcuts", kind: "command" as const, label: "Keyboard shortcuts", detail: "?", keywords: ["help"], payload: { type: "shortcuts" } },
       { id: "command:notifications", kind: "command" as const, label: "Notification settings", detail: "local only", keywords: ["alerts", "privacy", "quiet"], payload: { type: "notification-settings" } },
+      { id: "command:setup", kind: "command" as const, label: "Setup and integrations", detail: "hooks · hosts", keywords: ["hook", "hooks", "install", "ssh", "host", "terminal", "read-only", "observe"], payload: { type: "setup" } },
     ],
     transcripts: selected ? transcriptMatches.map((match) => ({ id: `transcript:${match.messageId}:${match.matchStart}`, kind: "transcript" as const, label: match.snippet, detail: match.role, keywords: [match.snippet], payload: { type: "session", id: selected.id } })) : [],
     // No bounded workspace file index or harness command catalog exists yet.
@@ -732,41 +772,15 @@ export default function App() {
     else if (payload?.type === "review") setReviewOpen(true);
     else if (payload?.type === "shortcuts") setShortcutsOpen(true);
     else if (payload?.type === "notification-settings") setNotificationSettingsOpen(true);
+    else if (payload?.type === "setup") openSetup();
     else if (payload?.type === "host" && payload.id) cockpit.setHostFilter(new Set([payload.id]));
-  }, [cockpit, openDraft]);
+  }, [cockpit, openDraft, openSetup]);
 
+  // Escape is owned per layer by Radix's DismissableLayer: only the topmost
+  // open surface sees it, and closing one never reaches the one beneath. This
+  // listener therefore carries the application shortcuts and nothing else.
   useEffect(() => {
     function keydown(event: KeyboardEvent) {
-      if (event.key === "Escape") {
-        // Modal layers own Escape through the shared focus registry. Check the
-        // registry instead of relying on capture-listener registration order.
-        if (hasActiveModalLayer()) return;
-        const appLayerOpen = paletteOpen || shortcutsOpen || reviewOpen;
-        const escapeActions = {
-          closePalette: () => setPaletteOpen(false),
-          closeShortcuts: () => setShortcutsOpen(false),
-          closeReview: () => setReviewOpen(false),
-          closeDrawer,
-        };
-        if (appLayerOpen && handleCockpitEscape(event, {
-          paletteOpen,
-          shortcutsOpen,
-          reviewOpen,
-          drawerOpen: false,
-        }, escapeActions)) return;
-        // Drawer-owned modal surfaces get the event at their own capture
-        // boundary. Never let the drawer itself treat that Escape as a second
-        // close. Composer menus are toggled through their existing control so
-        // their private state remains the source of truth.
-        if (document.querySelector('[data-thread-drawer] [aria-modal="true"]')) return;
-        if (handleOpenDrawerMenuEscape(event)) return;
-        if (handleCockpitEscape(event, {
-          paletteOpen: false,
-          shortcutsOpen: false,
-          reviewOpen: false,
-          drawerOpen: Boolean(draft || selected),
-        }, escapeActions)) return;
-      }
       if ((event.metaKey || event.ctrlKey) && !event.shiftKey && event.key.toLowerCase() === "k") { event.preventDefault(); setPaletteOpen((open) => !open); return; }
       if (isTypingTarget(event.target)) return;
       if (event.key === "?" && !event.metaKey && !event.ctrlKey && !event.altKey) { event.preventDefault(); setShortcutsOpen((open) => !open); return; }
@@ -792,7 +806,7 @@ export default function App() {
     }
     window.addEventListener("keydown", keydown, true);
     return () => window.removeEventListener("keydown", keydown, true);
-  }, [board.columns, changedFiles.length, closeDrawer, draft, openSession, paletteOpen, reviewOpen, selected, shortcutsOpen]);
+  }, [board.columns, changedFiles.length, draft, openSession, paletteOpen, selected, shortcutsOpen]);
 
   const toggleHost = useCallback((hostId: string) => {
     const next = new Set(cockpit.hostFilter.size === 0 ? cockpit.hosts.map((host) => host.id) : cockpit.hostFilter);
@@ -855,81 +869,98 @@ export default function App() {
         onNew={() => openDraft()}
       />
 
-      {(cockpit.snapshot.stale || cockpit.connection !== "open") && <div className="z-20 shrink-0"><OfflineState generatedAt={cockpit.snapshot.generatedAt} /></div>}
-      {cockpit.snapshot.diagnostics.length > 0 && <details className="z-20 shrink-0 border-b border-[var(--rule)] bg-[var(--warning-field)] px-4 py-2 text-[11.5px] text-[var(--warning)]"><summary className="cursor-pointer">{cockpit.snapshot.diagnostics.length} discovery {cockpit.snapshot.diagnostics.length === 1 ? "diagnostic" : "diagnostics"}</summary><ul className="mt-2 grid gap-1 text-[var(--text-muted)]">{cockpit.snapshot.diagnostics.slice(-8).map((diagnostic, index) => <li key={`${diagnostic.message}:${index}`}>{diagnostic.provider}: {diagnostic.message}</li>)}</ul></details>}
+      <SelectionBar sessions={selectedBoardSessions} onClear={() => setSelectedIds(new Set())} onAction={selectionAction} />
 
-      {contentMode === "empty" ? (
-        <div className="min-h-0 flex-1 overflow-y-auto">
-          <EmptyState repositories={cockpit.workspaces.map((workspace) => ({ id: workspace.id, name: workspace.label, path: workspace.path }))} onOpen={(workspaceId) => { const workspace = cockpit.workspaces.find((item) => item.id === workspaceId); if (workspace) openDraft({ hostId: workspace.hostId, path: workspace.path }); }} />
-        </div>
-      ) : contentMode === "first-run" ? (
-        <div className="min-h-0 flex-1 overflow-y-auto">
-          {firstRunSetup?.state === "loaded"
-            ? firstRunStep === "folder"
-              ? <FirstRun nearby={firstRunSetup.value.nearby} hosts={firstRunSetup.value.hosts} onChooseFolder={(workspace) => { setPendingFirstWorkspace({ hostId: workspace.hostId, path: workspace.path }); setFirstRunStep("hooks"); }} onBrowse={cockpit.completeWorkspacePath} />
-              : firstRunStep === "hooks"
-                ? <HookSetupStep hooks={firstRunSetup.value.hooks} onContinue={() => setFirstRunStep("ssh")} />
-                : <HostSetupStep hosts={firstRunSetup.value.hosts} onContinue={() => { openDraft(pendingFirstWorkspace ?? undefined); setFirstRunStep("folder"); }} />
-            : firstRunSetup?.state === "error"
-              ? <section className="mx-auto grid max-w-lg place-items-center p-10 text-center"><AlertCircle className="text-[var(--warning)]" /><h2 className="mt-3 text-[16px] font-semibold">Setup facts are unavailable</h2><p className="mt-1 text-[12.5px] text-[var(--text-muted)]">{firstRunSetup.error}</p><button type="button" className="mt-4 min-h-10 rounded-full bg-[var(--accent)] px-4 text-[12.5px] font-medium text-[var(--accent-ink)]" onClick={() => { setupLoadStarted.current = false; setFirstRunSetup(null); }}>Try again</button></section>
-              : <ConnectingState sources={["discovered repositories", "provider hook settings", "configured remote hosts"]} />}
-        </div>
-      ) : board.columns.length === 0 && board.bands.length === 0 ? (
-        <section className="grid min-h-0 flex-1 place-content-center p-6 text-center"><Search className="mx-auto text-[var(--text-muted)]" /><h2 className="mt-3 text-[15px] font-semibold">No sessions match these filters</h2><button type="button" className="mt-3 text-[12.5px] text-[var(--accent)] underline" onClick={() => { cockpit.setScope("all"); cockpit.setHostFilter(new Set()); }}>Clear filters</button></section>
-      ) : (
-        <>
-          <DesktopBoard columns={board.columns} selectedSessionIds={selectedIds} onOpenSession={openSession} onToggleSelection={toggleSelection} onNewThread={(column) => openDraft(workspaceForColumn(column))} />
-          <PhoneBoardBands bands={board.bands} onOpenSession={openSession} />
-        </>
+      {(cockpit.snapshot.stale || cockpit.connection !== "open") && <div className="z-20 shrink-0"><OfflineState generatedAt={cockpit.snapshot.generatedAt} /></div>}
+      {cockpit.snapshot.diagnostics.length > 0 && (
+        <Collapsible className="z-20 shrink-0 border-b border-[var(--rule)] bg-[var(--warning-field)] px-4 py-2 text-code-sm text-[var(--warning)]">
+          <CollapsibleTrigger data-compact-control className="cursor-pointer text-left">{cockpit.snapshot.diagnostics.length} discovery {cockpit.snapshot.diagnostics.length === 1 ? "diagnostic" : "diagnostics"}</CollapsibleTrigger>
+          <CollapsibleContent>
+            <ul className="mt-2 grid gap-1 text-[var(--text-muted)]">{cockpit.snapshot.diagnostics.slice(-8).map((diagnostic, index) => <li key={`${diagnostic.message}:${index}`}>{diagnostic.provider}: {diagnostic.message}</li>)}</ul>
+          </CollapsibleContent>
+        </Collapsible>
       )}
 
-      <ThreadDrawer
-        open={drawerOpen}
-        title={drawerTitle}
-        facts={drawerInfo}
-        todo={selected ? selectedPresentation?.todo ?? null : null}
-        onClose={closeDrawer}
-        composer={selected ? <SessionThreadComposer
-          session={selected}
-          activity={activity}
-          busy={selectedBusy}
-          mutationsReady={cockpit.mutationsReady}
-          onSend={(text, delivery) => cockpit.sendMessage(selected, text, delivery)}
-          onInterrupt={() => cockpit.interrupt(selected)}
-          onSetProfile={(profile) => cockpit.setProfile(selected, profile)}
-          onSetModel={(model) => cockpit.setModel(selected, model)}
-          onSetEffort={(effort) => cockpit.setEffort(selected, effort)}
-          modelOptions={selectedModelCatalog.models}
-          modelOptionsStatus={selectedModelCatalog.status}
-          {...(selectedModelCatalog.effortOptions !== undefined ? { effortOptions: selectedModelCatalog.effortOptions } : {})}
-          {...(restoredDraft?.sessionId === selected.id ? { restoredDraft: { key: restoredDraft.key, text: restoredDraft.text } } : {})}
-        /> : undefined}
-      >
-        {selected ? <SessionThread
-          key={selected.id}
-          session={selected}
-          activity={activity}
-          remote={selectedRemote}
-          busy={selectedBusy}
-          mutationsReady={cockpit.mutationsReady}
-          onRespond={(requestId, response) => cockpit.respond(selected, requestId, response)}
-          onRemoveQueued={(id) => cockpit.removeQueued(selected, id)}
-          onOpenEditor={(path) => cockpit.openEditor(selected, path)}
-          readKeys={readKeys}
-          onReadChange={(key, read) => setReadKeys((current) => { const next = new Set(current); if (read) next.add(key); else next.delete(key); return next; })}
-          loadAttach={() => cockpit.loadAttach(selected)}
-          loadSessionFacts={cockpit.loadSessionFacts}
-          loadPlanFile={loadSelectedPlanFile}
-          sessionsOnHost={selectedSessionsOnHost}
-          onContinueInWorkspace={() => openDraft({ hostId: selected.hostId, path: selected.workspaceIdentity?.worktreePath ?? selected.cwd ?? "" })}
-        /> : draft ? <DraftThread draft={draft} hosts={cockpit.hosts} workspaces={cockpit.workspaces} busy={Boolean(cockpit.busy.create)} mutationsReady={cockpit.mutationsReady} modelOptions={draftModelCatalog.models} modelOptionsStatus={draftModelCatalog.status} {...(draftModelCatalog.effortOptions !== undefined ? { effortOptions: draftModelCatalog.effortOptions } : {})} dispatch={dispatchDraft} onFirstSend={firstSend} /> : null}
-      </ThreadDrawer>
+      {/*
+        The drawer overlays the board region only. It must never become a
+        sibling of the header: `absolute inset-y-0` would then resolve against
+        the whole page and swallow every header control (spec 05 R7).
+      */}
+      <div className="relative flex min-h-0 flex-1 flex-col" data-board-region>
+        {contentMode === "empty" ? (
+          <div className="min-h-0 flex-1 overflow-y-auto">
+            <EmptyState repositories={cockpit.workspaces.map((workspace) => ({ id: workspace.id, name: workspace.label, path: workspace.path }))} onOpen={(workspaceId) => { const workspace = cockpit.workspaces.find((item) => item.id === workspaceId); if (workspace) openDraft({ hostId: workspace.hostId, path: workspace.path }); }} />
+          </div>
+        ) : contentMode === "first-run" ? (
+          <div className="min-h-0 flex-1 overflow-y-auto">
+            {setupFacts?.state === "loaded"
+              ? firstRunStep === "folder"
+                ? <FirstRun nearby={setupFacts.value.nearby} hosts={setupFacts.value.hosts} onChooseFolder={(workspace) => { setPendingFirstWorkspace({ hostId: workspace.hostId, path: workspace.path }); setFirstRunStep("hooks"); }} onBrowse={cockpit.completeWorkspacePath} />
+                : firstRunStep === "hooks"
+                  ? <HookSetupStep hooks={setupFacts.value.hooks} onContinue={() => setFirstRunStep("ssh")} />
+                  : <HostSetupStep hosts={setupFacts.value.hosts} onContinue={() => { openDraft(pendingFirstWorkspace ?? undefined); setFirstRunStep("folder"); }} />
+              : setupFacts?.state === "error"
+                ? <section className="mx-auto grid max-w-lg place-items-center p-10 text-center"><AlertCircle className="text-[var(--warning)]" /><h2 className="mt-3 text-title-md">Setup facts are unavailable</h2><p className="mt-1 text-meta-sm text-[var(--text-muted)]">{setupFacts.error}</p><Button variant="primary" size="touch" className="mt-4" onClick={refreshSetup}>Try again</Button></section>
+                : <ConnectingState sources={["discovered repositories", "provider hook settings", "configured remote hosts"]} />}
+          </div>
+        ) : board.columns.length === 0 && board.bands.length === 0 ? (
+          <section className="grid min-h-0 flex-1 place-content-center p-6 text-center"><Search className="mx-auto text-[var(--text-muted)]" /><h2 className="mt-3 text-title-sm">No sessions match these filters</h2><Button variant="ghost" size="sm" data-compact-control className="mx-auto mt-3 underline [color:var(--accent)]" onClick={() => { cockpit.setScope("all"); cockpit.setHostFilter(new Set()); }}>Clear filters</Button></section>
+        ) : (
+          <>
+            <DesktopBoard columns={board.columns} selectedSessionIds={selectedIds} onOpenSession={openSession} onToggleSelection={toggleSelection} onNewThread={(column) => openDraft(workspaceForColumn(column))} />
+            <PhoneBoardBands bands={board.bands} onOpenSession={openSession} />
+          </>
+        )}
+
+        <ThreadDrawer
+          open={drawerOpen}
+          title={drawerTitle}
+          facts={drawerInfo}
+          todo={selected ? selectedPresentation?.todo ?? null : null}
+          onClose={closeDrawer}
+          composer={selected ? <SessionThreadComposer
+            session={selected}
+            activity={activity}
+            busy={selectedBusy}
+            mutationsReady={cockpit.mutationsReady}
+            onSend={(text, delivery) => cockpit.sendMessage(selected, text, delivery)}
+            onInterrupt={() => cockpit.interrupt(selected)}
+            onSetProfile={(profile) => cockpit.setProfile(selected, profile)}
+            onSetModel={(model) => cockpit.setModel(selected, model)}
+            onSetEffort={(effort) => cockpit.setEffort(selected, effort)}
+            modelOptions={selectedModelCatalog.models}
+            modelOptionsStatus={selectedModelCatalog.status}
+            onOpenSetup={openSetup}
+            {...(selectedModelCatalog.effortOptions !== undefined ? { effortOptions: selectedModelCatalog.effortOptions } : {})}
+            {...(restoredDraft?.sessionId === selected.id ? { restoredDraft: { key: restoredDraft.key, text: restoredDraft.text } } : {})}
+          /> : undefined}
+        >
+          {selected ? <SessionThread
+            key={selected.id}
+            session={selected}
+            activity={activity}
+            remote={selectedRemote}
+            busy={selectedBusy}
+            mutationsReady={cockpit.mutationsReady}
+            onRespond={(requestId, response) => cockpit.respond(selected, requestId, response)}
+            onRemoveQueued={(id) => cockpit.removeQueued(selected, id)}
+            onOpenEditor={(path) => cockpit.openEditor(selected, path)}
+            readKeys={readKeys}
+            onReadChange={(key, read) => setReadKeys((current) => { const next = new Set(current); if (read) next.add(key); else next.delete(key); return next; })}
+            loadAttach={() => cockpit.loadAttach(selected)}
+            loadSessionFacts={cockpit.loadSessionFacts}
+            loadPlanFile={loadSelectedPlanFile}
+            sessionsOnHost={selectedSessionsOnHost}
+            onContinueInWorkspace={() => openDraft({ hostId: selected.hostId, path: selected.workspaceIdentity?.worktreePath ?? selected.cwd ?? "" })}
+          /> : draft ? <DraftThread draft={draft} hosts={cockpit.hosts} workspaces={cockpit.workspaces} busy={Boolean(cockpit.busy.create)} mutationsReady={cockpit.mutationsReady} modelOptions={draftModelCatalog.models} modelOptionsStatus={draftModelCatalog.status} {...(draftModelCatalog.effortOptions !== undefined ? { effortOptions: draftModelCatalog.effortOptions } : {})} dispatch={dispatchDraft} onFirstSend={firstSend} /> : null}
+        </ThreadDrawer>
+      </div>
 
       {reviewOpen && selected && <DiffReview changes={changedFiles} branch={selected.workspaceIdentity?.branch ?? null} uncommitted={selected.workspaceIdentity?.dirtyCount === null ? null : (selected.workspaceIdentity?.dirtyCount ?? 0) > 0} readKeys={readKeys} onReadChange={(key, read) => setReadKeys((current) => { const next = new Set(current); if (read) next.add(key); else next.delete(key); return next; })} {...(selected.control.capabilities.includes("open-editor") ? { onOpenEditor: (relativePath: string) => void cockpit.openEditor(selected, relativePath), resolveEditorPath: (path: string) => relativeEditorPath(selected.workspaceIdentity?.worktreePath ?? selected.cwd, path) } : {})} onClose={() => setReviewOpen(false)} />}
-      <SelectionBar sessions={selectedBoardSessions} onClear={() => setSelectedIds(new Set())} onAction={selectionAction} />
       <CommandPalette open={paletteOpen} sources={paletteSources} onOpenChange={setPaletteOpen} onChoose={choosePalette} onQueryChange={setPaletteQuery} />
       <ShortcutSheet open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
       {notificationSettingsOpen && <NotificationSettings preferences={notificationPreferences} onChange={setNotificationPreferences} onClose={() => setNotificationSettingsOpen(false)} />}
+      {setupOpen && <SetupDialog setup={setupFacts} onRetry={refreshSetup} onClose={() => setSetupOpen(false)} />}
 
       <CockpitToast
         actionError={cockpit.actionError}
@@ -938,8 +969,8 @@ export default function App() {
         onTakeOver={() => { if (selected) void cockpit.takeOverControl(selected).catch(() => undefined); }}
         onDismiss={() => { cockpit.clearActionError(); cockpit.clearNotice(); }}
       />
-      {cockpit.outbox.length > 0 && <aside className="fixed bottom-4 left-4 z-[70] border border-[var(--border)] bg-[var(--menu)] px-3 py-2 text-[11.5px] text-[var(--warning)]"><WifiOff size={13} className="mr-2 inline" />{cockpit.outbox.length} message{cockpit.outbox.length === 1 ? "" : "s"} held offline</aside>}
-      {cockpit.offlineReview[0] && <aside className="fixed bottom-16 left-4 z-[75] max-w-[min(440px,calc(100%-32px))] border-l-2 border-[var(--warning)] bg-[var(--menu)] p-3 text-[12px]"><p className="flex gap-2 text-[var(--warning)]"><TriangleAlert size={14} />Message needs review</p><p className="mt-1 text-[var(--text-muted)]">{cockpit.offlineReview[0].reason}</p><div className="mt-2 flex gap-3"><button type="button" className="text-[var(--accent)] underline" onClick={() => { const item = cockpit.offlineReview[0]!; if (cockpit.sessions.some((session) => session.id === item.sessionId)) { setDraft(null); cockpit.setSelectedId(item.sessionId); setRestoredDraft({ sessionId: item.sessionId, key: item.id, text: item.text }); } cockpit.dismissOfflineReview(item.id); }}>Restore draft</button><button type="button" className="text-[var(--text-muted)] underline" onClick={() => cockpit.dismissOfflineReview(cockpit.offlineReview[0]!.id)}>Discard</button></div></aside>}
+      {cockpit.outbox.length > 0 && <aside className="fixed bottom-4 left-4 z-[70] border border-[var(--border)] bg-[var(--menu)] px-3 py-2 text-code-sm text-[var(--warning)]"><WifiOff size={13} className="mr-2 inline" />{cockpit.outbox.length} message{cockpit.outbox.length === 1 ? "" : "s"} held offline</aside>}
+      {cockpit.offlineReview[0] && <aside className="fixed bottom-16 left-4 z-[75] max-w-[min(440px,calc(100%-32px))] border-l-2 border-[var(--warning)] bg-[var(--menu)] p-3 text-meta-sm"><p className="flex gap-2 text-[var(--warning)]"><TriangleAlert size={14} />Message needs review</p><p className="mt-1 text-[var(--text-muted)]">{cockpit.offlineReview[0].reason}</p><div className="mt-2 flex gap-3"><Button variant="ghost" size="sm" data-compact-control className="px-0 underline [color:var(--accent)]" onClick={() => { const item = cockpit.offlineReview[0]!; if (cockpit.sessions.some((session) => session.id === item.sessionId)) { setDraft(null); cockpit.setSelectedId(item.sessionId); setRestoredDraft({ sessionId: item.sessionId, key: item.id, text: item.text }); } cockpit.dismissOfflineReview(item.id); }}>Restore draft</Button><Button variant="ghost" size="sm" data-compact-control className="px-0 underline [color:var(--text-muted)]" onClick={() => cockpit.dismissOfflineReview(cockpit.offlineReview[0]!.id)}>Discard</Button></div></aside>}
       {privacyCovered && <div className="app-privacy-cover"><span className="app-privacy-cover__mark"><Command size={20} /></span></div>}
     </main>
   );

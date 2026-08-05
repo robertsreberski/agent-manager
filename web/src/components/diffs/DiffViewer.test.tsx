@@ -37,6 +37,12 @@ function gutter(renderedLine: HTMLElement, kind: "old" | "new" | "phone"): strin
   return result.textContent ?? "";
 }
 
+function marker(renderedLine: HTMLElement): HTMLElement {
+  const result = renderedLine.querySelector<HTMLElement>("[data-diff-marker]");
+  if (!result) throw new Error("Missing rendered diff marker");
+  return result;
+}
+
 function addedFilePatch(count: number): string {
   const body = Array.from({ length: count }, (_, index) => `+line ${String(index + 1)}`).join("\n");
   return `diff --git a/file.txt b/file.txt
@@ -57,16 +63,37 @@ describe("DiffViewer gutters", () => {
     expect(gutter(context, "phone")).toBe("4");
 
     const removed = line(container, "remove");
-    expect(removed).toHaveClass("bg-[var(--removed-field)]", "text-[var(--removed)]");
+    expect(removed).toHaveClass("bg-[var(--removed-field)]", "text-[var(--removed-line-text)]");
     expect(gutter(removed, "old")).toBe("5");
     expect(gutter(removed, "new")).toBe("");
     expect(gutter(removed, "phone")).toBe("5");
 
     const added = line(container, "add");
-    expect(added).toHaveClass("bg-[var(--added-field)]", "text-[var(--added)]");
+    expect(added).toHaveClass("bg-[var(--added-field)]", "text-[var(--added-line-text)]");
     expect(gutter(added, "old")).toBe("");
     expect(gutter(added, "new")).toBe("5");
     expect(gutter(added, "phone")).toBe("5");
+  });
+
+  /**
+   * Frame 10a splits the saturated marker from the quieter line prose. Asserting
+   * both halves — and that neither carries the other's token — stops a later
+   * change from collapsing them back into one colour.
+   */
+  it("keeps the +/− marker saturated while the line prose stays quiet", () => {
+    const { container } = render(<DiffViewer change={change()} />);
+
+    const added = line(container, "add");
+    expect(marker(added)).toHaveClass("text-[var(--added)]");
+    expect(marker(added).className).not.toContain("--added-line-text");
+    expect(added.className).not.toContain("text-[var(--added)]");
+
+    const removed = line(container, "remove");
+    expect(marker(removed)).toHaveClass("text-[var(--removed)]");
+    expect(marker(removed).className).not.toContain("--removed-line-text");
+    expect(removed.className).not.toContain("text-[var(--removed)]");
+
+    expect(marker(line(container, "context"))).toHaveClass("text-[var(--text-faint)]");
   });
 
   it("keeps one wrapping gutter through 900px and starts desktop gutters at 901px", () => {
@@ -199,6 +226,21 @@ describe("DiffViewer layout toggle", () => {
     render(<DiffViewer change={change()} onOpenEditor={onOpenEditor} />);
     fireEvent.click(screen.getByRole("button", { name: "Open in editor" }));
     expect(onOpenEditor).toHaveBeenCalledWith();
+  });
+
+  it("names the region the file disclosure controls and unmounts it when collapsed", () => {
+    const { container } = render(<DiffViewer change={change()} />);
+    const disclosure = screen.getByRole("button", { name: "file.txt" });
+
+    expect(disclosure).toHaveAttribute("aria-expanded", "true");
+    const controls = disclosure.getAttribute("aria-controls");
+    expect(controls).toBeTruthy();
+    expect(container.querySelector(`#${CSS.escape(controls!)}`)).toContainElement(line(container, "add"));
+
+    fireEvent.click(disclosure);
+    expect(disclosure).toHaveAttribute("aria-expanded", "false");
+    expect(disclosure).not.toHaveAttribute("aria-controls");
+    expect(container.querySelector('[data-diff-line="add"]')).toBeNull();
   });
 
   it("marks every sub-44px viewer control for coarse-pointer expansion", () => {

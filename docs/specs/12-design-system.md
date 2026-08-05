@@ -171,17 +171,23 @@ the SVGs from the design bundle; they are there so the mocks render standalone
 
 ### R11 — Component layer
 
-`web/src/components/ui/` is a hand-rolled shadcn-lite (button, badge, input, textarea, alert,
-dialog, sheet). The redesign needs menus, radio groups and tabs on top of it.
+**Status: satisfied.** This requirement previously described `web/src/components/ui/` as "a
+hand-rolled shadcn-lite (button, badge, input, textarea, alert, dialog, sheet)". That was never
+true — the directory existed but was empty, so every menu, dialog, sheet, palette, tooltip,
+select and checkbox was hand-rolled in place, along with a private focus trap, a modal-layer
+registry and six separate Escape handlers.
 
-Use proper shadcn/Radix primitives when a screen actually imports them and align the existing
-layer with those primitives. Remove every declared but unused Radix package now; re-add a package
-in the same slice as its first production import rather than reserving dependencies for future
-screens.
+`web/src/components/ui/` now holds real Radix-backed shadcn primitives: `button`, `badge`,
+`separator`, `collapsible`, `dialog`, `sheet`, `tooltip`, `dropdown-menu`, `select`, `checkbox`,
+`radio-group`, `command`. The rule this requirement actually encodes still stands and is
+unchanged: **re-add a package in the same slice as its first production import rather than
+reserving dependencies for future screens.** Each installed Radix package has a real consumer;
+none is reserved.
 
-**Every colour in this layer is a token.** The current `ui/badge.tsx:13-16` hardcodes
-`amber-500` / `red-500` / `emerald-500` / `blue-500`. Replace literals in surviving components;
-delete soon-replaced sidebar/banner components rather than spending a phase normalising dead code.
+**Every colour in this layer is a token** — no `amber-500`-style literals. Variants are named for
+their *meaning* (`Badge tone="warning" | "danger" | "remote" | "added"`), not their colour, so a
+wrong badge reads wrong in review. `Button variant="primary"` is the only lime variant, and R3
+governs it: lime is "wants you" and the operator's own action, never any other status.
 
 ## Removals (spec 13)
 

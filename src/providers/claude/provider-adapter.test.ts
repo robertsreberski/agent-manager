@@ -91,11 +91,13 @@ class BridgeQuery implements ClaudeSdkQuery, AsyncIterator<ClaudeSdkMessage> {
 class BridgeRuntime implements ClaudeSdkRuntime {
   readonly sdkVersion = CLAUDE_AGENT_SDK_VERSION;
   readonly queries: BridgeQuery[] = [];
+  nextQueryHook: ((query: BridgeQuery) => void) | null = null;
   #id = 0;
 
   createQuery(params: ClaudeSdkQueryParams): ClaudeSdkQuery {
     const query = new BridgeQuery(params);
     this.queries.push(query);
+    this.nextQueryHook?.(query);
     query.emit({
       type: "system",
       subtype: "init",
@@ -1073,5 +1075,167 @@ test("withdraws writable controls after terminal provider failure", async () => 
     /provider-confirmed empty Claude input queue/,
   );
   assert.equal(await adapter.getAttachInstruction(failed, context()), null);
+  adapter.dispose();
+});
+
+test("reads the draft model catalog before any manager-owned Claude thread exists", async () => {
+  const runtime = new BridgeRuntime();
+  const adapter = new ClaudeProviderControlAdapter({ runtime });
+  const draftContext: RequestContext = { ...context(), workspace: null };
+
+  const options = await adapter.getCreateSettingsOptions!(draftContext);
+  assert.deepEqual(options, {
+    source: "provider-api",
+    models: [{ value: "sonnet", label: "Sonnet", description: "Balanced" }],
+  });
+  assert.equal(runtime.queries.length, 1, "the catalog read owns exactly one query");
+  const probe = runtime.queries[0];
+  assert.ok(probe);
+  assert.equal(
+    probe.params.options.persistSession,
+    false,
+    "a draft catalog probe must not persist a resumable Claude session",
+  );
+  assert.equal(probe.closed, true, "the catalog probe is closed as soon as it answers");
+  assert.equal(
+    adapter.getManagedSession("managed-claude-1"),
+    null,
+    "the catalog probe never becomes a cockpit session",
+  );
+  adapter.dispose();
+});
+
+test("draft catalog exposes per-model efforts and never borrows another session", async () => {
+  const runtime = new BridgeRuntime();
+  const adapter = new ClaudeProviderControlAdapter({
+    runtime,
+    resolveWorkspace: () => "/workspace",
+  });
+  const created = await adapter.createSession({
+    provider: "claude",
+    workspaceId: "workspace",
+    initialMessage: "Unrelated work",
+    profile: "ask-first",
+    model: null,
+    effort: null,
+    idempotencyKey: "create-before-draft-catalog",
+  }, context());
+  const sessionQuery = runtime.queries[0];
+  assert.ok(sessionQuery);
+  sessionQuery.supportedModelCatalog = [
+    { value: "borrowed", displayName: "Borrowed", description: "Wrong source" },
+  ];
+
+  const draftQueryIndex = runtime.queries.length;
+  const options = await adapter.getCreateSettingsOptions!(context());
+  const draftQuery = runtime.queries[draftQueryIndex];
+  assert.ok(draftQuery, "the draft read starts its own bounded query");
+  assert.equal(sessionQuery.supportedModelsCalls, 0, "an unrelated session is never a catalog proxy");
+  assert.deepEqual(options.models.map((model) => model.value), ["sonnet"]);
+  assert.equal(created.provider, "claude");
+
+  assert.equal(draftQuery.closed, true);
+  // Every draft read re-probes: a cached catalog could outlive the provider
+  // capability it describes.
+  runtime.nextQueryHook = (query) => {
+    query.supportedModelCatalog = [{
+      value: "opus",
+      displayName: "Opus",
+      description: "Deep reasoning",
+      supportsEffort: true,
+      supportedEffortLevels: ["low", "high", "max"],
+    }];
+  };
+  assert.deepEqual(await adapter.getCreateSettingsOptions!(context()), {
+    source: "provider-api",
+    models: [{
+      value: "opus",
+      label: "Opus",
+      description: "Deep reasoning",
+      efforts: ["low", "high", "max"],
+    }],
+  });
+  adapter.dispose();
+});
+
+test("a failing draft catalog read is surfaced rather than fabricated", async () => {
+  const runtime = new BridgeRuntime();
+  const adapter = new ClaudeProviderControlAdapter({ runtime });
+  runtime.nextQueryHook = (query) => {
+    query.supportedModelsOverride = () => Promise.reject(new Error("CLI transport closed"));
+  };
+  await assert.rejects(
+    adapter.getCreateSettingsOptions!(context()),
+    /CLI transport closed/,
+  );
+  assert.equal(runtime.queries[0]?.closed, true, "a failed probe still releases its query");
+
+  runtime.nextQueryHook = null;
+  const recovered = await adapter.getCreateSettingsOptions!(context());
+  assert.deepEqual(recovered.models.map((model) => model.value), ["sonnet"]);
+  adapter.dispose();
+});
+
+test("manager-owned Claude sessions publish resolved workspace identity", async () => {
+  const runtime = new BridgeRuntime();
+  const identity = {
+    repoRoot: "/workspace",
+    repoName: "workspace",
+    worktreePath: "/workspace",
+    linked: false,
+    branch: "main",
+    detached: false,
+    dirtyCount: 3,
+    ahead: null,
+    behind: null,
+  };
+  const requests: Array<readonly (string | null | undefined)[]> = [];
+  const changes: SessionView[] = [];
+  const adapter = new ClaudeProviderControlAdapter({
+    runtime,
+    resolveWorkspace: () => "/workspace",
+    onSessionChanged: (session) => changes.push(session),
+    workspaceIdentityResolver: {
+      resolveMany: async (cwds) => {
+        requests.push(cwds);
+        return new Map(cwds.flatMap((cwd) => typeof cwd === "string" ? [[cwd, identity]] : []));
+      },
+    },
+  });
+  const created = await adapter.createSession({
+    provider: "claude",
+    workspaceId: "workspace",
+    initialMessage: "Start",
+    profile: "ask-first",
+    model: null,
+    effort: null,
+    idempotencyKey: "claude-workspace-identity",
+  }, context());
+  assert.deepEqual(requests, [["/workspace"]]);
+  assert.deepEqual(created.workspaceIdentity, identity);
+  assert.deepEqual(changes.at(-1)?.workspaceIdentity, identity);
+  adapter.dispose();
+});
+
+test("a Claude session stays publishable when git facts cannot be resolved", async () => {
+  const runtime = new BridgeRuntime();
+  const adapter = new ClaudeProviderControlAdapter({
+    runtime,
+    resolveWorkspace: () => "/workspace",
+    workspaceIdentityResolver: {
+      resolveMany: () => Promise.reject(new Error("git budget exhausted")),
+    },
+  });
+  const created = await adapter.createSession({
+    provider: "claude",
+    workspaceId: "workspace",
+    initialMessage: "Start",
+    profile: "ask-first",
+    model: null,
+    effort: null,
+    idempotencyKey: "claude-workspace-identity-budget",
+  }, context());
+  assert.equal(created.workspaceIdentity, null);
+  assert.equal(created.control.authority, "manager");
   adapter.dispose();
 });

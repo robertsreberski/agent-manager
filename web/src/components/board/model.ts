@@ -120,10 +120,45 @@ function fallbackRepoKey(session: CockpitSessionView): string {
   return `${session.hostId}:path:${session.cwd ?? "unknown"}`;
 }
 
-function columnKey(session: CockpitSessionView): string {
+function repoColumnKey(session: CockpitSessionView): string | null {
   return session.workspaceIdentity
     ? `${session.hostId}:repo:${session.workspaceIdentity.repoRoot}`
-    : fallbackRepoKey(session);
+    : null;
+}
+
+/**
+ * Repository facts are resolved per source and can legitimately be missing for
+ * one session in a workspace another session already identified (a slow or
+ * budget-exhausted git probe). Indexing every identified path lets those
+ * sessions join the existing column instead of opening a duplicate one for the
+ * same repository. The index is built over the whole visible set first, so the
+ * result never depends on session order.
+ */
+function identifiedColumnKeys(
+  sessions: readonly CockpitSessionView[],
+): Map<string, string> {
+  const byPath = new Map<string, string>();
+  for (const session of sessions) {
+    const key = repoColumnKey(session);
+    const identity = session.workspaceIdentity;
+    if (!key || !identity) continue;
+    for (const path of [identity.repoRoot, identity.worktreePath]) {
+      const existing = byPath.get(`${session.hostId}:${path}`);
+      if (existing === undefined || key < existing) {
+        byPath.set(`${session.hostId}:${path}`, key);
+      }
+    }
+  }
+  return byPath;
+}
+
+function columnKey(
+  session: CockpitSessionView,
+  identified: ReadonlyMap<string, string>,
+): string {
+  return repoColumnKey(session)
+    ?? (session.cwd ? identified.get(`${session.hostId}:${session.cwd}`) : undefined)
+    ?? fallbackRepoKey(session);
 }
 
 function worktreeKey(session: CockpitSessionView): string {
@@ -133,6 +168,11 @@ function worktreeKey(session: CockpitSessionView): string {
 function fallbackName(session: CockpitSessionView): string {
   const path = session.cwd?.replace(/\/+$/u, "") ?? "Unknown workspace";
   return path.split("/").filter(Boolean).at(-1) ?? path;
+}
+
+function worktreeLabel(session: CockpitSessionView): string {
+  const identity = session.workspaceIdentity;
+  return identity?.branch ?? (identity?.detached ? "detached" : fallbackName(session));
 }
 
 function sortSessionsWithinState(left: BoardSession, right: BoardSession): number {
@@ -216,8 +256,9 @@ export function buildBoard(
 
   const columnMap = new Map<string, BoardColumn>();
   const groupMaps = new Map<string, Map<string, BoardWorktree>>();
+  const identified = identifiedColumnKeys(scoped);
   for (const session of scoped) {
-    const key = columnKey(session);
+    const key = columnKey(session, identified);
     let column = columnMap.get(key);
     if (!column) {
       column = {
@@ -232,6 +273,10 @@ export function buildBoard(
       };
       columnMap.set(key, column);
       groupMaps.set(key, new Map());
+    } else if (session.workspaceIdentity) {
+      // A column opened by a session without git facts adopts them as soon as
+      // any session in the same repository supplies them.
+      column.repoName = session.workspaceIdentity.repoName;
     }
     column.latestAt = Math.max(column.latestAt, timestamp(session.updatedAt));
     column.wantsYou ||= session.boardState === "wants-you";
@@ -239,15 +284,17 @@ export function buildBoard(
     const groupKey = worktreeKey(session);
     let group = groups.get(groupKey);
     if (!group) {
-      const identity = session.workspaceIdentity;
       group = {
         key: groupKey,
-        identity,
-        label: identity?.branch ?? (identity?.detached ? "detached" : fallbackName(session)),
+        identity: session.workspaceIdentity,
         sessions: [],
+        label: worktreeLabel(session),
       };
       groups.set(groupKey, group);
       column.worktrees.push(group);
+    } else if (!group.identity && session.workspaceIdentity) {
+      group.identity = session.workspaceIdentity;
+      group.label = worktreeLabel(session);
     }
     group.sessions.push(session);
   }

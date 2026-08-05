@@ -4,7 +4,7 @@ import test from "node:test";
 import { ActivityHub, type ActivityFrame } from "../activity/index.ts";
 import type { SessionView } from "../core/types.ts";
 import { SelectedTranscriptActivityObserver } from "./activity-observer.ts";
-import type { TranscriptReadResult } from "./transcript.ts";
+import type { TranscriptItem, TranscriptReadResult } from "./transcript.ts";
 
 function externalSession(): SessionView {
   return {
@@ -71,24 +71,29 @@ function externalSession(): SessionView {
   };
 }
 
-function transcript(id: string, text: string, truncated = false): TranscriptReadResult {
+function available(items: TranscriptItem[], truncated = false): TranscriptReadResult {
   return {
-    messages: [{
-      id,
-      role: "assistant",
-      text,
-      createdAt: "2026-08-03T00:00:01.000Z",
-      status: "running",
-      label: null,
-    }],
+    items,
     transcript: {
       state: "available",
       truncated,
       source: "codex-rollout",
-      messageCount: 1,
+      itemCount: items.length,
       reason: null,
     },
   };
+}
+
+function transcript(id: string, text: string, truncated = false): TranscriptReadResult {
+  return available([{
+    kind: "message",
+    id,
+    role: "assistant",
+    text,
+    createdAt: "2026-08-03T00:00:01.000Z",
+    status: "running",
+    label: null,
+  }], truncated);
 }
 
 function delay(ms: number): Promise<void> {
@@ -160,12 +165,12 @@ test("projects transcript failure reasons into the sole activity timeline", () =
     reader: {
       read() {
         return {
-          messages: [],
+          items: [],
           transcript: {
             state: "unavailable",
             truncated: false,
             source: null,
-            messageCount: 0,
+            itemCount: 0,
             reason,
           },
         };
@@ -196,12 +201,12 @@ test("replaces an unavailable lifecycle fact when transcript content appears", (
   const session = externalSession();
   hub.ensureSession(session.id, session.provider);
   let current: TranscriptReadResult = {
-    messages: [],
+    items: [],
     transcript: {
       state: "unavailable",
       truncated: false,
       source: null,
-      messageCount: 0,
+      itemCount: 0,
       reason: "not-found",
     },
   };
@@ -219,6 +224,119 @@ test("replaces an unavailable lifecycle fact when transcript content appears", (
   assert.equal(items[0]?.kind === "message" ? items[0].text : null, "History is now available");
 
   release();
+  observer.dispose();
+  hub.dispose();
+});
+
+test("projects transcript tool and reasoning items with transcript-derived provenance", () => {
+  const hub = new ActivityHub({ streamEpoch: "observer-tools" });
+  const session = externalSession();
+  hub.ensureSession(session.id, session.provider);
+  const observer = new SelectedTranscriptActivityObserver({
+    hub,
+    reader: {
+      read: () => available([
+        {
+          kind: "reasoning",
+          id: "claude:msg-one:thinking:0",
+          text: "Read the reader first.",
+          createdAt: "2026-08-03T00:00:01.000Z",
+          status: "complete",
+          label: null,
+        },
+        {
+          kind: "tool",
+          id: "claude:tool:toolu_01",
+          toolCallId: "toolu_01",
+          name: "Read",
+          arguments: { file_path: "/repo/README.md" },
+          result: "# Agent Manager",
+          isError: false,
+          createdAt: "2026-08-03T00:00:02.000Z",
+          status: "complete",
+        },
+        {
+          kind: "tool",
+          id: "claude:tool:toolu_02",
+          toolCallId: "toolu_02",
+          name: "Bash",
+          arguments: { command: "rg -n seq" },
+          result: "rg: command not found",
+          isError: true,
+          createdAt: "2026-08-03T00:00:03.000Z",
+          status: "complete",
+        },
+      ]),
+    },
+  });
+
+  const release = observer.acquire(session);
+  const items = hub.snapshot(session.id)?.items ?? [];
+  assert.deepEqual(items.map((item) => [item.kind, item.id]), [
+    ["reasoning", "transcript:claude:msg-one:thinking:0"],
+    ["tool", "transcript:claude:tool:toolu_01"],
+    ["tool", "transcript:claude:tool:toolu_02"],
+  ]);
+  for (const item of items) {
+    assert.equal(item.source, "transcript");
+    assert.equal(item.confidence, "inferred");
+    assert.equal(item.exposure, "transcript-derived");
+  }
+
+  const reasoning = items[0];
+  assert.equal(reasoning?.kind === "reasoning" ? reasoning.text : null, "Read the reader first.");
+  assert.equal(reasoning?.kind === "reasoning" ? reasoning.reasoningKind : null, "summary");
+
+  const read = items[1];
+  assert.equal(read?.kind === "tool" ? read.name : null, "Read");
+  assert.equal(read?.kind === "tool" ? read.toolCallId : null, "toolu_01");
+  assert.deepEqual(read?.kind === "tool" ? read.arguments : null, { file_path: "/repo/README.md" });
+  assert.equal(read?.kind === "tool" ? read.result : null, "# Agent Manager");
+  assert.equal(read?.state, "complete");
+  assert.equal(items[2]?.state, "failed");
+
+  release();
+  observer.dispose();
+  hub.dispose();
+});
+
+test("re-observes a tool call when only its result arrives", async () => {
+  const hub = new ActivityHub({ streamEpoch: "observer-tool-result" });
+  const session = externalSession();
+  hub.ensureSession(session.id, session.provider);
+  const pending: TranscriptItem = {
+    kind: "tool",
+    id: "codex:tool:call_shell",
+    toolCallId: "call_shell",
+    name: "exec",
+    arguments: "ls -la",
+    result: null,
+    isError: false,
+    createdAt: "2026-08-03T00:00:01.000Z",
+    status: "running",
+  };
+  let current = available([pending]);
+  const frames: ActivityFrame[] = [];
+  const unsubscribe = hub.subscribe(session.id, (frame) => frames.push(frame));
+  const observer = new SelectedTranscriptActivityObserver({
+    hub,
+    reader: { read: () => structuredClone(current) },
+    runningPollMs: 100,
+    idlePollMs: 200,
+  });
+
+  const release = observer.acquire(session);
+  assert.equal(hub.snapshot(session.id)?.items[0]?.state, "running");
+
+  current = available([{ ...pending, result: "README.md", status: "complete" }]);
+  await delay(140);
+  const settled = hub.snapshot(session.id)?.items[0];
+  assert.equal(settled?.kind === "tool" ? settled.result : null, "README.md");
+  assert.equal(settled?.state, "complete");
+  assert.equal(frames.at(-1)?.type, "activity.upsert");
+
+  release();
+  unsubscribe();
   observer.dispose();
   hub.dispose();
 });

@@ -1,7 +1,6 @@
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { hasActiveModalLayer } from "../../hooks/use-modal-focus";
 import { DiffReview } from "./DiffReview";
 import { DIFF_PARSE_DEBOUNCE_MS, type FileChangeView } from "./DiffViewer";
 
@@ -35,16 +34,16 @@ describe("DiffReview file navigation", () => {
     expect(screen.getByText("2 files ·", { exact: false })).toHaveTextContent("2 files · +3 −0 · uncommitted");
   });
 
-  it("opens the phone file list as a bottom sheet and selects a file", () => {
-    const { container } = render(review());
+  it("opens the phone file list as a bottom sheet and selects a file", async () => {
+    render(review());
     fireEvent.click(screen.getByRole("button", { name: "Choose file, 1 of 2" }));
 
-    const sheet = screen.getByRole("dialog", { name: "Changed files" });
+    const sheet = await screen.findByRole("dialog", { name: "Changed files" });
     expect(within(sheet).getByRole("button", { name: "one.txt, +1, −0, read" })).toBeInTheDocument();
     fireEvent.click(within(sheet).getByRole("button", { name: "two.txt, +2, −0" }));
-    expect(screen.queryByRole("dialog", { name: "Changed files" })).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Changed files" })).not.toBeInTheDocument());
 
-    const main = container.querySelector<HTMLElement>("main[data-diff-scroll-container]");
+    const main = document.querySelector<HTMLElement>("main[data-diff-scroll-container]");
     if (!main) throw new Error("Missing review diff container");
     expect(within(main).getByRole("button", { name: "two.txt" })).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByRole("button", { name: "Choose file, 2 of 2" })).toBeInTheDocument();
@@ -53,8 +52,8 @@ describe("DiffReview file navigation", () => {
 
   it("keeps the phone footer read action wired to the selected file identity", () => {
     const onReadChange = vi.fn();
-    const { container } = render(review({ readKeys: new Set<string>(), onReadChange }));
-    const footer = container.querySelector<HTMLElement>("footer");
+    render(review({ readKeys: new Set<string>(), onReadChange }));
+    const footer = document.querySelector<HTMLElement>("[data-phone-file-footer]");
     if (!footer) throw new Error("Missing phone review footer");
     fireEvent.click(within(footer).getByRole("button", { name: "Mark read" }));
     expect(onReadChange).toHaveBeenCalledWith("one", true);
@@ -63,10 +62,10 @@ describe("DiffReview file navigation", () => {
     expect(onReadChange).toHaveBeenLastCalledWith("two", true);
   });
 
-  it("keeps the phone file selector through 900px and starts the desktop rail at 901px", () => {
-    const { container } = render(review());
-    const rail = container.querySelector<HTMLElement>("[data-desktop-file-rail]");
-    const footer = container.querySelector<HTMLElement>("[data-phone-file-footer]");
+  it("keeps the phone file selector through 900px and starts the desktop rail at 901px", async () => {
+    render(review());
+    const rail = document.querySelector<HTMLElement>("[data-desktop-file-rail]");
+    const footer = document.querySelector<HTMLElement>("[data-phone-file-footer]");
     if (!rail || !footer) throw new Error("Missing responsive file navigation");
 
     expect(rail).toHaveClass("hidden", "min-[901px]:block");
@@ -75,17 +74,18 @@ describe("DiffReview file navigation", () => {
     expect(footer.className).not.toContain("sm:");
 
     fireEvent.click(screen.getByRole("button", { name: "Choose file, 1 of 2" }));
-    const sheet = container.querySelector<HTMLElement>("[data-phone-file-sheet]");
+    await screen.findByRole("dialog", { name: "Changed files" });
+    const sheet = document.querySelector<HTMLElement>("[data-phone-file-sheet]");
     if (!sheet) throw new Error("Missing phone file sheet");
     expect(sheet).toHaveClass("min-[901px]:hidden");
     expect(sheet.className).not.toContain("sm:");
   });
 
   it("bounds every review surface so 320px and 390px phone layouts cannot scroll sideways", () => {
-    const { container } = render(review());
+    render(review());
     const root = screen.getByRole("dialog", { name: "Review changes" });
-    const main = container.querySelector<HTMLElement>("main[data-diff-scroll-container]");
-    const viewer = container.querySelector<HTMLElement>("article");
+    const main = document.querySelector<HTMLElement>("main[data-diff-scroll-container]");
+    const viewer = document.querySelector<HTMLElement>("article");
     if (!main || !viewer) throw new Error("Missing review surfaces");
 
     expect(root).toHaveClass("min-w-0", "max-w-full", "overflow-hidden");
@@ -96,74 +96,76 @@ describe("DiffReview file navigation", () => {
 });
 
 describe("DiffReview modal focus", () => {
-  it("contains focus, consumes Escape, and restores the review opener", () => {
+  it("contains focus, closes on Escape, and restores the review opener", async () => {
     function Harness() {
       const [open, setOpen] = useState(false);
       return <><button onClick={() => setOpen(true)}>Open review</button>{open && review({ onClose: () => setOpen(false) })}</>;
     }
-    const globalKeydown = vi.fn();
-    window.addEventListener("keydown", globalKeydown);
-    try {
-      render(<Harness />);
-      const opener = screen.getByRole("button", { name: "Open review" });
-      opener.focus();
-      fireEvent.click(opener);
+    render(<Harness />);
+    const opener = screen.getByRole("button", { name: "Open review" });
+    opener.focus();
+    fireEvent.click(opener);
 
-      const dialog = screen.getByRole("dialog", { name: "Review changes" });
-      const close = screen.getByRole("button", { name: "Close review" });
-      expect(dialog).toHaveAttribute("aria-modal", "true");
-      expect(close).toHaveFocus();
-      expect(close).toHaveAttribute("data-compact-control");
-      opener.focus();
-      expect(close).toHaveFocus();
+    const dialog = await screen.findByRole("dialog", { name: "Review changes" });
+    const close = within(dialog).getByRole("button", { name: "Close review" });
+    await waitFor(() => expect(close).toHaveFocus());
+    expect(close).toHaveAttribute("data-compact-control");
 
-      fireEvent.keyDown(window, { key: "Escape" });
-      expect(screen.queryByRole("dialog", { name: "Review changes" })).not.toBeInTheDocument();
-      expect(opener).toHaveFocus();
-      expect(globalKeydown).not.toHaveBeenCalled();
-    } finally {
-      window.removeEventListener("keydown", globalKeydown);
-    }
+    // Focus cannot leak back to the page behind the review.
+    opener.focus();
+    expect(dialog.contains(document.activeElement)).toBe(true);
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Review changes" })).not.toBeInTheDocument());
+    await waitFor(() => expect(opener).toHaveFocus());
   });
 
-  it("closes the nested phone file sheet first and restores its chooser", () => {
+  it("closes the nested phone file sheet first and restores its chooser", async () => {
     const onClose = vi.fn();
     render(review({ onClose }));
     const chooser = screen.getByRole("button", { name: "Choose file, 1 of 2" });
     chooser.focus();
     fireEvent.click(chooser);
 
-    const sheet = screen.getByRole("dialog", { name: "Changed files" });
+    const sheet = await screen.findByRole("dialog", { name: "Changed files" });
     const closeSheet = within(sheet).getByRole("button", { name: "Close changed files" });
-    expect(closeSheet).toHaveFocus();
+    await waitFor(() => expect(closeSheet).toHaveFocus());
     expect(closeSheet).toHaveAttribute("data-compact-control");
-    fireEvent.keyDown(window, { key: "Escape" });
 
-    expect(screen.queryByRole("dialog", { name: "Changed files" })).not.toBeInTheDocument();
+    // The topmost layer owns Escape: the sheet closes, the review does not.
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Changed files" })).not.toBeInTheDocument());
     expect(screen.getByRole("dialog", { name: "Review changes" })).toBeInTheDocument();
-    expect(chooser).toHaveFocus();
+    await waitFor(() => expect(chooser).toHaveFocus());
     expect(onClose).not.toHaveBeenCalled();
   });
 
-  it("keeps an earlier application capture listener from closing beneath the top modal", () => {
-    const onClose = vi.fn();
-    const closeAtApplicationLayer = vi.fn();
-    function applicationKeydown(event: KeyboardEvent) {
-      if (event.key === "Escape" && !hasActiveModalLayer()) closeAtApplicationLayer();
-    }
-    window.addEventListener("keydown", applicationKeydown, true);
-    try {
-      render(review({ onClose }));
-      fireEvent.click(screen.getByRole("button", { name: "Choose file, 1 of 2" }));
-      fireEvent.keyDown(window, { key: "Escape" });
+  it("names the sheet the phone chooser controls only while that sheet exists", async () => {
+    render(review());
+    const chooser = screen.getByRole("button", { name: "Choose file, 1 of 2" });
+    expect(chooser).toHaveAttribute("aria-expanded", "false");
+    expect(chooser).not.toHaveAttribute("aria-controls");
 
-      expect(screen.queryByRole("dialog", { name: "Changed files" })).not.toBeInTheDocument();
-      expect(screen.getByRole("dialog", { name: "Review changes" })).toBeInTheDocument();
-      expect(closeAtApplicationLayer).not.toHaveBeenCalled();
-      expect(onClose).not.toHaveBeenCalled();
-    } finally {
-      window.removeEventListener("keydown", applicationKeydown, true);
-    }
+    fireEvent.click(chooser);
+    const sheet = await screen.findByRole("dialog", { name: "Changed files" });
+    expect(chooser).toHaveAttribute("aria-expanded", "true");
+    expect(chooser.getAttribute("aria-controls")).toBe(sheet.id);
+  });
+
+  it("closes only one layer per Escape, so the review survives closing the sheet", async () => {
+    const onClose = vi.fn();
+    render(review({ onClose }));
+    fireEvent.click(screen.getByRole("button", { name: "Choose file, 1 of 2" }));
+    await screen.findByRole("dialog", { name: "Changed files" });
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Changed files" })).not.toBeInTheDocument());
+    expect(screen.getByRole("dialog", { name: "Review changes" })).toBeInTheDocument();
+    expect(onClose).not.toHaveBeenCalled();
+
+    // Only the next Escape reaches the review underneath it.
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(onClose).toHaveBeenCalledOnce());
   });
 });
 

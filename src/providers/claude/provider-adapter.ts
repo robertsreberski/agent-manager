@@ -10,6 +10,10 @@ import {
   type SessionView,
 } from "../../core/types.ts";
 import type { ActivityMutation } from "../../activity/index.ts";
+import {
+  WorkspaceIdentityResolver,
+  type WorkspaceIdentity,
+} from "../../core/worktree.ts";
 import type {
   ActionDispatchResult,
   AttachInstruction,
@@ -17,21 +21,30 @@ import type {
   ProviderControlAdapter,
   RequestContext,
   SessionAction,
+  SessionModelOption,
   SessionSettingsOptions,
 } from "../../server/contracts.ts";
 import { sessionSettingsOptionsSchema } from "../../server/contracts.ts";
+import { AsyncInbox } from "./async-inbox.ts";
 import { ClaudeManagedSession } from "./managed-session.ts";
 import { ClaudeActivityProjector } from "./activity-projector.ts";
 import { loadClaudeSdkRuntime } from "./runtime.ts";
 import type { ClaudeHookSourceArbiter } from "../hooks/claude-source.ts";
 import {
+  CLAUDE_MANAGER_OWNER_ENV,
+  CLAUDE_MANAGER_OWNER_VALUE,
+} from "../hooks/claude-source.ts";
+import { CLAUDE_REASONING_EFFORTS } from "../../shared/session.ts";
+import {
   CLAUDE_CODE_VERSION,
   type ClaudeEffortLevel,
   type ClaudeManagedSessionSnapshot,
+  type ClaudeModelInfo,
   type ClaudePendingRequest,
   type ClaudePermissionMode,
   type ClaudeRequestResponse,
   type ClaudeSdkRuntime,
+  type ClaudeSdkUserMessage,
 } from "./types.ts";
 
 interface ManagedEntry {
@@ -43,6 +56,7 @@ interface ManagedEntry {
 }
 
 const CLAUDE_SETTINGS_LOOKUP_TIMEOUT_MS = 2_000;
+const WORKSPACE_IDENTITY_BUDGET_MS = 2_500;
 
 export interface ClaudeProviderAdapterOptions {
   resolveWorkspace?(
@@ -50,6 +64,15 @@ export interface ClaudeProviderAdapterOptions {
     context: RequestContext,
   ): string | null | Promise<string | null>;
   runtime?: ClaudeSdkRuntime | (() => Promise<ClaudeSdkRuntime>);
+  /**
+   * Manager-owned sessions never pass through the discovery scan, so they
+   * resolve their repository facts through the same bounded resolver discovery
+   * uses. Without it a managed session opens a second board column for a
+   * repository the board already shows.
+   */
+  workspaceIdentityResolver?: Pick<WorkspaceIdentityResolver, "resolveMany">;
+  /** Bounds the git work one create may spend; exhaustion yields a null identity. */
+  workspaceIdentityBudgetMs?: number;
   onSessionChanged?: (session: SessionView) => void;
   onActivity?: (managerSessionId: string, mutation: ActivityMutation) => void;
   hookSourceArbiter?: ClaudeHookSourceArbiter;
@@ -165,6 +188,27 @@ function boundedSettingsLookup<T>(promise: Promise<T>): Promise<T> {
       },
     );
   });
+}
+
+/**
+ * Only fields the pinned `ModelInfo` actually declares are advertised.
+ * `ModelInfo` carries no default-model marker, so `isDefault` is never claimed,
+ * and effort sets are narrowed to the public Claude vocabulary.
+ */
+function claudeModelOption(model: ClaudeModelInfo): SessionModelOption {
+  const declared = model.supportsEffort === true && Array.isArray(model.supportedEffortLevels)
+    ? model.supportedEffortLevels
+    : [];
+  const efforts = [...new Set(declared)].filter(
+    (effort): effort is (typeof CLAUDE_REASONING_EFFORTS)[number] =>
+      (CLAUDE_REASONING_EFFORTS as readonly string[]).includes(effort),
+  );
+  return {
+    value: model.value,
+    label: model.displayName,
+    description: model.description,
+    ...(efforts.length > 0 ? { efforts } : {}),
+  };
 }
 
 function objectValue(value: unknown): Record<string, unknown> | null {
@@ -415,10 +459,36 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
   readonly #options: ClaudeProviderAdapterOptions;
   readonly #entries = new Map<string, ManagedEntry>();
   readonly #settingsLookups = new Map<ManagedEntry, Promise<SessionSettingsOptions>>();
+  readonly #workspaceIdentities = new Map<string, WorkspaceIdentity | null>();
+  readonly #workspaceIdentityResolver: Pick<WorkspaceIdentityResolver, "resolveMany">;
+  readonly #workspaceIdentityBudgetMs: number;
+  #draftSettingsLookup: Promise<SessionSettingsOptions> | null = null;
   #runtime: Promise<ClaudeSdkRuntime> | null = null;
 
   constructor(options: ClaudeProviderAdapterOptions) {
     this.#options = options;
+    this.#workspaceIdentityBudgetMs = Math.max(
+      1,
+      options.workspaceIdentityBudgetMs ?? WORKSPACE_IDENTITY_BUDGET_MS,
+    );
+    this.#workspaceIdentityResolver = options.workspaceIdentityResolver
+      ?? new WorkspaceIdentityResolver({ totalBudgetMs: this.#workspaceIdentityBudgetMs });
+  }
+
+  /**
+   * Repository facts are decoration, never a creation precondition: an error or
+   * an exhausted budget records a null identity rather than guessing a
+   * repository the git probe never confirmed.
+   */
+  async #resolveWorkspaceIdentity(cwd: string): Promise<void> {
+    try {
+      const identities = await this.#workspaceIdentityResolver.resolveMany([cwd], {
+        budgetMs: this.#workspaceIdentityBudgetMs,
+      });
+      this.#workspaceIdentities.set(cwd, identities.get(cwd) ?? null);
+    } catch {
+      if (!this.#workspaceIdentities.has(cwd)) this.#workspaceIdentities.set(cwd, null);
+    }
   }
 
   async createSession(
@@ -436,6 +506,10 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
       (await this.#options.resolveWorkspace?.(input.workspaceId, context)) ??
       null;
     if (!cwd) throw new Error(`Unknown or unauthorized workspace ${input.workspaceId}`);
+    if (context.signal.aborted) throw new Error("Claude session creation was cancelled");
+    // Resolved before the SDK query so the first published view already groups
+    // under its repository instead of opening a second board column.
+    await this.#resolveWorkspaceIdentity(cwd);
     if (context.signal.aborted) throw new Error("Claude session creation was cancelled");
 
     const runtime = await this.#getRuntime();
@@ -610,6 +684,39 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
     };
   }
 
+  /**
+   * Draft catalog discovery. It must answer before any manager-owned thread
+   * exists and must not borrow an unrelated session as a catalog proxy, so it
+   * opens its own non-persisted Query, reads the pinned SDK's `supportedModels`,
+   * and closes it again. Concurrent callers share one probe; a provider or
+   * transport failure propagates so the route withdraws the catalog instead of
+   * publishing a fabricated one.
+   */
+  async getCreateSettingsOptions(
+    context: RequestContext,
+  ): Promise<SessionSettingsOptions> {
+    if (context.signal.aborted) {
+      throw new Error("Claude draft settings lookup was cancelled");
+    }
+    let lookup = this.#draftSettingsLookup;
+    if (!lookup) {
+      lookup = boundedSettingsLookup(
+        this.#loadDraftSettingsOptions(context.workspace?.path ?? process.cwd()),
+      );
+      this.#draftSettingsLookup = lookup;
+      const activeLookup = lookup;
+      const clearLookup = (): void => {
+        if (this.#draftSettingsLookup === activeLookup) this.#draftSettingsLookup = null;
+      };
+      void lookup.then(clearLookup, clearLookup);
+    }
+    const options = await lookup;
+    if (context.signal.aborted) {
+      throw new Error("Claude draft settings lookup was cancelled");
+    }
+    return options;
+  }
+
   async getSettingsOptions(
     view: SessionView,
     context: RequestContext,
@@ -687,6 +794,51 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
     }
     this.#entries.clear();
     this.#settingsLookups.clear();
+    this.#workspaceIdentities.clear();
+    this.#draftSettingsLookup = null;
+  }
+
+  /**
+   * A Query is the SDK's only `supportedModels` edge, so the probe opens one
+   * directly rather than through `ClaudeManagedSession`: a managed session only
+   * becomes ready once a turn has started, and a draft has no prompt to send.
+   * The probe never sends input, never persists, and is always closed.
+   */
+  async #loadDraftSettingsOptions(cwd: string): Promise<SessionSettingsOptions> {
+    const runtime = await this.#getRuntime();
+    const prompt = new AsyncInbox<ClaudeSdkUserMessage>();
+    const query = runtime.createQuery({
+      prompt,
+      options: {
+        cwd,
+        persistSession: false,
+        includePartialMessages: true,
+        includeHookEvents: true,
+        forwardSubagentText: true,
+        permissionMode: "default",
+        allowDangerouslySkipPermissions: false,
+        env: {
+          ...process.env,
+          CLAUDE_AGENT_SDK_CLIENT_APP: "agent-manager",
+          [CLAUDE_MANAGER_OWNER_ENV]: CLAUDE_MANAGER_OWNER_VALUE,
+        },
+        // A catalog read runs no turn. If the provider ever asked anyway, the
+        // only safe answer from a surface with no operator is refusal.
+        canUseTool: () => Promise.reject(
+          new Error("A Claude draft catalog probe cannot answer tool permissions"),
+        ),
+        onElicitation: () => Promise.resolve({ action: "cancel" as const }),
+      },
+    });
+    try {
+      return sessionSettingsOptionsSchema.parse({
+        source: "provider-api",
+        models: (await query.supportedModels()).map(claudeModelOption),
+      });
+    } finally {
+      prompt.close();
+      query.close();
+    }
   }
 
   async #loadSettingsOptions(
@@ -698,11 +850,7 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
     this.#assertLiveSettingsEntry(providerSessionId, entry, generation);
     return sessionSettingsOptionsSchema.parse({
       source: "provider-api",
-      models: models.map((model) => ({
-        value: model.value,
-        label: model.displayName,
-        description: model.description,
-      })),
+      models: models.map(claudeModelOption),
     });
   }
 
@@ -885,7 +1033,9 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
         capabilities,
         withheld,
       },
-      workspaceIdentity: null,
+      workspaceIdentity: structuredClone(
+        this.#workspaceIdentities.get(snapshot.cwd) ?? null,
+      ),
       generation: snapshot.generation,
     };
   }

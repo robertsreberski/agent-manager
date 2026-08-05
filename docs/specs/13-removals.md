@@ -71,9 +71,13 @@ feature flags, dormant supervisors, or “temporary” second timelines.
 
 - Remove tracked `dogfood-output/` and ignore future output. Do not preserve it as a release
   asset or move it elsewhere in the repository.
-- Remove every unused dependency, including unused Radix packages, `@fastify/cookie`, and `ws`
-  typings/runtime if the final import audit confirms no production import. Re-add only with the
-  first real consumer.
+- Remove every unused dependency, including `@fastify/cookie` and `ws` typings/runtime if the
+  final import audit confirms no production import. Re-add only with the first real consumer.
+  **The Radix packages are no longer in this set.** They were pruned as unused, which locked the
+  app into hand-rolling every overlay; they have since been re-added *with* their consumers, as
+  spec 12 R11 requires. Each of `@radix-ui/react-{dropdown-menu,dialog,tooltip,select,checkbox,radio-group,collapsible,slot}`,
+  `cmdk` and `class-variance-authority` backs `web/src/components/ui/`, which the app imports
+  throughout. An import audit will find them used — do not prune them.
 - Remove obsolete generated web asset generations. Fix the PWA asset command to the actual
   `web/src/pwa` location and include woff2 fonts.
 - Add an exact package `files` allowlist containing runtime dist/assets, required metadata, and

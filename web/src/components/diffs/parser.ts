@@ -111,9 +111,18 @@ export function parseUnifiedDiff(
     while (index < lines.length) {
       const body = lines[index]!;
       if (body.startsWith("@@ ") || body.startsWith("diff --git ") || body.startsWith("--- ")) break;
-      if (body === "" && index === lines.length - 1) {
+      if (body === "") {
+        // A blank context line arrives as "" whenever trailing whitespace has
+        // been stripped from " ". Read it as context only while this hunk still
+        // owes lines; otherwise it is the empty tail left by the final newline.
+        if (seenOld >= oldCount && seenNew >= newCount) {
+          index++;
+          break;
+        }
+        hunk.lines.push({ kind: "context", text: "", oldLine, newLine });
+        oldLine++; newLine++; seenOld++; seenNew++;
         index++;
-        break;
+        continue;
       }
       const prefix = body[0];
       if (prefix === " ") {

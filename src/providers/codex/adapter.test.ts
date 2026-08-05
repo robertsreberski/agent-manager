@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { ActivityMutation } from "../../activity/index.ts";
+import type { WorkspaceIdentity } from "../../core/worktree.ts";
 import type { ManagedSessionRecoveryRecord } from "../../server/contracts.ts";
 import {
   CodexManagedAdapter,
@@ -530,6 +531,7 @@ test("starts a managed thread, stages a plan profile, and dispatches initial inp
   const { adapter, transport } = await initializedAdapter();
   transport.handlers.set("thread/start", () => threadResult());
   transport.handlers.set("thread/settings/update", () => null);
+  transport.handlers.set("thread/name/set", () => ({}));
   transport.handlers.set("turn/start", () => ({
     turn: { id: "turn-1", status: "inProgress", items: [] },
   }));
@@ -545,12 +547,14 @@ test("starts a managed thread, stages a plan profile, and dispatches initial inp
   assert.equal(state.pendingSettings?.profile, "plan");
   assert.equal(state.status, "running");
   assert.equal(state.activeTurnId, "turn-1");
+  assert.equal(state.name, "Build the cockpit");
   const methods = transport.messages.map((message) => message.method);
   assert.deepEqual(methods, [
     "initialize",
     "initialized",
     "thread/start",
     "thread/settings/update",
+    "thread/name/set",
     "turn/start",
   ]);
   assert.deepEqual(methodMessages(transport, "thread/settings/update")[0]?.params, {
@@ -2412,6 +2416,446 @@ test("transport death atomically fails managed sessions and in-flight controls",
     /App Server is unavailable/u,
   );
 
+  bridge.dispose();
+  await adapter.dispose();
+});
+
+function threadResultWithProvenance(
+  source: string | null,
+  threadSource: string | null,
+  name: string | null = null,
+): JsonObject {
+  const result = threadResult();
+  const thread = result.thread as JsonObject;
+  if (source !== null) thread.source = source;
+  if (threadSource !== null) thread.threadSource = threadSource;
+  thread.name = name;
+  return result;
+}
+
+function queueActivityMessages(
+  mutations: readonly ActivityMutation[],
+): Array<Array<{ id: string; status: string; text: string }>> {
+  const projections: Array<Array<{ id: string; status: string; text: string }>> = [];
+  for (const mutation of mutations) {
+    if (mutation.type !== "upsert") continue;
+    const item = mutation.item as unknown as {
+      kind: string;
+      messages?: Array<{ id: string; status: string; text: string }>;
+    };
+    if (item.kind !== "queue") continue;
+    projections.push((item.messages ?? []).map((message) => ({
+      id: message.id,
+      status: message.status,
+      text: message.text,
+    })));
+  }
+  return projections;
+}
+
+test("releasing the detail plane retains the manager queue and dispatches it after re-adoption", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("thread/start", () => threadResult());
+  transport.handlers.set("thread/resume", () => threadResult());
+  transport.handlers.set("thread/unsubscribe", () => ({ status: "unsubscribed" }));
+  let nextTurn = 0;
+  transport.handlers.set("turn/start", () => ({
+    turn: { id: `turn-${++nextTurn}`, status: "inProgress", items: [] },
+  }));
+  await adapter.startThread({ cwd: "/workspace", initialMessage: "first" });
+  const queued = await adapter.queueMessage("thread-1", "My message. Disappeared?");
+  assert.equal(queued.status, "queued");
+
+  await adapter.releaseThread("thread-1");
+  assert.equal(adapter.getThreadState("thread-1"), null);
+
+  const readopted = await adapter.adoptThread("thread-1", {
+    threadId: "thread-1",
+    treeId: null,
+    parentThreadId: null,
+    cwd: "/workspace",
+  });
+  assert.deepEqual(
+    readopted.queue.map((item) => item.text),
+    ["My message. Disappeared?"],
+    "detaching the detail plane must not destroy an operator's queued message",
+  );
+  await eventually(() => {
+    assert.equal(methodMessages(transport, "turn/start").length, 2);
+    assert.deepEqual(adapter.getThreadState("thread-1")?.queue, []);
+  });
+  assert.equal(
+    ((methodMessages(transport, "turn/start")[1]?.params as JsonObject)
+      .input as JsonObject[])[0]?.text,
+    "My message. Disappeared?",
+  );
+  await adapter.dispose();
+});
+
+test("remove-queued is advertised exactly while a queued activity item is rendered", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("thread/start", () => threadResult());
+  transport.handlers.set("thread/unsubscribe", () => ({ status: "unsubscribed" }));
+  transport.handlers.set("turn/start", () => ({
+    turn: { id: "turn-1", status: "inProgress", items: [] },
+  }));
+  const mutations: ActivityMutation[] = [];
+  adapter.subscribe((event) => {
+    if (event.type === "activity") mutations.push(event.mutation);
+  });
+  const bridge = new CodexProviderBridge({ adapter, resolveWorkspace: () => "/workspace" });
+  const context = {
+    actor: { id: "local", kind: "local" as const, displayName: "Local user" },
+    requestId: "queue-projection",
+    signal: new AbortController().signal,
+    workspace: { id: "workspace", label: "Workspace", path: "/workspace" },
+  };
+  const created = await bridge.createSession({
+    provider: "codex",
+    workspaceId: "workspace",
+    initialMessage: "first",
+    profile: "plan",
+    model: null,
+    effort: null,
+    idempotencyKey: "queue-projection-session",
+  }, context);
+  await bridge.acquireSelectedSession(created, context);
+
+  const queued = await adapter.queueMessage("thread-1", "second");
+  const rendered = queueActivityMessages(mutations).at(-1) ?? [];
+  assert.deepEqual(rendered.map((message) => message.text), ["second"]);
+  assert.equal(
+    bridge.getManagedSession("thread-1")?.control.capabilities.includes("remove-queued"),
+    true,
+    "a rendered queued item must be removable",
+  );
+
+  await adapter.removeQueuedMessage("thread-1", queued.id);
+  assert.deepEqual(queueActivityMessages(mutations).at(-1), []);
+  assert.equal(
+    bridge.getManagedSession("thread-1")?.control.capabilities.includes("remove-queued"),
+    false,
+  );
+
+  await adapter.queueMessage("thread-1", "third");
+  assert.deepEqual(
+    (queueActivityMessages(mutations).at(-1) ?? []).map((message) => message.text),
+    ["third"],
+  );
+  transport.handlers.set("thread/resume", () => threadResult());
+  await adapter.releaseThread("thread-1");
+  await adapter.adoptThread("thread-1", {
+    threadId: "thread-1",
+    treeId: null,
+    parentThreadId: null,
+    cwd: "/workspace",
+  });
+  assert.deepEqual(
+    (queueActivityMessages(mutations).at(-1) ?? []).map((message) => message.text),
+    adapter.getThreadState("thread-1")?.queue.map((item) => item.text),
+    "the rendered queue and the adapter queue must never diverge across a detach",
+  );
+  bridge.dispose();
+  await adapter.dispose();
+});
+
+test("drains the manager queue when the provider reports idle before turn/completed", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("thread/start", () => threadResult());
+  let nextTurn = 0;
+  transport.handlers.set("turn/start", () => ({
+    turn: { id: `turn-${++nextTurn}`, status: "inProgress", items: [] },
+  }));
+  const diagnostics: string[] = [];
+  adapter.subscribe((event) => {
+    if (event.type === "diagnostic") diagnostics.push(event.code);
+  });
+  await adapter.startThread({ cwd: "/workspace", initialMessage: "first" });
+  await adapter.queueMessage("thread-1", "second");
+  assert.equal(methodMessages(transport, "turn/start").length, 1);
+
+  // Codex 0.146 emits `thread/status/changed -> idle` immediately before
+  // `turn/completed`; the idle transition alone must release the queue.
+  transport.notify("thread/status/changed", {
+    threadId: "thread-1",
+    status: { type: "idle" },
+  });
+  await eventually(() => {
+    assert.equal(methodMessages(transport, "turn/start").length, 2);
+    assert.equal(adapter.getThreadState("thread-1")?.activeTurnId, "turn-2");
+    assert.deepEqual(adapter.getThreadState("thread-1")?.queue, []);
+  });
+
+  // The late completion of the turn the idle status already retired must not be
+  // mistaken for a superseded turn now that a newer turn is running.
+  transport.notify("turn/completed", {
+    threadId: "thread-1",
+    turn: { id: "turn-1", status: "completed", items: [] },
+  });
+  assert.equal(adapter.getThreadState("thread-1")?.activeTurnId, "turn-2");
+  assert.equal(adapter.getThreadState("thread-1")?.status, "running");
+  assert.deepEqual(diagnostics.filter((code) => code.includes("stale_completion")), []);
+  await adapter.dispose();
+});
+
+test("a manager-created thread reports manager provenance and keeps its confirmed profile", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set(
+    "thread/start",
+    () => threadResultWithProvenance("vscode", "agent-manager"),
+  );
+  transport.handlers.set(
+    "thread/resume",
+    () => threadResultWithProvenance("vscode", "agent-manager"),
+  );
+  transport.handlers.set("thread/unsubscribe", () => ({ status: "unsubscribed" }));
+  transport.handlers.set("thread/settings/update", () => null);
+  transport.handlers.set("thread/name/set", () => ({}));
+
+  const state = await adapter.startThread({ cwd: "/workspace", profile: "plan" });
+  assert.equal(
+    state.source,
+    "agent-manager",
+    "the environment-derived source kind must not misreport a manager-created thread",
+  );
+  const update = methodMessages(transport, "thread/settings/update")[0]
+    ?.params as JsonObject;
+  assert.equal((update.collaborationMode as JsonObject).mode, "plan");
+  assert.equal(update.approvalPolicy, "on-request");
+  assert.equal((update.sandboxPolicy as JsonObject).type, "workspaceWrite");
+  assert.equal(
+    adapter.getThreadState("thread-1")?.profile,
+    null,
+    "the profile stays unknown until the provider confirms it",
+  );
+
+  transport.notify("thread/settings/updated", {
+    threadId: "thread-1",
+    threadSettings: {
+      cwd: "/workspace",
+      model: "gpt-5.6",
+      approvalPolicy: "on-request",
+      sandboxPolicy: { type: "workspaceWrite" },
+      collaborationMode: { mode: "plan", settings: { model: "gpt-5.6" } },
+    },
+  });
+  assert.equal(adapter.getThreadState("thread-1")?.profile, "plan");
+
+  await adapter.releaseThread("thread-1");
+  const readopted = await adapter.adoptThread("thread-1", {
+    threadId: "thread-1",
+    treeId: null,
+    parentThreadId: null,
+    cwd: "/workspace",
+  });
+  assert.equal(
+    readopted.profile,
+    "plan",
+    "thread/resume carries no collaboration mode, so the confirmed profile must survive detach",
+  );
+  await adapter.dispose();
+});
+
+test("names a manager-created thread only through the advertised rename RPC", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("thread/start", () => threadResult());
+  transport.handlers.set("turn/start", () => ({
+    turn: { id: "turn-1", status: "inProgress", items: [] },
+  }));
+  transport.handlers.set("thread/name/set", () => ({}));
+  const named = await adapter.startThread({
+    cwd: "/workspace",
+    initialMessage: "  Ship the cockpit queue fix\nand nothing else  ",
+  });
+  assert.deepEqual(methodMessages(transport, "thread/name/set")[0]?.params, {
+    threadId: "thread-1",
+    name: "Ship the cockpit queue fix",
+  });
+  assert.equal(named.name, "Ship the cockpit queue fix");
+  await adapter.dispose();
+
+  const withdrawn = await initializedAdapter();
+  withdrawn.transport.handlers.set("thread/start", () => threadResult());
+  withdrawn.transport.handlers.set("turn/start", () => ({
+    turn: { id: "turn-1", status: "inProgress", items: [] },
+  }));
+  const unnamed = await withdrawn.adapter.startThread({
+    cwd: "/workspace",
+    initialMessage: "Ship the cockpit queue fix",
+  });
+  assert.equal(
+    unnamed.name,
+    null,
+    "a rejected thread-name RPC must not fabricate a provider name",
+  );
+  assert.equal(
+    withdrawn.adapter.capabilities.controls.includes("thread.rename"),
+    false,
+    "method-not-found withdraws the rename control",
+  );
+  assert.equal(
+    methodMessages(withdrawn.transport, "turn/start").length,
+    1,
+    "a missing thread-name RPC never blocks the initial message",
+  );
+  await withdrawn.adapter.dispose();
+});
+
+test("create-time profile falls back to next-turn overrides when the live method is withdrawn", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("thread/start", () => threadResult());
+  transport.handlers.set("turn/start", () => ({
+    turn: { id: "turn-1", status: "inProgress", items: [] },
+  }));
+  const state = await adapter.startThread({
+    cwd: "/workspace",
+    profile: "plan",
+    initialMessage: "first",
+  });
+  assert.equal(state.profile, null, "an unconfirmed profile is never asserted");
+  assert.equal(adapter.capabilities.settingsDelivery, "next-turn");
+  const start = methodMessages(transport, "turn/start")[0]?.params as JsonObject;
+  assert.equal((start.collaborationMode as JsonObject).mode, "plan");
+  assert.equal(start.approvalPolicy, "on-request");
+  await adapter.dispose();
+});
+
+const PAOLA_IDENTITY: WorkspaceIdentity = {
+  repoRoot: "/workspace",
+  repoName: "workspace",
+  worktreePath: "/workspace",
+  linked: false,
+  branch: "master",
+  detached: false,
+  dirtyCount: 25,
+  ahead: null,
+  behind: null,
+};
+
+class FakeWorkspaceIdentityResolver {
+  readonly requests: Array<readonly (string | null | undefined)[]> = [];
+  identity: WorkspaceIdentity | null = PAOLA_IDENTITY;
+  failure: Error | null = null;
+
+  async resolveMany(
+    cwds: readonly (string | null | undefined)[],
+  ): Promise<Map<string, WorkspaceIdentity | null>> {
+    this.requests.push(cwds);
+    if (this.failure) throw this.failure;
+    const result = new Map<string, WorkspaceIdentity | null>();
+    for (const cwd of cwds) {
+      if (typeof cwd === "string") result.set(cwd, this.identity);
+    }
+    return result;
+  }
+}
+
+test("bridge-published Codex sessions carry resolved workspace identity", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("thread/start", () => threadResult());
+  transport.handlers.set("thread/name/set", () => ({}));
+  transport.handlers.set("turn/start", () => ({
+    turn: { id: "turn-1", status: "inProgress", items: [] },
+  }));
+  const resolver = new FakeWorkspaceIdentityResolver();
+  const bridge = new CodexProviderBridge({
+    adapter,
+    resolveWorkspace: () => "/workspace",
+    workspaceIdentityResolver: resolver,
+  });
+  const context = {
+    actor: { id: "local", kind: "local" as const, displayName: "Local user" },
+    requestId: "workspace-identity-create",
+    signal: new AbortController().signal,
+    workspace: { id: "workspace", label: "Workspace", path: "/workspace" },
+  };
+  const created = await bridge.createSession({
+    provider: "codex",
+    workspaceId: "workspace",
+    initialMessage: "first",
+    profile: "plan",
+    model: null,
+    effort: null,
+    idempotencyKey: "workspace-identity-session",
+  }, context);
+  assert.deepEqual(resolver.requests, [["/workspace"]]);
+  assert.deepEqual(
+    created.workspaceIdentity,
+    PAOLA_IDENTITY,
+    "a manager-created session must land in the same board column as its repository",
+  );
+  assert.deepEqual(
+    bridge.getManagedSession("thread-1")?.workspaceIdentity,
+    PAOLA_IDENTITY,
+  );
+  bridge.dispose();
+  await adapter.dispose();
+});
+
+test("workspace identity stays null when the bounded git resolution cannot answer", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("thread/start", () => threadResult());
+  transport.handlers.set("thread/name/set", () => ({}));
+  transport.handlers.set("turn/start", () => ({
+    turn: { id: "turn-1", status: "inProgress", items: [] },
+  }));
+  const resolver = new FakeWorkspaceIdentityResolver();
+  resolver.failure = new Error("git budget exhausted");
+  const bridge = new CodexProviderBridge({
+    adapter,
+    resolveWorkspace: () => "/workspace",
+    workspaceIdentityResolver: resolver,
+  });
+  const context = {
+    actor: { id: "local", kind: "local" as const, displayName: "Local user" },
+    requestId: "workspace-identity-budget",
+    signal: new AbortController().signal,
+    workspace: { id: "workspace", label: "Workspace", path: "/workspace" },
+  };
+  const created = await bridge.createSession({
+    provider: "codex",
+    workspaceId: "workspace",
+    initialMessage: "first",
+    profile: "plan",
+    model: null,
+    effort: null,
+    idempotencyKey: "workspace-identity-budget-session",
+  }, context);
+  assert.equal(created.workspaceIdentity, null);
+  assert.equal(created.id, "local:codex:thread-1", "creation still succeeds");
+  bridge.dispose();
+  await adapter.dispose();
+});
+
+test("bridge reports manager provenance and the created thread name", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set(
+    "thread/start",
+    () => threadResultWithProvenance("vscode", "agent-manager"),
+  );
+  transport.handlers.set("thread/name/set", () => ({}));
+  transport.handlers.set("thread/settings/update", () => null);
+  transport.handlers.set("turn/start", () => ({
+    turn: { id: "turn-1", status: "inProgress", items: [] },
+  }));
+  const bridge = new CodexProviderBridge({ adapter, resolveWorkspace: () => "/workspace" });
+  const context = {
+    actor: { id: "local", kind: "local" as const, displayName: "Local user" },
+    requestId: "provenance-create",
+    signal: new AbortController().signal,
+    workspace: { id: "workspace", label: "Workspace", path: "/workspace" },
+  };
+  const created = await bridge.createSession({
+    provider: "codex",
+    workspaceId: "workspace",
+    initialMessage: "Fix the stranded queue",
+    profile: "plan",
+    model: null,
+    effort: null,
+    idempotencyKey: "provenance-session",
+  }, context);
+  assert.equal(created.source, "agent-manager");
+  assert.equal(created.name, "Fix the stranded queue");
   bridge.dispose();
   await adapter.dispose();
 });

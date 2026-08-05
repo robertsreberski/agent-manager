@@ -1,12 +1,29 @@
 import { useEffect, useMemo, useState } from "react";
 import { AlertCircle, Check, ChevronDown, Pencil } from "lucide-react";
 import { usePhoneViewport } from "../../hooks/use-phone-viewport";
+import {
+  Button,
+  Checkbox,
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+  RadioGroup,
+  RadioGroupItem,
+} from "../ui";
 import { isExactRespondableRequest, type AtomicQuestionResponse, type ExactQuestionRequest, type RequestQuestion } from "./model";
 
 interface DraftAnswer {
   selected: string[];
   custom: string;
 }
+
+/*
+  `cn` resolves `text-*` by class group, and the named type scale (`text-meta-sm`)
+  and a token colour (`text-[var(--accent-ink)]`) land in the same group — one
+  silently drops the other, which on a lime fill means near-white ink at 1.2:1.
+  The arbitrary `color:` property has its own group, so a filled button can state
+  both its size and its ink.
+*/
 
 function isAnswered(question: RequestQuestion, answer: DraftAnswer | undefined): boolean {
   if (!answer) return false;
@@ -109,84 +126,141 @@ export function QuestionRequest({ request, elapsed, disabled = false, onSubmit }
   if (!exact) {
     return (
       <section className="border-l-2 border-dashed border-[var(--accent)] bg-[var(--surface-raised)] px-3 py-2.5" aria-label={`${request.label} needs attention`}>
-        <p className="text-[13px] font-medium text-[var(--text)]">{request.label}</p>
-        <p className="mt-1 text-[12.5px] text-[var(--text-muted)]">This request is inferred or incomplete. Answer it in the native provider interface.</p>
+        <p className="text-meta font-medium text-[var(--text)]">{request.label}</p>
+        <p className="mt-1 text-meta-sm text-[var(--text-muted)]">This request is inferred or incomplete. Answer it in the native provider interface.</p>
       </section>
     );
   }
 
+  // Frame 6a states only the two keys it offers on the open question.
+  const pickHint = !question ? null
+    : question.options.length > 0 ? `1–${Math.min(9, question.options.length)} to pick · ↵ to send`
+      : "↵ to send";
+
   return (
-    <section className="text-[13px]" data-request-id={request.id} data-question-shortcut-ready={open && exact && !disabled && !submitting ? "true" : "false"} aria-label={`${request.label} question`}>
-      <button type="button" className="flex min-h-11 w-full items-center gap-2 text-left text-[var(--accent)]" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
-        <AlertCircle size={15} strokeWidth={1.75} />
-        <span>Needs action: <strong>{request.label}</strong></span>
-        {request.questions.length > 1 && <span className="font-mono text-[11px]">{Math.min(completedCount + 1, request.questions.length)}/{request.questions.length}</span>}
-        {elapsed && <span className="ml-auto font-mono text-[11px] opacity-70">{elapsed}</span>}
-        <ChevronDown size={14} className={`transition-transform ${open ? "rotate-180" : ""}`} />
-      </button>
-      {open && (
-        <div className="ml-6 grid gap-2">
-          {request.questions.length > 1 && (
-            <div className="flex gap-1" aria-label={`${completedCount} of ${request.questions.length} answered`}>
-              {request.questions.map((item) => <span key={item.id} className={`h-[3px] w-[13px] ${isAnswered(item, answers[item.id]) ? "bg-[var(--accent)]" : "bg-[var(--border)]"}`} />)}
-            </div>
-          )}
+    <section className="min-w-0 max-w-full text-meta" data-request-id={request.id} data-question-shortcut-ready={open && exact && !disabled && !submitting ? "true" : "false"} aria-label={`${request.label} question`}>
+      <Collapsible open={open} onOpenChange={setOpen} className="min-w-0">
+        <CollapsibleTrigger asChild>
+          <Button variant="ghost" size="touch" className="w-full min-w-0 justify-start gap-2 px-0 py-1.5 text-left text-[var(--accent)] hover:text-[var(--accent)]">
+            <AlertCircle size={16} strokeWidth={1.75} className="shrink-0" />
+            <span className="min-w-0 flex-1 truncate text-body-sm">Needs action: <strong className="font-semibold">{request.label}</strong></span>
+            {request.questions.length > 1 && (
+              <span className="flex shrink-0 items-center gap-1.5 font-mono text-code-sm opacity-85" aria-label={`${completedCount} of ${request.questions.length} answered`}>
+                {Math.min(completedCount + 1, request.questions.length)}/{request.questions.length}
+                <span className="flex gap-0.5">
+                  {request.questions.map((item) => <span key={item.id} className={`h-[3px] w-[13px] ${isAnswered(item, answers[item.id]) ? "bg-[var(--accent)]" : "bg-[var(--border-strong)]"}`} />)}
+                </span>
+              </span>
+            )}
+            {elapsed && <span className="shrink-0 text-meta-sm tabular-nums opacity-70">{elapsed}</span>}
+            <ChevronDown size={15} className={`shrink-0 transition-transform ${open ? "rotate-180" : ""}`} />
+          </Button>
+        </CollapsibleTrigger>
+        <CollapsibleContent className="ml-6 grid min-w-0 grid-cols-[minmax(0,1fr)] gap-1.5 pt-0.5 pb-2">
           {request.questions.map((item, index) => {
             const answer = answers[item.id];
             const answered = isAnswered(item, answer);
             if (index !== active) {
-              return (
-                <button key={item.id} type="button" data-compact-control className="flex min-h-10 items-center gap-2 border-b border-[var(--rule)] text-left" onClick={() => setActive(index)}>
-                  <span className="w-5 font-mono text-[11px] text-[var(--text-faint)]">{index + 1}</span>
-                  <span className="min-w-0 flex-1 truncate text-[12.5px] text-[var(--text-muted)]">{item.prompt}</span>
-                  {answered && answer ? <span className="max-w-[45%] truncate font-medium text-[var(--text)]">{summarizedAnswer(item, answer)}</span> : <span className="font-mono text-[10px] text-[var(--text-faint)]">{item.multiple ? "multiple" : item.options.length ? "choose one" : "write"}</span>}
-                  {answered && <Pencil size={12} strokeWidth={1.75} />}
-                </button>
+              return answered && answer ? (
+                <Button key={item.id} variant="ghost" size="sm" data-compact-control className="h-auto min-h-10 w-full items-start justify-start gap-2.5 px-0 py-2 text-left whitespace-normal" onClick={() => setActive(index)}>
+                  <Check size={15} strokeWidth={1.75} className="mt-[3px] shrink-0 text-[var(--accent)]" />
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-meta-sm text-[var(--text-muted)]">{item.prompt}</span>
+                    <span className="block text-[13.5px] leading-[19px] font-medium text-[var(--text)] [overflow-wrap:anywhere]">{summarizedAnswer(item, answer)}</span>
+                  </span>
+                  <Pencil size={14} strokeWidth={1.75} className="mt-[3px] shrink-0 text-[var(--text-faint)]" />
+                </Button>
+              ) : (
+                <Button key={item.id} variant="ghost" size="sm" data-compact-control className="h-auto min-h-10 w-full justify-start gap-2.5 px-0 py-2.5 text-left" onClick={() => setActive(index)}>
+                  <span className="w-[15px] shrink-0 text-center font-mono text-code-sm font-medium text-[var(--text-faint)]">{index + 1}</span>
+                  <span className="min-w-0 flex-1 truncate text-[13.5px] leading-[19px] text-[var(--text-muted)]">{item.prompt}</span>
+                  <span className="shrink-0 font-mono text-code-xs text-[var(--text-faint)]">{item.multiple ? "pick many" : item.options.length ? "pick one" : "free text"}</span>
+                </Button>
               );
             }
             const described = item.options.some((option) => option.description);
-            return (
-              <fieldset key={item.id} className="bg-[var(--surface-raised)] p-3" disabled={disabled || submitting}>
-                <legend className="px-1 text-sm font-medium"><span className="mr-1 font-mono text-[11px] text-[var(--text-faint)]">{index + 1}.</span>{item.prompt}</legend>
-                {item.header && <p className="mt-1 font-mono text-[10px] uppercase tracking-[0.12em] text-[var(--text-muted)]">{item.header}</p>}
-                <div className={`mt-3 ${described ? "grid gap-2" : "flex flex-wrap gap-2"}`}>
-                  {item.options.map((option, optionIndex) => {
-                    const selected = answer?.selected.includes(option.id) ?? false;
-                    return (
-                      <label key={option.id} className={described
-                        ? `flex min-h-[46px] cursor-pointer items-start gap-2.5 border px-3 py-2.5 ${selected ? "border-[var(--accent)] bg-[var(--wants-field)]" : "border-[var(--border)]"}`
-                        : `flex ${phone ? "min-h-[46px]" : "min-h-8"} cursor-pointer items-center rounded-full border px-3 text-[12.5px] ${selected || option.recommended && !answer ? "border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-ink)]" : "border-[var(--border)]"}`}
-                      >
-                        <input className="sr-only" type={item.multiple ? "checkbox" : "radio"} name={`request-${request.id}-${item.id}`} checked={selected} onChange={() => choose(item, option.id)} />
-                        {described && <span className={`mt-0.5 grid size-4 shrink-0 place-items-center ${item.multiple ? "" : "rounded-full"} border ${selected ? "border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-ink)]" : "border-[var(--text-faint)]"}`}>{selected && <Check size={11} />}</span>}
-                        <span><span className="block font-medium">{option.label}<kbd className="ml-2 font-mono text-[9px] opacity-60">{optionIndex + 1}</kbd></span>{option.description && <span className="mt-0.5 block text-[12.5px] leading-[18px] text-[var(--text-muted)] [text-wrap:pretty]">{option.description}</span>}</span>
-                      </label>
-                    );
-                  })}
-                  {item.allowFreeText && !described && item.options.length > 0 && (
-                    customOpen[item.id] || Boolean(answer?.custom)
-                      ? <input autoFocus id={`custom-${request.id}-${item.id}`} type={item.secret ? "password" : "text"} autoComplete={item.secret ? "new-password" : undefined} value={answer?.custom ?? ""} onChange={(event) => setCustom(item, event.target.value)} className={`${phone ? "min-h-[46px]" : "min-h-8"} min-w-32 max-w-full rounded-full border border-dashed border-[var(--border)] bg-transparent px-3 text-[12.5px] outline-none placeholder:text-[var(--text-muted)] focus:border-[var(--accent)]`} placeholder="Something else…" aria-label={`${item.prompt} custom answer`} />
-                      : <button type="button" data-compact-control className={`${phone ? "min-h-[46px]" : "min-h-8"} rounded-full border border-dashed border-[var(--border)] px-3 text-[12.5px] text-[var(--text-muted)] hover:border-[var(--accent)]`} onClick={() => setCustomOpen((current) => ({ ...current, [item.id]: true }))}>Something else…</button>
-                  )}
-                </div>
-                {item.allowFreeText && (described || item.options.length === 0) && (
-                  <input id={`custom-${request.id}-${item.id}`} type={item.secret ? "password" : "text"} autoComplete={item.secret ? "new-password" : undefined} value={answer?.custom ?? ""} onChange={(event) => setCustom(item, event.target.value)} className="mt-3 min-h-[46px] w-full border border-dashed border-[var(--border)] bg-transparent px-3 outline-none focus:border-[var(--accent)]" placeholder="Something else…" aria-label={`${item.prompt} custom answer`} />
+            const locked = disabled || submitting;
+            /*
+              Frame 9a-2: a described option is a full-width row and never
+              collapses into a pill, because a pill would have to truncate the
+              description — the one part of the option the provider wrote to be
+              read before choosing.
+            */
+            const layout = `mt-3 min-w-0 ${described || item.options.length === 0 ? "grid grid-cols-[minmax(0,1fr)] gap-1.5" : "flex flex-wrap gap-2"}`;
+            const rows = (
+              <>
+                {item.options.map((option, optionIndex) => {
+                  const selected = answer?.selected.includes(option.id) ?? false;
+                  // The control is the real one either way. A pill states its own
+                  // choice by filling, so the box/circle is only drawn on the rows
+                  // that have no fill of their own.
+                  const indicator = described ? "mt-[3px]" : "sr-only";
+                  return (
+                    <label key={option.id} className={described
+                      ? `flex min-h-[46px] min-w-0 cursor-pointer items-start gap-[11px] px-3 py-2.5 ${selected ? "bg-[var(--wants-field)] outline outline-[var(--wants-outline)]" : "border border-[var(--border)]"}`
+                      : `flex ${phone ? "min-h-[46px]" : "min-h-8"} max-w-full cursor-pointer items-center rounded-full border px-3 text-meta-sm ${selected || option.recommended && !answer ? "border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-ink)]" : "border-[var(--border)]"}`}
+                    >
+                      {item.multiple
+                        ? <Checkbox className={indicator} disabled={locked} checked={selected} onCheckedChange={() => choose(item, option.id)} />
+                        : <RadioGroupItem className={indicator} value={option.id} />}
+                      <span className="min-w-0 flex-1">
+                        <span className="block text-body-sm font-medium [overflow-wrap:anywhere]">{option.label}</span>
+                        {option.description && <span className="mt-0.5 block text-meta-sm text-[var(--text-muted)] [text-wrap:pretty]">{option.description}</span>}
+                      </span>
+                      {described && <kbd className="shrink-0 bg-[var(--menu)] px-1.5 font-mono text-code-xs font-medium text-[var(--text-muted)]">{optionIndex + 1}</kbd>}
+                    </label>
+                  );
+                })}
+                {item.allowFreeText && !described && item.options.length > 0 && (
+                  customOpen[item.id] || Boolean(answer?.custom)
+                    ? <input autoFocus id={`custom-${request.id}-${item.id}`} type={item.secret ? "password" : "text"} autoComplete={item.secret ? "new-password" : undefined} value={answer?.custom ?? ""} onChange={(event) => setCustom(item, event.target.value)} className={`${phone ? "min-h-[46px]" : "min-h-8"} min-w-32 max-w-full rounded-full border border-dashed border-[var(--border)] bg-transparent px-3 text-meta-sm outline-none placeholder:text-[var(--text-muted)] focus:border-[var(--accent)]`} placeholder="Something else…" aria-label={`${item.prompt} custom answer`} />
+                    : <Button variant="secondary" size={phone ? "touch" : "sm"} data-compact-control className="rounded-full border-dashed border-[var(--border)] px-3 hover:border-[var(--accent)]" onClick={() => setCustomOpen((current) => ({ ...current, [item.id]: true }))}><span className="text-meta-sm text-[var(--text-muted)]">Something else…</span></Button>
                 )}
+                {/* With described options the free-text escape keeps the same
+                    full-width row, dashed, rather than shrinking to a pill. */}
+                {item.allowFreeText && (described || item.options.length === 0) && (
+                  <label className="flex min-h-[46px] min-w-0 cursor-text items-center gap-[11px] border border-dashed border-[var(--border-strong)] px-3 py-2.5">
+                    <span className="size-4 shrink-0 rounded-full border border-[var(--text-faint)]" aria-hidden="true" />
+                    <input id={`custom-${request.id}-${item.id}`} type={item.secret ? "password" : "text"} autoComplete={item.secret ? "new-password" : undefined} value={answer?.custom ?? ""} onChange={(event) => setCustom(item, event.target.value)} className="min-w-0 flex-1 bg-transparent text-body-sm outline-none placeholder:text-[var(--text-muted)]" placeholder="Something else…" aria-label={`${item.prompt} custom answer`} />
+                  </label>
+                )}
+              </>
+            );
+            return (
+              <fieldset key={item.id} className="my-1 min-w-0 max-w-full bg-[var(--surface-raised-active)] px-3.5 py-[13px]" disabled={locked}>
+                {/* A flex `legend` will not shrink below max-content, so an unbroken
+                    provider token would widen the whole drawer at 390px. */}
+                <legend className="block max-w-full text-title-sm font-medium [overflow-wrap:anywhere] [text-wrap:pretty]"><span className="mr-2 font-mono text-code-sm font-medium text-[var(--accent)]">{index + 1}</span>{item.prompt}</legend>
+                {item.header && <p className="mt-1 font-mono text-eyebrow uppercase text-[var(--text-muted)]">{item.header}</p>}
+                {/*
+                  One provider choice is one control: a `multiple` question is a
+                  set of checkboxes, a single-answer question is one radio group
+                  whose value is the empty string the moment free text takes over,
+                  which is what keeps "Other" and the provider's own options
+                  mutually exclusive.
+                */}
+                {item.multiple || item.options.length === 0
+                  ? <div className={layout}>{rows}</div>
+                  : <RadioGroup className={layout} aria-label={item.prompt} disabled={locked} value={answer?.selected[0] ?? ""} onValueChange={(optionId) => choose(item, optionId)}>{rows}</RadioGroup>}
                 <div className="mt-3 flex justify-between">
-                  <button type="button" data-compact-control disabled={index === 0} className="min-h-9 text-[12px] text-[var(--text-muted)] disabled:invisible" onClick={() => setActive(index - 1)}>Previous</button>
-                  {index < request.questions.length - 1 ? <button type="button" data-compact-control disabled={!answered} className="min-h-9 rounded-full bg-[var(--accent)] px-4 font-medium text-[var(--accent-ink)] disabled:opacity-35" onClick={() => setActive(index + 1)}>Next</button> : (!phone || request.questions.length === 1) && <button type="button" disabled={!complete || submitting} className="min-h-11 rounded-full bg-[var(--accent)] px-4 font-medium text-[var(--accent-ink)] disabled:opacity-35 sm:min-h-9" onClick={() => void submit()}>Send {request.questions.length > 1 ? `${request.questions.length} answers` : "answer"}</button>}
+                  <Button variant="ghost" size="sm" data-compact-control disabled={index === 0} className="px-0 disabled:invisible" onClick={() => setActive(index - 1)}>Previous</Button>
+                  {index < request.questions.length - 1
+                    ? <Button variant="primary" size="sm" data-compact-control disabled={!answered} className={`px-4 font-semibold`} onClick={() => setActive(index + 1)}>Next</Button>
+                    : (!phone || request.questions.length === 1) && <Button variant="primary" size="sm" data-compact-control disabled={!complete || submitting} className={`px-4 font-semibold`} onClick={() => void submit()}>Send {request.questions.length > 1 ? `${request.questions.length} answers` : "answer"}</Button>}
                 </div>
               </fieldset>
             );
           })}
+          {!phone && pickHint && <span className="pt-1 font-mono text-code-sm text-[var(--text-faint)]">{pickHint}</span>}
           {phone && request.questions.length > 1 && (
             <footer className="question-request__phone-footer" data-phone-sticky-footer aria-label="Question submission">
-              <span className="min-w-0 flex-1 font-mono text-[12px] text-[var(--text-muted)]">{remainingCount === 0 ? "All questions answered" : `${remainingCount} ${remainingCount === 1 ? "question" : "questions"} left`}</span>
-              <button type="button" disabled={!complete || submitting} className="min-h-11 shrink-0 rounded-full bg-[var(--accent)] px-4 font-medium text-[var(--accent-ink)] disabled:bg-[var(--surface-selected)] disabled:text-[var(--text-muted)]" onClick={() => void submit()}>Send {request.questions.length} answers</button>
+              <span className="min-w-0 flex-1 font-mono text-meta-sm leading-[1.4] text-[var(--text-muted)]">{remainingCount === 0 ? "All questions answered" : `${remainingCount} ${remainingCount === 1 ? "question" : "questions"} left`}</span>
+              {/* The one atomic send on a phone: nothing leaves until every question is answered. */}
+              <Button variant="primary" size="touch" disabled={!complete || submitting} className={`shrink-0 px-[18px] font-semibold disabled:bg-[var(--surface-selected)] disabled:[color:var(--text-muted)] disabled:opacity-100`} onClick={() => void submit()}>Send {request.questions.length} answers</Button>
             </footer>
           )}
-        </div>
-      )}
+        </CollapsibleContent>
+      </Collapsible>
     </section>
   );
 }

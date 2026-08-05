@@ -1,5 +1,27 @@
 import { clsx, type ClassValue } from "clsx";
-import { twMerge } from "tailwind-merge";
+import { extendTailwindMerge } from "tailwind-merge";
+
+/**
+ * The handoff's type ladder from `styles.css` (spec 12 R6). tailwind-merge only
+ * knows its own default scale, so it files an unrecognised `text-*` under
+ * text-COLOR — which meant `text-meta-sm` silently evicted
+ * `text-[var(--accent-ink)]` from the same group. On a filled lime button that
+ * left near-white ink on `--accent`, roughly 1.2:1. Declaring the scale as
+ * font-size puts the two in different groups so both survive.
+ */
+const TYPE_SCALE = [
+  "display", "display-md", "display-sm",
+  "title", "title-md", "title-sm",
+  "card",
+  "body", "body-sm",
+  "meta", "meta-sm",
+  "code", "code-sm", "code-xs",
+  "eyebrow",
+] as const;
+
+const twMerge = extendTailwindMerge({
+  extend: { classGroups: { "font-size": [{ text: [...TYPE_SCALE] }] } },
+});
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));

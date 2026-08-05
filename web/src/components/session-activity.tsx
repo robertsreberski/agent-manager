@@ -164,6 +164,18 @@ export function preferredFileChangeItems(items: readonly ActivityItem[]): Activi
   }).sort((left, right) => left.seq - right.seq || left.id.localeCompare(right.id));
 }
 
+type ActivityLifecycleItem = Extract<ActivityItem, { kind: "lifecycle" }>;
+
+const TURN_END_EVENTS: ReadonlyArray<ActivityLifecycleItem["event"]> = [
+  "turn-completed",
+  "turn-failed",
+  "turn-interrupted",
+];
+
+function isTurnEnd(item: ActivityItem): item is ActivityLifecycleItem {
+  return item.kind === "lifecycle" && TURN_END_EVENTS.includes(item.event);
+}
+
 function groupState(items: readonly ActivityItem[]): ActivityState {
   const terminal = [...items].reverse().find((item) => item.kind === "lifecycle"
     && ["turn-completed", "turn-failed", "turn-interrupted"].includes(item.event));
@@ -219,6 +231,27 @@ function turnFacts(items: readonly ActivityItem[]): TurnFacts | null {
   };
 }
 
+/**
+ * A `TurnMarker` already states the end time, duration, subagents, diff totals,
+ * tokens and cost of the turn, so an adjacent "Turn completed" row would state
+ * the same fact twice. A failure or interruption is not restated by the marker —
+ * it carries no outcome — so those rows survive, as does any provider `details`.
+ */
+/**
+ * Spec 05 R12 puts the turn's totals in the turn marker. Anything the marker
+ * already states must not also render as its own row, or every turn reports
+ * itself twice — a `Turn completed` line above its own footer, and a usage row
+ * repeating the token total the footer carries.
+ */
+function restatedByTurnMarker(item: ActivityItem, facts: TurnFacts): boolean {
+  if (item.kind === "usage") return facts.tokens !== null || facts.costUsd !== null;
+  return isTurnEnd(item)
+    && item.event === "turn-completed"
+    && item.level === "info"
+    && item.details === null
+    && !item.truncated;
+}
+
 function assistantMessage(
   id: string,
   items: readonly ActivityItem[],
@@ -228,16 +261,36 @@ function assistantMessage(
   if (items.length === 0) return null;
   const state = groupState(items);
   const facts = turnFacts(factItems);
+  const rendered = facts ? items.filter((item) => !restatedByTurnMarker(item, facts)) : items;
   return {
     id,
     role: "assistant",
     status: messageStatus(state),
     content: [
-      ...items.map((item) => activityPart(item, subagents, items)),
+      ...rendered.map((item) => activityPart(item, subagents, items)),
       ...(facts ? [{ type: "data" as const, name: `${DATA_PREFIX}turn-marker`, data: facts }] : []),
     ] satisfies ThreadContent,
     ...(itemDate(items[0]!) ? { createdAt: itemDate(items[0]!) } : {}),
   };
+}
+
+/**
+ * Deterministic intra-turn bands. `ActivityHub` freezes an item's `seq` at its
+ * first upsert, so a provider that streams the final answer before it reports
+ * the turn totals — or reports usage before it reports the turn start — would
+ * otherwise render the answer buried under its own footer. Provider order is
+ * preserved inside each band, so tool calls never move relative to reasoning.
+ */
+function turnRank(
+  item: ActivityItem,
+  initialUserId: string | null,
+  finalIds: ReadonlySet<string>,
+): number {
+  if (initialUserId !== null && item.id === initialUserId) return 0;
+  if (item.kind === "lifecycle" && item.event === "turn-started") return 1;
+  if (finalIds.has(item.id)) return 3;
+  if (item.kind === "usage" || isTurnEnd(item)) return 4;
+  return 2;
 }
 
 function messagesForTurn(turnKey: string, source: readonly ActivityItem[]): ThreadMessageLike[] {
@@ -249,13 +302,13 @@ function messagesForTurn(turnKey: string, source: readonly ActivityItem[]): Thre
     .filter((item) => item.kind !== "file-change" || preferredFileIds.has(item.id))
     .sort((left, right) => left.seq - right.seq || left.id.localeCompare(right.id));
   const initialUser = ordered.find((item) => item.kind === "message" && item.role === "user");
-  const finals = ordered.filter((item) => item.kind === "message" && item.role === "assistant" && item.phase === "final");
-  const finalIds = new Set(finals.map((item) => item.id));
-  const semantic = [
-    ...(initialUser ? [initialUser] : []),
-    ...ordered.filter((item) => item.id !== initialUser?.id && !finalIds.has(item.id)),
-    ...finals,
-  ];
+  const finalIds = new Set(ordered.flatMap((item) => (
+    item.kind === "message" && item.role === "assistant" && item.phase === "final" ? [item.id] : []
+  )));
+  const semantic = [...ordered].sort((left, right) =>
+    turnRank(left, initialUser?.id ?? null, finalIds) - turnRank(right, initialUser?.id ?? null, finalIds)
+    || left.seq - right.seq
+    || left.id.localeCompare(right.id));
   const result: ThreadMessageLike[] = [];
   let assistantItems: ActivityItem[] = [];
   let segment = 0;
@@ -427,7 +480,7 @@ function FileChanges({ item, controls }: { item: ActivityFileChangeItem & { upse
         const stableKey = `${item.id}:${change.operation}:${change.previousPath ?? ""}:${change.path}:${String(index)}`;
         return <DiffViewer key={stableKey} change={change} read={controls.readKeys.has(change.readKey)} onReadChange={controls.onReadChange} {...(controls.canOpenEditor && relativePath && controls.onOpenEditor ? { onOpenEditor: () => controls.onOpenEditor!(relativePath) } : {})} />;
       })}
-      {item.truncated && <p className="text-[11.5px] text-[var(--warning)]">The provider truncated this change.</p>}
+      {item.truncated && <p className="text-code-sm text-[var(--warning)]">The provider truncated this change.</p>}
     </section>
   );
 }
@@ -466,16 +519,16 @@ function Attention({ item, controls }: { item: ActivityAttentionItem; controls: 
   }
   return (
     <section className="my-2 border-l-2 border-dashed border-[var(--accent)] bg-[var(--surface-raised)] p-3" data-attention-confidence={item.confidence}>
-      <p className="flex items-start gap-2 text-[13px]"><CircleAlert size={15} className="mt-0.5 text-[var(--accent)]" /><strong>{item.title ?? item.attentionKind.replaceAll("-", " ")}</strong></p>
-      {item.summary && <p className="mt-1 text-[12.5px] leading-5 text-[var(--text-muted)]">{item.summary}</p>}
-      <p className="mt-2 text-[11.5px] text-[var(--text-faint)]">{item.resolved ? "Resolved in the harness." : "Open the native harness to respond; this request is not safely representable here."}</p>
+      <p className="flex items-start gap-2 text-meta"><CircleAlert size={15} className="mt-0.5 text-[var(--accent)]" /><strong>{item.title ?? item.attentionKind.replaceAll("-", " ")}</strong></p>
+      {item.summary && <p className="mt-1 text-meta-sm text-[var(--text-muted)]">{item.summary}</p>}
+      <p className="mt-2 text-code-sm text-[var(--text-faint)]">{item.resolved ? "Resolved in the harness." : "Open the native harness to respond; this request is not safely representable here."}</p>
     </section>
   );
 }
 
 function Lifecycle({ item }: { item: Extract<ActivityItem, { kind: "lifecycle" }> }) {
   return (
-    <section className={`my-2 border-l-2 p-3 text-[12.5px] ${item.level === "error" ? "border-[var(--danger)] bg-[var(--danger-field)]" : item.level === "warning" ? "border-[var(--warning)] bg-[var(--warning-field)]" : "border-[var(--border)] bg-[var(--surface-raised)]"}`}>
+    <section className={`my-2 border-l-2 p-3 text-meta-sm ${item.level === "error" ? "border-[var(--danger)] bg-[var(--danger-field)]" : item.level === "warning" ? "border-[var(--warning)] bg-[var(--warning-field)]" : "border-[var(--border)] bg-[var(--surface-raised)]"}`}>
       <p className="flex items-center gap-2"><Radio size={13} /><strong>{item.title}</strong></p>
       {item.details && <p className="mt-1 whitespace-pre-wrap text-[var(--text-muted)]">{item.details}</p>}
       {item.truncated && <p className="mt-1 text-[var(--warning)]">Details were truncated by the provider.</p>}
@@ -484,14 +537,18 @@ function Lifecycle({ item }: { item: Extract<ActivityItem, { kind: "lifecycle" }
 }
 
 function Usage({ item }: { item: Extract<ActivityItem, { kind: "usage" }> }) {
+  // Only reached while a turn is still open; once it ends the turn marker states
+  // the totals and this row is suppressed. `0 reasoning` is noise rather than a
+  // fact worth a column, so a zero reasoning count is omitted.
   const facts = [
-    item.inputTokens === null ? null : `${item.inputTokens} input`,
-    item.outputTokens === null ? null : `${item.outputTokens} output`,
-    item.reasoningTokens === null ? null : `${item.reasoningTokens} reasoning`,
-    item.totalTokens === null ? null : `${item.totalTokens} total`,
+    item.inputTokens === null ? null : `${item.inputTokens.toLocaleString()} input`,
+    item.outputTokens === null ? null : `${item.outputTokens.toLocaleString()} output`,
+    item.reasoningTokens ? `${item.reasoningTokens.toLocaleString()} reasoning` : null,
+    item.totalTokens === null ? null : `${item.totalTokens.toLocaleString()} total`,
     item.costUsd === null ? null : `$${item.costUsd.toFixed(4)}`,
   ].filter((value): value is string => value !== null);
-  return <p className="my-2 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[10.5px] text-[var(--text-faint)]"><Gauge size={13} />{facts.map((fact) => <span key={fact}>{fact}</span>)}</p>;
+  if (facts.length === 0) return null;
+  return <p className="my-2 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-code-xs text-[var(--text-faint)]"><Gauge size={13} className="shrink-0" />{facts.map((fact) => <span key={fact}>{fact}</span>)}</p>;
 }
 
 function Plan({ item, controls }: { item: Extract<ActivityItem, { kind: "plan" }>; controls: ActivityPlanControls }) {
@@ -510,7 +567,7 @@ function Plan({ item, controls }: { item: Extract<ActivityItem, { kind: "plan" }
   return <div className="my-3"><PlanArtifact plan={plan} disabled={disabled} loadFile={controls.loadFile} {...(actionable ? {
     onExecute: () => controls.onRespond(requestId, { kind: "decision", decision: "allow" }),
     onSendBack: (_plan: PlanArtifactView, notes: string) => controls.onRespond(requestId, { kind: "decision", decision: "deny", reason: notes }),
-  } : {})} />{item.truncated && <p className="mt-1 text-[11.5px] text-[var(--warning)]">The plan is truncated.</p>}</div>;
+  } : {})} />{item.truncated && <p className="mt-1 text-code-sm text-[var(--warning)]">The plan is truncated.</p>}</div>;
 }
 
 export function renderActivityData(name: string, data: unknown, controls: ActivityDataControls): ReactNode {
@@ -546,5 +603,5 @@ export function remoteHostLabel(session: SessionView, remote: boolean): string |
 }
 
 export function ActivityRetentionBoundary() {
-  return <p className="mb-4 border-l-2 border-[var(--warning)] bg-[var(--warning-field)] p-3 text-[12.5px] text-[var(--warning)]"><AlertTriangle size={14} className="mr-2 inline" />Earlier provider activity is outside the retained stream window.</p>;
+  return <p className="border-l-2 border-[var(--warning)] bg-[var(--warning-field)] p-3 text-meta-sm text-[var(--warning)]"><AlertTriangle size={14} className="mr-2 inline" />Earlier provider activity is outside the retained stream window.</p>;
 }
