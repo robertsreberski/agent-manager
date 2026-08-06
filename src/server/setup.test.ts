@@ -107,7 +107,6 @@ function installedClaudeToken(root: string): string {
 test("setup previews and applies exact local hooks without exposing secrets", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "agent-manager-setup-"));
   const repo = join(root, "observed-repo");
-  let codexProbe: [string, string] | null = null;
   const backend = await createAgentManagerServer({
     host: "127.0.0.1",
     port: 43_127,
@@ -122,14 +121,6 @@ test("setup previews and applies exact local hooks without exposing secrets", as
       createdAt: "2026-08-04T00:00:00.000Z",
       settingsPath: join(root, ".claude", "legacy-settings.json"),
     }],
-    codexHookTrustStatus: async (settingsPath, expectedCommand) => {
-      codexProbe = [settingsPath, expectedCommand];
-      return {
-        state: "absent",
-        reason: "No matching command hook",
-        installedEvents: [],
-      };
-    },
     setupHarnessProbe: async () => ({
       codex: { state: "missing", reason: "codex is not installed on this host." },
       claude: { state: "present", reason: null },
@@ -161,21 +152,14 @@ test("setup previews and applies exact local hooks without exposing secrets", as
   assert.deepEqual(setup.nearby.map(({ path, source }) => ({ path, source })), [{ path: repo, source: "discovered" }]);
   assert.equal(backend.database.listWorkspaces()[0]?.path, repo);
   assert.equal(setup.hooks.claude.state, "absent");
-  assert.deepEqual(codexProbe, [
-    join(root, ".codex", "hooks.json"),
-    `'${join(root, "Library", "Application Support", "agent-manager", "hooks", "codex-user-hook.mjs")}'`,
-  ]);
   assert.equal(setup.hooks.claude.changed, true);
   assert.match(setup.hooks.claude.previewId ?? "", /^[0-9a-f-]{36}$/u);
   assert.ok(Number.isFinite(Date.parse(setup.hooks.claude.expiresAt ?? "")));
   assert.match(setup.hooks.claude.diff, /\[REDACTED\]/u);
   assert.doesNotMatch(first.body, /Bearer (?!\[REDACTED\])[A-Za-z0-9_-]{16,}/u);
   assert.match(setup.hooks.claude.command, /hooks install --provider claude/u);
-  assert.match(setup.hooks.codex.command, /hooks install --provider codex/u);
   assert.equal(existsSync(join(root, ".claude", "settings.json")), false);
-  assert.equal(existsSync(join(root, ".codex", "hooks.json")), false);
   assert.equal(backend.database.listClaudeHookInstallRecords().length, 0);
-  assert.equal(backend.database.listCodexHookInstallRecords().length, 0);
   const studio = setup.hosts.find(({ id }) => id === "studio");
   assert.equal(studio?.harnesses.codex.state, "missing");
   assert.equal(studio?.harnesses.claude.state, "present");
@@ -186,7 +170,6 @@ test("setup previews and applies exact local hooks without exposing secrets", as
     headers: { host, cookie: auth.cookie },
   })).json());
   assert.equal(repeated.hooks.claude.previewId, setup.hooks.claude.previewId);
-  assert.equal(repeated.hooks.codex.previewId, setup.hooks.codex.previewId);
 
   const unauthenticated = await backend.app.inject({
     method: "POST",
@@ -229,7 +212,10 @@ test("setup previews and applies exact local hooks without exposing secrets", as
   });
   assert.equal(unconfirmed.statusCode, 400, unconfirmed.body);
 
-  const mismatched = await backend.app.inject({
+  // Codex hooks are retired, so the provider is no longer a value this route
+  // accepts at all: the request fails validation rather than reaching a
+  // preview it could never have matched.
+  const retiredProvider = await backend.app.inject({
     method: "POST",
     url: "/api/v1/setup/hooks/apply",
     headers: mutationHeaders(auth),
@@ -239,12 +225,23 @@ test("setup previews and applies exact local hooks without exposing secrets", as
       confirmed: true,
     },
   });
+  assert.equal(retiredProvider.statusCode, 400, retiredProvider.body);
+  assert.match(retiredProvider.body, /VALIDATION_ERROR/u);
+
+  const mismatched = await backend.app.inject({
+    method: "POST",
+    url: "/api/v1/setup/hooks/apply",
+    headers: mutationHeaders(auth),
+    payload: {
+      provider: "claude",
+      previewId: "00000000-0000-4000-8000-000000000000",
+      confirmed: true,
+    },
+  });
   assert.equal(mismatched.statusCode, 409, mismatched.body);
 
   assert.equal(backend.database.listClaudeHookInstallRecords().length, 0);
-  assert.equal(backend.database.listCodexHookInstallRecords().length, 0);
   assert.equal(existsSync(join(root, ".claude", "settings.json")), false);
-  assert.equal(existsSync(join(root, ".codex", "hooks.json")), false);
 
   const claudePayload = {
     provider: "claude" as const,
@@ -273,29 +270,6 @@ test("setup previews and applies exact local hooks without exposing secrets", as
   assert.deepEqual(new Set(outcomes), new Set(["applied", "already-applied"]));
   assert.equal(backend.database.listClaudeHookInstallRecords().length, 1);
   assert.equal(existsSync(join(root, ".claude", "settings.json")), true);
-
-  const codexApply = await backend.app.inject({
-    method: "POST",
-    url: "/api/v1/setup/hooks/apply",
-    headers: mutationHeaders(auth),
-    payload: {
-      provider: "codex",
-      previewId: setup.hooks.codex.previewId,
-      confirmed: true,
-    },
-  });
-  assert.equal(codexApply.statusCode, 200, codexApply.body);
-  assert.equal(setupHookApplyResponseSchema.parse(codexApply.json()).outcome, "applied");
-  assert.equal(backend.database.listCodexHookInstallRecords().length, 1);
-  assert.equal(existsSync(join(root, ".codex", "hooks.json")), true);
-  assert.equal(existsSync(join(
-    root,
-    "Library",
-    "Application Support",
-    "agent-manager",
-    "hooks",
-    "codex-user-hook.mjs",
-  )), true);
 
   const loadedTokenReply = await backend.app.inject({
     method: "POST",
@@ -345,10 +319,6 @@ test("setup previews and applies exact local hooks without exposing secrets", as
   assert.equal(installed.hooks.claude.changed, false);
   assert.equal(installed.hooks.claude.previewId, null);
   assert.equal(installed.hooks.claude.expiresAt, null);
-  assert.equal(installed.hooks.codex.changed, false);
-  assert.equal(installed.hooks.codex.previewId, null);
-  assert.equal(installed.hooks.codex.expiresAt, null);
-  assert.equal(installed.hooks.codex.state, "untrusted");
 });
 
 test("setup rejects expired and stale exact hook previews", async (t) => {
@@ -415,27 +385,4 @@ test("setup rejects expired and stale exact hook previews", async (t) => {
   assert.match(stale.body, /SETUP_HOOK_PREVIEW_STALE/u);
   assert.equal(backend.database.listClaudeHookInstallRecords().length, 0);
 
-  const shimPath = join(
-    root,
-    "Library",
-    "Application Support",
-    "agent-manager",
-    "hooks",
-    "codex-user-hook.mjs",
-  );
-  mkdirSync(join(shimPath, ".."), { recursive: true });
-  writeFileSync(shimPath, "// external edit after preview\n", "utf8");
-  const staleCodex = await backend.app.inject({
-    method: "POST",
-    url: "/api/v1/setup/hooks/apply",
-    headers: mutationHeaders(auth),
-    payload: {
-      provider: "codex",
-      previewId: refreshed.hooks.codex.previewId,
-      confirmed: true,
-    },
-  });
-  assert.equal(staleCodex.statusCode, 409, staleCodex.body);
-  assert.equal(backend.database.listCodexHookInstallRecords().length, 0);
-  assert.equal(readFileSync(shimPath, "utf8"), "// external edit after preview\n");
 });

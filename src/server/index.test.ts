@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   statSync,
   symlinkSync,
+  writeFileSync,
 } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -149,6 +153,57 @@ test("production composition releases its instance lease after synchronous provi
     });
     await replacement.close();
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("composed startup sweeps retired Codex hooks from the configured home, never the real one", async () => {
+  const root = mkdtempSync("/tmp/am-codex-sweep-");
+  const home = join(root, "home");
+  const shimDirectory = join(home, "Library", "Application Support", "agent-manager", "hooks");
+  const settingsPath = join(home, ".codex", "hooks.json");
+  const shimPath = join(shimDirectory, "codex-user-hook.mjs");
+  mkdirSync(join(home, ".codex"), { recursive: true });
+  mkdirSync(shimDirectory, { recursive: true });
+  writeFileSync(settingsPath, JSON.stringify({
+    hooks: {
+      SessionStart: [
+        { hooks: [{ type: "command", command: shimPath, timeout: 5 }] },
+        { hooks: [{ type: "command", command: "/opt/operator-hook", timeout: 9 }] },
+      ],
+    },
+  }, null, 2));
+  writeFileSync(shimPath, "#!/usr/bin/env node\n");
+
+  /*
+    The real home must be untouched. A composed server reaching for `homedir()`
+    instead of its configured home would rewrite the developer's own Codex
+    configuration every time this suite runs — which is exactly what happened
+    before the sweep took its home as an argument.
+  */
+  const realSettings = join(homedir(), ".codex", "hooks.json");
+  const realBefore = existsSync(realSettings) ? readFileSync(realSettings, "utf8") : null;
+
+  const backend = await createAgentManagerServer({
+    managedProviders: false,
+    staticDir: false,
+    discovery: false,
+    homeDirectory: home,
+    runtimeDirectory: join(root, "runtime"),
+    databasePath: join(root, "state.sqlite"),
+  });
+  try {
+    const after = readFileSync(settingsPath, "utf8");
+    assert.doesNotMatch(after, /agent-manager/u, "our own hook entries are removed");
+    assert.match(after, /operator-hook/u, "the operator's own hook survives");
+    assert.equal(existsSync(shimPath), false, "the generated shim is removed");
+    assert.equal(
+      existsSync(realSettings) ? readFileSync(realSettings, "utf8") : null,
+      realBefore,
+      "the real home is never touched by a configured-home sweep",
+    );
+  } finally {
+    await backend.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

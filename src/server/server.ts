@@ -36,11 +36,6 @@ import {
   type CreatedWorktree,
 } from "../core/worktree-admin.ts";
 import {
-  CodexHookBridge,
-} from "../providers/codex/codex-hook-bridge.ts";
-import type { CodexHookAuthorizationRecord } from "../providers/codex/codex-hook-auth.ts";
-import { registerCodexHookRoute } from "../providers/codex/codex-hook-route.ts";
-import {
   ClaudeHookBridge,
   ClaudeHookSourceArbiter,
   registerClaudeHookRoute,
@@ -277,7 +272,6 @@ const IMMUTABLE = "public, max-age=31536000, immutable";
 const SETTINGS_OPTIONS_TIMEOUT_MS = 3_000;
 const SESSION_FACTS_TIMEOUT_MS = 3_000;
 const MANAGED_SESSION_RECOVERY_TIMEOUT_MS = 30_000;
-const CODEX_HOOK_FRESHNESS_MS = 30_000;
 const CONTENT_SECURITY_POLICY = [
   "default-src 'self'",
   "base-uri 'none'",
@@ -348,7 +342,6 @@ export interface AgentManagerServerOptions {
   /** Test/embedder seam; production authorization records load from ManagerDatabase. */
   claudeHookAuthorizationRecords?: readonly HookAuthorizationRecord[];
   /** Test/embedder seam; production authorization records load from ManagerDatabase. */
-  codexHookAuthorizationRecords?: readonly CodexHookAuthorizationRecord[];
   database?: ManagerDatabase;
   adapters?: ProviderControlAdapters;
   /** Ensure a provider runtime is live before a user-forced recovery series. */
@@ -396,13 +389,11 @@ export interface AgentManagerServerOptions {
   /** Pinned Node executable written into the Codex hook shim. */
   nodeExecutable?: string;
   /** Read-only live Codex hooks/list trust and enable probe. */
-  codexHookTrustStatus?: SetupHookManagerOptions["codexTrustStatus"];
   /** Test seam for bounded browser-confirmed hook preview expiry. */
   setupHookNow?: () => Date;
   /** Test seam; production browser hook previews expire after five minutes. */
   setupHookPreviewTtlMs?: number;
   /** Test/embedder seam; production hook authority evidence expires after 30 seconds. */
-  codexHookFreshnessMs?: number;
   /** Test seam for identity-checked local CLI takeover. */
   cliTakeoverInspector?: LocalCliProcessInspector;
   /** Exact private Codex App Server socket whose native clients share manager ownership. */
@@ -1485,136 +1476,8 @@ export async function createAgentManagerServer(
       message: "A Claude hook event could not be projected faithfully.",
     }),
   });
-  const codexHookLastSeenAt = new Map<string, number>();
-  const codexHookBases = new Map<string, SessionRecord>();
-  const codexHookExpiryTimers = new Map<string, NodeJS.Timeout>();
-  const codexHookFreshnessMs = Math.max(
-    1,
-    options.codexHookFreshnessMs ?? CODEX_HOOK_FRESHNESS_MS,
-  );
-  const codexHookSession = (providerSessionId: string): string =>
-    sessionRecordId("local", "codex", providerSessionId);
-  const hasRecentCodexHookEvidence = (sessionId: string, now = Date.now()): boolean => {
-    const lastSeenAt = codexHookLastSeenAt.get(sessionId);
-    return lastSeenAt !== undefined
-      && lastSeenAt <= now
-      && now - lastSeenAt <= codexHookFreshnessMs;
-  };
-  const codexHookCapabilities = (
-    session: SessionRecord,
-  ): SessionRecord["control"]["capabilities"] => session.control.capabilities.filter(
-    (capability) => capability === "preview"
-      || capability === "attach"
-      || capability === "resume"
-      || capability === "open-editor",
-  );
-  const decorateCodexHookSession = (session: SessionRecord): SessionRecord => {
-    if (
-      session.provider !== "codex"
-      || session.hostId !== "local"
-      || session.control.authority === "manager"
-      || !hasRecentCodexHookEvidence(session.id)
-    ) return session;
-    const capabilities = codexHookCapabilities(session);
-    return {
-      ...session,
-      control: {
-        ...session.control,
-        plane: "codex-hook-bridge",
-        authority: "foreign",
-        capabilities,
-        withheld: session.control.withheld.filter((withheld) =>
-          capabilities.includes(withheld.capability)
-        ),
-      },
-    };
-  };
-  const rememberCodexHookBase = (session: SessionRecord): SessionRecord => {
-    if (
-      session.provider !== "codex"
-      || session.hostId !== "local"
-      || session.control.authority === "manager"
-    ) return session;
-    if (session.control.plane !== "codex-hook-bridge") {
-      codexHookBases.set(session.id, structuredClone(session));
-    }
-    return decorateCodexHookSession(codexHookBases.get(session.id) ?? session);
-  };
-  const refreshCodexHookSession = (sessionId: string): void => {
-    const current = state.get(sessionId);
-    if (!current || current.control.authority === "manager") return;
-    const base = codexHookBases.get(sessionId);
-    if (!base) return;
-    state.upsert(withLocalEditorCapability(
-      cliTakeover.decorate(decorateCodexHookSession(base)),
-      editorLauncher !== null,
-    ));
-  };
-  const scheduleCodexHookExpiry = (sessionId: string, seenAt: number): void => {
-    const previous = codexHookExpiryTimers.get(sessionId);
-    if (previous) clearTimeout(previous);
-    const timer = setTimeout(() => {
-      codexHookExpiryTimers.delete(sessionId);
-      if (codexHookLastSeenAt.get(sessionId) !== seenAt) return;
-      codexHookLastSeenAt.delete(sessionId);
-      refreshCodexHookSession(sessionId);
-    }, codexHookFreshnessMs + 1);
-    timer.unref();
-    codexHookExpiryTimers.set(sessionId, timer);
-  };
-  const codexHookAuthorizationRecords = (): CodexHookAuthorizationRecord[] => {
-    const records = new Map<string, CodexHookAuthorizationRecord>();
-    for (const record of [
-      ...(options.codexHookAuthorizationRecords ?? []),
-      ...database.listCodexHookInstallRecords(),
-    ]) {
-      records.set(record.id, {
-        id: record.id,
-        provider: "codex",
-        tokenDigest: record.tokenDigest,
-        createdAt: record.createdAt,
-        settingsPath: record.settingsPath,
-        shimPath: record.shimPath,
-      });
-    }
-    return [...records.values()];
-  };
-  const codexHookBridge = new CodexHookBridge({
-    authorizationRecords: codexHookAuthorizationRecords(),
-    onActivity: (providerSessionId, mutation) => {
-      const sessionId = codexHookSession(providerSessionId);
-      if (state.get(sessionId)?.control.authority === "manager") return;
-      activityHub.ingest(sessionId, "codex", mutation);
-    },
-    onHookSeen: (event) => {
-      const sessionId = codexHookSession(event.providerSessionId);
-      if (state.get(sessionId)?.control.authority !== "manager") {
-        const receivedAt = Date.parse(event.receivedAt);
-        const at = Number.isFinite(receivedAt) ? receivedAt : Date.now();
-        codexHookLastSeenAt.set(sessionId, at);
-        refreshCodexHookSession(sessionId);
-        scheduleCodexHookExpiry(sessionId, at);
-      }
-      try {
-        database.markCodexHookSeen(event.installId, event.receivedAt);
-      } catch {
-        state.addDiagnostic({
-          provider: "codex",
-          level: "warning",
-          message: "Codex hook activity is live, but its liveness receipt could not be persisted.",
-        });
-      }
-      discovery?.scan();
-    },
-    onError: () => state.addDiagnostic({
-      provider: "codex",
-      level: "warning",
-      message: "A Codex hook event could not be projected faithfully.",
-    }),
-  });
   const reloadHookAuthorizations = (): void => {
     claudeHookBridge.replaceAuthorizationRecords(hookAuthorizationRecords());
-    codexHookBridge.replaceAuthorizationRecords(codexHookAuthorizationRecords());
   };
   const setupHooks = new SetupHookManager({
     database,
@@ -1626,9 +1489,6 @@ export async function createAgentManagerServer(
     ...(options.setupHookPreviewTtlMs === undefined
       ? {}
       : { previewTtlMs: options.setupHookPreviewTtlMs }),
-    ...(options.codexHookTrustStatus
-      ? { codexTrustStatus: options.codexHookTrustStatus }
-      : {}),
   });
   const auth = new AuthManager({
     allowedHosts,
@@ -1806,7 +1666,6 @@ export async function createAgentManagerServer(
     const external = sessions
       .filter((session) => !retainedIds.has(session.id))
       .map(rememberClaudeHookBase)
-      .map(rememberCodexHookBase)
       .map((session) => cliTakeover.decorate(session))
       .map((session) => withLocalEditorCapability(session, editorLauncher !== null));
     state.replace([
@@ -1824,8 +1683,7 @@ export async function createAgentManagerServer(
     state.replace(
       (options.initialSessions ?? state.list())
         .map(rememberClaudeHookBase)
-        .map(rememberCodexHookBase)
-        .map((session) => cliTakeover.decorate(session))
+          .map((session) => cliTakeover.decorate(session))
         .map((session) => withLocalEditorCapability(session, editorLauncher !== null)),
       [],
     );
@@ -2169,7 +2027,6 @@ export async function createAgentManagerServer(
   });
 
   registerClaudeHookRoute(app, claudeHookBridge);
-  registerCodexHookRoute(app, codexHookBridge);
 
   app.addHook("onSend", async (request, reply, payload) => {
     const rawContentType = reply.getHeader("content-type");
@@ -4360,8 +4217,6 @@ export async function createAgentManagerServer(
       claudeHookBridge.shutdown();
       setupHooks.clear();
       const takeoverShutdown = cliTakeover.dispose();
-      for (const timer of codexHookExpiryTimers.values()) clearTimeout(timer);
-      codexHookExpiryTimers.clear();
       for (const handoff of nativeHandoffs.values()) {
         clearTimeout(handoff.timer);
         handoff.preparationController?.abort(new Error("server shutdown"));

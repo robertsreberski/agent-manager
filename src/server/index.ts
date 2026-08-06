@@ -11,11 +11,11 @@ import { ClaudeHookSourceArbiter } from "../providers/hooks/index.ts";
 import {
   CodexAppServerSupervisor,
   CodexProviderBridge,
-  readCodexHookStatus,
 } from "../providers/codex/index.ts";
 import type { Diagnostic } from "../core/types.ts";
 import type { WorkerPort } from "../discovery/index.ts";
 import { ensurePrivateRuntimeDirectory, type AgentManagerPaths } from "../ops/config.ts";
+import { sweepRetiredCodexHooks } from "../ops/codex-hooks-cleanup.ts";
 import type { ProviderControlAdapters } from "./contracts.ts";
 import { ManagerDatabase } from "./persistence.ts";
 import { LocalPlanFileReader } from "./plan-file.ts";
@@ -96,6 +96,52 @@ function boundedShutdown<T>(promise: Promise<T>, timeoutMs: number, label: strin
       },
     );
   });
+}
+
+/**
+ * Remove what the retired Codex command-hook plane wrote into the operator's
+ * Codex configuration, once, at startup.
+ *
+ * Draining the durable records is what makes project-scoped installs reachable:
+ * nothing else names those files. The user-scope path is swept regardless, so
+ * an install whose database was reset is still cleaned up.
+ *
+ * Every failure here is reported and then tolerated. A hook this misses is
+ * inert — its shim posts to a route this build no longer serves and discards
+ * the reply — so none of it is worth refusing to start over.
+ */
+async function sweepRetiredCodexHookInstalls(
+  database: ManagerDatabase,
+  diagnostics: Diagnostic[],
+  /*
+    The configured home, never `homedir()` directly. This function edits files
+    the operator owns, so a test that composes a server against a temporary home
+    must have its sweep land there — reaching for the real home instead would
+    rewrite the developer's own Codex configuration from a test run.
+  */
+  homeDirectory: string,
+): Promise<void> {
+  try {
+    const recorded = database.takeRetiredCodexHookInstalls();
+    const reports = await sweepRetiredCodexHooks({ homeDirectory, recorded });
+    // A successful removal is silent. `Diagnostic` carries only `warning` and
+    // `error`, and housekeeping that worked is neither; only a leftover the
+    // operator now has to remove by hand is worth their attention.
+    for (const report of reports) {
+      if (!report.error) continue;
+      diagnostics.push({
+        provider: "codex",
+        level: "warning",
+        message: `Could not clean retired Agent Manager hooks from ${report.settingsPath}: ${report.error}. Remove the agent-manager entries by hand if Codex still runs them.`,
+      });
+    }
+  } catch (error) {
+    diagnostics.push({
+      provider: "codex",
+      level: "warning",
+      message: `Retired Codex hook cleanup did not run: ${error instanceof Error ? error.message : String(error)}`,
+    });
+  }
 }
 
 function runtimeValidationPaths(
@@ -205,7 +251,17 @@ export async function createAgentManagerServer(
   const planFileReader = serverOptions.planFileReader ?? new LocalPlanFileReader({ runtimeDirectory });
   const transcriptReader = serverOptions.transcriptReader ?? new LocalSessionTranscriptReader();
   const diagnostics: Diagnostic[] = [...(serverOptions.initialDiagnostics ?? [])];
-  let codexHookTrustStatus = serverOptions.codexHookTrustStatus;
+  /*
+    The Codex command-hook plane is retired: it could never gate anything, and
+    the App Server already reports exact events for managed threads. Sweep what
+    it wrote out of the operator's Codex config once, here, while the durable
+    records that name the project-scoped files still exist.
+
+    Best-effort by construction. A hook we fail to remove is inert — its shim
+    posts to an endpoint this build no longer serves and discards the reply —
+    so nothing about it justifies refusing to start.
+  */
+  await sweepRetiredCodexHookInstalls(database, diagnostics, serverOptions.homeDirectory ?? homedir());
   let backendForRecovery: AgentManagerBackend | null = null;
   let activeCodexBridge: CodexProviderBridge | null = null;
   let retiredCodexBridge: CodexProviderBridge | null = null;
@@ -461,15 +517,6 @@ export async function createAgentManagerServer(
         message: `Managed Codex runtime could not reconnect after ${String(event.attempts)} attempts: ${event.lastError}`,
       });
     });
-    codexHookTrustStatus ??= (settingsPath, expectedCommand) => {
-      const activeAdapter = codexSupervisor?.adapter;
-      if (!activeAdapter) throw new Error("Managed Codex runtime is reconnecting");
-      return readCodexHookStatus(
-        activeAdapter.rpc,
-        [dirname(dirname(settingsPath))],
-        expectedCommand,
-      );
-    };
     try {
       const managedAdapter = await codexSupervisor.start();
       publishCodexBridge(managedAdapter);
@@ -528,7 +575,6 @@ export async function createAgentManagerServer(
         if (activeCodexBridge && adapters.codex === activeCodexBridge) return;
         publishCodexBridge(managedAdapter);
       },
-      ...(codexHookTrustStatus ? { codexHookTrustStatus } : {}),
       onShutdown: async () => {
         const errors: unknown[] = [];
         try {

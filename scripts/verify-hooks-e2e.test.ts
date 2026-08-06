@@ -11,10 +11,8 @@ import { ManagerDatabase } from "../src/server/persistence.ts";
 import { createAgentManagerServer } from "../src/server/server.ts";
 import { observeOnlyControl, sessionRecordId } from "../src/shared/session.ts";
 import {
-  CODEX_HOOK_TRUST_EXPECT_SCRIPT,
   claudeCliArguments,
   codexCliArguments,
-  codexHookTrustArguments,
   copyRegularCredential,
   createIsolatedWorkspace,
   exerciseClaudeAllowAndDeny,
@@ -143,23 +141,6 @@ test("provider argv is noninteractive, disposable, and does not select remote/ba
   assert.equal(claude.includes("dontAsk"), false);
   assert.equal(claude.includes("--background"), false);
   assert.equal(claude.includes("--remote-control"), false);
-
-  const trust = codexHookTrustArguments(
-    "/tmp/disposable-root/trust.exp",
-    "/trusted/bin/codex",
-    "/tmp/disposable-project",
-  );
-  assert.deepEqual(trust, [
-    "-f",
-    "/tmp/disposable-root/trust.exp",
-    "/trusted/bin/codex",
-    "/tmp/disposable-project",
-  ]);
-  assert.match(CODEX_HOOK_TRUST_EXPECT_SCRIPT, /Hooks\.\*need\.\*review/u);
-  assert.match(CODEX_HOOK_TRUST_EXPECT_SCRIPT, /send -- "2\\r"/u);
-  assert.match(CODEX_HOOK_TRUST_EXPECT_SCRIPT, /spawn_out\(slave,name\)/u);
-  assert.match(CODEX_HOOK_TRUST_EXPECT_SCRIPT, /OpenAI\.\*Codex/u);
-  assert.doesNotMatch(CODEX_HOOK_TRUST_EXPECT_SCRIPT, /dangerously-bypass-hook-trust/u);
 });
 
 test("provider output parsers require exact disposable identity/auth evidence", () => {

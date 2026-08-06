@@ -16,12 +16,6 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { inspectCodexHookCommand } from "../src/ops/codex-hooks-config.ts";
-import {
-  applyCodexHookPlan,
-  previewCodexHookInstall,
-  readCodexHookSource,
-} from "../src/ops/codex-hooks.ts";
 import {
   applyClaudeHookSettingsPlan,
   inspectClaudeHookInstall,
@@ -30,9 +24,7 @@ import {
   resolveClaudeHookSettingsPath,
 } from "../src/ops/hooks.ts";
 import { canonicalExecutable } from "../src/ops/executables.ts";
-import { generateCodexHookToken } from "../src/providers/codex/codex-hook-auth.ts";
 import { parseCodexVersion } from "../src/providers/codex/version.ts";
-import { probeCodexHookStatus } from "../src/providers/codex/codex-hook.ts";
 import { CLAUDE_CODE_VERSION } from "../src/providers/claude/types.ts";
 import { generateHookBearerToken } from "../src/providers/hooks/auth.ts";
 import type { SessionRecord } from "../src/core/types.ts";
@@ -62,85 +54,6 @@ const CLAUDE_PROMPT = [
   `The second request will be denied. After it is denied, reply with exactly ${CLAUDE_MARKER}.`,
 ].join(" ");
 
-export const CODEX_HOOK_TRUST_EXPECT_SCRIPT = String.raw`
-set timeout 45
-log_user 0
-set executable [lindex $argv 0]
-set project [lindex $argv 1]
-if {$executable eq "" || $project eq ""} {
-  puts stderr "codex hook trust interface arguments are missing"
-  exit 64
-}
-spawn -noecho $executable --no-alt-screen --disable apps --disable plugins -C $project
-stty rows 40 columns 120 < $spawn_out(slave,name)
-set stage "startup"
-expect {
-  -re {\x1b\[6n} {
-    send -- "\033\[1;1R"
-    exp_continue
-  }
-  -re {\x1b\]10;\?\x1b\\} {
-    send -- "\033\]10;rgb:ffff/ffff/ffff\007"
-    exp_continue
-  }
-  -re {\x1b\]11;\?\x1b\\} {
-    send -- "\033\]11;rgb:0000/0000/0000\007"
-    exp_continue
-  }
-  -re {\x1b\[\?u} {
-    send -- "\033\[?0u"
-    exp_continue
-  }
-  -re {\x1b\[c} {
-    send -- "\033\[?1;2c"
-    exp_continue
-  }
-  -re {Do.*you.*trust.*contents.*directory\?} {
-    set stage "workspace-trust"
-    send -- "\r"
-    exp_continue
-  }
-  -re {Hooks.*need.*review} {
-    set stage "hook-review"
-    send -- "2\r"
-    exp_continue
-  }
-  -re {OpenAI.*Codex} {
-    set stage "main-screen"
-    after 250
-    send -- "\003"
-  }
-  timeout {
-    puts stderr "codex hook trust interface timed out at $stage"
-    exit 124
-  }
-  eof {
-    puts stderr "codex hook trust interface exited before completion at $stage"
-    exit 70
-  }
-}
-set timeout 10
-expect {
-  eof {}
-  timeout {
-    send -- "\003"
-    expect {
-      eof {}
-      timeout {
-        puts stderr "codex hook trust interface did not stop"
-        exit 124
-      }
-    }
-  }
-}
-set result [wait]
-set exitCode [lindex $result 3]
-if {$exitCode != 0} {
-  puts stderr "codex hook trust interface exited $exitCode"
-  exit $exitCode
-}
-puts "codex-hook-trust-complete"
-`;
 
 export type HookE2eProvider = Provider | "all";
 export type HookE2eStatus = "passed" | "skipped" | "failed";
@@ -281,13 +194,6 @@ export function claudeCliArguments(input: {
   ];
 }
 
-export function codexHookTrustArguments(
-  scriptPath: string,
-  executable: string,
-  project: string,
-): string[] {
-  return ["-f", scriptPath, executable, project];
-}
 
 export function parseCodexThreadId(stdout: string): string | null {
   for (const line of stdout.split(/\r?\n/u)) {
@@ -1011,157 +917,6 @@ async function createBackend(input: {
   return backend;
 }
 
-async function runCodexGate(baseEnvironment: NodeJS.ProcessEnv): Promise<HookE2eResult> {
-  let executable: string;
-  try {
-    executable = executableFor("codex", baseEnvironment);
-  } catch (error) {
-    return skipped("codex", "Codex CLI is unavailable", [error instanceof Error ? error.message : String(error)]);
-  }
-  const workspace = await createIsolatedWorkspace();
-  let backend: AgentManagerBackend | null = null;
-  let database: ManagerDatabase | null = null;
-  try {
-    const environment = isolatedEnvironment(workspace, "codex", baseEnvironment);
-    const versionOutput = await runCommand(executable, ["--version"], {
-      cwd: workspace.project,
-      env: environment,
-      timeoutMs: AUTH_TIMEOUT_MS,
-      maxOutputBytes: 64 * 1_024,
-    });
-    const version = parseCodexVersion(`${versionOutput.stdout}\n${versionOutput.stderr}`);
-    if (versionOutput.exitCode !== 0 || version === null) {
-      throw commandFailure("Codex version probe", versionOutput, workspace.root);
-    }
-    if (!version.startsWith("0.146.")) {
-      throw new Error(`Codex ${version} is outside the pinned 0.146.x hook contract`);
-    }
-    const authentication = await prepareCodexAuthentication(
-      executable,
-      workspace,
-      environment,
-      baseEnvironment,
-    );
-    if (!authentication.ready) {
-      return skipped("codex", "Codex authentication cannot be exercised in an isolated home", [
-        `CLI: ${version}`,
-        authentication.evidence,
-      ]);
-    }
-
-    const port = await loopbackPort();
-    const origin = `http://127.0.0.1:${String(port)}`;
-    const endpoint = `${origin}/api/v1/hooks/codex`;
-    const source = await readCodexHookSource({ scope: "user", homeDirectory: workspace.home });
-    const plan = previewCodexHookInstall({
-      source,
-      endpoint,
-      bearerToken: generateCodexHookToken(),
-      installId: `e2e-${randomUUID()}`,
-      nodeExecutable: process.execPath,
-    });
-    assertDisposablePath(plan.settingsPath, workspace, "Codex settings");
-    assertDisposablePath(plan.shimPath, workspace, "Codex shim");
-    await applyCodexHookPlan(plan, { confirmed: true });
-    const [settingsText, shimInfo] = await Promise.all([
-      readFile(plan.settingsPath, "utf8"),
-      lstat(plan.shimPath),
-    ]);
-    if (inspectCodexHookCommand(settingsText, plan.record.command).state !== "current") {
-      throw new Error("Generated disposable Codex hook settings are not current");
-    }
-    if (shimInfo.isSymbolicLink() || !shimInfo.isFile() || (shimInfo.mode & 0o777) !== 0o700) {
-      throw new Error("Generated disposable Codex shim is not a mode-0700 regular file");
-    }
-
-    const awaitingTrust = await probeCodexHookStatus({
-      codexExecutable: executable,
-      cwds: [workspace.project],
-      expectedCommand: plan.record.command,
-      environment,
-    });
-    if (awaitingTrust.state !== "awaiting-trust") {
-      throw new Error(`Disposable Codex hook unexpectedly began in ${awaitingTrust.state} state`);
-    }
-    const trustScriptPath = join(workspace.root, "codex-hook-trust.exp");
-    assertDisposablePath(trustScriptPath, workspace, "Codex trust script");
-    await writeFile(trustScriptPath, CODEX_HOOK_TRUST_EXPECT_SCRIPT, { mode: 0o600 });
-    const trust = await runCommand("/usr/bin/expect", codexHookTrustArguments(
-      trustScriptPath,
-      executable,
-      workspace.project,
-    ), {
-      cwd: workspace.project,
-      env: { ...environment, TERM: "xterm-256color" },
-      timeoutMs: 60_000,
-      maxOutputBytes: 256 * 1_024,
-    });
-    if (
-      trust.exitCode !== 0
-      || trust.timedOut
-      || trust.outputLimitExceeded
-      || trust.stdout.trim() !== "codex-hook-trust-complete"
-    ) {
-      throw commandFailure("Codex disposable hook trust review", trust, workspace.root);
-    }
-    const trusted = await probeCodexHookStatus({
-      codexExecutable: executable,
-      cwds: [workspace.project],
-      expectedCommand: plan.record.command,
-      environment,
-    });
-    if (trusted.state !== "trusted") {
-      throw new Error(`Codex hooks/list reported ${trusted.state} after disposable trust review`);
-    }
-
-    database = new ManagerDatabase();
-    database.upsertCodexHookInstallRecord(plan.record);
-    backend = await createBackend({ port, origin, workspace, database });
-    const provider = await runCommand(executable, codexCliArguments(workspace.project), {
-      cwd: workspace.project,
-      env: environment,
-      timeoutMs: COMMAND_TIMEOUT_MS,
-    });
-    if (provider.exitCode !== 0 || provider.timedOut || provider.outputLimitExceeded) {
-      throw commandFailure("Codex disposable provider run", provider, workspace.root);
-    }
-    if (!provider.stdout.includes(CODEX_MARKER)) {
-      throw new Error("Codex disposable run did not return its unique completion marker");
-    }
-    const providerSessionId = parseCodexThreadId(provider.stdout);
-    if (!providerSessionId) throw new Error("Codex JSON stream did not expose thread.started identity");
-    await waitFor("Codex authenticated hook receipt", () =>
-      database?.getCodexHookInstallRecord(plan.settingsPath)?.lastSeenAt !== null
-    );
-    const receipt = database.getCodexHookInstallRecord(plan.settingsPath)?.lastSeenAt;
-    if (!receipt) throw new Error("Codex backend did not persist an authenticated hook receipt");
-    const projection = verifyProjectedSession(
-      backend,
-      "codex",
-      providerSessionId,
-      CODEX_PROMPT,
-      workspace.project,
-    );
-    return {
-      provider: "codex",
-      status: "passed",
-      summary: "real Codex CLI invoked the generated shim and projected authenticated activity",
-      evidence: [
-        `CLI: ${version} (${executable})`,
-        authentication.evidence,
-        "isolation: temporary HOME/CODEX_HOME/XDG/TMP/project; disposable trust review plus local ephemeral provider run; no remote daemon",
-        "hook: generated temporary settings plus a mode-0700 shim; real hook review changed hooks/list from awaiting-trust to trusted; no trust bypass",
-        `backend: authenticated receipt ${receipt}; session ${providerSessionId}; ${String(projection.itemCount)} items / sequence ${String(projection.sequence)}`,
-        "cleanup: only the generated temporary root is removed",
-      ],
-    };
-  } finally {
-    if (backend) await backend.close();
-    else database?.close();
-    await removeIsolatedWorkspace(workspace);
-  }
-}
-
 async function runClaudeGate(baseEnvironment: NodeJS.ProcessEnv): Promise<HookE2eResult> {
   let executable: string;
   try {
@@ -1311,9 +1066,14 @@ export async function runHookE2eProvider(
   baseEnvironment: NodeJS.ProcessEnv = process.env,
 ): Promise<HookE2eResult> {
   try {
-    return provider === "codex"
-      ? await runCodexGate(baseEnvironment)
-      : await runClaudeGate(baseEnvironment);
+    if (provider === "codex") {
+      // The Codex command-hook plane is retired; the App Server carries exact
+      // events for managed threads and there is nothing left to gate.
+      return skipped("codex", "Codex hooks are retired", [
+        "Agent Manager reads Codex sessions through the App Server",
+      ]);
+    }
+    return await runClaudeGate(baseEnvironment);
   } catch (error) {
     return {
       provider,

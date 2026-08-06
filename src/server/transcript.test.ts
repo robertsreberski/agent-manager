@@ -13,8 +13,7 @@ import test, { afterEach } from "node:test";
 import { ActivityHub } from "../activity/hub.ts";
 import type { SessionView } from "../core/types.ts";
 import { projectCodexNotification } from "../providers/codex/activity-projector.ts";
-import { projectCodexHook } from "../providers/codex/codex-hook-projector.ts";
-import { parseCodexHookInput } from "../providers/codex/codex-hook.ts";
+import { codexMessageCorrelationId } from "../providers/codex/activity-projector.ts";
 import { SelectedTranscriptActivityObserver } from "./activity-observer.ts";
 import {
   LocalSessionTranscriptReader,
@@ -207,7 +206,7 @@ MEMORY.md:10-12|note=[workspace decision]
   });
 });
 
-test("Codex derives the same turn-scoped message identity as hooks without merging repeated prompts", () => {
+test("Codex derives the same turn-scoped message identity as the App Server without merging repeated prompts", () => {
   const firstTurn = "turn-11111111-1111-4111-8111-111111111111";
   const secondTurn = "turn-22222222-2222-4222-8222-222222222222";
   const fixture = codexFixture([
@@ -268,37 +267,29 @@ test("Codex derives the same turn-scoped message identity as hooks without mergi
   const secondFinal = messages.find((item) => item.text === "Second final");
   assert.ok(firstUser && secondUser && commentary && firstFinal && secondFinal);
 
-  const hookItem = (
-    event: "UserPromptSubmit" | "Stop",
+  /*
+    The transcript reader and the App Server projector reconstruct the same
+    conversation from different sources, so they must agree on message
+    identity — that agreement is what lets an exact live item replace its
+    inferred transcript twin instead of doubling it.
+  */
+  const exact = (
+    role: "user" | "assistant",
     turnId: string,
     message: string,
-  ) => {
-    const projection = projectCodexHook(parseCodexHookInput(JSON.stringify({
-      session_id: CODEX_ID,
-      transcript_path: fixture.file,
-      cwd: "/fixture",
-      hook_event_name: event,
-      model: "gpt-5.6",
-      turn_id: turnId,
-      ...(event === "UserPromptSubmit"
-        ? { prompt: message }
-        : { last_assistant_message: message }),
-    })), "2026-08-03T10:02:00.000Z").mutations[0];
-    assert.ok(projection?.type === "upsert");
-    return projection.item;
-  };
+  ): string => codexMessageCorrelationId(CODEX_ID, turnId, role, message);
 
   assert.equal(
     firstUser.correlationId,
-    hookItem("UserPromptSubmit", firstTurn, "Repeat this prompt").correlationId,
+    exact("user", firstTurn, "Repeat this prompt"),
   );
   assert.equal(
     firstFinal.correlationId,
-    hookItem("Stop", firstTurn, "First final").correlationId,
+    exact("assistant", firstTurn, "First final"),
   );
   assert.equal(
     secondFinal.correlationId,
-    hookItem("Stop", secondTurn, "Second final").correlationId,
+    exact("assistant", secondTurn, "Second final"),
   );
   assert.notEqual(
     firstUser.correlationId,

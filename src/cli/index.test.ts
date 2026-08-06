@@ -575,72 +575,8 @@ test("Claude hook CLI uses the configured loopback endpoint, explicit consent, a
   assert.match(stderr.read(), /machine-local/);
 });
 
-test("Codex hook CLI installs the observation shim with explicit consent and live reload", async () => {
-  const stdout = output();
-  const config = defaultConfig();
-  config.backend.port = 45_679;
-  let reloaded = "";
-  let received: unknown = null;
-  let nodeExecutable = "";
-  let trustProbe: [string, string] | null = null;
-  const exitCode = await runCli([
-    "hooks", "install", "--provider", "codex", "--yes",
-  ], {
-    stdout: stdout.writer,
-    loadConfig: () => config,
-    homeDirectory: "/Users/test",
-    controlSocketPath: "/private/tmp/agent-manager-test/control.sock",
-    async codexHookStatus(settingsPath, expectedCommand) {
-      trustProbe = [settingsPath, expectedCommand];
-      return {
-        state: "awaiting-trust",
-        reason: "trust the hook",
-        installedEvents: [],
-      };
-    },
-    async operateCodexHook(input, dependencies) {
-      received = input;
-      nodeExecutable = dependencies.nodeExecutable ?? "";
-      assert.equal(
-        (await dependencies.trustStatus?.("/Users/test/.codex/hooks.json", "'shim'"))?.state,
-        "awaiting-trust",
-      );
-      assert.equal(await dependencies.confirm?.({} as never), true);
-      return {
-        operation: "install",
-        outcome: "applied",
-        status: {
-          state: "awaiting-trust",
-          settingsPath: "/Users/test/.codex/hooks.json",
-          shimPath: "/Users/test/Library/Application Support/agent-manager/hooks/codex-user-hook.mjs",
-          configuration: null,
-          trust: null,
-          lastSeenAt: null,
-        },
-        plan: null,
-      };
-    },
-    async reloadHookAuthorizations(path) {
-      reloaded = path;
-      return { ok: true };
-    },
-  });
 
-  assert.equal(exitCode, 0);
-  assert.equal(nodeExecutable, process.execPath);
-  assert.deepEqual(trustProbe, ["/Users/test/.codex/hooks.json", "'shim'"]);
-  assert.deepEqual(received, {
-    operation: "install",
-    scope: "user",
-    homeDirectory: "/Users/test",
-    endpoint: "http://127.0.0.1:45679/api/v1/hooks/codex",
-  });
-  assert.equal(reloaded, "/private/tmp/agent-manager-test/control.sock");
-  assert.match(stdout.read(), /awaiting-trust/);
-  assert.match(stdout.read(), /Open \/hooks in Codex/);
-});
-
-test("hook status without a provider reports both harnesses", async () => {
+test("hook status without a provider reports the one harness that still has hooks", async () => {
   const stdout = output();
   const providers: string[] = [];
   const exitCode = await runCli(["hooks", "status"], {
@@ -659,26 +595,20 @@ test("hook status without a provider reports both harnesses", async () => {
         plan: null,
       };
     },
-    async operateCodexHook() {
-      providers.push("codex");
-      return {
-        operation: "status",
-        outcome: "inspected",
-        status: {
-          state: "absent",
-          settingsPath: "/Users/test/.codex/hooks.json",
-          shimPath: "/Users/test/Library/Application Support/agent-manager/hooks/codex-user-hook.mjs",
-          configuration: null,
-          trust: null,
-          lastSeenAt: null,
-        },
-        plan: null,
-      };
-    },
   });
 
   assert.equal(exitCode, 0);
-  assert.deepEqual(providers, ["claude", "codex"]);
+  // Codex hooks are retired, so nothing asks Codex anything.
+  assert.deepEqual(providers, ["claude"]);
   assert.match(stdout.read(), /Claude hooks \(user\): absent/);
-  assert.match(stdout.read(), /Codex hooks \(user\): absent/);
+  assert.doesNotMatch(stdout.read(), /Codex hooks/);
+});
+
+test("hooks install --provider codex reports the plane is retired", async () => {
+  const stderr = output();
+  const exitCode = await runCli(["hooks", "install", "--provider", "codex", "--yes"], {
+    stderr: stderr.writer,
+  });
+  assert.equal(exitCode, 1);
+  assert.match(stderr.read(), /Codex hooks are retired/u);
 });

@@ -5,7 +5,7 @@ import type { SelectedSessionFactsResponse } from "../../../../src/shared/sessio
 import type { CockpitSessionView } from "../../lib/cockpit-view";
 import { EmptyState, FirstRun, HookSetupStep, HostSetupStep, SessionCapabilityPanel, SessionEndedState } from "./SystemStates";
 
-function hook(provider: "claude" | "codex", overrides: Partial<SetupHookOffer> = {}): SetupHookOffer {
+function hook(provider: "claude", overrides: Partial<SetupHookOffer> = {}): SetupHookOffer {
   return {
     provider,
     state: "absent",
@@ -225,18 +225,16 @@ describe("first-run setup", () => {
     const onContinue = vi.fn();
     const onApply = vi.fn(async () => undefined);
     render(<HookSetupStep
-      hooks={{ claude: hook("claude"), codex: hook("codex") }}
+      hooks={{ claude: hook("claude") }}
       onApply={onApply}
       onContinue={onContinue}
     />);
 
-    expect(screen.getAllByText("Not installed")).toHaveLength(2);
+    expect(screen.getAllByText("Not installed")).toHaveLength(1);
     expect(screen.getByText(/Hooks add exact live activity and surface held approvals or questions/iu)).toHaveTextContent("Sending new messages still requires provider control");
     expect(screen.queryByText(/see and answer sessions/iu)).not.toBeInTheDocument();
     expect(screen.queryByText("agent-manager hooks install --provider claude --scope user")).not.toBeInTheDocument();
-    expect(screen.getAllByText(/Bearer \[REDACTED\]/u)).toHaveLength(2);
-    expect(screen.getByText(/Web-native manager control does not depend on this optional CLI observation hook/u)).toBeInTheDocument();
-    expect(screen.getByText(/browser does not bypass Codex hook trust/u)).toBeInTheDocument();
+    expect(screen.getAllByText(/Bearer \[REDACTED\]/u)).toHaveLength(1);
     fireEvent.click(screen.getByRole("button", { name: "Install claude hook" }));
     await waitFor(() => expect(onApply).toHaveBeenCalledWith("claude", "11111111-1111-4111-8111-111111111111"));
     fireEvent.click(screen.getAllByRole("button", { name: "Advanced · manual installation" })[0]!);
@@ -246,7 +244,7 @@ describe("first-run setup", () => {
   });
 
   it("names the region the settings-diff disclosure controls and collapses it", () => {
-    render(<HookSetupStep hooks={{ claude: hook("claude"), codex: hook("codex") }} standalone />);
+    render(<HookSetupStep hooks={{ claude: hook("claude") }} standalone />);
     const [disclosure] = screen.getAllByRole("button", { name: "Exact redacted settings diff" });
     if (!disclosure) throw new Error("Missing settings diff disclosure");
 
@@ -258,30 +256,28 @@ describe("first-run setup", () => {
     fireEvent.click(disclosure);
     expect(disclosure).toHaveAttribute("aria-expanded", "false");
     expect(disclosure).not.toHaveAttribute("aria-controls");
-    expect(screen.getAllByText(/Bearer \[REDACTED\]/u)).toHaveLength(1);
+    expect(screen.queryAllByText(/Bearer \[REDACTED\]/u)).toHaveLength(0);
   });
 
   it("drops the wizard framing outside first run while retaining the in-app install action", () => {
     const onApply = vi.fn(async () => undefined);
-    render(<HookSetupStep hooks={{ claude: hook("claude"), codex: hook("codex") }} onApply={onApply} standalone />);
+    render(<HookSetupStep hooks={{ claude: hook("claude") }} onApply={onApply} standalone />);
 
     expect(screen.queryByText("Optional setup · 2 of 3")).not.toBeInTheDocument();
     expect(screen.getByText("Provider hooks")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Continue without installing hooks" })).not.toBeInTheDocument();
     expect(screen.queryByText("agent-manager hooks install --provider claude --scope user")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Install claude hook" })).toBeEnabled();
-    expect(screen.getByRole("button", { name: "Install codex hook" })).toBeEnabled();
   });
 
   it("keeps apply pending locally and reports a failed provider update", async () => {
     let rejectApply!: (error: Error) => void;
     const onApply = vi.fn(() => new Promise<void>((_resolve, reject) => { rejectApply = reject; }));
     const onRefresh = vi.fn();
-    render(<HookSetupStep hooks={{ claude: hook("claude"), codex: hook("codex") }} onApply={onApply} onRefresh={onRefresh} standalone />);
+    render(<HookSetupStep hooks={{ claude: hook("claude") }} onApply={onApply} onRefresh={onRefresh} standalone />);
 
     fireEvent.click(screen.getByRole("button", { name: "Install claude hook" }));
     expect(await screen.findByRole("button", { name: "Installing…" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Install codex hook" })).toBeDisabled();
     rejectApply(new Error("That preview expired. Refresh setup and try again."));
 
     expect(await screen.findByRole("alert")).toHaveTextContent("That preview expired. Refresh setup and try again.");
@@ -334,14 +330,12 @@ describe("first-run setup", () => {
     render(<HookSetupStep
       hooks={{
         claude: hook("claude", { state: "active", changed: false, diff: "", previewId: null, expiresAt: null }),
-        codex: hook("codex", { state: "awaiting-trust", changed: false, diff: "", previewId: null, expiresAt: null }),
       }}
       onContinue={vi.fn()}
     />);
     expect(screen.getByText("Active")).toBeInTheDocument();
-    expect(screen.getByText("Installed · awaiting Codex trust")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Install/u })).not.toBeInTheDocument();
-    expect(screen.getAllByText("No settings change needed")).toHaveLength(2);
+    expect(screen.getAllByText("No settings change needed")).toHaveLength(1);
   });
 
   it("browses through bounded server folder suggestions and chooses a real returned path", async () => {

@@ -252,7 +252,6 @@ export interface WorkspaceIdentity {
 
 export type ControlPlane =
   | "codex-private"
-  | "codex-hook-bridge"
   | "claude-sdk"
   | "claude-hook-bridge"
   | "tmux-attach"
