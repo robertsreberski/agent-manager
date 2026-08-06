@@ -9,6 +9,13 @@ import {
   type WorkspaceIdentity,
 } from "../../core/worktree.ts";
 import {
+  allCapabilities,
+  deferredToLaterLayers,
+  resolveControlCapabilities,
+  type CapabilityRuling,
+  type CapabilityRulings,
+} from "../shared/capabilities.ts";
+import {
   DEFAULT_SANDBOX_POLICY,
   emptyChildSummary,
   providerControlCoordination,
@@ -112,26 +119,6 @@ const MAX_RECOVERY_RECORDS = 100;
 const RECOVERY_CONCURRENCY = 4;
 const WORKSPACE_IDENTITY_BUDGET_MS = 2_500;
 const ADOPTION_CONFIRMATION_TIMEOUT_MS = 5_000;
-const UNLOADED_CAPABILITIES: SessionView["control"]["withheld"][number]["capability"][] = [
-  "queue",
-  "steer",
-  "interrupt",
-  "respond",
-  "set-profile",
-  "set-sandbox",
-  "set-model",
-  "set-effort",
-  "remove-queued",
-  "end",
-  "archive",
-  "delete",
-  "attach",
-  "resume",
-];
-const QUARANTINED_CAPABILITIES: SessionView["control"]["withheld"][number]["capability"][] = [
-  ...UNLOADED_CAPABILITIES,
-  "retry-control",
-];
 const QUARANTINE_REASON =
   "Codex rollback is not confirmed; all controls remain quarantined";
 const STALE_REQUEST_FAILURE: ActionDispatchResult = {
@@ -300,32 +287,55 @@ function sessionStatus(state: CodexThreadState): SessionView["status"] {
 }
 
 
-function mappedCapabilities(
+/**
+ * The App Server did not advertise this control at all, which is a different
+ * fact from a control that exists but is momentarily unavailable.
+ */
+const UNADVERTISED = "This Codex App Server does not advertise this control";
+
+/**
+ * One ruling per control for a managed Codex thread. The published capability
+ * and withheld lists are both derived from this, so they cannot contradict
+ * each other and no control can fall out of both unnoticed.
+ */
+function codexCapabilityRulings(
   adapter: CodexManagedAdapter,
   state: CodexThreadState,
   creationIssue: CodexManagedCreationIssue | null,
-): SessionView["control"]["capabilities"] {
+): CapabilityRulings {
   const controls = new Set(adapter.capabilities.controls);
-  const result: SessionView["control"]["capabilities"] = [];
+  const advertised = (
+    control: Parameters<typeof controls.has>[0],
+    granted: boolean,
+    reason: string,
+  ): CapabilityRuling => (controls.has(control) ? (granted ? true : reason) : UNADVERTISED);
+  const attach: CapabilityRuling = controls.has("native.attach") ? true : UNADVERTISED;
+
   if (creationIssue) {
-    // Do not permit another prompt or mode mutation until a human has inspected
-    // the provider thread. Exact pending-request responses and interruption are
-    // safe because both are bound to provider-issued IDs.
-    if (state.pendingRequests.some((request) =>
-      request.respondable && request.kind !== "elicitation"
-    ) && controls.has("request.respond")) {
-      result.push("respond");
-    }
-    if (state.activeTurnId && controls.has("turn.interrupt")) result.push("interrupt");
-    if (controls.has("native.attach")) result.push("attach", "resume");
-    return result;
+    /*
+      Do not permit another prompt or mode mutation until a human has inspected
+      the provider thread. Exact pending-request responses and interruption stay
+      available because both are bound to provider-issued IDs.
+    */
+    const quarantined = "This Codex thread needs a human to inspect it first";
+    return {
+      ...allCapabilities(quarantined),
+      ...deferredToLaterLayers(),
+      respond: advertised(
+        "request.respond",
+        state.pendingRequests.some((request) =>
+          request.respondable && request.kind !== "elicitation"
+        ),
+        quarantined,
+      ),
+      interrupt: advertised("turn.interrupt", Boolean(state.activeTurnId), quarantined),
+      attach,
+      resume: attach,
+    } as CapabilityRulings;
   }
-  if (controls.has("turn.queue")) result.push("queue");
-  if (controls.has("turn.steer")) result.push("steer");
-  if (state.activeTurnId && controls.has("turn.interrupt")) result.push("interrupt");
-  if (state.pendingRequests.some((request) => request.respondable) &&
-      controls.has("request.respond")) result.push("respond");
+
   const idle = !state.activeTurnId && state.status !== "running";
+  const busy = "Available when the Codex turn is idle";
   /*
     Profile and sandbox stay idle-only: they govern the approval policy and
     containment the running turn is already executing tool calls under, and must
@@ -337,40 +347,31 @@ function mappedCapabilities(
     override rather than refused. Hiding the control taught the cockpit that a
     session streaming its first turn had no model choice at all.
   */
-  if (idle) {
-    if (controls.has("profile.set")) result.push("set-profile");
-    if (controls.has("sandbox.set")) result.push("set-sandbox");
-  }
-  if (controls.has("model.set")) result.push("set-model");
-  if (controls.has("effort.set")) result.push("set-effort");
-  if (idle) {
-    if (controls.has("thread.archive")) result.push("archive");
-    if (controls.has("thread.delete")) result.push("delete");
-  }
-  if (state.queue.some((item) => item.status === "queued")) result.push("remove-queued");
-  if (controls.has("thread.unsubscribe")) result.push("end");
-  if (controls.has("native.attach")) result.push("attach", "resume");
-  return result;
-}
-
-function withheldCapabilities(
-  adapter: CodexManagedAdapter,
-  state: CodexThreadState,
-): SessionView["control"]["withheld"] {
-  if (state.activeTurnId || state.status === "running") {
-    // Model and effort are absent here: they are granted during a turn and
-    // applied at the next one, so they are never withheld for being busy.
-    return ["set-profile", "set-sandbox", "archive", "delete"].map(
-      (capability) => ({
-        capability: capability as SessionView["control"]["withheld"][number]["capability"],
-        reason: "Available when the Codex turn is idle",
-      }),
-    );
-  }
-  if (!adapter.capabilities.compatible && adapter.capabilities.reason) {
-    return [{ capability: "queue", reason: adapter.capabilities.reason }];
-  }
-  return [];
+  return {
+    ...deferredToLaterLayers(),
+    queue: !adapter.capabilities.compatible && adapter.capabilities.reason
+      ? adapter.capabilities.reason
+      : advertised("turn.queue", true, busy),
+    steer: advertised("turn.steer", true, busy),
+    interrupt: advertised("turn.interrupt", Boolean(state.activeTurnId), "Available while a Codex turn is running"),
+    respond: advertised(
+      "request.respond",
+      state.pendingRequests.some((request) => request.respondable),
+      "Available while Codex is waiting on an answer",
+    ),
+    "set-profile": advertised("profile.set", idle, busy),
+    "set-sandbox": advertised("sandbox.set", idle, busy),
+    "set-model": advertised("model.set", true, busy),
+    "set-effort": advertised("effort.set", true, busy),
+    "remove-queued": state.queue.some((item) => item.status === "queued")
+      ? true
+      : "Available while a message is queued",
+    attach,
+    resume: attach,
+    end: advertised("thread.unsubscribe", true, busy),
+    archive: advertised("thread.archive", idle, busy),
+    delete: advertised("thread.delete", idle, busy),
+  } as CapabilityRulings;
 }
 
 export function encodeCodexRequestId(id: JsonRpcId): string {
@@ -1461,27 +1462,32 @@ export class CodexProviderBridge implements ProviderControlAdapter {
               error: quarantine.error,
             }
           : null,
-        capabilities: controlsLoaded
-          ? mappedCapabilities(this.adapter, state, metadata.creationIssue)
-          : [],
-        withheld: quarantine
-          ? QUARANTINED_CAPABILITIES.map((capability) => ({
-              capability,
-              reason: QUARANTINE_REASON,
-            }))
-          : controlsLoaded
-          ? withheldCapabilities(this.adapter, state)
-          : UNLOADED_CAPABILITIES.map((capability) => ({
-              capability,
-              /*
-                A state, not an instruction. Every reader of `withheld` is
-                already inside the drawer, which is what acquires the thread
-                lease in the first place — telling them to "select this
-                session" named an internal lease phase as if it were something
-                left undone.
-              */
-              reason: "Loading exact Codex controls…",
-            })),
+        ...resolveControlCapabilities(
+          quarantine
+            ? {
+                ...allCapabilities(QUARANTINE_REASON),
+                ...deferredToLaterLayers(),
+                /*
+                  The one capability quarantine takes back from the layer that
+                  normally owns it. An unconfirmed rollback must not offer a
+                  retry that could re-enter the same uncertain release.
+                */
+                "retry-control": QUARANTINE_REASON,
+              } as CapabilityRulings
+            : controlsLoaded
+            ? codexCapabilityRulings(this.adapter, state, metadata.creationIssue)
+            : {
+                /*
+                  A state, not an instruction. Every reader of `withheld` is
+                  already inside the drawer, which is what acquires the thread
+                  lease in the first place — telling them to "select this
+                  session" named an internal lease phase as if it were something
+                  left undone.
+                */
+                ...allCapabilities("Loading exact Codex controls…"),
+                ...deferredToLaterLayers(),
+              } as CapabilityRulings,
+        ),
         takeover: null,
       },
       workspaceIdentity: structuredClone(this.#workspaceIdentities.get(cwd) ?? null),

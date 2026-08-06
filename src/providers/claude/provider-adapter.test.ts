@@ -1091,7 +1091,7 @@ test("ending manager control preserves the closed session and native resume path
   assert.ok(ended);
   assert.equal(ended.status, "completed");
   assert.equal(ended.control.plane, "resume-only");
-  assert.deepEqual(ended.control.capabilities, ["resume", "attach"]);
+  assert.deepEqual(ended.control.capabilities, ["attach", "resume"]);
   assert.equal(hookSourceArbiter.shouldPollTranscript("managed-claude-1"), true);
   const instruction = await adapter.getAttachInstruction(ended, context());
   assert.equal(instruction?.kind, "claude-resume");
@@ -1145,7 +1145,7 @@ test("refuses to close Claude control until the durable stopped intent commits",
   assert.equal(persistenceAttempts, 2);
   assert.deepEqual(
     adapter.getManagedSession(created.providerThreadId)?.control.capabilities,
-    ["resume", "attach"],
+    ["attach", "resume"],
   );
   await adapter.dispose();
 });
@@ -1520,7 +1520,7 @@ test("restores deliberately stopped Claude control without opening an SDK query"
   assert.equal(restored.profile.value, "plan");
   assert.equal(restored.model.value, "opus");
   assert.equal(restored.effort.value, "high");
-  assert.deepEqual(restored.control.capabilities, ["resume", "attach"]);
+  assert.deepEqual(restored.control.capabilities, ["attach", "resume"]);
 
   const instruction = await adapter.getAttachInstruction(restored, context());
   assert.equal(instruction?.kind, "claude-resume");
@@ -1601,7 +1601,7 @@ test("failed durable activation aborts only the provisional writer and preserves
   const rolledBack = adapter.getManagedSession(record.providerThreadId);
   assert.ok(rolledBack);
   assert.equal(rolledBack.status, "completed");
-  assert.deepEqual(rolledBack.control.capabilities, ["resume", "attach"]);
+  assert.deepEqual(rolledBack.control.capabilities, ["attach", "resume"]);
   assert.equal(changes.length, publishedBeforeResume);
   assert.equal(hookSourceArbiter.shouldPollTranscript(record.providerThreadId), true);
 

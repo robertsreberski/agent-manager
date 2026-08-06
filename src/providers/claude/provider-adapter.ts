@@ -39,6 +39,12 @@ import {
 } from "../hooks/claude-source.ts";
 import { CLAUDE_REASONING_EFFORTS, noSandbox } from "../../shared/session.ts";
 import {
+  deferredToLaterLayers,
+  resolveControlCapabilities,
+  type CapabilityRuling,
+  type CapabilityRulings,
+} from "../shared/capabilities.ts";
+import {
   CLAUDE_CODE_VERSION,
   type ClaudeEffortLevel,
   type ClaudeManagedSessionSnapshot,
@@ -1834,71 +1840,40 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
     const handoffReadiness = nativeHandoffReadiness(snapshot);
     const canAttach = handoffReadiness.ready;
     const canResume = !writableManagerControls && handoffReadiness.ready;
-    const capabilities: SessionView["control"]["capabilities"] = [];
-    if (writableManagerControls) {
-      capabilities.push(
-        "queue",
-        "interrupt",
-        "set-profile",
-        "set-model",
-        "set-effort",
-        "end",
-      );
-      if (snapshot.canSteer) capabilities.push("steer");
-      if (snapshot.pendingRequests.some((request) => request.kind !== "elicitation")) {
-        capabilities.push("respond");
-      }
-      if (snapshot.stagedMessages.length > 0) capabilities.push("remove-queued");
-    }
-    if (canResume) capabilities.push("resume");
-    if (canAttach) capabilities.push("attach");
-
-    const withheld: SessionView["control"]["withheld"] = [];
-    if (!writableManagerControls) {
-      const reason = snapshot.owner === "native"
-        ? "The native Claude CLI currently owns this session"
-        : "The Claude SDK query has ended; resume it before changing the session";
-      for (const capability of [
-        "queue",
-        "steer",
-        "interrupt",
-        "respond",
-        "set-profile",
-        "set-model",
-        "set-effort",
-        "remove-queued",
-        "end",
-      ] as const) {
-        withheld.push({ capability, reason });
-      }
-    } else {
-      if (!snapshot.canSteer) {
-        withheld.push({
-          capability: "steer",
-          reason: `Steering requires Claude Code ${CLAUDE_CODE_VERSION}`,
-        });
-      }
-      if (!snapshot.pendingRequests.some((request) => request.kind !== "elicitation")) {
-        withheld.push({ capability: "respond", reason: "Claude is not waiting for a respondable request" });
-      }
-      if (snapshot.stagedMessages.length === 0) {
-        withheld.push({ capability: "remove-queued", reason: "There are no staged messages" });
-      }
-    }
-    if (!canAttach) withheld.push({ capability: "attach", reason: handoffReadiness.reason });
-    if (!canResume) {
-      withheld.push({
-        capability: "resume",
-        reason: writableManagerControls
-          ? "Resume is available only after the managed Claude query ends"
-          : handoffReadiness.reason,
-      });
-    }
-    withheld.push(
-      { capability: "set-sandbox", reason: "Claude has no sandbox setting" },
-      { capability: "archive", reason: "Claude does not expose session archive" },
-      { capability: "delete", reason: "Claude does not expose session deletion" },
-    );
+    /*
+      One ruling per control, so the published capability and withheld lists are
+      derived from the same answer instead of being maintained beside each other.
+    */
+    const noWrites = snapshot.owner === "native"
+      ? "The native Claude CLI currently owns this session"
+      : "The Claude SDK query has ended; resume it before changing the session";
+    const writable = (granted: boolean, reason: string): CapabilityRuling =>
+      writableManagerControls ? (granted ? true : reason) : noWrites;
+    const rulings = {
+      ...deferredToLaterLayers(),
+      queue: writable(true, noWrites),
+      steer: writable(snapshot.canSteer, `Steering requires Claude Code ${CLAUDE_CODE_VERSION}`),
+      interrupt: writable(true, noWrites),
+      respond: writable(
+        snapshot.pendingRequests.some((request) => request.kind !== "elicitation"),
+        "Claude is not waiting for a respondable request",
+      ),
+      "set-profile": writable(true, noWrites),
+      "set-model": writable(true, noWrites),
+      "set-effort": writable(true, noWrites),
+      "remove-queued": writable(snapshot.stagedMessages.length > 0, "There are no staged messages"),
+      end: writable(true, noWrites),
+      attach: canAttach ? true : handoffReadiness.reason,
+      resume: canResume
+        ? true
+        : writableManagerControls
+        ? "Resume is available only after the managed Claude query ends"
+        : handoffReadiness.reason,
+      // Exact facts about the harness, not conditions that could later clear.
+      "set-sandbox": "Claude has no sandbox setting",
+      archive: "Claude does not expose session archive",
+      delete: "Claude does not expose session deletion",
+    } as CapabilityRulings;
 
     return {
       id,
@@ -1960,8 +1935,7 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
         authority: managerControls ? "manager" : "foreign",
         coordination: providerControlCoordination("claude"),
         recovery: null,
-        capabilities,
-        withheld,
+        ...resolveControlCapabilities(rulings),
         takeover: null,
       },
       workspaceIdentity: structuredClone(

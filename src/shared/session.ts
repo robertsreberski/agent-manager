@@ -279,6 +279,41 @@ export type ControlCapability =
   | "retry-control"
   | "open-editor";
 
+/**
+ * Every control capability, in the order a session view publishes them.
+ *
+ * The union alone could not stop a new member being silently omitted from the
+ * several hand-maintained lists that enumerate capabilities; the two assertions
+ * below make adding one a compile error until every list rules on it.
+ */
+export const CONTROL_CAPABILITIES = [
+  "queue",
+  "steer",
+  "interrupt",
+  "respond",
+  "set-profile",
+  "set-sandbox",
+  "set-model",
+  "set-effort",
+  "remove-queued",
+  "preview",
+  "attach",
+  "resume",
+  "end",
+  "archive",
+  "delete",
+  "take-control",
+  "cancel-take-control",
+  "retry-control",
+  "open-editor",
+] as const satisfies readonly ControlCapability[];
+
+/** Fails to compile if a `ControlCapability` is missing from the list above. */
+type ControlCapabilitiesAreTotal =
+  Exclude<ControlCapability, typeof CONTROL_CAPABILITIES[number]> extends never ? true : never;
+const controlCapabilitiesAreTotal: ControlCapabilitiesAreTotal = true;
+void controlCapabilitiesAreTotal;
+
 export type ControlCoordinationMode = "shared" | "exclusive" | "observe-only";
 export type NativeAttachCoordination = "join" | "handoff" | "none";
 export type ResponseResolution = "first-response-wins" | "single-controller";
