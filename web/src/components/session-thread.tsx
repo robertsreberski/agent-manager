@@ -19,12 +19,14 @@ import { SessionCapabilityPanel, SessionEndedState } from "./system";
 import {
   ActivityRetentionBoundary,
   activityToThreadMessages,
+  currentContext,
   currentQueue,
   currentTodo,
   exactCurrentActivityRequestIds,
   exactPlanApprovalRequestIds,
   remoteHostLabel,
   renderActivityData,
+  supersededAttentionIds,
   todoView,
   type ActivityDataControls,
 } from "./session-activity";
@@ -354,6 +356,7 @@ export function SessionThread({
   // cannot offer them — truncated or superseded — keeps its approval card, so
   // the operator is never left without a way to answer.
   const planOwnedRequestIds = useMemo(() => new Set(planApprovalRequestIds.values()), [planApprovalRequestIds]);
+  const supersededIds = useMemo(() => supersededAttentionIds(activity.items), [activity.items]);
   useEffect(() => {
     let cancelled = false;
     setFacts(null);
@@ -388,12 +391,20 @@ export function SessionThread({
       if (attachRequestRef.current === request) setLoadingAttach(false);
     }
   }
+  const canRespond = session.control.capabilities.includes("respond");
   const controls: ActivityDataControls = {
     attention: {
       exactRequestIds,
       planOwnedRequestIds,
+      supersededIds,
       mutationsReady,
-      canRespond: session.control.capabilities.includes("respond"),
+      canRespond,
+      // Only the harness's own words. A questionnaire this session cannot
+      // answer has to say so, and inventing the reason is what sent operators
+      // looking for a setting that was never missing.
+      respondUnavailableReason: canRespond
+        ? null
+        : session.control.withheld.find((item) => item.capability === "respond")?.reason ?? null,
       busy,
       workspaceRoot: session.workspaceIdentity?.worktreePath ?? session.cwd,
       remoteHost: remoteHostLabel(session, remote),
@@ -554,6 +565,8 @@ export function SessionThreadComposer({
   }, [session.id]);
   const queued = currentQueue(activity);
   const todo = currentTodo(activity);
+  const pinnedTodo = todo ? todoView(todo, session.todoProgress) : null;
+  const context = currentContext(activity);
   const canQueue = session.control.capabilities.includes("queue");
   const canSteer = session.control.capabilities.includes("steer");
   const canStop = session.control.capabilities.includes("interrupt");
@@ -740,7 +753,14 @@ export function SessionThreadComposer({
       : noWriteReason;
   return (
     <div className="grid min-w-0 max-w-full gap-3" data-session-thread-composer>
-      {todo && <TodoList list={todoView(todo, session.todoProgress)} placement="pinned" canMessage={canQueue} canStop={canStop && mutationsReady} onAsk={() => setText("What is happening with the current todo?")} onStop={() => void onInterrupt()} />}
+      {/*
+        Only a list still being worked earns a pin. `currentTodo` returns the
+        last one the session ever wrote, running or not, so a finished list sat
+        above the composer forever — a settled summary row taking permanent
+        height on a session that had stopped. The timeline still renders it
+        where it happened.
+      */}
+      {pinnedTodo?.running && <TodoList list={pinnedTodo} placement="pinned" canMessage={canQueue} canStop={canStop && mutationsReady} onAsk={() => setText("What is happening with the current todo?")} onStop={() => void onInterrupt()} />}
       <QueuedMessageCount count={queued.length} />
       {showControlStatus && (
         <Collapsible
@@ -843,6 +863,7 @@ export function SessionThreadComposer({
         effort={session.effort.value}
         profile={session.profile.value}
         sandbox={session.sandbox.value}
+        context={context ? { usage: context, contextWindow: context.contextWindow } : null}
         modelOptions={modelOptions}
         modelOptionsStatus={modelOptionsStatus}
         modelChangeUnavailableReason={canSetModel ? null : unavailableReason("set-model")}

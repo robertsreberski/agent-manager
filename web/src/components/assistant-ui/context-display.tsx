@@ -1,5 +1,5 @@
 import type { FC, ReactNode } from "react";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "../ui";
+import { Popover, PopoverContent, PopoverTrigger, Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "../ui";
 import { cn } from "../../lib/utils";
 
 /*
@@ -53,47 +53,50 @@ function segments(usage: ContextTokenUsage): { label: string; tokens: number }[]
   ].filter((segment) => segment.tokens > 0);
 }
 
-function ContextDisplayPopover({
+/**
+ * The breakdown itself, with no opinion about what surrounds it.
+ *
+ * It is deliberately not a `TooltipContent`: the transcript's meter reveals on
+ * hover, and the composer's chip has to open on a click, so the same body has
+ * to sit inside either a `Tooltip` or a `Popover`.
+ */
+function ContextDisplayDetail({
   usage,
   totalTokens,
   percent,
   modelContextWindow,
-  side,
 }: {
   usage: ContextTokenUsage;
   totalTokens: number;
   percent: number;
   modelContextWindow: number;
-  side: "top" | "right" | "bottom" | "left";
 }) {
   const parts = segments(usage);
   return (
-    <TooltipContent side={side} sideOffset={8} data-slot="context-display-popover" className="w-56 p-3 text-left">
-      <div className="text-code-xs">
-        <div className="flex items-baseline justify-between gap-6 whitespace-nowrap">
-          <span className="font-medium">Context usage</span>
-          <span className="text-[var(--text-muted)] tabular-nums">
-            {formatTokenCount(Math.min(totalTokens, modelContextWindow))} of {formatTokenCount(modelContextWindow)}
-          </span>
-        </div>
-        <div className="mt-2.5 h-1 overflow-hidden rounded-full bg-[var(--surface-selected)]">
-          <div
-            className={cn("h-full rounded-full transition-[width] duration-300", totalTokens > 0 && "min-w-1", barColor(percent))}
-            style={{ width: `${percent}%` }}
-          />
-        </div>
-        {parts.length > 0 && (
-          <div className="mt-3 grid gap-1.5">
-            {parts.map((segment) => (
-              <div key={segment.label} className="flex items-baseline justify-between gap-6">
-                <span className="text-[var(--text-muted)]">{segment.label}</span>
-                <span className="font-mono tabular-nums">{formatTokenCount(segment.tokens)}</span>
-              </div>
-            ))}
-          </div>
-        )}
+    <div className="text-code-xs">
+      <div className="flex items-baseline justify-between gap-6 whitespace-nowrap">
+        <span className="font-medium">Context usage</span>
+        <span className="text-[var(--text-muted)] tabular-nums">
+          {formatTokenCount(Math.min(totalTokens, modelContextWindow))} of {formatTokenCount(modelContextWindow)}
+        </span>
       </div>
-    </TooltipContent>
+      <div className="mt-2.5 h-1 overflow-hidden rounded-full bg-[var(--surface-selected)]">
+        <div
+          className={cn("h-full rounded-full transition-[width] duration-300", totalTokens > 0 && "min-w-1", barColor(percent))}
+          style={{ width: `${percent}%` }}
+        />
+      </div>
+      {parts.length > 0 && (
+        <div className="mt-3 grid gap-1.5">
+          {parts.map((segment) => (
+            <div key={segment.label} className="flex items-baseline justify-between gap-6">
+              <span className="text-[var(--text-muted)]">{segment.label}</span>
+              <span className="font-mono tabular-nums">{formatTokenCount(segment.tokens)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -104,6 +107,12 @@ export interface ContextDisplayProps {
   className?: string;
   side?: "top" | "right" | "bottom" | "left";
   children?: ReactNode;
+}
+
+const TRIGGER = "inline-flex min-h-6 items-center gap-1.5 rounded-sm px-1 font-mono text-code-xs tabular-nums text-[var(--text-muted)] transition-colors hover:bg-[var(--surface-selected)] hover:text-[var(--text)]";
+
+function triggerLabel(percent: number, modelContextWindow: number): string {
+  return `Context usage: ${Math.round(percent)}% of ${formatTokenCount(modelContextWindow)}`;
 }
 
 function ContextDisplayShell({ usage, modelContextWindow, className, side = "top", children }: ContextDisplayProps) {
@@ -118,18 +127,56 @@ function ContextDisplayShell({ usage, modelContextWindow, className, side = "top
             type="button"
             data-slot="context-display-trigger"
             data-compact-control="height"
-            aria-label={`Context usage: ${Math.round(percent)}% of ${formatTokenCount(modelContextWindow)}`}
-            className={cn(
-              "inline-flex min-h-6 items-center gap-1.5 rounded-sm px-1 font-mono text-code-xs tabular-nums text-[var(--text-muted)] transition-colors hover:bg-[var(--surface-selected)] hover:text-[var(--text)]",
-              className,
-            )}
+            aria-label={triggerLabel(percent, modelContextWindow)}
+            className={cn(TRIGGER, className)}
           >
             {children}
           </button>
         </TooltipTrigger>
-        <ContextDisplayPopover usage={usage} totalTokens={totalTokens} percent={percent} modelContextWindow={modelContextWindow} side={side} />
+        <TooltipContent side={side} sideOffset={8} data-slot="context-display-popover" className="w-56 p-3 text-left">
+          <ContextDisplayDetail usage={usage} totalTokens={totalTokens} percent={percent} modelContextWindow={modelContextWindow} />
+        </TooltipContent>
       </Tooltip>
     </TooltipProvider>
+  );
+}
+
+export interface ContextDisplayChipProps extends ContextDisplayProps {
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+}
+
+/**
+ * The composer's meter: the same fact, opened by a click rather than a hover.
+ *
+ * The transcript printed one of these per turn, scattered down the thread. The
+ * window state belongs beside the model and the effort — one reading of it, in
+ * the bar the operator is already looking at when they decide what to send.
+ */
+function ContextDisplayChip({ usage, modelContextWindow, className, side = "top", open, onOpenChange }: ContextDisplayChipProps) {
+  const totalTokens = usage.totalTokens ?? 0;
+  if (modelContextWindow === null || modelContextWindow <= 0) return null;
+  const percent = usagePercent(totalTokens, modelContextWindow);
+  return (
+    <Popover {...(open === undefined ? {} : { open })} {...(onOpenChange ? { onOpenChange } : {})}>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          data-slot="context-display-trigger"
+          data-compact-control="height"
+          aria-label={triggerLabel(percent, modelContextWindow)}
+          className={cn(TRIGGER, className)}
+        >
+          <span className="h-1 w-10 overflow-hidden rounded-full bg-[var(--surface-selected)]" aria-hidden="true">
+            <span className={cn("block h-full rounded-full", totalTokens > 0 && "min-w-1", barColor(percent))} style={{ width: `${percent}%` }} />
+          </span>
+          {Math.round(percent)}%
+        </button>
+      </PopoverTrigger>
+      <PopoverContent side={side} align="start" sideOffset={8} data-slot="context-display-popover" className="w-56 p-3 text-left">
+        <ContextDisplayDetail usage={usage} totalTokens={totalTokens} percent={percent} modelContextWindow={modelContextWindow} />
+      </PopoverContent>
+    </Popover>
   );
 }
 
@@ -162,5 +209,6 @@ const ContextDisplayText: FC<ContextDisplayProps> = (props) => {
 export const ContextDisplay = {
   Bar: ContextDisplayBar,
   Text: ContextDisplayText,
+  Chip: ContextDisplayChip,
   Root: ContextDisplayShell,
 };

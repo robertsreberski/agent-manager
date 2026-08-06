@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { ChevronDown, LoaderCircle } from "lucide-react";
 import { cva, type VariantProps } from "class-variance-authority";
 import { useScrollLock } from "@assistant-ui/react";
@@ -55,10 +55,14 @@ export type ToolGroupRootProps = Omit<
     onOpenChange?: (open: boolean) => void;
     defaultOpen?: boolean;
     /**
-     * Held open while the run is still in motion, and not collapsible for as
-     * long as it is: a group whose calls are still landing is the one thing the
-     * operator is watching. `ReasoningRoot` holds its panel open the same way
-     * for the same reason.
+     * The run is still in motion. It drives the trigger's spinner and `active`
+     * chip only — a group is collapsed until the operator opens it, whether or
+     * not calls are still landing.
+     *
+     * Upstream this also forces the panel open and blocks the toggle. That put
+     * every streaming run's whole body on screen and made the panel collapse
+     * and reopen in each gap between calls, which read as the header rendering
+     * twice. The count and the spinner already say a run is going.
      */
     active?: boolean;
   };
@@ -78,26 +82,15 @@ function ToolGroupRoot({
   const lockScroll = useScrollLock(collapsibleRef, ANIMATION_DURATION);
 
   const isControlled = controlledOpen !== undefined;
-  const isOpen = isControlled ? controlledOpen : active || uncontrolledOpen;
-
-  // Returning to the collapsed state when the run settles is a height change
-  // like any other, so it takes the same scroll lock a toggle does. Without it
-  // the panel's whole run of rows leaves the transcript in one 200ms animation
-  // and drops everything below it out from under the operator.
-  const wasActive = useRef(active);
-  useEffect(() => {
-    if (wasActive.current && !active && !isControlled && !uncontrolledOpen) lockScroll();
-    wasActive.current = active;
-  }, [active, isControlled, uncontrolledOpen, lockScroll]);
+  const isOpen = isControlled ? controlledOpen : uncontrolledOpen;
 
   const handleOpenChange = useCallback(
     (open: boolean) => {
-      if (active) return;
       lockScroll();
       if (!isControlled) setUncontrolledOpen(open);
       controlledOnOpenChange?.(open);
     },
-    [active, lockScroll, isControlled, controlledOnOpenChange],
+    [lockScroll, isControlled, controlledOnOpenChange],
   );
 
   return (
@@ -155,8 +148,16 @@ function ToolGroupTrigger({
           />}
       <span className="relative min-w-0 flex-1 truncate text-start text-meta-sm font-medium leading-none">
         {label}
+        {/*
+          `.shimmer` is a gradient masked over a second copy of the text, so the
+          copy has to sit exactly on the original. Re-declaring the type scale
+          here re-introduced its paired 18px line-height against the parent's
+          `leading-none`, and the overlay rendered ~3px low — the header read as
+          if it had been painted twice. It inherits everything instead, the way
+          `ReasoningTrigger` already does.
+        */}
         {active && (
-          <span aria-hidden="true" className="shimmer pointer-events-none absolute inset-0 text-meta-sm motion-reduce:animate-none">
+          <span aria-hidden="true" className="shimmer pointer-events-none absolute inset-0 motion-reduce:animate-none">
             {label}
           </span>
         )}

@@ -1136,3 +1136,131 @@ test("states no window when the provider reported none", () => {
 
   assert.equal(usage[0]?.kind === "usage" ? usage[0].contextWindow : "missing", null);
 });
+
+/*
+  A provider message's text and its tool calls have to keep the order Claude
+  emitted them in, and the only thing carrying that order is `seq` — which the
+  hub freezes at an item's *first* upsert. So a text item that gets re-created
+  under a new id does not return to where it was; it goes to the end, below tool
+  calls the assistant had already introduced.
+
+  Claude splits one provider message across several records, and a record's
+  content-array index space does not have to line up with the stream lane's.
+  Matching a partial on the index alone was therefore a coin flip.
+*/
+test("keeps a streamed text block above the tool call it introduced", () => {
+  const hub = new ActivityHub();
+  const projector = new ClaudeActivityProjector();
+  hub.ensureSession("chronology", "claude");
+  const feed = (message: Record<string, unknown>) => {
+    for (const mutation of projector.projectMessage(sdk(message))) {
+      hub.ingest("chronology", "claude", mutation);
+    }
+  };
+
+  feed({
+    ...baseMessage("stream_event", "shift-start"),
+    parent_tool_use_id: null,
+    event: {
+      type: "message_start",
+      message: {
+        id: "api-shift",
+        role: "assistant",
+        content: [],
+        model: "claude-test",
+        stop_reason: null,
+        stop_sequence: null,
+        type: "message",
+        usage: { input_tokens: 5, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      },
+    },
+  });
+
+  // A thought took block 0, so the text is at 1 and the tool at 2. The record
+  // below carries only the text and the tool, and its content array starts at
+  // 0 — which is exactly how one provider message split across records reaches
+  // this projector.
+  feed({
+    ...baseMessage("stream_event", "shift-thinking-start"),
+    parent_tool_use_id: null,
+    event: { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } },
+  });
+  feed({
+    ...baseMessage("stream_event", "shift-text-start"),
+    parent_tool_use_id: null,
+    event: { type: "content_block_start", index: 1, content_block: { type: "text", text: "", citations: null } },
+  });
+  feed({
+    ...baseMessage("stream_event", "shift-tool-start"),
+    parent_tool_use_id: null,
+    event: {
+      type: "content_block_start",
+      index: 2,
+      content_block: { type: "tool_use", id: "toolu_shift", name: "Read", input: {} },
+    },
+  });
+
+  feed({
+    ...baseMessage("assistant", "shift-final"),
+    parent_tool_use_id: null,
+    message: {
+      id: "api-shift",
+      role: "assistant",
+      content: [
+        { type: "text", text: "Let me read the file." },
+        { type: "tool_use", id: "toolu_shift", name: "Read", input: { file_path: "/tmp/x.ts" } },
+      ],
+      model: "claude-test",
+      stop_reason: "tool_use",
+      stop_sequence: null,
+      type: "message",
+      usage: { input_tokens: 5, output_tokens: 9, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    },
+  });
+
+  /*
+    The property that matters is the rendered one. `seq` freezes at an item's
+    first upsert, so a text block re-created under a fresh id takes a slot at
+    the end of the timeline while the tool it introduced keeps the early one it
+    streamed into — and the assistant's own words render below the tool call.
+  */
+  const rendered = hub.snapshot("chronology")!.items
+    .flatMap((item) => item.kind === "message" || item.kind === "tool" ? [item.kind] : []);
+  assert.deepEqual(rendered, ["message", "tool"]);
+
+  const text = hub.snapshot("chronology")!.items.find((item) => item.kind === "message");
+  assert.equal(text?.kind === "message" ? text.text : null, "Let me read the file.");
+});
+
+/*
+  Known gap, pinned deliberately rather than fixed here: a minted text id is
+  keyed on the *provider message* id plus the content index, but Claude reuses
+  one message id across records whose index spaces both start at zero. Two
+  records' text blocks therefore collide on one id. The transcript path keeps
+  record identity for exactly this reason (see `claudeChain` in
+  `server/transcript.ts`); aligning the live path needs `correlationId` to be
+  re-scoped with it — live puts it on a message's first text block, the
+  transcript on its last — or reconciliation starts duplicating text.
+*/
+test("mints text ids from the provider message id, so records sharing one id collide", () => {
+  const projector = new ClaudeActivityProjector();
+  const record = (uuid: string, text: string) => sdk({
+    ...baseMessage("assistant", uuid),
+    parent_tool_use_id: null,
+    message: {
+      id: "api-split",
+      role: "assistant",
+      content: [{ type: "text", text }],
+      model: "claude-test",
+      stop_reason: "end_turn",
+      stop_sequence: null,
+      type: "message",
+      usage: { input_tokens: 5, output_tokens: 9, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    },
+  });
+
+  const first = upserts(projector.projectMessage(record("split-a", "Checking."))).find((item) => item.kind === "message");
+  const second = upserts(projector.projectMessage(record("split-b", "Done."))).find((item) => item.kind === "message");
+
+  assert.equal(second?.id, first?.id);
+});

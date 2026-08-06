@@ -192,46 +192,67 @@ describe("tool group containment", () => {
     }
   });
 
-  it("keeps an active group forced open", () => {
+  it("starts an active group collapsed, and still says it is active", () => {
     render(
       <ToolGroupShell status={{ type: "running" }} active count={1} duration={null}>
         <span>call</span>
       </ToolGroupShell>,
     );
-    expect(screen.getByRole("button", { expanded: true })).toBeInTheDocument();
+    expect(screen.getByRole("button", { expanded: false })).toBeInTheDocument();
     expect(screen.getByText("active")).toBeInTheDocument();
   });
 
   /*
-    Every call in a run reads `complete` in the gap between one result and the
-    next call landing. Deriving the hold from the parts alone collapsed the panel
-    in every one of those gaps and reopened it on the next call — once per tool,
-    for the length of the turn. `active` is the caller's answer to "is this run
-    still in motion", and it outranks the settled status.
+    `active` used to force the panel open and block the toggle. Every call in a
+    run reads `complete` in the gap between one result and the next, so the flag
+    flickered, and with it the panel — which is what made the header look as
+    though it rendered twice. It now decorates the trigger and nothing else.
   */
-  it("holds a settled run open while its turn is still in motion", () => {
+  it("does not open a settled run because its turn is still in motion", () => {
     render(
       <ToolGroupShell status={{ type: "complete" }} active count={3} duration="2.5s">
         <span>call</span>
       </ToolGroupShell>,
     );
 
-    expect(screen.getByRole("button", { expanded: true })).toBeInTheDocument();
+    expect(screen.getByRole("button", { expanded: false })).toBeInTheDocument();
     // A span is a fact about a finished run. Printed beside the `active` chip it
     // blinked in during every gap, because that is exactly when every call in
     // the group has reported a completion time.
     expect(screen.queryByText("2.5s")).not.toBeInTheDocument();
   });
 
-  it("ignores a toggle while the run is held open", () => {
+  it("honours a toggle while the run is still active", () => {
     render(
       <ToolGroupShell status={{ type: "complete" }} active count={3} duration={null}>
         <span>call</span>
       </ToolGroupShell>,
     );
 
-    fireEvent.click(screen.getByRole("button", { expanded: true }));
+    fireEvent.click(screen.getByRole("button", { expanded: false }));
     expect(screen.getByRole("button", { expanded: true })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { expanded: true }));
+    expect(screen.getByRole("button", { expanded: false })).toBeInTheDocument();
+  });
+
+  /*
+    The shimmer is a gradient masked over a duplicate copy of the label, so the
+    copy must sit exactly on the original. It once re-declared the type scale
+    and inherited an 18px line-height into a `leading-none` parent, offsetting
+    the ghost by ~3px — two visibly stacked headers.
+  */
+  it("paints the shimmer copy with the trigger's own metrics", () => {
+    const { container } = render(
+      <ToolGroupShell status={{ type: "running" }} active count={2} duration={null}>
+        <span>call</span>
+      </ToolGroupShell>,
+    );
+
+    const shimmer = container.querySelector(".shimmer")!;
+    expect(shimmer.textContent).toBe("2 tool calls");
+    for (const name of shimmer.className.split(/\s+/u)) {
+      expect(name, `shimmer overrides ${name}`).not.toMatch(/^(text-|leading-|font-)/u);
+    }
   });
 });
 

@@ -122,7 +122,16 @@ export function ThreadDrawer({ open, title, facts = [], todo = null, onClose, ch
         {/* The phone surface rules the header off; the desktop drawer does not. */}
         <Separator className="shrink-0 bg-[var(--border-hairline)] min-[901px]:hidden" />
         <div ref={viewportRef} className="min-h-0 min-w-0 max-w-full flex-1 overflow-x-hidden overflow-y-auto overscroll-contain bg-inherit pt-4 pr-[calc(1rem_+_max(0px,env(safe-area-inset-right)))] pb-2 pl-[calc(1rem_+_max(0px,env(safe-area-inset-left)))] min-[901px]:px-6 min-[901px]:pt-2 min-[901px]:pb-3" data-thread-content>{children}</div>
-        {composer && <footer className="safe-area-bottom w-full min-w-0 max-w-full shrink-0 overflow-x-clip bg-inherit pt-2 pr-[calc(1rem_+_max(0px,env(safe-area-inset-right)))] pb-2 pl-[calc(1rem_+_max(0px,env(safe-area-inset-left)))] min-[901px]:px-6 min-[901px]:pt-0 min-[901px]:pb-[18px]" data-thread-composer>{composer}</footer>}
+        {/*
+          The bottom inset is stated inline rather than taken from
+          `.safe-area-bottom`. That utility is unlayered, so it outranks every
+          Tailwind `pb-*` here no matter the order they are written in: the
+          desktop drawer silently lost its 18px to a `max(0px, …)` that resolves
+          to zero, and on an iOS home-bar device the raw inset replaced the
+          padding instead of joining it. `max()` of the two keeps whichever is
+          larger, which is what was meant both times.
+        */}
+        {composer && <footer className="w-full min-w-0 max-w-full shrink-0 overflow-x-clip bg-inherit pt-2 pr-[calc(1rem_+_max(0px,env(safe-area-inset-right)))] pb-[max(0.5rem,env(safe-area-inset-bottom))] pl-[calc(1rem_+_max(0px,env(safe-area-inset-left)))] min-[901px]:px-6 min-[901px]:pt-0 min-[901px]:pb-[max(18px,env(safe-area-inset-bottom))]" data-thread-composer>{composer}</footer>}
       </DialogPrimitive.Content>
     </DialogPrimitive.Root>
   );

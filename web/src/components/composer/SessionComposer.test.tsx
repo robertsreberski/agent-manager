@@ -296,7 +296,21 @@ describe("SessionComposer", () => {
 
     expect(screen.queryByText("This harness is observation-only.")).not.toBeInTheDocument();
     expect(document.querySelector("[data-withheld-reasons]")).toBeNull();
-    expect(screen.getByRole("textbox", { name: "Message" })).toHaveAttribute("placeholder", "");
+    const field = screen.getByRole("textbox", { name: "Message" });
+    // The control-status block above the composer states the reason; the field
+    // names its own state instead of repeating it. It used to be blanked
+    // outright, which left 52px of void on exactly the sessions that look most
+    // like something is missing.
+    expect(field).toHaveAttribute("placeholder", "Read-only");
+    expect(field.getAttribute("placeholder")).not.toContain("observation-only");
+    // And it claims no room to type in, because nothing can be typed into it.
+    expect(field.style.minHeight).toBe("24px");
+  });
+
+  it("keeps a writable composer at its full typing target", () => {
+    renderComposer({});
+
+    expect(screen.getByRole("textbox", { name: "Message" }).style.minHeight).toBe("52px");
   });
 
   it("keeps a readable-but-unwritable model catalog inspectable", async () => {
@@ -395,8 +409,11 @@ describe("SessionComposer", () => {
     expect(runtime).toContainElement(screen.getByRole("img", { name: /Max effort/u }));
     expect(policies).toContainElement(screen.getByRole("button", { name: /Full access/u }));
     expect(policies).toContainElement(screen.getByRole("button", { name: /Sandbox unknown/u }));
-    expect(policies?.querySelectorAll(".composer-wide-separator")).toHaveLength(2);
     expect(actions).toContainElement(screen.getByRole("button", { name: "Queue message" }));
+    // The dividers that used to sit between these groups were governed by a
+    // container query no drawer could satisfy, so they never rendered. The gap
+    // separates the groups now.
+    expect(toolbar?.querySelectorAll(".composer-wide-separator")).toHaveLength(0);
   });
 
   it("marks every compact primary composer control for coarse-pointer expansion", () => {

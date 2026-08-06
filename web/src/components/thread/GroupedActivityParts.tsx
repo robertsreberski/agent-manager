@@ -53,9 +53,10 @@ const BLOCK = "min-w-0 max-w-full overflow-x-hidden bg-[var(--surface-raised)] p
 /**
  * assistant-ui's ToolGroup, wearing the cockpit's grammar.
  *
- * A run that is still going is held open and cannot be collapsed — a group
- * whose calls are still landing is the one thing the operator is watching.
- * `ToolGroupRoot` owns that hold, and the scroll lock for the moment it lets go.
+ * Every group starts collapsed and can be toggled at any point, including while
+ * its calls are still landing: the count, the spinner and the `active` chip are
+ * what report a run in motion, and holding the panel open buried each turn in
+ * its own detail. `ToolGroupRoot` owns the open state and the scroll lock.
  */
 export function ToolGroupShell({ status, active, count, duration, defaultOpen = false, children }: { status: { type: string }; active: boolean; count: number; duration: string | null; defaultOpen?: boolean; children: React.ReactNode }) {
   return (

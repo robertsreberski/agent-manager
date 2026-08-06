@@ -30,7 +30,7 @@ import {
 import { redactActivityText } from "../activity/redaction.ts";
 import {
   codexMessageCorrelationId,
-  codexRequestUserInputCorrelationId,
+  codexRequestUserInputKey,
 } from "../providers/codex/activity-projector.ts";
 import type {
   Provider,
@@ -844,9 +844,9 @@ function codexItems(
       items.push({
         kind: "tool",
         id: stableItemId("codex", callId, fileIdentity, record.offset, "tool"),
-        correlationId: name === "request_user_input" && providerItemId
-          ? codexRequestUserInputCorrelationId(sessionId, providerItemId)
-          : correlationId("tool", callId),
+        correlationId: (name === "request_user_input"
+          ? codexRequestUserInputKey(sessionId, providerItemId, stringValue(payload.call_id))
+          : null) ?? correlationId("tool", callId),
         turnId: turnByProviderId.get(callId)
           ?? (providerItemId ? turnByProviderId.get(providerItemId) : undefined)
           ?? activeTurnId,
@@ -991,12 +991,19 @@ function claudeChain(
   for (const segment of segments) {
     const byUuid = new Map<string, JsonlRecord>();
     /*
-      Sibling counts per parent, restricted to identity-matching records. A parent
-      with more than one such child is a fork: two writers answered the same
-      message. Only the chosen chain's parents are consulted, so an unrelated
-      branch elsewhere in the file is not reported as this conversation forking.
+      Sibling counts per parent, restricted to identity-matching records, and
+      counted *per record type*. A parent with more than one child of the same
+      type is a fork: two writers answered the same message the same way.
+
+      Counting children of any type is not the same question, and it is the
+      question this used to ask. Claude's normal structure hangs an `assistant`
+      record and a `user` record — the reply and the tool result that answers
+      it, or the next operator turn — off one parent constantly, and an
+      `attachment` beside a `user` just as often. Every real session measured
+      tripped that rule and every one of them flew the "this conversation
+      forked" banner while nothing had forked.
     */
-    const childCounts = new Map<string, number>();
+    const childCounts = new Map<string, Map<string, number>>();
     let latest: JsonlRecord | null = null;
     for (const record of segment.records) {
       const uuid = stringValue(record.object.uuid);
@@ -1007,7 +1014,12 @@ function claudeChain(
       if (matchesClaudeIdentity(record.object, session, isChild)) {
         latest = record;
         const parentUuid = stringValue(record.object.parentUuid);
-        if (parentUuid) childCounts.set(parentUuid, (childCounts.get(parentUuid) ?? 0) + 1);
+        if (parentUuid) {
+          const kind = stringValue(record.object.type) ?? "unknown";
+          const byKind = childCounts.get(parentUuid) ?? new Map<string, number>();
+          byKind.set(kind, (byKind.get(kind) ?? 0) + 1);
+          childCounts.set(parentUuid, byKind);
+        }
       }
     }
     if (!latest) continue;
@@ -1024,7 +1036,9 @@ function claudeChain(
       }
       visited.add(uuid);
       segmentRecords.push(cursor);
-      if ((childCounts.get(uuid) ?? 0) > 1) forked = true;
+      for (const count of childCounts.get(uuid)?.values() ?? []) {
+        if (count > 1) forked = true;
+      }
       const parentUuid = stringValue(cursor.object.parentUuid);
       if (!parentUuid) break;
       const parent = byUuid.get(parentUuid);

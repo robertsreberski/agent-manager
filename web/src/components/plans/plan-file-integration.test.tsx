@@ -46,6 +46,8 @@ describe("plan file activity integration", () => {
       attention: {
         exactRequestIds: new Set(), mutationsReady: true, canRespond: false, busy: false,
         planOwnedRequestIds: new Set<string>(),
+        supersededIds: new Set<string>(),
+        respondUnavailableReason: null,
         workspaceRoot: "/work/app", remoteHost: null, sessionsOnHost: null,
         onRespond: vi.fn(async () => undefined),
       },
@@ -104,6 +106,8 @@ describe("plan file activity integration", () => {
       attention: {
         exactRequestIds: new Set(["plan-request"]), mutationsReady: true, canRespond: true, busy: false,
         planOwnedRequestIds: new Set(["plan-request"]),
+        supersededIds: new Set<string>(),
+        respondUnavailableReason: null,
         workspaceRoot: "/work/app", remoteHost: null, sessionsOnHost: null,
         onRespond: vi.fn(async () => undefined),
       },

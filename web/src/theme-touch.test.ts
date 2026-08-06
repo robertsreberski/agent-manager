@@ -87,17 +87,29 @@ describe("composer width containment", () => {
   it("responds to the composer's own width instead of the viewport", () => {
     expect(block(/\[data-session-composer\]\s*\{[^}]+\}/u))
       .toContain("container: session-composer / inline-size");
-    expect(styles).toContain("@container session-composer (min-width: 52rem)");
-
-    const compact = block(/\.composer-toolbar\s*\{[^}]+\}/u);
-    expect(compact).toContain("display: grid");
-    expect(compact).toContain('"runtime actions"');
-    expect(compact).toContain('"policies policies"');
   });
 
-  it("keeps compact controls grouped and wide-only separators out of wrapped rows", () => {
+  /*
+    The threshold has to be one the drawer can actually reach. It was 52rem
+    against a composer whose content box inside the 760px drawer is about
+    42.6rem, so every rule the query governed — the single-row layout included —
+    was unreachable, and the toolbar paid a second row and its gap forever.
+  */
+  it("puts the wide treatment inside a width the drawer can reach", () => {
+    const threshold = /@container session-composer \(min-width: (\d+(?:\.\d+)?)rem\)/u.exec(styles);
+    expect(threshold).not.toBeNull();
+    expect(Number(threshold![1])).toBeLessThanOrEqual(42);
+  });
+
+  it("lets the control groups share a row and wrap only when they must", () => {
+    const toolbar = block(/\.composer-toolbar\s*\{[^}]+\}/u);
+    expect(toolbar).toContain("display: flex");
+    expect(toolbar).toContain("flex-wrap: wrap");
+    expect(toolbar).not.toContain("grid-template-areas");
+
     expect(block(/\.composer-toolbar__policies\s*\{[^}]+\}/u)).toContain("flex-wrap: wrap");
-    expect(block(/\.composer-wide-separator\s*\{[^}]+\}/u)).toContain("display: none");
+    // Actions stay last on whichever line they land on.
+    expect(block(/\.composer-toolbar__actions\s*\{[^}]+\}/u)).toContain("margin-left: auto");
   });
 });
 

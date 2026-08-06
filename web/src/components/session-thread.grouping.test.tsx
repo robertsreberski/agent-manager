@@ -256,12 +256,15 @@ describe("tool grouping in a rendered thread", () => {
   A tool call carries no status of its own: assistant-ui derives one, and a call
   that has reported a result is `complete`. So in the gap between one result and
   the model emitting the next call — seconds, routinely — every part in the run
-  reads settled, and a group that took its open state from that alone collapsed
-  and snapped back open once per tool for the whole turn. The turn's own
-  lifecycle item is the signal that tells "this run finished" apart from "this
-  run has gone quiet"; these pin that it is the one being read.
+  reads settled. The turn's own lifecycle item is the signal that tells "this run
+  finished" apart from "this run has gone quiet", and it is what the trigger's
+  spinner and `active` chip are derived from.
+
+  The panel itself is no longer derived from any of it: a group is collapsed
+  until the operator opens it. These pin that the *reported* state still tracks
+  the turn, and that the disclosure stays out of it.
 */
-describe("a tool run held open across the gaps between its calls", () => {
+describe("a tool run reported as active across the gaps between its calls", () => {
   const turnStarted: ActivityItem = {
     ...common, id: "turn-1", seq: 0, turnId: "turn-1", state: "running", completedAt: null,
     kind: "lifecycle", event: "turn-started", level: "info", title: "Claude started responding", details: null,
@@ -275,7 +278,7 @@ describe("a tool run held open across the gaps between its calls", () => {
     return container.querySelectorAll("[data-tool-group-status] [data-slot='tool-group-trigger']")[index]!;
   }
 
-  it("stays open while every call in it has settled and the turn has not", () => {
+  it("still reads active while every call in it has settled and the turn has not", () => {
     const { container } = renderThread([
       turnStarted,
       tool("t-1", "Read", 1, "turn-1"),
@@ -283,7 +286,6 @@ describe("a tool run held open across the gaps between its calls", () => {
     ]);
 
     expect(group(container).textContent).toContain("2 tool calls");
-    expect(group(container).getAttribute("aria-expanded")).toBe("true");
     // Both calls reported a completion time, so the group has an exact span —
     // but a span is a fact about a finished run, and printing it here is what
     // made the label blink in and out across the gaps.
@@ -291,7 +293,7 @@ describe("a tool run held open across the gaps between its calls", () => {
     expect(group(container).querySelector(".tabular-nums")).toBeNull();
   });
 
-  it("collapses once, when the turn itself ends", () => {
+  it("reports its span once the turn itself ends", () => {
     const { container } = renderThread([
       turnStarted,
       tool("t-1", "Read", 1, "turn-1"),
@@ -299,10 +301,10 @@ describe("a tool run held open across the gaps between its calls", () => {
       turnCompleted,
     ]);
 
-    expect(group(container).getAttribute("aria-expanded")).toBe("false");
+    expect(group(container).textContent).not.toContain("active");
   });
 
-  it("holds only the run the next call will join, not every run in the turn", () => {
+  it("reports only the run the next call will join as active", () => {
     const { container } = renderThread([
       turnStarted,
       tool("t-1", "Read", 1, "turn-1"),
@@ -311,11 +313,23 @@ describe("a tool run held open across the gaps between its calls", () => {
     ]);
 
     expect(container.querySelectorAll("[data-tool-group-status]")).toHaveLength(2);
-    // The first run is finished — a recorded message closed it — so it collapses
-    // even though the turn is still going. Holding every group open would bury a
-    // long turn in its own detail.
-    expect(group(container, 0).getAttribute("aria-expanded")).toBe("false");
-    expect(group(container, 1).getAttribute("aria-expanded")).toBe("true");
+    // The first run is finished — a recorded message closed it — so it stops
+    // reporting itself as active even though the turn is still going.
+    expect(group(container, 0).textContent).not.toContain("active");
+    expect(group(container, 1).textContent).toContain("active");
+  });
+
+  it("leaves every group collapsed, whatever the turn is doing", () => {
+    const { container } = renderThread([
+      turnStarted,
+      tool("t-1", "Read", 1, "turn-1"),
+      { ...common, id: "m-1", seq: 2, turnId: "turn-1", kind: "message", role: "assistant", phase: "final", text: "The first file is clear.", label: null },
+      tool("t-2", "Grep", 3, "turn-1"),
+    ]);
+
+    for (const trigger of container.querySelectorAll("[data-tool-group-status] [data-slot='tool-group-trigger']")) {
+      expect(trigger.getAttribute("aria-expanded")).toBe("false");
+    }
   });
 });
 

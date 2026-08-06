@@ -108,15 +108,35 @@ export function codexMessageCorrelationId(
 
 /**
  * Canonical identity for one request_user_input item across the Codex rollout
- * and App Server surfaces. The rollout's response-item id is the same itemId
- * the App Server places on its server request, so no prompt text or answer
- * content needs to participate in reconciliation.
+ * and App Server surfaces, so no prompt text or answer content needs to
+ * participate in reconciliation.
+ *
+ * The rollout's response-item id is *expected* to be the same itemId the App
+ * Server places on its server request — but neither side is guaranteed to state
+ * one. Where the response-item id is absent both sides fall back to the call id
+ * instead, via `codexRequestUserInputKey`. When they agree the hub collapses the
+ * two into one item; when they cannot, the drawer suppresses the transcript copy
+ * at render time rather than showing the questionnaire twice.
  */
 export function codexRequestUserInputCorrelationId(
   threadId: string,
   itemId: string,
 ): string {
   return scopedId("request-user-input-correlation", threadId, itemId);
+}
+
+/**
+ * The identity both surfaces agree on, in preference order: the response-item
+ * id, then the call id. Returns null when a surface states neither, which is
+ * the one case correlation cannot bridge.
+ */
+export function codexRequestUserInputKey(
+  threadId: string,
+  itemId: string | null,
+  callId: string | null,
+): string | null {
+  const identity = itemId ?? callId;
+  return identity ? codexRequestUserInputCorrelationId(threadId, identity) : null;
 }
 
 function itemActivityId(
@@ -673,6 +693,15 @@ function projectThreadItem(
     case "dynamicToolCall": {
       const namespace = stringValue(item.namespace);
       const tool = stringValue(item.tool) ?? "tool";
+      /*
+        `request_user_input` reaches this projector twice: once as the server
+        request that carries the questions and can be answered, and once as the
+        plain tool row below. The tool row has no transcript twin to reconcile
+        against — the transcript turns that call into an attention item too — so
+        it survived as a second, inert `request_user_input` beside the
+        questionnaire. The attention item is the faithful rendering of this call.
+      */
+      if (tool === "request_user_input") break;
       mutations.push(toolItem(id, turnId, state, times, {
         toolCallId: itemId,
         name: namespace ? `${namespace}.${tool}` : tool,
@@ -1278,7 +1307,11 @@ export function projectCodexServerRequest(
   const startedAt = isoFromMilliseconds(request.params.startedAtMs) ??
     notificationTime(request);
   const updatedAt = notificationTime(request) ?? startedAt;
-  const providerItemId = stringValue(request.params.itemId);
+  const correlation = codexRequestUserInputKey(
+    threadId,
+    stringValue(request.params.itemId),
+    stringValue(request.params.callId),
+  );
   return {
     threadId,
     mutations: [upsert({
@@ -1291,8 +1324,8 @@ export function projectCodexServerRequest(
         updatedAt,
         null,
       ),
-      ...(request.method === "item/tool/requestUserInput" && providerItemId
-        ? { correlationId: codexRequestUserInputCorrelationId(threadId, providerItemId) }
+      ...(request.method === "item/tool/requestUserInput" && correlation
+        ? { correlationId: correlation }
         : {}),
       requestId: jsonRpcIdKey(request.id),
       attentionKind,

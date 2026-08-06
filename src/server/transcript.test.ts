@@ -270,6 +270,87 @@ test("Codex correlates a rollout request_user_input with its exact App Server re
   hub.dispose();
 });
 
+/*
+  The correlation key is the response-item id, and neither surface is obliged to
+  state one. Where the rollout row carries only a `call_id` the key falls back to
+  it, so a request the App Server also names by call id still collapses into one
+  item instead of reaching the drawer as two questionnaires.
+*/
+test("Codex correlates a request_user_input the surfaces name only by call id", () => {
+  const turnId = "turn-question";
+  const fixture = codexFixture([
+    codexMeta(),
+    {
+      type: "event_msg",
+      timestamp: "2026-08-03T10:00:00Z",
+      payload: { type: "task_started", turn_id: turnId },
+    },
+    {
+      type: "response_item",
+      timestamp: "2026-08-03T10:00:01Z",
+      payload: {
+        // No `id` at all — only the call id identifies this row.
+        type: "function_call",
+        call_id: "call_question",
+        name: "request_user_input",
+        arguments: JSON.stringify({
+          questions: [{
+            id: "destination",
+            header: "Destination",
+            question: "Where should we go?",
+            options: [{ label: "Moon cabin", description: "Quiet views." }],
+          }],
+        }),
+      },
+    },
+  ]);
+  const reader = new LocalSessionTranscriptReader({ codexHome: fixture.home });
+  assert.equal(
+    toolsOf(reader.read(codexSession()))[0]?.correlationId,
+    codexRequestUserInputCorrelationId(CODEX_ID, "call_question"),
+  );
+
+  const managerSessionId = `local:codex:${CODEX_ID}`;
+  const session = {
+    id: managerSessionId,
+    provider: "codex",
+    providerThreadId: CODEX_ID,
+    providerTreeId: CODEX_ID,
+    parentId: null,
+    status: "running",
+  } as SessionView;
+  const hub = new ActivityHub({ streamEpoch: "question-callid" });
+  const observer = new SelectedTranscriptActivityObserver({ hub, reader });
+  observer.seedOnce(session);
+
+  const exact = projectCodexServerRequest({
+    id: "rpc-question",
+    method: "item/tool/requestUserInput",
+    emittedAtMs: Date.parse("2026-08-03T10:00:02.000Z"),
+    params: {
+      threadId: CODEX_ID,
+      turnId,
+      callId: "call_question",
+      questions: [{
+        id: "destination",
+        header: "Destination",
+        question: "Where should we go?",
+        options: [{ label: "Moon cabin", description: "Quiet views." }],
+      }],
+    },
+  });
+  assert.ok(exact);
+  for (const mutation of exact.mutations) hub.ingest(managerSessionId, "codex", mutation);
+
+  const reconciled = hub.snapshot(managerSessionId)?.items ?? [];
+  assert.equal(reconciled.length, 1, "one request, one item — not a live copy beside a read-only twin");
+  assert.equal(reconciled[0]?.source, "provider-api");
+  assert.equal(reconciled[0]?.kind === "attention" ? reconciled[0].respondable : false, true);
+
+  observer.dispose();
+  hub.dispose();
+});
+
 test("Codex transcript separates a trailing memory citation from visible assistant text", () => {
   const fixture = codexFixture([
     codexMeta(),
@@ -662,6 +743,35 @@ test("a linear Claude transcript reports no fork", () => {
   writeFileSync(join(project, `${CLAUDE_ID}.jsonl`), jsonl([
     claudeRow({ uuid: "u1", type: "user", content: "Hello" }),
     claudeRow({ uuid: "a1", parentUuid: "u1", type: "assistant", content: [{ type: "text", text: "Answer" }], messageId: "msg-one" }),
+  ]));
+
+  const result = new LocalSessionTranscriptReader({ claudeHome: fixture.home }).read(claudeRootSession());
+  assert.equal(result.transcript.forked, false);
+});
+
+/*
+  The shape every ordinary Claude turn has: one assistant reply and the user
+  record that answers it — a tool result, or the operator's next message — both
+  hanging off the same parent. Counting children of any type made that a fork,
+  so the "this conversation forked" banner flew on every real session measured
+  while nothing had forked. A fork is two children of the *same* type.
+*/
+test("an assistant reply and the user record answering it are not a fork", () => {
+  const fixture = claudeHome();
+  const project = join(fixture.projects, "-fixture-project");
+  mkdirSync(project);
+  writeFileSync(join(project, `${CLAUDE_ID}.jsonl`), jsonl([
+    claudeRow({ uuid: "u1", type: "user", content: "Read the file" }),
+    claudeRow({
+      uuid: "a1",
+      parentUuid: "u1",
+      type: "assistant",
+      content: [{ type: "tool_use", id: "toolu_1", name: "Read", input: { file_path: "/tmp/x.ts" } }],
+      messageId: "msg-one",
+    }),
+    // Both of these parent onto `a1`: the tool's result, and the reply that follows it.
+    claudeRow({ uuid: "u2", parentUuid: "a1", type: "user", content: "result" }),
+    claudeRow({ uuid: "a2", parentUuid: "a1", type: "assistant", content: [{ type: "text", text: "Done" }], messageId: "msg-two" }),
   ]));
 
   const result = new LocalSessionTranscriptReader({ claudeHome: fixture.home }).read(claudeRootSession());

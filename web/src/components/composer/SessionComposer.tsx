@@ -5,6 +5,7 @@ import { CODEX_SANDBOX_MODES, sandboxPolicy } from "../../../../src/shared/sessi
 import type { CockpitProvider, ExecutionProfile } from "../../lib/cockpit-view";
 import { isTypingTarget } from "../../lib/shortcuts";
 import { coveringModelOption } from "../../lib/model-catalog";
+import { ContextDisplay, type ContextTokenUsage } from "../assistant-ui/context-display";
 import {
   ModelSelectorContent,
   ModelSelectorEffort,
@@ -63,6 +64,12 @@ export interface SessionComposerProps {
   model: string | null;
   effort: ReasoningEffort | null;
   profile: ExecutionProfile | null;
+  /**
+   * How full the model's context window is, as the provider stated it. Null
+   * where no provider stated a window — the chip renders nothing rather than
+   * invent a denominator.
+   */
+  context?: { usage: ContextTokenUsage; contextWindow: number | null } | null;
   /** Codex-only containment setting; Claude sessions render no control. */
   sandbox?: SandboxPolicy | null;
   providerOptions?: readonly CockpitProvider[];
@@ -137,7 +144,7 @@ function effortLabel(effort: ReasoningEffort | null): string {
 export function SessionComposer(props: SessionComposerProps) {
   const {
     value, onChange, onSend, onStop, isRunning, canQueue, canSteer, canStop,
-    readOnlyReason, provider, model, effort, profile, providerOptions = ["codex", "claude"],
+    readOnlyReason, provider, model, effort, profile, context = null, providerOptions = ["codex", "claude"],
     modelOptions = [], modelOptionsStatus = null, effortOptions = [],
     modelChangeUnavailableReason = null, effortChangeUnavailableReason = null,
     profileChangeUnavailableReason = null, sandboxChangeUnavailableReason = null,
@@ -152,7 +159,7 @@ export function SessionComposer(props: SessionComposerProps) {
   // Radix owns focus, dismissal, roving tabindex and positioning; this exists
   // solely so ⌘⇧M and M can drive the same menus the triggers do, and so the
   // two menus stay mutually exclusive.
-  const [openMenu, setOpenMenu] = useState<"runtime" | "profile" | "sandbox" | null>(null);
+  const [openMenu, setOpenMenu] = useState<"runtime" | "profile" | "sandbox" | "context" | null>(null);
   const settingsDisabled = !draft && settingsIdleOnly && isRunning;
   const runtimeHasAction = Boolean(onProviderChange || onModelChange || onEffortChange || onResetSettings || onReloadModels);
   // A catalog the harness will not let this cockpit write is still worth
@@ -215,12 +222,19 @@ export function SessionComposer(props: SessionComposerProps) {
   const sendDisabled = busy || value.trim().length === 0 || !canQueue;
   const effortIndex = effort === null ? -1 : effortOptions.indexOf(effort);
   const hasEffortScale = effortOptions.length > 0 && effortIndex >= 0;
+  /*
+    A composer nobody can type into does not need room to type in. The 52px
+    floor is there so an empty writable field is a comfortable target; held on a
+    read-only session it was 52px of blank nothing above the toolbar, which is
+    most of what read as "excessive space" on observed sessions.
+  */
+  const minComposerHeight = readOnlyReason ? 24 : 52;
   useEffect(() => {
     const element = textareaRef.current;
     if (!element) return;
     element.style.height = "0px";
-    element.style.height = `${Math.min(120, Math.max(52, element.scrollHeight))}px`;
-  }, [value]);
+    element.style.height = `${Math.min(120, Math.max(minComposerHeight, element.scrollHeight))}px`;
+  }, [minComposerHeight, value]);
 
   /*
     Frame 5a's placeholder promises `@mention files, run /commands`. Both are
@@ -380,11 +394,17 @@ export function SessionComposer(props: SessionComposerProps) {
         onClick={(event) => syncTrigger(event.currentTarget)}
         onBlur={() => setTrigger(null)}
         disabled={Boolean(readOnlyReason) || busy}
-        className="block min-h-[52px] max-h-[120px] w-full resize-none overflow-y-auto border-0 bg-transparent px-0.5 pt-0 pb-2.5 text-body text-[var(--text)] outline-none placeholder:text-[var(--text-faint)]"
+        // The field's own bottom padding sat inside a container that already
+        // pays `pb-2.5`, so every composer carried 20px of stacked gutter.
+        className="block max-h-[120px] w-full resize-none overflow-y-auto border-0 bg-transparent px-0.5 pt-0 pb-0 text-body text-[var(--text)] outline-none placeholder:text-[var(--text-faint)]"
+        style={{ minHeight: `${minComposerHeight}px` }}
         aria-label="Message"
         aria-autocomplete="list"
         aria-expanded={Boolean(trigger && suggestions.length > 0)}
-        placeholder={readOnlyReason ? "" : isRunning ? "Queue a message…" : composerPlaceholder(provider, Boolean(onSearchFiles))}
+        // Never the withheld reason: the control-status block above the composer
+        // already states it, and saying it twice is what that reads as. This is
+        // the field naming its own state, in as few words as it takes.
+        placeholder={readOnlyReason ? "Read-only" : isRunning ? "Queue a message…" : composerPlaceholder(provider, Boolean(onSearchFiles))}
       />
       <div className="composer-toolbar min-w-0 max-w-full" data-composer-toolbar>
         <div className="composer-toolbar__runtime">
@@ -516,7 +536,6 @@ export function SessionComposer(props: SessionComposerProps) {
           </span>
         </div>
         <div className="composer-toolbar__policies">
-        <span className="composer-wide-separator h-3.5 w-px shrink-0 bg-[var(--border)]" />
         <DropdownMenu open={openMenu === "profile"} onOpenChange={(next) => setOpenMenu(next ? "profile" : null)}>
           <DropdownMenuTrigger asChild disabled={profileDisabled}>
             <Button
@@ -552,7 +571,6 @@ export function SessionComposer(props: SessionComposerProps) {
         */}
         {showSandbox && (
           <>
-            <span className="composer-wide-separator h-3.5 w-px shrink-0 bg-[var(--border)]" />
             <DropdownMenu open={openMenu === "sandbox"} onOpenChange={(next) => setOpenMenu(next ? "sandbox" : null)}>
               <DropdownMenuTrigger asChild disabled={sandboxDisabled}>
                 <Button
@@ -594,6 +612,20 @@ export function SessionComposer(props: SessionComposerProps) {
         )}
         </div>
         <div className="composer-toolbar__actions">
+        {/*
+          The session's one context reading. It used to print once per turn down
+          the transcript, which restated a running state as history; here it sits
+          beside the model and the effort, where the operator is already deciding
+          what the next message has room for.
+        */}
+        {context && (
+          <ContextDisplay.Chip
+            usage={context.usage}
+            modelContextWindow={context.contextWindow}
+            open={openMenu === "context"}
+            onOpenChange={(open) => setOpenMenu(open ? "context" : null)}
+          />
+        )}
         <span className="hidden shrink-0 font-mono text-code-sm whitespace-nowrap text-[var(--text-muted)] md:inline">{isRunning ? "queues while running" : "↵ sends"}</span>
         {/*
           A withheld capability, not decoration: it stays visible, disabled, and

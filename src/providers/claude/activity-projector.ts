@@ -2054,6 +2054,22 @@ export class ClaudeActivityProjector {
     return lane;
   }
 
+  /**
+   * The streamed partial this content block finishes, if the lane still holds
+   * one.
+   *
+   * Matching on the content-array index alone is not enough. Claude splits one
+   * provider message across several records, and a record's index space does
+   * not have to line up with the lane's — so a miss deleted the partial and
+   * re-emitted its text under a fresh id. `seq` freezes at an item's first
+   * upsert, so that fresh id took a slot at the *end* of the timeline, and the
+   * assistant's own words sank below tool calls it had introduced.
+   *
+   * A tool block never had this problem: it matches on `toolCallId` and ignores
+   * the index entirely. Text and thinking have no such id, so they fall back to
+   * the next unclaimed partial of the same kind in lane order, which is the
+   * order the provider streamed them in.
+   */
   #matchingPartial(
     lane: StreamLane | undefined,
     index: number,
@@ -2064,7 +2080,9 @@ export class ClaudeActivityProjector {
     const candidate = lane.blocks.get(index);
     const block = candidate?.kind === kind && !claimed.has(candidate.id)
       ? candidate
-      : undefined;
+      : [...lane.blocks.values()].find((entry) => (
+          entry.kind === kind && !claimed.has(entry.id)
+        ));
     if (block) claimed.add(block.id);
     return block;
   }

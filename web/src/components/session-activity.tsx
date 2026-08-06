@@ -5,12 +5,11 @@ import type {
   MessageTiming,
   ThreadMessageLike,
 } from "@assistant-ui/react";
-import { AlertTriangle, BookOpen, CircleAlert, Gauge, Radio } from "lucide-react";
+import { AlertTriangle, BookOpen, CircleAlert, Radio } from "lucide-react";
 import { DiffViewer, diffIdentityKey, fileChangeIsUpserting, relativeEditorPath, type FileChangeView } from "./diffs";
 import { PlanArtifact, TodoList, type PlanArtifactView, type TodoListView } from "./plans";
 import { ApprovalRequest, QuestionRequest, type ExactQuestionRequest } from "./requests";
 import { QueuedMessages } from "./composer";
-import { ContextDisplay } from "./assistant-ui/context-display";
 import { buildSubagentHierarchy, TurnMarker, type SubagentFrameData, type TurnFacts } from "./thread";
 import { jsonForDisplay } from "../lib/session-activity";
 import type {
@@ -21,6 +20,7 @@ import type {
   ActivityMemoryCitation,
   ActivityState,
   ActivityTodoItem,
+  ActivityUsageItem,
   RequestResponse,
   SessionActivityView,
   SessionView,
@@ -41,9 +41,13 @@ export interface ActivityAttentionControls {
    * generic permission card must not compete with it for the same request.
    */
   planOwnedRequestIds: ReadonlySet<string>;
+  /** Ids of transcript copies an exact request already states. See `supersededAttentionIds`. */
+  supersededIds: ReadonlySet<string>;
   mutationsReady: boolean;
   canRespond: boolean;
   busy: boolean;
+  /** Why this session cannot answer, where the harness said. */
+  respondUnavailableReason: string | null;
   workspaceRoot: string | null;
   remoteHost: string | null;
   sessionsOnHost: number | null;
@@ -533,6 +537,50 @@ export function exactCurrentActivityRequestIds(items: readonly ActivityItem[]): 
     : []));
 }
 
+/** The questions an attention item asks, as a value two items can be compared by. */
+function questionSignature(item: ActivityAttentionItem): string {
+  return JSON.stringify(item.questions.map((question) => [
+    question.text,
+    question.options.map((option) => option.label),
+  ]));
+}
+
+/**
+ * Transcript-derived requests that an exact provider-api request already states.
+ *
+ * Codex raises one `request_user_input` on two surfaces — the App Server, which
+ * can be answered, and the rollout, which cannot — and they are meant to collapse
+ * on a shared `correlationId`. That key is built from the response-item id, and
+ * neither surface is obliged to state one, so the pair can reach the drawer as
+ * two items: a live questionnaire and a read-only twin of it.
+ *
+ * Two copies is not only noise. `QuestionRequest` refuses its `1`-`9` and Enter
+ * shortcuts whenever more than one questionnaire is on screen, because it cannot
+ * tell which one a keystroke meant.
+ *
+ * Matching on the request id alone is not enough — the two surfaces name the
+ * request differently — so the questions themselves are the fallback identity.
+ */
+export function supersededAttentionIds(items: readonly ActivityItem[]): ReadonlySet<string> {
+  const exact = items.filter((item): item is ActivityAttentionItem => (
+    item.kind === "attention" && item.source === "provider-api" && item.questions.length > 0
+  ));
+  if (exact.length === 0) return new Set();
+  const byRequestId = new Set(exact.map((item) => item.requestId).filter((id): id is string => id !== null));
+  const bySignature = new Set(exact.map(questionSignature));
+  return new Set(items.flatMap((item) => (
+    item.kind === "attention"
+      && item.source === "transcript"
+      && item.questions.length > 0
+      && (
+        (item.requestId !== null && byRequestId.has(item.requestId))
+        || bySignature.has(questionSignature(item))
+      )
+      ? [item.id]
+      : []
+  )));
+}
+
 export function exactPlanApprovalRequestIds(
   items: readonly ActivityItem[],
   exactRequestIds: ReadonlySet<string>,
@@ -561,6 +609,28 @@ export function currentQueue(activity: SessionActivityView) {
 
 export function currentTodo(activity: SessionActivityView): ActivityTodoItem | null {
   return [...activity.items].reverse().find((item): item is ActivityTodoItem => item.kind === "todo") ?? null;
+}
+
+/**
+ * How full the model's context window is, as one reading for the composer.
+ *
+ * Scope is the whole question, and the tempting answer is the wrong one. Codex
+ * reports two usage items per update: `turn` is the most recent request, and
+ * `thread` is every request in the conversation summed. Only the first is
+ * occupancy — a chat request carries the whole conversation as input, so the
+ * latest turn's tokens *are* what the window holds. The thread total re-counts
+ * that prefix once per turn, so it climbs without bound and pins the meter at
+ * 100% on any conversation of length. Claude states no thread scope at all.
+ *
+ * Without a provider-stated window there is no denominator, and this returns
+ * null rather than let the composer guess at the number it is missing.
+ */
+export function currentContext(activity: SessionActivityView): ActivityUsageItem | null {
+  const withWindow = activity.items.filter((item): item is ActivityUsageItem => (
+    item.kind === "usage" && item.contextWindow !== null && item.contextWindow > 0
+  ));
+  const turns = withWindow.filter((item) => item.scope === "turn");
+  return (turns.length > 0 ? turns : withWindow).at(-1) ?? null;
 }
 
 export function todoView(item: ActivityTodoItem, progress: SessionView["todoProgress"] = null): TodoListView {
@@ -636,6 +706,10 @@ function FileChanges({ item, controls }: { item: ActivityFileChangeItem & { upse
 
 function Attention({ item, controls }: { item: ActivityAttentionItem; controls: ActivityAttentionControls }) {
   const exact = controls.exactRequestIds.has(item.requestId);
+  // A transcript copy of a request the provider is also stating exactly. The
+  // exact one is the only one that can be answered, and two on screen disable
+  // the keyboard path for both.
+  if (controls.supersededIds.has(item.id)) return null;
   /*
     The plan renders this request, and on phone the approval card is a modal
     sheet that would cover the plan it is asking about. Only where the plan can
@@ -649,7 +723,16 @@ function Attention({ item, controls }: { item: ActivityAttentionItem; controls: 
     && controls.planOwnedRequestIds.has(item.requestId)
   ) return null;
   if ((item.attentionKind === "question" || item.attentionKind === "elicitation") && item.questions.length > 0) {
-    return <QuestionRequest request={questionView(item)} disabled={!exact || !controls.mutationsReady || !controls.canRespond || controls.busy} onSubmit={controls.onRespond} />;
+    return (
+      <QuestionRequest
+        request={questionView(item)}
+        disabled={!exact || !controls.mutationsReady || !controls.canRespond || controls.busy}
+        // A disabled questionnaire used to keep every affordance of a live one
+        // and swallow the click. Where the harness named a reason, it is stated.
+        {...(controls.canRespond ? {} : { disabledReason: controls.respondUnavailableReason })}
+        onSubmit={controls.onRespond}
+      />
+    );
   }
   if (["approval", "permission", "sandbox"].includes(item.attentionKind) && exact) {
     return (
@@ -718,32 +801,6 @@ function Lifecycle({ item }: { item: Extract<ActivityItem, { kind: "lifecycle" }
   );
 }
 
-function Usage({ item }: { item: Extract<ActivityItem, { kind: "usage" }> }) {
-  // Only reached while a turn is still open; once it ends the turn marker states
-  // the totals and this row is suppressed. `0 reasoning` is noise rather than a
-  // fact worth a column, so a zero reasoning count is omitted.
-  const facts = [
-    item.inputTokens === null ? null : `${item.inputTokens.toLocaleString()} input`,
-    item.outputTokens === null ? null : `${item.outputTokens.toLocaleString()} output`,
-    item.reasoningTokens ? `${item.reasoningTokens.toLocaleString()} reasoning` : null,
-    item.totalTokens === null ? null : `${item.totalTokens.toLocaleString()} total`,
-    item.costUsd === null ? null : `$${item.costUsd.toFixed(4)}`,
-  ].filter((value): value is string => value !== null);
-  if (facts.length === 0) return null;
-  return (
-    <p className="my-2 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-code-xs text-[var(--text-muted)]">
-      <Gauge size={13} className="shrink-0" />
-      {facts.map((fact) => <span key={fact}>{fact}</span>)}
-      {/*
-        How full the window is, where the provider stated a window. Without one
-        there is no denominator, and the component renders nothing rather than
-        let the cockpit guess at the number it is missing.
-      */}
-      <ContextDisplay.Bar usage={item} modelContextWindow={item.contextWindow} />
-    </p>
-  );
-}
-
 function Plan({ item, controls }: { item: Extract<ActivityItem, { kind: "plan" }>; controls: ActivityPlanControls }) {
   const plan: PlanArtifactView = {
     id: item.id,
@@ -801,7 +858,14 @@ export function renderActivityData(name: string, data: unknown, controls: Activi
     case "attention": return <Attention item={item} controls={controls.attention} />;
     case "queue": return <div className="my-3"><QueuedMessages messages={item.messages.flatMap((message) => message.status === "dispatched" ? [] : [{ id: message.id, text: message.text, status: message.status }])} canRemove={controls.queue.canRemove && !controls.queue.busy} withheldReason={controls.queue.withheldReason} /></div>;
     case "lifecycle": return <Lifecycle item={item} />;
-    case "usage": return <Usage item={item} />;
+    /*
+      Usage is a running total, not an event. Printed as a row it restated the
+      same fact once per turn all the way down the transcript, and every number
+      in it is already stated where it belongs: the turn's own tokens and cost
+      in its turn marker, and how full the window is in the composer. The items
+      are still the source for both — they just no longer render as history.
+    */
+    case "usage": return null;
     case "subagent": return null; // GroupedActivityParts owns the subagent frame.
     default: return null;
   }

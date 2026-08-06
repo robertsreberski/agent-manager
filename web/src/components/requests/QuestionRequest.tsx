@@ -41,10 +41,20 @@ export interface QuestionRequestProps {
   request: ExactQuestionRequest;
   elapsed?: string;
   disabled?: boolean;
+  /**
+   * Why this session cannot answer a request it *could* otherwise answer.
+   *
+   * `readOnly` is a fact about the request — the provider never exposed it for
+   * answering. `disabled` is a fact about the session, and the two are not the
+   * same: an exact, respondable question in an observed session kept every
+   * affordance of a live one, styled the selected option, and then swallowed
+   * the click. This is what turns that into a stated reason.
+   */
+  disabledReason?: string | null;
   onSubmit: (requestId: string, response: AtomicQuestionResponse) => Promise<void> | void;
 }
 
-export function QuestionRequest({ request, elapsed, disabled = false, onSubmit }: QuestionRequestProps) {
+export function QuestionRequest({ request, elapsed, disabled = false, disabledReason = null, onSubmit }: QuestionRequestProps) {
   const phone = usePhoneViewport();
   const exact = isExactRespondableRequest(request);
   const readOnly = !exact;
@@ -55,6 +65,13 @@ export function QuestionRequest({ request, elapsed, disabled = false, onSubmit }
   const [customOpen, setCustomOpen] = useState<Record<string, boolean>>({});
   const [submitting, setSubmitting] = useState(false);
   const question = request.questions[active];
+  /*
+    Nothing here can be acted on: either the provider never exposed the request
+    for answering (`readOnly`), or this session cannot answer it (`disabled`), or
+    an answer is already in flight. The controls were always disabled on all
+    three, but only the first said so or looked it.
+  */
+  const locked = readOnly || disabled || submitting;
   const complete = request.questions.length > 0 && request.questions.every((item) => isAnswered(item, answers[item.id]));
   const completedCount = request.questions.filter((item) => isAnswered(item, answers[item.id])).length;
   const remainingCount = request.questions.length - completedCount;
@@ -169,11 +186,16 @@ export function QuestionRequest({ request, elapsed, disabled = false, onSubmit }
           </Button>
         </CollapsibleTrigger>
         <CollapsibleContent className="ml-6 grid min-w-0 grid-cols-[minmax(0,1fr)] gap-1.5 pt-0.5 pb-2">
-          {readOnly && (
+          {locked && !submitting && (
             <p className="border-l-2 border-dashed border-[var(--accent)] bg-[var(--surface-raised)] px-3 py-2 text-meta-sm text-[var(--text-muted)]" data-question-read-only-guidance>
-              {request.state === "resolved"
-                ? `Resolved in the ${codexTranscript ? "active Codex surface" : "native provider interface"}. Answers are not shown here.`
-                : `Read only here. Answer this in the ${codexTranscript ? "active Codex surface" : "native provider interface"}.`}
+              {readOnly
+                ? request.state === "resolved"
+                  ? `Resolved in the ${codexTranscript ? "active Codex surface" : "native provider interface"}. Answers are not shown here.`
+                  : `Read only here. Answer this in the ${codexTranscript ? "active Codex surface" : "native provider interface"}.`
+                // The request itself is answerable; this session is not the one
+                // that can answer it. Saying nothing is what made a live-looking
+                // questionnaire swallow every click.
+                : disabledReason ?? "This session cannot answer right now. Take control to respond."}
             </p>
           )}
           {request.questions.map((item, index) => {
@@ -198,7 +220,6 @@ export function QuestionRequest({ request, elapsed, disabled = false, onSubmit }
               );
             }
             const described = item.options.some((option) => option.description);
-            const locked = readOnly || disabled || submitting;
             /*
               Frame 9a-2: a described option is a full-width row and never
               collapses into a pill, because a pill would have to truncate the
@@ -216,8 +237,8 @@ export function QuestionRequest({ request, elapsed, disabled = false, onSubmit }
                   const indicator = described ? "mt-[3px]" : "sr-only";
                   return (
                     <label key={option.id} className={described
-                      ? `flex min-h-[46px] min-w-0 ${readOnly ? "cursor-default" : "cursor-pointer"} items-start gap-[11px] px-3 py-2.5 ${selected ? "bg-[var(--wants-field)] outline outline-[var(--wants-outline)]" : "border border-[var(--border)]"}`
-                      : `flex ${phone ? "min-h-[46px]" : "min-h-8"} max-w-full ${readOnly ? "cursor-default" : "cursor-pointer"} items-center rounded-full border px-3 text-meta-sm ${selected || option.recommended && !answer ? "border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-ink)]" : "border-[var(--border)]"}`}
+                      ? `flex min-h-[46px] min-w-0 ${locked ? "cursor-default" : "cursor-pointer"} items-start gap-[11px] px-3 py-2.5 ${selected ? "bg-[var(--wants-field)] outline outline-[var(--wants-outline)]" : "border border-[var(--border)]"}`
+                      : `flex ${phone ? "min-h-[46px]" : "min-h-8"} max-w-full ${locked ? "cursor-default" : "cursor-pointer"} items-center rounded-full border px-3 text-meta-sm ${selected || option.recommended && !answer ? "border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-ink)]" : "border-[var(--border)]"}`}
                     >
                       {item.multiple
                         ? <Checkbox className={indicator} disabled={locked} checked={selected} onCheckedChange={() => choose(item, option.id)} />
@@ -231,7 +252,7 @@ export function QuestionRequest({ request, elapsed, disabled = false, onSubmit }
                   );
                 })}
                 {item.allowFreeText && !described && item.options.length > 0 && (
-                  readOnly
+                  locked
                     ? <input disabled id={`custom-${request.id}-${item.id}`} type={item.secret ? "password" : "text"} autoComplete={item.secret ? "new-password" : undefined} value="" readOnly className={`${phone ? "min-h-[46px]" : "min-h-8"} min-w-32 max-w-full rounded-full border border-dashed border-[var(--border)] bg-transparent px-3 text-meta-sm outline-none placeholder:text-[var(--text-muted)]`} placeholder="Something else…" aria-label={`${item.prompt} custom answer`} />
                     : customOpen[item.id] || Boolean(answer?.custom)
                     ? <input autoFocus id={`custom-${request.id}-${item.id}`} type={item.secret ? "password" : "text"} autoComplete={item.secret ? "new-password" : undefined} value={answer?.custom ?? ""} onChange={(event) => setCustom(item, event.target.value)} className={`${phone ? "min-h-[46px]" : "min-h-8"} min-w-32 max-w-full rounded-full border border-dashed border-[var(--border)] bg-transparent px-3 text-meta-sm outline-none placeholder:text-[var(--text-muted)] focus:border-[var(--accent)]`} placeholder="Something else…" aria-label={`${item.prompt} custom answer`} />
@@ -248,7 +269,7 @@ export function QuestionRequest({ request, elapsed, disabled = false, onSubmit }
               </>
             );
             return (
-              <fieldset key={item.id} className="my-1 min-w-0 max-w-full bg-[var(--surface-raised-active)] px-3.5 py-[13px]" disabled={locked}>
+              <fieldset key={item.id} className="my-1 min-w-0 max-w-full bg-[var(--surface-raised-active)] px-3.5 py-[13px]" disabled={locked} data-question-locked={locked ? "true" : "false"}>
                 {/* A flex `legend` will not shrink below max-content, so an unbroken
                     provider token would widen the whole drawer at 390px. */}
                 <legend className="block max-w-full text-title-sm font-medium [overflow-wrap:anywhere] [text-wrap:pretty]"><span className="mr-2 font-mono text-code-sm font-medium text-[var(--accent)]">{index + 1}</span>{item.prompt}</legend>
@@ -276,8 +297,11 @@ export function QuestionRequest({ request, elapsed, disabled = false, onSubmit }
           {exact && phone && request.questions.length > 1 && (
             <footer className="question-request__phone-footer" data-phone-sticky-footer aria-label="Question submission">
               <span className="min-w-0 flex-1 font-mono text-meta-sm leading-[1.4] text-[var(--text-muted)]">{remainingCount === 0 ? "All questions answered" : `${remainingCount} ${remainingCount === 1 ? "question" : "questions"} left`}</span>
-              {/* The one atomic send on a phone: nothing leaves until every question is answered. */}
-              <Button variant="primary" size="touch" disabled={!complete || submitting} className={`shrink-0 px-[18px] font-semibold disabled:bg-[var(--surface-selected)] disabled:[color:var(--text-muted)] disabled:opacity-100`} onClick={() => void submit()}>Send {request.questions.length} answers</Button>
+              {/* The one atomic send on a phone: nothing leaves until every question is answered.
+                  It sits outside the disabled `fieldset`, so it has to state the
+                  lock itself — it used to look live and no-op, because `submit`
+                  bails on `disabled`. */}
+              <Button variant="primary" size="touch" disabled={locked || !complete} className={`shrink-0 px-[18px] font-semibold disabled:bg-[var(--surface-selected)] disabled:[color:var(--text-muted)] disabled:opacity-100`} onClick={() => void submit()}>Send {request.questions.length} answers</Button>
             </footer>
           )}
         </CollapsibleContent>
