@@ -19,6 +19,7 @@ import { resolveCodexExecutionProfiles } from "../discovery/observe.ts";
 import { ensurePrivateRuntimeDirectory, type AgentManagerPaths } from "../ops/config.ts";
 import { sweepRetiredCodexHooks } from "../ops/codex-hooks-cleanup.ts";
 import type { ProviderControlAdapters } from "./contracts.ts";
+import { mergeClaudeManagedSessionMetadata } from "./claude-managed-metadata.ts";
 import {
   codexProfileRepairCandidateIds,
   mergeCodexManagedSessionMetadata,
@@ -304,22 +305,7 @@ export async function createAgentManagerServer(
             (record) => record.id === session.id && record.provider === "claude",
           );
           if (!persisted) return;
-          const nextMetadata = {
-            ...persisted.metadata,
-            name: session.name,
-            profile: session.profile.value,
-            model: session.model.value,
-            effort: session.effort.value,
-            managerControl: session.providerStatus === "closed"
-              ? persisted.metadata.managerControl ?? "active"
-              : "active",
-            ...(session.control.authority === "manager"
-              ? {
-                  ownership: "shared",
-                  recovery: null,
-                }
-              : {}),
-          };
+          const nextMetadata = mergeClaudeManagedSessionMetadata(persisted, session);
           if (JSON.stringify(nextMetadata) === JSON.stringify(persisted.metadata)) return;
           database.upsertManagedSession({
             ...persisted,

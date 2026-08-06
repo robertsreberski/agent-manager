@@ -14,6 +14,7 @@ import type {
   LocalCliProcessIdentity,
   LocalCliProcessInspector,
 } from "./cli-takeover.ts";
+import { mergeClaudeManagedSessionMetadata } from "./claude-managed-metadata.ts";
 import { ManagerDatabase } from "./persistence.ts";
 import { createAgentManagerServer } from "./server.ts";
 import { SessionStateStore } from "./state.ts";
@@ -157,6 +158,40 @@ function recoveryAdapter(
       for (const record of records) {
         onRestore(record);
         state.upsert(recoveredView(record));
+      }
+      return {
+        restoredSessionIds: records.map((record) => record.managerSessionId),
+        failures: [],
+        truncated: false,
+      };
+    },
+  };
+}
+
+function productionPersistenceRecoveryAdapter(
+  database: ManagerDatabase,
+  state: SessionStateStore,
+  onRestore: (record: ManagedSessionRecoveryRecord) => void = () => undefined,
+): ProviderControlAdapter {
+  return {
+    async createSession() { throw new Error("not used"); },
+    async performAction() { return { status: "succeeded" }; },
+    async restoreManagedSessions(records) {
+      for (const record of records) {
+        onRestore(record);
+        const view = recoveredView(record);
+        const persisted = database.listManagedSessions().find(
+          (candidate) => candidate.id === record.managerSessionId,
+        );
+        assert.ok(persisted);
+        // Production receives the provider callback before the coordinator
+        // validates the completed restore. Exercise that ordering here.
+        database.upsertManagedSession({
+          ...persisted,
+          metadata: mergeClaudeManagedSessionMetadata(persisted, view),
+          updatedAt: new Date().toISOString(),
+        });
+        state.upsert(view);
       }
       return {
         restoredSessionIds: records.map((record) => record.managerSessionId),
@@ -340,7 +375,12 @@ test("legacy Claude managerControl migration uses durable End evidence exactly o
 test("a persisted managed Claude identity survives its own write on restart", async (t) => {
   const database = new ManagerDatabase();
   database.addWorkspace({ id: "workspace", label: "Workspace", path: "/tmp/workspace" });
-  persistClaude(database, "round-trip", { ownership: "shared", managerControl: "active" });
+  persistClaude(database, "round-trip", {
+    ownership: "shared",
+    managerControl: "active",
+    nativeOwner: null,
+    handoffId: null,
+  });
   const state = new SessionStateStore();
   let restores = 0;
   const backend = await createAgentManagerServer({
@@ -349,7 +389,7 @@ test("a persisted managed Claude identity survives its own write on restart", as
     database,
     state,
     adapters: {
-      claude: recoveryAdapter(state, (record) => {
+      claude: productionPersistenceRecoveryAdapter(database, state, (record) => {
         restores += 1;
         assert.equal(record.ownership, "shared");
       }),
@@ -370,12 +410,22 @@ test("a persisted managed Claude identity survives its own write on restart", as
   await waitFor(() => {
     assert.equal(restores, 1, "the persisted identity must be recovered, not skipped");
     assert.equal(state.get("local:claude:round-trip")?.control.recovery, null);
+    const persisted = database.listManagedSessions().find(
+      (record) => record.id === "local:claude:round-trip",
+    );
+    assert.equal("nativeOwner" in (persisted?.metadata ?? {}), false);
+    assert.equal("handoffId" in (persisted?.metadata ?? {}), false);
   }, "managed Claude restart round trip");
   assert.deepEqual(
     state.snapshot().diagnostics.filter((d) => /Skipped invalid persisted/u.test(d.message)),
     [],
     "a record the server wrote itself must never be rejected as invalid",
   );
+  const persisted = database.listManagedSessions().find(
+    (record) => record.id === "local:claude:round-trip",
+  );
+  assert.equal("nativeOwner" in (persisted?.metadata ?? {}), false);
+  assert.equal("handoffId" in (persisted?.metadata ?? {}), false);
 });
 
 test("an exact pre-cutover Claude identity canonicalizes only after shared recovery succeeds", async (t) => {
@@ -395,7 +445,7 @@ test("an exact pre-cutover Claude identity canonicalizes only after shared recov
     database,
     state,
     adapters: {
-      claude: recoveryAdapter(state, (record) => {
+      claude: productionPersistenceRecoveryAdapter(database, state, (record) => {
         restores += 1;
         assert.equal(record.ownership, "shared");
       }),

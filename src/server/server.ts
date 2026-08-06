@@ -84,6 +84,7 @@ import {
   type RemoteHostDefinition,
 } from "../remote/index.ts";
 import { AuthManager, type AuthManagerOptions, type AuthSession } from "./auth.ts";
+import { isLegacyClaudeSharedRecoveryCandidate } from "./claude-managed-metadata.ts";
 import { repairPersistedCodexManagedSessions } from "./codex-managed-metadata.ts";
 import {
   createSessionSchema,
@@ -568,15 +569,6 @@ function codexIdentityBaselineMissing(record: ManagedSessionRecoveryRecord): boo
     record.providerTreeId === undefined
     || record.providerParentThreadId === undefined
   );
-}
-
-function isLegacyClaudeSharedRecoveryCandidate(record: ManagedSessionMetadata): boolean {
-  // Only the old steady manager-owned state has an unambiguous shared-join
-  // meaning. Transitional handoff/native ownership remains fail-closed.
-  return record.provider === "claude"
-    && record.metadata.ownership === "manager-exclusive"
-    && (record.metadata.nativeOwner ?? null) === null
-    && (record.metadata.handoffId ?? null) === null;
 }
 
 function managedRecoveryRecords(database: ManagerDatabase, provider: Provider): {
@@ -1597,6 +1589,11 @@ export async function createAgentManagerServer(
     if (!persisted) return false;
     const canonicalizeLegacyClaudeOwnership = recovery === null
       && isLegacyClaudeSharedRecoveryCandidate(persisted);
+    const removeRetiredClaudeOwnershipKeys = recovery === null
+      && persisted.provider === "claude"
+      && (canonicalizeLegacyClaudeOwnership || persisted.metadata.ownership === "shared")
+      && (persisted.metadata.nativeOwner ?? null) === null
+      && (persisted.metadata.handoffId ?? null) === null;
     // `recovery === null` is published only after the adapter confirmed the
     // exact provider session and workspace. Until then, leave durable legacy
     // ownership untouched so a failed or cancelled attempt cannot authorize it.
@@ -1607,7 +1604,7 @@ export async function createAgentManagerServer(
         : persisted.metadata.ownership ?? "shared",
       recovery,
     };
-    if (canonicalizeLegacyClaudeOwnership) {
+    if (removeRetiredClaudeOwnershipKeys) {
       delete metadata.nativeOwner;
       delete metadata.handoffId;
     }
