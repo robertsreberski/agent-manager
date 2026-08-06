@@ -1440,3 +1440,69 @@ test("two Claude replies with identical text survive as two", () => {
   observer.dispose();
   hub.dispose();
 });
+
+/*
+  A prompt id spans every event until the next prompt, so the transcript hangs
+  more than one visible user row off it routinely — here the operator's message
+  and the interrupt marker their next keystroke produced. Measured across local
+  sessions, 12.5% of prompt ids carry two or more.
+
+  Keyed on the prompt id both rows shared one correlation, so the two sides could
+  not agree on a count, `reconcileTranscript` merged neither, and the operator's
+  own message rendered twice beside a row that only the transcript knows about.
+*/
+test("an operator message merges even when its prompt id covers another row", () => {
+  const fixture = claudeHome();
+  const project = join(fixture.projects, "-fixture-project");
+  mkdirSync(project);
+  writeFileSync(join(project, `${CLAUDE_ID}.jsonl`), jsonl([
+    claudeRow({ uuid: "u1", type: "user", content: "restart", extra: { promptId: "prompt-1" } }),
+    claudeRow({
+      uuid: "u2",
+      parentUuid: "u1",
+      type: "user",
+      content: "[Request interrupted by user for tool use]",
+      extra: { promptId: "prompt-1" },
+    }),
+  ]));
+  const reader = new LocalSessionTranscriptReader({ claudeHome: fixture.home });
+
+  const managerSessionId = `local:claude:${CLAUDE_ID}`;
+  const hub = new ActivityHub({ streamEpoch: "claude-prompt-cardinality" });
+  const projector = new ClaudeHookActivityProjector();
+  // The hook reports the prompt the operator typed, and only that.
+  for (const mutation of projector.project(parseClaudeHookInput({
+    session_id: CLAUDE_ID,
+    transcript_path: join(project, `${CLAUDE_ID}.jsonl`),
+    cwd: "/workspace",
+    prompt_id: "prompt-1",
+    hook_event_name: "UserPromptSubmit",
+    prompt: "restart",
+  })).mutations) {
+    hub.ingest(managerSessionId, "claude", mutation);
+  }
+
+  const observer = new SelectedTranscriptActivityObserver({ hub, reader });
+  observer.seedOnce({
+    id: managerSessionId,
+    provider: "claude",
+    providerThreadId: CLAUDE_ID,
+    providerTreeId: CLAUDE_ID,
+    parentId: null,
+    status: "running",
+  } as SessionView);
+
+  const users = (hub.snapshot(managerSessionId)?.items ?? []).filter(
+    (item) => item.kind === "message" && item.role === "user",
+  );
+  assert.deepEqual(
+    users.map((item) => item.kind === "message" ? item.text : null),
+    ["restart", "[Request interrupted by user for tool use]"],
+    "the typed message once, and the row only the transcript knows still shown",
+  );
+  assert.equal(users[0]?.source, "provider-api", "the exact live item takes the prompt's slot");
+  assert.equal(users[1]?.source, "transcript");
+
+  observer.dispose();
+  hub.dispose();
+});

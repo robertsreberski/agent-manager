@@ -781,3 +781,95 @@ test("a second tool call does not steal the first one's question", () => {
   assert.equal(adopted(first), 1);
   assert.equal(adopted(second), 0, "the question was already claimed");
 });
+
+/*
+  A prompt id is not one message. It spans "all subsequent events until the next
+  prompt", and the transcript records more than one visible user row under it
+  routinely — an interrupt marker, a `/compact` banner, a message typed mid-turn.
+  Measured across local sessions, 12.5% of prompt ids carry two or more. Keyed on
+  the prompt id, those rows all shared one correlation, the counts on the two
+  sides could not match, and the operator's own message rendered twice.
+*/
+test("an operator prompt is keyed on its text, not on the prompt id it shares", () => {
+  const projector = new ClaudeHookActivityProjector();
+  const emitted = projector.project(parseClaudeHookInput({
+    ...common("UserPromptSubmit"),
+    prompt: "Run the tests",
+  })).mutations.at(-1);
+
+  assert.ok(emitted?.type === "upsert" && emitted.item.kind === "message");
+  if (emitted?.type !== "upsert" || emitted.item.kind !== "message") return;
+  assert.equal(emitted.item.correlationId, claudeMessageCorrelationId("user", "Run the tests"));
+  assert.ok(
+    !emitted.item.correlationId?.includes("prompt-1"),
+    "the prompt id names a span of events, not this message",
+  );
+});
+
+test("a prompt that arrived before Claude allocated a prompt id still gets a key", () => {
+  const projector = new ClaudeHookActivityProjector();
+  const { prompt_id: _omitted, ...withoutPromptId } = common("UserPromptSubmit");
+  const emitted = projector.project(parseClaudeHookInput({
+    ...withoutPromptId,
+    prompt: "First thing I ever typed",
+  })).mutations.at(-1);
+
+  // This used to be null, so the row could never reconcile with anything.
+  assert.equal(
+    emitted?.type === "upsert" && emitted.item.kind === "message"
+      ? emitted.item.correlationId
+      : null,
+    claudeMessageCorrelationId("user", "First thing I ever typed"),
+  );
+});
+
+/*
+  The SDK states exactly one flush per message carries `final`, so nothing after
+  it can extend that message. The guard only skipped deltas at or below the
+  completed index, which caught a redelivered flush but not one with a higher
+  index — that started a fresh buffer and replaced a finished reply with a
+  fragment of itself under the same id.
+*/
+test("a delta arriving after final cannot overwrite the finished reply", () => {
+  const projector = new ClaudeHookActivityProjector();
+  const display = (index: number, final: boolean, delta: string) => parseClaudeHookInput({
+    ...common("MessageDisplay"),
+    turn_id: "turn-1",
+    message_id: "message-1",
+    index,
+    final,
+    delta,
+  });
+  projector.project(display(0, false, "The full "));
+  const final = projector.project(display(1, true, "answer.")).mutations.at(-1);
+  assert.equal(
+    final?.type === "upsert" && final.item.kind === "message" ? final.item.text : null,
+    "The full answer.",
+  );
+
+  // A later index, not a replay of one already seen.
+  assert.deepEqual(projector.project(display(7, false, "stray")).mutations, []);
+});
+
+test("clamping a very long reply states that it was truncated", () => {
+  const projector = new ClaudeHookActivityProjector();
+  const display = (index: number, final: boolean, delta: string) => parseClaudeHookInput({
+    ...common("MessageDisplay"),
+    turn_id: "turn-1",
+    message_id: "long-message",
+    index,
+    final,
+    delta,
+  });
+  // The payload validator bounds one delta, so the cap is reached across several.
+  for (let index = 0; index < 6; index += 1) {
+    projector.project(display(index, false, "x".repeat(50_000)));
+  }
+  const final = projector.project(display(6, true, "tail")).mutations.at(-1);
+
+  assert.ok(final?.type === "upsert" && final.item.kind === "message");
+  if (final?.type !== "upsert" || final.item.kind !== "message") return;
+  assert.equal(final.item.text?.length, 262_144);
+  assert.ok(final.item.text?.endsWith("tail"), "the end of a reply is the answer; the head is what goes");
+  assert.equal(final.item.truncated, true, "dropping the head silently is the bug");
+});

@@ -1278,7 +1278,19 @@ function claudeItems(
       items.push({
         kind: "message",
         id,
-        correlationId: correlationId("message", promptId ?? providerId),
+        /*
+          Not the prompt id. A prompt id spans every event until the next prompt,
+          and more than one visible user row hangs off it routinely — an
+          interrupt marker, a `/compact` banner, a message typed mid-turn. Two
+          rows sharing one key against the single item the hook reports made the
+          counts unequal, and reconciliation merged neither, so the operator's
+          own message rendered twice.
+
+          The text is the identity. Rows the live surfaces never produce keep a
+          key of their own and stay transcript-only; the real prompt pairs one
+          to one.
+        */
+        correlationId: claudeMessageCorrelationId("user", redactActivityText(text)),
         turnId: activeTurnId,
         role: "user",
         text,

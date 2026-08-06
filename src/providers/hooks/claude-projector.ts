@@ -17,6 +17,8 @@ import { toolApprovalFacts } from "../approval-facts.ts";
 interface DisplayMessage {
   text: string;
   nextIndex: number;
+  /** The head was dropped to stay inside the field bound; say so on the item. */
+  truncated?: boolean;
 }
 
 type TaskProjectionStep = ActivityTodoInputStep;
@@ -213,13 +215,28 @@ export class ClaudeHookActivityProjector {
 
       case "UserPromptSubmit": {
         const identity = input.prompt_id ?? digest(input.prompt);
+        const safePrompt = redactActivityText(input.prompt);
         mutations.push(upsert({
           ...base,
           id: itemId(input, "message:user", identity),
-          correlationId: input.prompt_id ? `message:${input.prompt_id}` : null,
+          /*
+            The prompt id used to be the key, and a prompt id is not one message.
+            It spans "all subsequent events until the next prompt", and the
+            transcript records more than one visible user row under it routinely
+            — an interrupt marker, a `/compact` banner, a second prompt typed
+            mid-turn. Reconciliation requires equal counts on both sides, so two
+            transcript rows against this one item merged neither, and the
+            operator's own message appeared twice.
+
+            Keyed on the text, each row is its own identity: the rows this hook
+            never produces simply stay transcript-only, and the real prompt pairs
+            one to one. Also gives a prompt that arrived before Claude allocated
+            a prompt id a key at all, where it previously had none.
+          */
+          correlationId: claudeMessageCorrelationId("user", safePrompt),
           kind: "message",
           role: "user",
-          text: redactActivityText(input.prompt),
+          text: safePrompt,
           state: "complete",
         }));
         break;
@@ -386,8 +403,18 @@ export class ClaudeHookActivityProjector {
 
       case "MessageDisplay": {
         const key = `${input.session_id}\0${input.message_id}`;
-        const completedIndex = this.#completedDisplays.get(key);
-        if (completedIndex !== undefined && input.index <= completedIndex) break;
+        /*
+          A message that has flushed `final` is finished — the SDK states exactly
+          one flush per message carries it — so nothing that arrives afterwards
+          can extend it.
+
+          This only skipped deltas at or below the completed index, which caught
+          a redelivered flush but not one with a *higher* index. That passed,
+          found no live buffer, started a fresh one at `{ text: "" }`, and
+          upserted the same item id with just that delta — replacing a complete
+          reply with a fragment of itself.
+        */
+        if (this.#completedDisplays.has(key)) break;
         const current = this.#displayMessages.get(key) ?? { text: "", nextIndex: 0 };
         if (input.index < current.nextIndex) break;
         if (input.index > current.nextIndex) {
@@ -404,7 +431,13 @@ export class ClaudeHookActivityProjector {
         }
         current.text += redactActivityText(input.delta);
         current.nextIndex = input.index + 1;
-        if (current.text.length > 262_144) current.text = current.text.slice(-262_144);
+        // Keeping the tail of a very long reply is the right call — the end is
+        // the answer — but dropping the beginning of it silently is not. The
+        // drawer can only say so if the item says so.
+        if (current.text.length > 262_144) {
+          current.text = current.text.slice(-262_144);
+          current.truncated = true;
+        }
         this.#displayMessages.set(key, current);
         /*
           Redacted twice on purpose. Each delta is redacted as it lands so a
@@ -437,6 +470,7 @@ export class ClaudeHookActivityProjector {
           kind: "message",
           role: "assistant",
           text: safeText,
+          ...(current.truncated ? { truncated: true } : {}),
           state: input.final ? "complete" : "running",
         }));
         if (input.final) {
