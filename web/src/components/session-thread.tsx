@@ -681,8 +681,16 @@ export function SessionThreadComposer({
       setResumeBusy(false);
     }
   }
-  const unavailableReason = (capability: "set-model" | "set-effort" | "set-profile" | "set-sandbox", fallback: string) =>
-    session.control.withheld.find((item) => item.capability === capability)?.reason ?? fallback;
+  /*
+    Every published view rules on every capability, so a withheld entry is
+    always there to read. The fallback exists only so a hole cannot render an
+    empty tooltip — it deliberately claims nothing about the harness, because
+    the fabricated "this harness does not expose it" is precisely what told
+    operators to go looking for a setting that was never missing.
+  */
+  const unavailableReason = (capability: "set-model" | "set-effort" | "set-profile" | "set-sandbox") =>
+    session.control.withheld.find((item) => item.capability === capability)?.reason
+      ?? "This control is unavailable for this session.";
   const effortChoices = composerEffortOptions(session.provider, effortOptions, canSetEffort);
   const takeoverFailed = takeover?.state === "failed";
   const showControlStatus = Boolean(noWriteReason || recovery || canTakeControl || canResumeHere || takeoverFailed || resumeError);
@@ -828,13 +836,16 @@ export function SessionThreadComposer({
         sandbox={session.sandbox.value}
         modelOptions={modelOptions}
         modelOptionsStatus={modelOptionsStatus}
-        modelChangeUnavailableReason={canSetModel ? null : unavailableReason("set-model", "This harness does not expose live model changes.")}
-        effortChangeUnavailableReason={canSetEffort ? null : unavailableReason("set-effort", "This harness does not expose live effort changes.")}
-        profileChangeUnavailableReason={canSetProfile ? null : unavailableReason("set-profile", "This harness does not expose live execution-profile changes.")}
-        sandboxChangeUnavailableReason={canSetSandbox ? null : unavailableReason("set-sandbox", "This harness does not expose live sandbox changes.")}
+        modelChangeUnavailableReason={canSetModel ? null : unavailableReason("set-model")}
+        effortChangeUnavailableReason={canSetEffort ? null : unavailableReason("set-effort")}
+        profileChangeUnavailableReason={canSetProfile ? null : unavailableReason("set-profile")}
+        sandboxChangeUnavailableReason={canSetSandbox ? null : unavailableReason("set-sandbox")}
         effortOptions={effortChoices}
         profileOptions={canSetProfile ? PROFILES : session.profile.value ? [session.profile.value] : []}
         busy={busy}
+        {...(canShowTakeControl && takeover?.methods[0]
+          ? { onTakeControl: () => { void beginTakeover(takeover.methods[0]!); } }
+          : {})}
         {...(canSetModel ? { onModelChange: (model: string) => void onSetModel(model) } : {})}
         {...(canSetEffort ? { onEffortChange: (effort: ReasoningEffort) => void onSetEffort(effort) } : {})}
         {...(canSetProfile ? { onProfileChange: (profile: ExecutionProfile) => void onSetProfile(profile) } : {})}

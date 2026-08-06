@@ -1,3 +1,10 @@
+import {
+  DEFERRED,
+  allCapabilities,
+  deferredToLaterLayers,
+  resolveControlCapabilities,
+} from "./capabilities.ts";
+
 export type Provider = "codex" | "claude";
 
 export function sessionRecordId(hostId: string, provider: Provider, providerThreadId: string): string {
@@ -537,6 +544,18 @@ export function providerEffort(
   };
 }
 
+/**
+ * Why a session Agent Manager only watches refuses a write.
+ *
+ * Naming the remedy rather than the absence is the whole point. This is a
+ * session the manager can see but does not own — the harness supports the
+ * write perfectly well, and `take-control` is offered alongside. Saying the
+ * harness lacks the feature would be false, and would send the operator
+ * looking for a setting instead of the button that fixes it.
+ */
+export const OBSERVE_ONLY_REASON =
+  "Agent Manager is observing this session. Take control to change it.";
+
 export function observeOnlyControl(): SessionControl {
   return {
     plane: "observe-only",
@@ -547,8 +566,30 @@ export function observeOnlyControl(): SessionControl {
       responseResolution: "single-controller",
     },
     recovery: null,
-    capabilities: [],
-    withheld: [],
+    /*
+      Rule on every control, rather than publishing two empty lists.
+      A capability in neither list is a hole: the cockpit disables the control
+      because it was not granted, then finds no reason to show and invents one.
+      That is exactly how an observed session came to claim its harness had no
+      model setting.
+
+      `take-control` and the rest of the later-layer capabilities stay deferred
+      — the takeover coordinator and the editor launcher decide those after
+      this record is published, and a withheld entry here reads as a standing
+      refusal that stops them being granted at all.
+    */
+    ...resolveControlCapabilities({
+      ...allCapabilities(OBSERVE_ONLY_REASON),
+      ...deferredToLaterLayers(),
+      /*
+        Discovery decides these too, and it decides them by *replacing*
+        `capabilities` while keeping `withheld` as it found it — see the tmux
+        pane matcher. Withholding them here would leave them granted and
+        withheld at once the moment an observed session is matched to a pane.
+      */
+      attach: DEFERRED,
+      resume: DEFERRED,
+    }),
     takeover: null,
   };
 }

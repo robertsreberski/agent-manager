@@ -7,6 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import type { Runtime } from "../core/types.ts";
 import { sessionRecordSchema } from "../shared/wire.ts";
+import { OBSERVE_ONLY_REASON } from "../shared/session.ts";
 
 import {
   analyzeCodexEvents,
@@ -221,19 +222,39 @@ test("production observe scan attaches an exact official-CLI tmux match and make
       tty: "ttys001",
       attachedClients: 1,
     });
-    assert.deepEqual(sessions.get(liveThread)?.control, {
-      plane: "tmux-attach",
-      authority: "foreign",
-      coordination: {
-        mode: "observe-only",
-        nativeAttach: "none",
-        responseResolution: "single-controller",
-      },
-      recovery: null,
-      capabilities: ["preview", "attach"],
-      withheld: [],
-      takeover: null,
+    const liveControl = sessions.get(liveThread)?.control;
+    assert.equal(liveControl?.plane, "tmux-attach");
+    assert.equal(liveControl?.authority, "foreign");
+    assert.deepEqual(liveControl?.coordination, {
+      mode: "observe-only",
+      nativeAttach: "none",
+      responseResolution: "single-controller",
     });
+    assert.equal(liveControl?.recovery, null);
+    assert.deepEqual(liveControl?.capabilities, ["preview", "attach"]);
+    assert.equal(liveControl?.takeover, null);
+    /*
+      An observed session states why each write is refused, and names the
+      remedy. Publishing an empty `withheld` left the cockpit disabling every
+      control and then inventing an explanation — which is how an observed
+      session came to claim its harness had no model setting.
+    */
+    assert.deepEqual(
+      liveControl?.withheld.map(({ capability }) => capability),
+      ["queue", "steer", "interrupt", "respond", "set-profile", "set-sandbox",
+       "set-model", "set-effort", "remove-queued", "end", "archive", "delete"],
+    );
+    for (const entry of liveControl?.withheld ?? []) {
+      assert.equal(entry.reason, OBSERVE_ONLY_REASON);
+    }
+    // Whatever discovery grants must not also be refused.
+    for (const granted of liveControl?.capabilities ?? []) {
+      assert.equal(
+        liveControl?.withheld.some(({ capability }) => capability === granted),
+        false,
+        `${granted} is granted and withheld`,
+      );
+    }
     assert.equal(sessions.get(recentThread)?.terminal, null);
     assert.equal(sessions.get(recentThread)?.control.plane, "resume-only");
     assert.equal(sessions.get(recentThread)?.control.authority, "none");

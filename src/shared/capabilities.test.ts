@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { CONTROL_CAPABILITIES } from "../../shared/session.ts";
+import { CONTROL_CAPABILITIES, OBSERVE_ONLY_REASON, observeOnlyControl } from "./session.ts";
+import { assertCapabilityContract } from "../providers/shared/session-view.conformance.test.ts";
 import {
   DEFERRED,
   allCapabilities,
@@ -82,4 +83,33 @@ test("allCapabilities covers the vocabulary exactly", () => {
   const { capabilities, withheld } = resolveControlCapabilities(table as CapabilityRulings);
   assert.deepEqual(capabilities, []);
   assert.deepEqual(withheld, []);
+});
+
+test("an observed session refuses every write it cannot do, and says why", () => {
+  const control = observeOnlyControl();
+  assertCapabilityContract(control);
+
+  /*
+    The regression this exists for. Publishing two empty lists left the cockpit
+    disabling every control and then reaching for a fallback string, which told
+    operators the harness had no model setting — of a harness that has one, on a
+    session Agent Manager simply does not own.
+  */
+  const withheld = new Map(control.withheld.map(({ capability, reason }) => [capability, reason]));
+  for (const capability of ["set-model", "set-effort", "set-profile", "queue", "steer"] as const) {
+    assert.equal(control.capabilities.includes(capability), false, `${capability} must not be granted`);
+    assert.equal(withheld.get(capability), OBSERVE_ONLY_REASON, `${capability} must state why`);
+  }
+  assert.match(OBSERVE_ONLY_REASON, /take control/iu, "the reason names the remedy");
+  assert.doesNotMatch(OBSERVE_ONLY_REASON, /harness/iu, "the reason blames no harness limitation");
+
+  /*
+    Discovery grants these by replacing `capabilities` outright while keeping
+    `withheld`, so withholding them here would leave them granted and refused at
+    the same time the moment a session is matched to a tmux pane.
+  */
+  for (const capability of ["take-control", "attach", "resume", "preview", "open-editor"] as const) {
+    assert.equal(withheld.has(capability), false, `${capability} must stay deferred`);
+    assert.equal(control.capabilities.includes(capability), false, `${capability} must stay deferred`);
+  }
 });
