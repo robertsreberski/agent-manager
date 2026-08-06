@@ -28,6 +28,7 @@ import {
   type ActivityMemoryCitation,
 } from "../activity/index.ts";
 import { redactActivityText } from "../activity/redaction.ts";
+import { claudeMessageCorrelationId } from "../providers/claude/correlation.ts";
 import {
   codexMessageCorrelationId,
   codexRequestUserInputKey,
@@ -1142,7 +1143,6 @@ function claudeAssistantBlocks(
   items: TranscriptItem[],
   seenItemIds: Set<string>,
   seenTextFragments: Map<string, Set<string>>,
-  textItemsByProviderMessage: Map<string, number[]>,
   toolIndex: Map<string, number>,
 ): void {
   const createdAt = timestamp(outer.timestamp);
@@ -1199,11 +1199,21 @@ function claudeAssistantBlocks(
     const id = `${messageKey}:text:${String(index)}`;
     if (seenItemIds.has(id)) return;
     seenItemIds.add(id);
-    const itemIndex = items.length;
     items.push({
       kind: "message",
       id,
-      correlationId: null,
+      /*
+        The text, not the provider message id. Claude's live surfaces cannot
+        reach that id — the hook bridge only ever sees a CLI display UUID that is
+        never written here — so keying on it paired this row with the SDK stream
+        and left the hook's copy of the same reply standing beside it. The text
+        is the one name all three surfaces know.
+
+        Per block, too. This used to be assigned after the fact to the *last*
+        text item of each provider message, so any earlier block could never
+        correlate with anything.
+      */
+      correlationId: claudeMessageCorrelationId("assistant", redactActivityText(text)),
       turnId,
       role: "assistant",
       text,
@@ -1212,11 +1222,6 @@ function claudeAssistantBlocks(
       label: null,
       memoryCitation: null,
     });
-    if (providerMessageId) {
-      const indexes = textItemsByProviderMessage.get(providerMessageId) ?? [];
-      indexes.push(itemIndex);
-      textItemsByProviderMessage.set(providerMessageId, indexes);
-    }
   });
 }
 
@@ -1230,7 +1235,6 @@ function claudeItems(
   const items: TranscriptItem[] = [];
   const seenItemIds = new Set<string>();
   const seenTextFragments = new Map<string, Set<string>>();
-  const textItemsByProviderMessage = new Map<string, number[]>();
   const toolIndex = new Map<string, number>();
   let activeTurnId: string | null = null;
   let truncated = chain.truncated;
@@ -1298,14 +1302,8 @@ function claudeItems(
       items,
       seenItemIds,
       seenTextFragments,
-      textItemsByProviderMessage,
       toolIndex,
     );
-  }
-  for (const [providerMessageId, indexes] of textItemsByProviderMessage) {
-    const last = indexes.at(-1);
-    const item = last === undefined ? undefined : items[last];
-    if (item?.kind === "message") item.correlationId = correlationId("message", providerMessageId);
   }
   const capped = capItems(settleToolCalls(items));
   truncated ||= capped.truncated;

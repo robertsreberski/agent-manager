@@ -4,7 +4,7 @@ export const CLAUDE_MANAGER_OWNER_ENV = "AGENT_MANAGER_SESSION_OWNER";
 export const CLAUDE_MANAGER_OWNER_VALUE = "manager";
 
 export type ClaudeHookSourceDecision =
-  | { accepted: true; suppressTranscriptPolling: true }
+  | { accepted: true }
   | { accepted: false; reason: "manager-owned" };
 
 /**
@@ -16,13 +16,14 @@ export type ClaudeHookSourceDecision =
  * the operator's terminal, and dropping it would leave the cockpit blind to half
  * of a shared conversation.
  *
- * Ownership used to lapse after a 30s hook silence, which any single long tool
- * call produced. Polling then resumed alongside the live bridge, and because
- * the two sources id the same tool call differently (`transcript:claude:tool:…`
- * against `claude-hook:<sid>:tool:…`) the hub — which dedupes by id — held both.
- * Every message, thought and tool call in the transcript appeared a second
- * time. Liveness is still tracked, for callers that report it; it just no
- * longer hands the same session to two producers.
+ * It does *not* decide whether the transcript is read. It used to claim to —
+ * `shouldPollTranscript` and a `suppressTranscriptPolling` flag on every accepted
+ * decision — but nothing ever consulted either, and the transcript observer runs
+ * for every local session regardless. That stale promise mattered: it read as a
+ * guarantee that no two producers ever share a session, which is precisely how
+ * every assistant reply on a hook-fed session came to be stated twice while the
+ * duplication looked impossible by construction. Overlap is expected and the hub
+ * correlates it; see `providers/claude/correlation.ts`.
  */
 export class ClaudeHookSourceArbiter {
   readonly #managerOwned = new Set<string>();
@@ -58,10 +59,15 @@ export class ClaudeHookSourceArbiter {
       writer is the point.
     */
     this.#lastHookAt.set(input.session_id, options.now ?? Date.now());
-    return { accepted: true, suppressTranscriptPolling: true };
+    return { accepted: true };
   }
 
-  shouldPollTranscript(sessionId: string): boolean {
+  /**
+   * No producer has claimed this session — the manager does not hold it and no
+   * hook has spoken for it. A statement about what has been observed, not a
+   * licence to start a second producer.
+   */
+  isUnclaimed(sessionId: string): boolean {
     return !this.#managerOwned.has(sessionId) && !this.#lastHookAt.has(sessionId);
   }
 

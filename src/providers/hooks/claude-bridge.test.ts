@@ -13,6 +13,7 @@ import {
   CLAUDE_PERMISSION_PROVIDER_TIMEOUT_MS,
   ClaudePermissionBroker,
 } from "./claude-broker.ts";
+import { claudeMessageCorrelationId } from "../claude/correlation.ts";
 import { ClaudeHookActivityProjector } from "./claude-projector.ts";
 import {
   CLAUDE_MANAGER_OWNER_VALUE,
@@ -365,6 +366,75 @@ test("folds MessageDisplay deltas without replaying duplicates", () => {
   assert.deepEqual(projector.project(second).mutations, []);
 });
 
+/*
+  The reply has to carry the identity every other surface can also compute.
+
+  The hook names an assistant message with a CLI display UUID that the SDK
+  documents as "Not the API msg_… id" and that is never written to the
+  transcript, so keying on it meant the transcript's copy of the same reply could
+  never pair with this one and every reply on a hook-fed session was stated
+  twice. The text is the only name the two share.
+*/
+test("an assistant reply is keyed on its text, and sits in its prompt's turn", () => {
+  const projector = new ClaudeHookActivityProjector();
+  const emitted = projector.project(parseClaudeHookInput({
+    ...common("MessageDisplay"),
+    turn_id: "turn-1",
+    message_id: "display-uuid-1",
+    index: 0,
+    final: true,
+    delta: "All four clean.",
+  })).mutations.at(-1);
+
+  assert.ok(emitted?.type === "upsert" && emitted.item.kind === "message");
+  if (emitted?.type !== "upsert" || emitted.item.kind !== "message") return;
+  assert.equal(
+    emitted.item.correlationId,
+    claudeMessageCorrelationId("assistant", "All four clean."),
+    "the transcript computes this same key from the same text",
+  );
+  assert.ok(
+    !emitted.item.correlationId?.includes("display-uuid-1"),
+    "the display UUID reaches no other surface and must not be the key",
+  );
+  /*
+    `turn_id` is a different identifier from the `prompt_id` every other item in
+    this projector carries — and the one the transcript records. Keyed on it, the
+    reply was the only item in its turn that did not group with the tool calls
+    that produced it.
+  */
+  assert.equal(emitted.item.turnId, "prompt-1");
+});
+
+/*
+  Each delta is redacted as it lands, so a secret never rests unredacted in the
+  buffer — but a secret split across two deltas matches neither of them. The
+  accumulation is redacted too, which catches it, and is also what makes this
+  text the same string the transcript publishes.
+*/
+test("a secret split across two display deltas is still redacted", () => {
+  const projector = new ClaudeHookActivityProjector();
+  projector.project(parseClaudeHookInput({
+    ...common("MessageDisplay"),
+    turn_id: "turn-1",
+    message_id: "split-secret",
+    index: 0,
+    final: false,
+    delta: "token sk-ant-api03-AAAA",
+  }));
+  const final = projector.project(parseClaudeHookInput({
+    ...common("MessageDisplay"),
+    turn_id: "turn-1",
+    message_id: "split-secret",
+    index: 1,
+    final: true,
+    delta: "BBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMM",
+  })).mutations.at(-1);
+
+  const text = final?.type === "upsert" && final.item.kind === "message" ? final.item.text ?? "" : "";
+  assert.ok(!text.includes("AAAABBBB"), `the joined secret survived redaction: ${text}`);
+});
+
 test("a native peer turn on a manager-owned session is accepted, not a conflict", () => {
   const hook = parseClaudeHookInput({ ...common("Stop"), stop_hook_active: false });
   const arbiter = new ClaudeHookSourceArbiter();
@@ -372,14 +442,14 @@ test("a native peer turn on a manager-owned session is accepted, not a conflict"
     accepted: false,
     reason: "manager-owned",
   }, "the manager's own SDK child is a duplicate source, not a peer");
-  assert.equal(arbiter.shouldPollTranscript("session-1"), true);
+  assert.equal(arbiter.isUnclaimed("session-1"), true);
   assert.equal(arbiter.accept(hook, { now: 10 }).accepted, true);
-  assert.equal(arbiter.shouldPollTranscript("session-1"), false);
+  assert.equal(arbiter.isUnclaimed("session-1"), false);
   // A single long tool call used to exceed the old health window and hand the
   // same session to the poller as well, so every hook item gained a
   // `transcript:`-prefixed twin. Silence is not evidence the bridge is gone.
   assert.equal(arbiter.lastHookAt("session-1"), 10);
-  assert.equal(arbiter.shouldPollTranscript("session-1"), false);
+  assert.equal(arbiter.isUnclaimed("session-1"), false);
 
   /*
     The load-bearing assertion of this slice, and the exact inverse of what this
@@ -390,13 +460,10 @@ test("a native peer turn on a manager-owned session is accepted, not a conflict"
     projected instead of dropped.
   */
   arbiter.markManagerOwned("session-1");
-  assert.deepEqual(arbiter.accept(hook, { now: 20 }), {
-    accepted: true,
-    suppressTranscriptPolling: true,
-  });
+  assert.deepEqual(arbiter.accept(hook, { now: 20 }), { accepted: true });
   assert.equal(arbiter.lastHookAt("session-1"), 20);
   arbiter.forget("session-1");
-  assert.equal(arbiter.shouldPollTranscript("session-1"), true);
+  assert.equal(arbiter.isUnclaimed("session-1"), true);
 });
 
 test("bridge authenticates, projects, holds, answers, and resolves one external permission", async () => {

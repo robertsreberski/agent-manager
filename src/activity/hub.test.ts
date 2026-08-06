@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { claudeMessageCorrelationId } from "../providers/claude/correlation.ts";
 import { ActivityHub } from "./hub.ts";
 import type { ActivityFrame, ActivityItemDraft } from "./types.ts";
 import type { TodoProgress } from "../shared/session.ts";
@@ -1226,4 +1227,56 @@ test("a source withdraws only its own items when it hands the session over", () 
     ["claude-hook:one"],
   );
   assert.equal(hub.removeMatching("session-1", (id) => id.startsWith("transcript:")), false);
+});
+
+/*
+  The repeated-message protection asked whether a key began with Codex's own
+  prefix, so it stopped at Codex's border. Claude correlates on the same kind of
+  digest — its surfaces share no identifier, so the text is the only key — and
+  without this every repeated Claude reply deleted its predecessor.
+*/
+test("a repeated exact message survives whichever provider minted the digest", () => {
+  const hub = new ActivityHub({ streamEpoch: "repeated-message-any-provider" });
+  const correlationId = claudeMessageCorrelationId("assistant", "Done.");
+  for (const id of ["hook:first", "hook:second"] as const) {
+    hub.ingest("session-1", "claude", {
+      type: "upsert",
+      item: {
+        id,
+        kind: "message",
+        role: "assistant",
+        phase: null,
+        text: "Done.",
+        state: "complete",
+        correlationId,
+        source: "provider-api",
+        confidence: "exact",
+        exposure: "provider-exposed",
+      },
+    });
+  }
+  assert.deepEqual(
+    hub.snapshot("session-1")?.items.map((item) => item.id),
+    ["hook:first", "hook:second"],
+    "a content grouping key never deletes a distinct exact occurrence",
+  );
+
+  const transcript = ["first", "second"].map((occurrence) => ({
+    id: `transcript:${occurrence}`,
+    kind: "message" as const,
+    role: "assistant" as const,
+    phase: null,
+    text: "Done.",
+    state: "complete" as const,
+    correlationId,
+    source: "transcript" as const,
+    confidence: "inferred" as const,
+    exposure: "transcript-derived" as const,
+  }));
+  assert.equal(hub.reconcileTranscript("session-1", "claude", transcript, false), true);
+  assert.deepEqual(
+    hub.snapshot("session-1")?.items.map((item) => item.id),
+    ["hook:first", "hook:second"],
+    "equal cardinalities pair in order; the exact items keep the slots",
+  );
 });

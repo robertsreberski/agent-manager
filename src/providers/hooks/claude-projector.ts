@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 
+import { claudeMessageCorrelationId } from "../claude/correlation.ts";
 import {
   redactActivityJson,
   redactActivityText,
@@ -405,14 +406,37 @@ export class ClaudeHookActivityProjector {
         current.nextIndex = input.index + 1;
         if (current.text.length > 262_144) current.text = current.text.slice(-262_144);
         this.#displayMessages.set(key, current);
+        /*
+          Redacted twice on purpose. Each delta is redacted as it lands so a
+          secret never sits unredacted in the buffer, but a secret split across
+          two deltas matches neither of them and survives the join. Redacting the
+          accumulation catches it — and it is what makes this text the same
+          string the transcript reader publishes, which the correlation below
+          depends on.
+        */
+        const safeText = redactActivityText(current.text);
         mutations.push(upsert({
           ...base,
-          turnId: input.turn_id,
+          /*
+            `input.turn_id` is a different identifier from the `prompt_id` every
+            other item in this projector carries, and it is the one the
+            transcript records too. Keying the assistant message on it made the
+            reply the only item in its turn that did not group with the tool
+            calls that produced it.
+          */
           id: itemId(input, "message:assistant", input.message_id),
-          correlationId: `message:${input.message_id}`,
+          /*
+            Not `message:${input.message_id}`. That id is a CLI display UUID —
+            the SDK says outright it is "Not the API msg_… id" — and it is never
+            written to the transcript, so the transcript's twin of this reply,
+            keyed on the API message id, could never pair with it. Every
+            assistant reply was therefore stated twice. The text is the only
+            name both surfaces know.
+          */
+          correlationId: claudeMessageCorrelationId("assistant", safeText),
           kind: "message",
           role: "assistant",
-          text: current.text,
+          text: safeText,
           state: input.final ? "complete" : "running",
         }));
         if (input.final) {

@@ -18,6 +18,7 @@ import {
   type ActivitySnapshotFrame,
   type Provider,
 } from "./types.ts";
+import { isMessageCorrelation } from "./correlation.ts";
 import { redactActivityJson, redactActivityText } from "./redaction.ts";
 
 export const ACTIVITY_DEFAULT_LIMITS: ActivityHubLimits = Object.freeze({
@@ -204,16 +205,25 @@ export class ActivityHub {
         const soleCandidate = correlationCandidates.length === 1
           ? correlationCandidates[0]
           : undefined;
-        // A turn/text digest is a cross-source grouping key, not an occurrence
-        // identity. Two App Server messages may deliberately contain identical
-        // text in one turn; preserve both exact occurrences so transcript
-        // reconciliation can pair equal cardinalities in chronological order.
-        const repeatedExactCodexMessage = soleCandidate !== undefined
+        /*
+          A turn/text digest is a cross-source grouping key, not an occurrence
+          identity. Two live messages may deliberately contain identical text in
+          one turn — "Done." is a common reply — so preserve both exact
+          occurrences and let transcript reconciliation pair equal cardinalities
+          in chronological order.
+
+          This asked whether the key began with Codex's own prefix, which meant
+          the protection stopped at Codex's border. Claude reaches the hub from
+          two surfaces that share no identifier and correlates on the same kind
+          of digest, and without this every repeated Claude reply would delete
+          its predecessor.
+        */
+        const repeatedExactMessage = soleCandidate !== undefined
           && soleCandidate.source !== "transcript"
           && soleCandidate.kind === "message"
           && mutation.item.kind === "message"
-          && mutation.item.correlationId?.startsWith("codex/message-correlation/") === true;
-        const correlated = soleCandidate && !repeatedExactCodexMessage
+          && isMessageCorrelation(mutation.item.correlationId);
+        const correlated = soleCandidate && !repeatedExactMessage
           ? [soleCandidate]
           : [];
         const chronologicalSlot = correlated.reduce(

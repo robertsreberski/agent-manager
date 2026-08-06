@@ -1,4 +1,8 @@
-import { createHash } from "node:crypto";
+import {
+  contentHash,
+  messageCorrelationId,
+  scopedCorrelationId,
+} from "../../activity/correlation.ts";
 
 import type {
   ActivityApprovalFacts,
@@ -66,16 +70,8 @@ function finiteNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
-function encodeSegment(value: string): string {
-  return encodeURIComponent(value);
-}
-
 function scopedId(kind: string, ...parts: string[]): string {
-  return `codex/${kind}/${parts.map(encodeSegment).join("/")}`;
-}
-
-function contentHash(...parts: string[]): string {
-  return createHash("sha256").update(parts.join("\u0000")).digest("hex").slice(0, 20);
+  return scopedCorrelationId("codex", kind, ...parts);
 }
 
 /**
@@ -89,6 +85,10 @@ function contentHash(...parts: string[]): string {
  * The content digest is important for live steering: more than one user
  * message can belong to the same provider turn. The turn id keeps identical
  * prompts in different turns distinct.
+ *
+ * Claude needs the same trick for a different reason — its two surfaces share no
+ * identifier at all — so the construction now lives in `activity/correlation.ts`.
+ * This wrapper keeps Codex's own keys byte-identical to what they always were.
  */
 export function codexMessageCorrelationId(
   threadId: string,
@@ -96,14 +96,7 @@ export function codexMessageCorrelationId(
   role: "user" | "assistant",
   text: string,
 ): string {
-  const normalized = text.trim().slice(0, 262_144);
-  return scopedId(
-    "message-correlation",
-    threadId,
-    turnId,
-    role,
-    contentHash(normalized),
-  );
+  return messageCorrelationId("codex", threadId, turnId, role, text);
 }
 
 /**

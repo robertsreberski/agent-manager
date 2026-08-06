@@ -18,6 +18,8 @@ import {
   projectCodexNotification,
   projectCodexServerRequest,
 } from "../providers/codex/activity-projector.ts";
+import { ClaudeHookActivityProjector } from "../providers/hooks/claude-projector.ts";
+import { parseClaudeHookInput } from "../providers/hooks/claude-types.ts";
 import { SelectedTranscriptActivityObserver } from "./activity-observer.ts";
 import {
   LocalSessionTranscriptReader,
@@ -1293,4 +1295,148 @@ test("a rolled-away Codex rollout re-resolves rather than failing the read", () 
   const messages = second.items.filter((item) => item.kind === "message");
   assert.equal(messages.length, 1);
   assert.match(JSON.stringify(messages[0]), /Moved/u);
+});
+
+/*
+  The bug this whole slice exists for, end to end.
+
+  A hook-fed Claude session has two producers writing one hub session: the hook
+  bridge live, and the transcript as bounded history. They are meant to collapse
+  on `correlationId`, and for assistant replies they could not — the transcript
+  keyed on the Anthropic message id while the hook keyed on a CLI display UUID
+  the SDK documents as "Not the API msg_… id" and which is never written to the
+  transcript. Two identifier spaces with nothing in common, so every reply was
+  stated twice, in two different turns.
+*/
+test("a Claude assistant reply reported by both the hook and the transcript renders once", () => {
+  const fixture = claudeHome();
+  const project = join(fixture.projects, "-fixture-project");
+  mkdirSync(project);
+  writeFileSync(join(project, `${CLAUDE_ID}.jsonl`), jsonl([
+    claudeRow({ uuid: "u1", type: "user", content: "Run the tests", extra: { promptId: "prompt-1" } }),
+    claudeRow({
+      uuid: "a1",
+      parentUuid: "u1",
+      type: "assistant",
+      content: [{ type: "text", text: "All four clean." }],
+      messageId: "msg_011CdmZy6yof9mBwYmYA42Gr",
+    }),
+  ]));
+  const reader = new LocalSessionTranscriptReader({ claudeHome: fixture.home });
+
+  const managerSessionId = `local:claude:${CLAUDE_ID}`;
+  const hub = new ActivityHub({ streamEpoch: "claude-hook-transcript" });
+  const projector = new ClaudeHookActivityProjector();
+
+  // The hook speaks first, as it does live.
+  for (const mutation of projector.project(parseClaudeHookInput({
+    session_id: CLAUDE_ID,
+    transcript_path: join(project, `${CLAUDE_ID}.jsonl`),
+    cwd: "/workspace",
+    prompt_id: "prompt-1",
+    hook_event_name: "MessageDisplay",
+    turn_id: "turn-uuid-the-transcript-never-records",
+    message_id: "display-uuid-the-transcript-never-records",
+    index: 0,
+    final: true,
+    delta: "All four clean.",
+  })).mutations) {
+    hub.ingest(managerSessionId, "claude", mutation);
+  }
+
+  const observer = new SelectedTranscriptActivityObserver({ hub, reader });
+  observer.seedOnce({
+    id: managerSessionId,
+    provider: "claude",
+    providerThreadId: CLAUDE_ID,
+    providerTreeId: CLAUDE_ID,
+    parentId: null,
+    status: "running",
+  } as SessionView);
+
+  const replies = (hub.snapshot(managerSessionId)?.items ?? []).filter(
+    (item) => item.kind === "message" && item.role === "assistant",
+  );
+  assert.equal(replies.length, 1, "one reply, not a live copy beside a transcript twin");
+  assert.equal(replies[0]?.source, "provider-api", "the exact live item wins the slot");
+  assert.equal(replies[0]?.kind === "message" ? replies[0].text : null, "All four clean.");
+  assert.equal(replies[0]?.turnId, "prompt-1", "and it sits in the turn its tool calls are in");
+
+  // Re-hydrating the same transcript changes nothing.
+  const hydratedSeq = hub.snapshot(managerSessionId)!.seq;
+  observer.seedOnce({
+    id: managerSessionId,
+    provider: "claude",
+    providerThreadId: CLAUDE_ID,
+    providerTreeId: CLAUDE_ID,
+    parentId: null,
+    status: "running",
+  } as SessionView);
+  assert.equal(hub.snapshot(managerSessionId)!.seq, hydratedSeq);
+
+  observer.dispose();
+  hub.dispose();
+});
+
+/*
+  Two replies with identical text are two replies. The key is a content digest,
+  so it cannot tell them apart on its own — the hub preserves both live
+  occurrences and reconciliation pairs equal cardinalities in order.
+*/
+test("two Claude replies with identical text survive as two", () => {
+  const fixture = claudeHome();
+  const project = join(fixture.projects, "-fixture-project");
+  mkdirSync(project);
+  writeFileSync(join(project, `${CLAUDE_ID}.jsonl`), jsonl([
+    claudeRow({ uuid: "u1", type: "user", content: "Twice please", extra: { promptId: "prompt-1" } }),
+    claudeRow({ uuid: "a1", parentUuid: "u1", type: "assistant", content: [{ type: "text", text: "Done." }], messageId: "msg-a" }),
+    claudeRow({ uuid: "u2", parentUuid: "a1", type: "user", content: "Again", extra: { promptId: "prompt-2" } }),
+    claudeRow({ uuid: "a2", parentUuid: "u2", type: "assistant", content: [{ type: "text", text: "Done." }], messageId: "msg-b" }),
+  ]));
+  const reader = new LocalSessionTranscriptReader({ claudeHome: fixture.home });
+
+  const managerSessionId = `local:claude:${CLAUDE_ID}`;
+  const hub = new ActivityHub({ streamEpoch: "claude-identical-replies" });
+  const projector = new ClaudeHookActivityProjector();
+  for (const [promptId, messageId] of [["prompt-1", "display-1"], ["prompt-2", "display-2"]] as const) {
+    for (const mutation of projector.project(parseClaudeHookInput({
+      session_id: CLAUDE_ID,
+      transcript_path: join(project, `${CLAUDE_ID}.jsonl`),
+      cwd: "/workspace",
+      prompt_id: promptId,
+      hook_event_name: "MessageDisplay",
+      turn_id: `turn-${promptId}`,
+      message_id: messageId,
+      index: 0,
+      final: true,
+      delta: "Done.",
+    })).mutations) {
+      hub.ingest(managerSessionId, "claude", mutation);
+    }
+  }
+  assert.equal(
+    hub.snapshot(managerSessionId)?.items.filter((item) => item.kind === "message").length,
+    2,
+    "a content grouping key must never delete a distinct exact occurrence",
+  );
+
+  const observer = new SelectedTranscriptActivityObserver({ hub, reader });
+  observer.seedOnce({
+    id: managerSessionId,
+    provider: "claude",
+    providerThreadId: CLAUDE_ID,
+    providerTreeId: CLAUDE_ID,
+    parentId: null,
+    status: "running",
+  } as SessionView);
+
+  const replies = (hub.snapshot(managerSessionId)?.items ?? []).filter(
+    (item) => item.kind === "message" && item.role === "assistant",
+  );
+  assert.equal(replies.length, 2, "2-to-2 cardinality pairing, not four rows and not one");
+  assert.deepEqual(replies.map((item) => item.source), ["provider-api", "provider-api"]);
+  assert.deepEqual(replies.map((item) => item.turnId), ["prompt-1", "prompt-2"]);
+
+  observer.dispose();
+  hub.dispose();
 });

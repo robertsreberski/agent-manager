@@ -10,6 +10,8 @@ import type {
   ActivityTodoRewriteState,
 } from "../../activity/index.ts";
 import { reconcileTodoRewrite } from "../../activity/index.ts";
+import { redactActivityText } from "../../activity/redaction.ts";
+import { claudeMessageCorrelationId } from "./correlation.ts";
 import type {
   ClaudeManagedSessionSnapshot,
   ClaudePendingRequest,
@@ -722,7 +724,6 @@ export class ClaudeActivityProjector {
         : "complete";
     const phase = message.message.stop_reason === "tool_use" ? "commentary" : "final";
     const matchedPartialIds = new Set<string>();
-    let hasCorrelatedText = false;
 
     for (const [index, rawContent] of message.message.content.entries()) {
       const content = rawContent as unknown as Record<string, unknown>;
@@ -730,15 +731,28 @@ export class ClaudeActivityProjector {
       if (type === "text") {
         const partial = this.#matchingPartial(lane, index, "text", matchedPartialIds);
         const id = partial?.id ?? itemId("message", `${message.message.id}:${index}`);
+        const text = typeof content.text === "string" ? content.text : "";
         mutations.push({
           type: "upsert",
           item: {
             id,
-            correlationId: hasCorrelatedText ? null : `message:${message.message.id}`,
+            /*
+              The API message id used to be the key, which paired this with its
+              transcript twin and with nothing else — the hook bridge reports the
+              same reply under a display UUID that never reaches the transcript,
+              so a hook-fed session stated every reply twice. All three surfaces
+              now key on the text, the only name they share.
+
+              It was also assigned to the first text block of a message only,
+              while the transcript assigned it to the last; every other block on
+              either side was left uncorrelated. Each block carries its own key
+              now, so the two sides agree block for block.
+            */
+            correlationId: claudeMessageCorrelationId("assistant", redactActivityText(text)),
             kind: "message",
             role: "assistant",
             phase,
-            text: typeof content.text === "string" ? content.text : "",
+            text,
             state,
             turnId,
             parentId: this.#parentId(message.parent_tool_use_id),
@@ -747,7 +761,6 @@ export class ClaudeActivityProjector {
             exposure: "provider-exposed",
           },
         });
-        hasCorrelatedText = true;
         this.#linkChild(message.parent_tool_use_id, id, mutations, {
           ...(message.subagent_type ? { name: message.subagent_type } : {}),
           ...(message.task_description

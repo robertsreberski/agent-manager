@@ -1063,7 +1063,7 @@ test("ending manager control preserves the closed session and native resume path
   }, context());
   const query = runtime.queries[0];
   assert.ok(query);
-  assert.equal(hookSourceArbiter.shouldPollTranscript("managed-claude-1"), false);
+  assert.equal(hookSourceArbiter.isUnclaimed("managed-claude-1"), false);
 
   const queued = await adapter.performAction(created, {
     type: "send",
@@ -1136,7 +1136,7 @@ test("ending manager control preserves the closed session and native resume path
   assert.equal(ended.status, "completed");
   assert.equal(ended.control.plane, "resume-only");
   assert.deepEqual(ended.control.capabilities, ["attach", "resume"]);
-  assert.equal(hookSourceArbiter.shouldPollTranscript("managed-claude-1"), true);
+  assert.equal(hookSourceArbiter.isUnclaimed("managed-claude-1"), true);
   const instruction = await adapter.getAttachInstruction(ended, context());
   assert.equal(instruction?.kind, "claude-resume");
   assert.deepEqual(instruction?.argv, ["claude", "--resume", "managed-claude-1"]);
@@ -1505,7 +1505,7 @@ test("restores deliberately stopped Claude control without opening an SDK query"
   });
   assert.equal(runtime.queries.length, 0, "restart must not auto-resume ended control");
   assert.equal(
-    hookSourceArbiter.shouldPollTranscript(record.providerThreadId),
+    hookSourceArbiter.isUnclaimed(record.providerThreadId),
     true,
     "dormant history must never be announced as a live manager-owned writer",
   );
@@ -1554,7 +1554,7 @@ test("in-web resume stays dormant until commit, then atomically publishes one ex
     "the public entry must remain dormant before durable commit",
   );
   assert.equal(changes.length, publishedBeforeResume);
-  assert.equal(hookSourceArbiter.shouldPollTranscript(record.providerThreadId), true);
+  assert.equal(hookSourceArbiter.isUnclaimed(record.providerThreadId), true);
   /*
     Native resume used to be blocked here: an uncommitted SDK owner would have
     raced a native CLI for exclusive ownership. Nothing races now — a CLI launched
@@ -1575,7 +1575,7 @@ test("in-web resume stays dormant until commit, then atomically publishes one ex
   assert.equal(committed.control.authority, "manager");
   assert.ok(committed.control.capabilities.includes("queue"));
   assert.equal(adapter.getManagedSession(record.providerThreadId)?.status, "idle");
-  assert.equal(hookSourceArbiter.shouldPollTranscript(record.providerThreadId), false);
+  assert.equal(hookSourceArbiter.isUnclaimed(record.providerThreadId), false);
   assert.equal(runtime.queries.length, 1);
   await adapter.dispose();
 });
@@ -1603,7 +1603,7 @@ test("failed durable activation aborts only the provisional writer and preserves
   assert.equal(rolledBack.status, "completed");
   assert.deepEqual(rolledBack.control.capabilities, ["attach", "resume"]);
   assert.equal(changes.length, publishedBeforeResume);
-  assert.equal(hookSourceArbiter.shouldPollTranscript(record.providerThreadId), true);
+  assert.equal(hookSourceArbiter.isUnclaimed(record.providerThreadId), true);
 
   await adapter.resumeSession(rolledBack, "plan", context());
   assert.equal(runtime.queries.length, 2, "rollback must permit one clean retry");
@@ -1869,10 +1869,7 @@ test("a native peer turn leaves the joined manager query alive and writable", as
     only when the HTTP hook happened to be installed, which is why it passed
     every unit test while being broken in every real session.
   */
-  assert.deepEqual(arbiter.accept(hook), {
-    accepted: true,
-    suppressTranscriptPolling: true,
-  });
+  assert.deepEqual(arbiter.accept(hook), { accepted: true });
   assert.deepEqual(losses, [], "a peer turn is not a managed-session loss");
   const joined = adapter.getManagedSession("managed-claude-1");
   assert.notEqual(joined, null, "web control survives a native peer turn");
@@ -2146,7 +2143,7 @@ test("external Claude adoption resumes the exact identity and stays unpublished 
   assert.equal(adapter.getManagedSession(external.providerThreadId), null);
   assert.equal(hookSourceArbiter.lastHookAt(external.providerThreadId), 10);
   assert.equal(
-    hookSourceArbiter.shouldPollTranscript(external.providerThreadId),
+    hookSourceArbiter.isUnclaimed(external.providerThreadId),
     false,
     "hook/transcript authority stays external until durable commit",
   );
@@ -2165,7 +2162,7 @@ test("external Claude adoption resumes the exact identity and stays unpublished 
     && mutation.item.text === "Buffered before durable commit"
   ));
   assert.equal(hookSourceArbiter.lastHookAt(external.providerThreadId), null);
-  assert.equal(hookSourceArbiter.shouldPollTranscript(external.providerThreadId), false);
+  assert.equal(hookSourceArbiter.isUnclaimed(external.providerThreadId), false);
   adapter.abortExternalAdoption(external.providerThreadId);
   assert.ok(adapter.getManagedSession(external.providerThreadId));
   await adapter.dispose();
@@ -2206,7 +2203,7 @@ test("a native hook during first adoption no longer aborts the joining writer", 
   */
   const adopted = await adapter.adoptExternalSession(external, "ask-first", context());
   assert.equal(adopted.providerThreadId, external.providerThreadId);
-  assert.deepEqual(decisions, [{ accepted: true, suppressTranscriptPolling: true }]);
+  assert.deepEqual(decisions, [{ accepted: true }]);
   assert.equal(runtime.queries.at(-1)?.closeCalls, 0);
   assert.equal(runtime.queries.at(-1)?.params.options.abortController.signal.aborted, false);
   assert.equal(hookSourceArbiter.lastHookAt(external.providerThreadId), 42);
@@ -2245,7 +2242,7 @@ test("rolling back first adoption preserves hook and transcript authority with n
   assert.deepEqual(activity, []);
   assert.equal(adapter.getManagedSession(external.providerThreadId), null);
   assert.equal(hookSourceArbiter.lastHookAt(external.providerThreadId), 77);
-  assert.equal(hookSourceArbiter.shouldPollTranscript(external.providerThreadId), false);
+  assert.equal(hookSourceArbiter.isUnclaimed(external.providerThreadId), false);
   assert.equal(hookSourceArbiter.accept(hook, { now: 78 }).accepted, true);
   await adapter.dispose();
 });
