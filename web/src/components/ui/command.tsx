@@ -4,7 +4,7 @@ import type * as React from "react";
 
 import { cn } from "@/lib/utils";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "./dialog";
-import { menuItem } from "./dropdown-menu";
+import { menuItem, menuItemDisabledWhenTrue } from "./dropdown-menu";
 
 function Command({ className, ...props }: React.ComponentProps<typeof CommandPrimitive>) {
   return (
@@ -150,7 +150,8 @@ function CommandItem({ className, ...props }: React.ComponentProps<typeof Comman
       data-slot="command-item"
       className={cn(
         menuItem,
-        "data-[selected=true]:bg-[var(--surface-selected)] data-[disabled=true]:pointer-events-none data-[disabled=true]:opacity-45",
+        menuItemDisabledWhenTrue,
+        "data-[selected=true]:bg-[var(--surface-selected)]",
         className,
       )}
       {...props}

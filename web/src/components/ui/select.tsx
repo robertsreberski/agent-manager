@@ -3,7 +3,7 @@ import { Check, ChevronDown, ChevronUp } from "lucide-react";
 import type * as React from "react";
 
 import { cn } from "@/lib/utils";
-import { menuItem, menuSurface } from "./dropdown-menu";
+import { menuItem, menuItemDisabledWhenPresent, menuSurface } from "./dropdown-menu";
 
 function Select({ ...props }: React.ComponentProps<typeof SelectPrimitive.Root>) {
   return <SelectPrimitive.Root data-slot="select" {...props} />;
@@ -93,7 +93,7 @@ function SelectLabel({ className, ...props }: React.ComponentProps<typeof Select
 
 function SelectItem({ className, children, ...props }: React.ComponentProps<typeof SelectPrimitive.Item>) {
   return (
-    <SelectPrimitive.Item data-slot="select-item" className={cn(menuItem, "pr-8", className)} {...props}>
+    <SelectPrimitive.Item data-slot="select-item" className={cn(menuItem, menuItemDisabledWhenPresent, "pr-8", className)} {...props}>
       <SelectPrimitive.ItemText>{children}</SelectPrimitive.ItemText>
       <span className="pointer-events-none absolute right-2.5 grid size-4 place-items-center">
         <SelectPrimitive.ItemIndicator>
