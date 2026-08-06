@@ -14,7 +14,7 @@ import {
   sessionRecordId,
 } from "./session.ts";
 
-export const WIRE_SCHEMA_VERSION = 7 as const;
+export const WIRE_SCHEMA_VERSION = 8 as const;
 
 export interface WireIdentity {
   schemaVersion: number | null;
@@ -192,10 +192,15 @@ const timestampSchema = z.string().refine(
   "must be a timestamp",
 );
 
+const sessionControlPeerSchema = z.object({
+  kind: z.enum(["manager", "native"]),
+  pid: z.number().int().positive(),
+  startedAt: timestampSchema,
+}).strict();
+
 const sessionControlRecoverySchema = z.object({
   state: z.enum([
     "reconnecting",
-    "waiting-for-native-exit",
     "retrying",
     "needs-attention",
   ]),
@@ -205,29 +210,6 @@ const sessionControlRecoverySchema = z.object({
   nextRetryAt: timestampSchema.nullable(),
   error: z.string().min(1).nullable(),
 }).strict().superRefine((recovery, context) => {
-  if (recovery.state === "waiting-for-native-exit") {
-    if (recovery.deadlineAt !== null) {
-      context.addIssue({
-        code: "custom",
-        message: "waiting for native exit cannot expose a recovery deadline",
-        path: ["deadlineAt"],
-      });
-    }
-    if (recovery.nextRetryAt !== null) {
-      context.addIssue({
-        code: "custom",
-        message: "waiting for native exit cannot expose an internal poll time",
-        path: ["nextRetryAt"],
-      });
-    }
-    if (recovery.error === null) {
-      context.addIssue({
-        code: "custom",
-        message: "waiting for native exit requires an ownership reason",
-        path: ["error"],
-      });
-    }
-  }
   if (recovery.state === "retrying" && recovery.nextRetryAt === null) {
     context.addIssue({
       code: "custom",
@@ -380,6 +362,7 @@ export const sessionRecordSchema: z.ZodType<SessionRecord> = z.object({
       capability: controlCapabilitySchema,
       reason: z.string().min(1),
     }).strict()),
+    peers: z.array(sessionControlPeerSchema),
     takeover: sessionTakeoverSchema.nullable(),
   }).strict(),
   workspaceIdentity: workspaceIdentitySchema.nullable(),
@@ -466,15 +449,37 @@ export const sessionRecordSchema: z.ZodType<SessionRecord> = z.object({
     session.control.plane === "claude-sdk"
     && (
       session.provider !== "claude"
-      || coordination.mode !== "exclusive"
-      || coordination.nativeAttach !== "handoff"
+      || coordination.mode !== "shared"
+      || coordination.nativeAttach !== "join"
       || coordination.responseResolution !== "single-controller"
     )
   ) {
     context.addIssue({
       code: "custom",
-      message: "the Claude SDK plane requires exclusive handoff and single-controller coordination",
+      message: "the Claude SDK plane requires shared join and single-controller coordination",
       path: ["control", "coordination"],
+    });
+  }
+  /*
+    A peer list is only meaningful where the provider lets clients coexist. An
+    observe-only projection that claimed peers would be asserting knowledge of
+    live writers it never proved.
+  */
+  if (session.control.peers.length > 0 && coordination.mode === "observe-only") {
+    context.addIssue({
+      code: "custom",
+      message: "observe-only control cannot enumerate live provider peers",
+      path: ["control", "peers"],
+    });
+  }
+  const duplicatePeer = session.control.peers.find(
+    (peer, index) => session.control.peers.findIndex((other) => other.pid === peer.pid) !== index,
+  );
+  if (duplicatePeer) {
+    context.addIssue({
+      code: "custom",
+      message: `duplicate control peer pid: ${String(duplicatePeer.pid)}`,
+      path: ["control", "peers"],
     });
   }
 });

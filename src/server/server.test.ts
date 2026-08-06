@@ -24,11 +24,7 @@ import type {
 import type { LocalCliProcessInspector } from "./cli-takeover.ts";
 import { createAgentManagerServer } from "./server.ts";
 import {
-  requestAttachAuthorizeSpawnFromControlSocket,
-  requestAttachExitedFromControlSocket,
-  requestAttachFailedFromControlSocket,
   requestAttachFromControlSocket,
-  requestAttachStartedFromControlSocket,
 } from "./control-socket.ts";
 import { ManagerDatabase, type OperationalAuditInput } from "./persistence.ts";
 import { unknownSandbox } from "../shared/session.ts";
@@ -144,6 +140,7 @@ function session(overrides: Partial<SessionView> = {}): SessionView {
       recovery: null,
       capabilities: ["queue", "steer", "interrupt", "respond", "set-profile", "preview", "attach"],
       withheld: [],
+      peers: [],
       takeover: null,
     },
     workspaceIdentity: null,
@@ -165,6 +162,7 @@ function claudeSession(overrides: Partial<SessionView> = {}): SessionView {
       recovery: null,
       capabilities: ["queue", "steer", "interrupt", "respond", "set-profile", "preview", "attach"],
       withheld: [],
+      peers: [],
       takeover: null,
     },
     ...overrides,
@@ -302,6 +300,7 @@ test("hydrates exact current manager attention only through the bounded per-sess
         recovery: null,
         capabilities: ["respond"],
         withheld: [],
+        peers: [],
         takeover: null,
       },
     });
@@ -995,7 +994,6 @@ test("browser attach exposes only the guarded manager CLI wrapper", async (t) =>
   });
 
   assert.equal(response.statusCode, 200, response.body);
-  assert.equal(response.json<{ requiresHandoff: boolean }>().requiresHandoff, false);
   assert.deepEqual(response.json<{ instruction: { kind: string; argv: string[] } }>().instruction, {
     kind: "manager-cli",
     argv: ["agent-manager", "attach", "local:codex:thread-1"],
@@ -1036,6 +1034,7 @@ test("browser resume exposes the guarded manager CLI wrapper without requiring a
             truncated: false,
             itemCount: 0,
             reason: null,
+            forked: false,
           },
         };
       },
@@ -1070,437 +1069,32 @@ test("browser resume exposes the guarded manager CLI wrapper without requiring a
   });
 
   assert.equal(response.statusCode, 200, response.body);
-  assert.equal(response.json<{ requiresHandoff: boolean }>().requiresHandoff, false);
   assert.deepEqual(response.json<{ instruction: { kind: string; argv: string[] } }>().instruction, {
     kind: "manager-cli",
     argv: ["agent-manager", "attach", resumeOnly.id],
     cwd: resumeOnly.cwd,
-    warning: "Run locally to resume this exact Claude conversation; web replies remain unavailable while it runs.",
+    warning: "Run locally to join this exact Claude conversation; web control stays active, and if both surfaces send at once the conversation forks.",
   });
 
+  // A plain provider command with no handoff id and no spawn nonce: joining does
+  // not authorize an ownership transfer, so there is nothing to correlate.
   const native = await requestAttachFromControlSocket(temporary.socketPath, resumeOnly.id);
   assert.deepEqual(native.instruction.argv, [
     "claude",
     "--resume",
     "thread-1",
   ]);
-  assert.ok(native.instruction.handoffId);
-  assert.ok(native.instruction.spawnNonce);
 });
 
-test("pre-spawn wrapper death reclaims safely after a bounded scan proves no child exists", async (t) => {
-  const temporary = temporaryControlSocket();
-  const database = new ManagerDatabase();
-  const managed = claudeSession();
-  persistManagedClaude(database);
-  let reclaimCalls = 0;
-  const inspector = exactClaudeProcessInspector();
-  inspector.findAssociated = () => ({ state: "exited" });
-  const backend = await createAgentManagerServer({
-    discovery: false,
-    staticDir: false,
-    database,
-    cliTakeoverInspector: inspector,
-    cliTakeoverTimings: { inspectionTimeoutMs: 20, pollIntervalMs: 2 },
-    controlSocketPath: temporary.socketPath,
-    adapters: {
-      claude: {
-        async createSession() { return managed; },
-        async performAction() { return { status: "succeeded" }; },
-        async getAttachInstruction() {
-          return {
-            kind: "claude-resume",
-            argv: ["claude", "--resume", "thread-1"],
-            cwd: "/tmp/workspace",
-            warning: null,
-          };
-        },
-        async reclaimFromCli() {
-          reclaimCalls += 1;
-          return managed;
-        },
-      },
-    },
-    initialSessions: [managed],
-  });
-  t.after(async () => {
-    await backend.close().catch(() => undefined);
-    rmSync(temporary.root, { recursive: true, force: true });
-  });
+/*
+  Removed with the exclusive handoff they covered: pre-spawn wrapper death,
+  unreported-child adoption, provider-attached audit failure, attach-started
+  registry association, and timed-out native reclaim. All five exercised the
+  authorized-wrapper lifecycle that moved Claude's single writer to a terminal and
+  reclaimed it afterwards. A joined CLI transfers nothing, so `attach` hands over
+  a command and there is no lifecycle left to assert.
+*/
 
-  const reply = await requestAttachFromControlSocket(temporary.socketPath, managed.id);
-  assert.ok(reply.instruction.handoffId);
-  assert.ok(reply.instruction.spawnNonce);
-  const wrapper = spawn(process.execPath, ["-e", "setTimeout(() => {}, 250)"], {
-    stdio: "ignore",
-  });
-  await once(wrapper, "spawn");
-  await requestAttachAuthorizeSpawnFromControlSocket(
-    temporary.socketPath,
-    managed.id,
-    reply.instruction.handoffId!,
-    reply.instruction.spawnNonce!,
-    wrapper.pid!,
-  );
-  await once(wrapper, "exit");
-  const deadline = Date.now() + 1_500;
-  while (reclaimCalls === 0 && Date.now() < deadline) await delay(10);
-
-  assert.equal(reclaimCalls, 1);
-  const retry = await requestAttachFromControlSocket(temporary.socketPath, managed.id);
-  assert.ok(retry.instruction.handoffId);
-  assert.equal(
-    backend.state.snapshot().diagnostics.some((item) =>
-      item.message.includes("wrapper died before reporting the provider child")
-      || item.message.includes("wrapper exited before reporting its child")
-    ),
-    true,
-  );
-});
-
-test("wrapper death adopts an exact unreported child and reclaims only after that child exits", async (t) => {
-  const temporary = temporaryControlSocket();
-  const database = new ManagerDatabase();
-  const managed = claudeSession();
-  persistManagedClaude(database);
-  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 5000)"], {
-    stdio: "ignore",
-  });
-  await once(child, "spawn");
-  const identity = {
-    pid: child.pid!,
-    uid: process.getuid?.() ?? 501,
-    executable: "claude" as const,
-    startedAt: "Wed Aug 5 10:00:00 2026",
-    providerSessionId: managed.providerThreadId,
-    cwd: managed.cwd!,
-  };
-  const inspector: LocalCliProcessInspector = {
-    inspect(_view, expected) {
-      if (child.exitCode !== null) return { state: "exited" };
-      if (expected && expected.pid !== identity.pid) {
-        return { state: "mismatch", reason: "child identity changed" };
-      }
-      return { state: "running", identity };
-    },
-    findAssociated() {
-      return child.exitCode === null
-        ? { state: "running", identity }
-        : { state: "exited" };
-    },
-    terminate() {},
-  };
-  let attachedCalls = 0;
-  let exitedCalls = 0;
-  let reclaimCalls = 0;
-  const backend = await createAgentManagerServer({
-    discovery: false,
-    staticDir: false,
-    database,
-    cliTakeoverInspector: inspector,
-    cliTakeoverTimings: { inspectionTimeoutMs: 20, pollIntervalMs: 2 },
-    controlSocketPath: temporary.socketPath,
-    adapters: {
-      claude: {
-        async createSession() { return managed; },
-        async performAction() { return { status: "succeeded" }; },
-        async getAttachInstruction() {
-          return {
-            kind: "claude-resume",
-            argv: ["claude", "--resume", "thread-1"],
-            cwd: managed.cwd,
-            warning: null,
-          };
-        },
-        markCliAttached() { attachedCalls += 1; },
-        markCliExited() { exitedCalls += 1; },
-        async reclaimFromCli() {
-          reclaimCalls += 1;
-          return managed;
-        },
-      },
-    },
-    initialSessions: [managed],
-  });
-  t.after(async () => {
-    if (child.exitCode === null) child.kill("SIGTERM");
-    await backend.close().catch(() => undefined);
-    rmSync(temporary.root, { recursive: true, force: true });
-  });
-
-  const reply = await requestAttachFromControlSocket(temporary.socketPath, managed.id);
-  const wrapper = spawn(process.execPath, ["-e", "setTimeout(() => {}, 100)"], {
-    stdio: "ignore",
-  });
-  await once(wrapper, "spawn");
-  await requestAttachAuthorizeSpawnFromControlSocket(
-    temporary.socketPath,
-    managed.id,
-    reply.instruction.handoffId!,
-    reply.instruction.spawnNonce!,
-    wrapper.pid!,
-  );
-  await once(wrapper, "exit");
-  const attachDeadline = Date.now() + 1_500;
-  while (attachedCalls === 0 && Date.now() < attachDeadline) await delay(10);
-
-  assert.equal(attachedCalls, 1);
-  assert.equal(reclaimCalls, 0);
-  const persisted = database.listManagedSessions().find((record) => record.id === managed.id);
-  assert.equal(persisted?.metadata.ownership, "native-exclusive");
-  assert.equal((persisted?.metadata.nativeOwner as { pid?: number } | null)?.pid, child.pid);
-
-  child.kill("SIGTERM");
-  await once(child, "exit");
-  const reclaimDeadline = Date.now() + 1_500;
-  while (reclaimCalls === 0 && Date.now() < reclaimDeadline) await delay(10);
-  assert.equal(exitedCalls, 1);
-  assert.equal(reclaimCalls, 1);
-});
-
-test("provider-attached state survives audit failure and classifies a later failure as an exit", async (t) => {
-  const temporary = temporaryControlSocket();
-  const database = new ManagerDatabase();
-  const managed = claudeSession();
-  persistManagedClaude(database);
-  const originalAudit = database.auditOperation.bind(database);
-  database.auditOperation = ((input: OperationalAuditInput) => {
-    if (input.operation === "native.handoff" && input.outcome === "attached") {
-      throw new Error("injected attached audit failure");
-    }
-    originalAudit(input);
-  }) as ManagerDatabase["auditOperation"];
-  let attachedCalls = 0;
-  let exitedCalls = 0;
-  let failedCalls = 0;
-  const backend = await createAgentManagerServer({
-    discovery: false,
-    staticDir: false,
-    database,
-    cliTakeoverInspector: exactClaudeProcessInspector(),
-    controlSocketPath: temporary.socketPath,
-    adapters: {
-      claude: {
-        async createSession() { return managed; },
-        async performAction() { return { status: "succeeded" }; },
-        async getAttachInstruction() {
-          return {
-            kind: "claude-resume",
-            argv: ["claude", "--resume", "thread-1"],
-            cwd: "/tmp/workspace",
-            warning: null,
-          };
-        },
-        markCliAttached() { attachedCalls += 1; },
-        markCliExited() { exitedCalls += 1; },
-        markCliAttachFailed() { failedCalls += 1; },
-        async reclaimFromCli() { return managed; },
-      },
-    },
-    initialSessions: [managed],
-  });
-  t.after(async () => {
-    await backend.close().catch(() => undefined);
-    rmSync(temporary.root, { recursive: true, force: true });
-  });
-
-  const reply = await requestAttachFromControlSocket(temporary.socketPath, managed.id);
-  const handoffId = reply.instruction.handoffId!;
-  const spawnNonce = reply.instruction.spawnNonce!;
-  await requestAttachAuthorizeSpawnFromControlSocket(
-    temporary.socketPath,
-    managed.id,
-    handoffId,
-    spawnNonce,
-    process.pid,
-  );
-  await requestAttachStartedFromControlSocket(
-    temporary.socketPath,
-    managed.id,
-    handoffId,
-    spawnNonce,
-    process.pid,
-  );
-  await requestAttachFailedFromControlSocket(
-    temporary.socketPath,
-    managed.id,
-    handoffId,
-    "lost wrapper acknowledgement",
-  );
-
-  assert.equal(attachedCalls, 1);
-  assert.equal(exitedCalls, 1);
-  assert.equal(failedCalls, 0);
-});
-
-test("attach-started waits for Claude's exact registry association before committing ownership", async (t) => {
-  const temporary = temporaryControlSocket();
-  const database = new ManagerDatabase();
-  const managed = claudeSession();
-  persistManagedClaude(database);
-  const identity = {
-    pid: process.pid,
-    uid: process.getuid?.() ?? 501,
-    executable: "claude" as const,
-    startedAt: "Wed Aug 5 10:00:00 2026",
-    providerSessionId: managed.providerThreadId,
-    cwd: managed.cwd!,
-  };
-  let inspections = 0;
-  const inspector: LocalCliProcessInspector = {
-    inspect(_view, expected) {
-      inspections += 1;
-      return inspections === 1
-        ? { state: "pending", identity, reason: "Claude registry is not ready" }
-        : { state: "running", identity: expected ?? identity };
-    },
-    findAssociated() {
-      return { state: "running", identity };
-    },
-    terminate() {},
-  };
-  let attachedCalls = 0;
-  const backend = await createAgentManagerServer({
-    discovery: false,
-    staticDir: false,
-    database,
-    cliTakeoverInspector: inspector,
-    cliTakeoverTimings: { inspectionTimeoutMs: 100, pollIntervalMs: 2 },
-    controlSocketPath: temporary.socketPath,
-    adapters: {
-      claude: {
-        async createSession() { return managed; },
-        async performAction() { return { status: "succeeded" }; },
-        async getAttachInstruction() {
-          return {
-            kind: "claude-resume",
-            argv: ["claude", "--resume", managed.providerThreadId],
-            cwd: managed.cwd,
-            warning: null,
-          };
-        },
-        markCliAttached() { attachedCalls += 1; },
-        async reclaimFromCli() { return managed; },
-      },
-    },
-    initialSessions: [managed],
-  });
-  t.after(async () => {
-    await backend.close().catch(() => undefined);
-    rmSync(temporary.root, { recursive: true, force: true });
-  });
-
-  const reply = await requestAttachFromControlSocket(temporary.socketPath, managed.id);
-  await requestAttachAuthorizeSpawnFromControlSocket(
-    temporary.socketPath,
-    managed.id,
-    reply.instruction.handoffId!,
-    reply.instruction.spawnNonce!,
-    process.pid,
-  );
-  await requestAttachStartedFromControlSocket(
-    temporary.socketPath,
-    managed.id,
-    reply.instruction.handoffId!,
-    reply.instruction.spawnNonce!,
-    process.pid,
-  );
-
-  assert.ok(inspections >= 2);
-  assert.equal(attachedCalls, 1);
-  assert.equal(
-    database.listManagedSessions().find((record) => record.id === managed.id)?.metadata.ownership,
-    "native-exclusive",
-  );
-  await requestAttachFailedFromControlSocket(
-    temporary.socketPath,
-    managed.id,
-    reply.instruction.handoffId!,
-    "test cleanup",
-  );
-});
-
-test("timed-out native reclaim observes one shared provider transition until eventual success", async (t) => {
-  const temporary = temporaryControlSocket();
-  const database = new ManagerDatabase();
-  const managed = claudeSession();
-  persistManagedClaude(database);
-  let resolveReclaim!: (view: SessionView) => void;
-  const pendingReclaim = new Promise<SessionView>((resolve) => {
-    resolveReclaim = resolve;
-  });
-  let reclaimCalls = 0;
-  const backend = await createAgentManagerServer({
-    discovery: false,
-    staticDir: false,
-    shutdownTimeoutMs: 250,
-    database,
-    cliTakeoverInspector: exactClaudeProcessInspector(),
-    controlSocketPath: temporary.socketPath,
-    adapters: {
-      claude: {
-        async createSession() { return managed; },
-        async performAction() { return { status: "succeeded" }; },
-        async getAttachInstruction() {
-          return {
-            kind: "claude-resume",
-            argv: ["claude", "--resume", "thread-1"],
-            cwd: "/tmp/workspace",
-            warning: null,
-          };
-        },
-        async reclaimFromCli() {
-          reclaimCalls += 1;
-          return await pendingReclaim;
-        },
-      },
-    },
-    initialSessions: [managed],
-  });
-  t.after(async () => {
-    resolveReclaim(managed);
-    await backend.close().catch(() => undefined);
-    rmSync(temporary.root, { recursive: true, force: true });
-  });
-
-  const reply = await requestAttachFromControlSocket(temporary.socketPath, managed.id);
-  const handoffId = reply.instruction.handoffId!;
-  const spawnNonce = reply.instruction.spawnNonce!;
-  await requestAttachAuthorizeSpawnFromControlSocket(
-    temporary.socketPath,
-    managed.id,
-    handoffId,
-    spawnNonce,
-    process.pid,
-  );
-  await requestAttachStartedFromControlSocket(
-    temporary.socketPath,
-    managed.id,
-    handoffId,
-    spawnNonce,
-    process.pid,
-  );
-  await assert.rejects(
-    requestAttachExitedFromControlSocket(
-      temporary.socketPath,
-      managed.id,
-      handoffId,
-      0,
-    ),
-    /attach-lifecycle-failed/,
-  );
-  assert.equal(reclaimCalls, 1);
-  await assert.rejects(
-    requestAttachFromControlSocket(temporary.socketPath, managed.id),
-    /attach-unavailable/,
-  );
-
-  resolveReclaim(managed);
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.equal(reclaimCalls, 1);
-  const next = await requestAttachFromControlSocket(temporary.socketPath, managed.id);
-  assert.ok(next.instruction.spawnNonce);
-});
 
 test("session creation reserves a durable idempotency intent before provider dispatch", async (t) => {
   let calls = 0;
@@ -1669,6 +1263,7 @@ test("proxies remote sessions through SSH and reserves takeover for a real write
         "retry-control",
       ],
       withheld: [],
+      peers: [],
       takeover: null,
     },
   });
@@ -1850,7 +1445,6 @@ lines.on("line", (line) => {
     headers,
   });
   assert.equal(attach.statusCode, 200, attach.body);
-  assert.equal(attach.json<{ requiresHandoff: boolean }>().requiresHandoff, false);
   const attachInstruction = attach.json<{ instruction: { kind: string; argv: string[] } }>().instruction;
   assert.equal(attachInstruction.kind, "ssh");
   assert.deepEqual(attachInstruction.argv.slice(0, 3), ["ssh", "-t", "dev@build-host"]);
@@ -2423,6 +2017,7 @@ test("streams retained transcript history when managed Codex detail acquisition 
           truncated: false,
           itemCount: 1,
           reason: null,
+          forked: false,
         },
         items: [{
           kind: "message",

@@ -57,6 +57,7 @@ function session(updatedAt = "2026-08-04T10:00:00.000Z"): SessionRecord {
       recovery: null,
       capabilities: [],
       withheld: [],
+      peers: [],
       takeover: null,
     },
     workspaceIdentity: null,

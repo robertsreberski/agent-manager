@@ -107,16 +107,19 @@ function FactRow({ label, children }: { label: string; children: ReactNode }) {
 
 function capabilitySentence(session: CockpitSessionView, capability: SessionCapability): string {
   if (capability === "attach" && session.control.coordination.nativeAttach === "join") {
-    return "Open the same conversation in Codex CLI";
+    return session.provider === "codex"
+      ? "Open the same conversation in Codex CLI"
+      : "Open the same conversation in Claude Code";
   }
-  if (capability === "attach" && session.control.coordination.nativeAttach === "handoff") {
-    return "Move provider control to the CLI";
-  }
-  if (capability === "take-control" && session.provider === "codex") {
+  /*
+    Only Codex offers takeover now: a standalone Codex process must migrate once
+    before it can be shared, because a rollout is a flat event log with no parent
+    pointers and cannot represent two concurrent writers. Claude is joined
+    instead, so the Claude branch that used to read "Move exclusive Claude Code
+    control to the web app" is gone.
+  */
+  if (capability === "take-control") {
     return "Migrate once to shared CLI + web control";
-  }
-  if (capability === "take-control" && session.provider === "claude") {
-    return "Move exclusive Claude Code control to the web app";
   }
   return CAPABILITY_SENTENCE[capability];
 }
@@ -182,7 +185,6 @@ export function SessionCapabilityPanel({
   factsStatus,
   attachCommand,
   attachDescription,
-  attachRequiresHandoff = false,
   attachError,
   loadingAttach,
   onRevealAttach,
@@ -193,7 +195,6 @@ export function SessionCapabilityPanel({
   factsStatus: "loading" | "loaded" | "error";
   attachCommand?: string | null;
   attachDescription?: string | null;
-  attachRequiresHandoff?: boolean;
   attachError?: string | null;
   loadingAttach?: boolean;
   onRevealAttach?: () => void;
@@ -208,17 +209,13 @@ export function SessionCapabilityPanel({
   const changes = workspaceChangeFacts(workspace);
   const canRevealAttach = offered.has("attach") || offered.has("resume");
   const joinsNative = session.control.coordination.nativeAttach === "join";
-  const handsOffNative = session.control.coordination.nativeAttach === "handoff";
-  const ended = ["completed", "failed", "interrupted"].includes(session.activity);
-  const nativeCommandLabel = joinsNative
+  const nativeCommandLabel = session.provider === "codex"
     ? "Show Codex CLI join command"
-    : session.provider === "claude"
-      ? ended ? "Show Claude Code resume command" : "Show Claude Code handoff command"
-      : "Show guarded resume command";
+    : "Show Claude Code join command";
   const account = facts?.account.available ? facts.account : null;
   return (
     <section className="grid grid-cols-[minmax(0,1fr)] gap-5 text-meta">
-      <FactSection title="Where it runs"><div className="mt-1"><FactRow label="Host">{session.hostLabel}{session.hostId !== session.hostLabel ? <span className="ml-2 text-[var(--text-muted)]">{session.hostId}</span> : null}</FactRow><FactRow label="Repository">{workspace?.repoName ?? "Unknown"}</FactRow><FactRow label="Worktree">{workspace?.worktreePath ?? session.cwd ?? "Unknown"}</FactRow><FactRow label="Branch">{workspace?.detached ? "Detached HEAD" : workspace?.branch ?? "Unknown"}</FactRow>{workspace?.dirtyCount !== null && workspace?.dirtyCount !== undefined && <FactRow label="Changes">{changes === null ? "Clean" : `${workspaceChangeLabel(changes)} uncommitted`}</FactRow>}<FactRow label="Harness"><span className="font-sans font-medium">{HARNESS_LABEL[session.control.plane]}</span>{session.model && <span className="ml-2 text-[var(--text-muted)]">{session.model}</span>}{session.effort && <span className="ml-2 text-[var(--text-muted)]">{session.effort}</span>}</FactRow><FactRow label="Control">{archived ? "Archived · read-only" : session.control.coordination.mode === "shared" ? "Shared CLI + web" : session.control.coordination.mode === "exclusive" ? "One active writer" : "Observation only"}{session.control.recovery && <span className="ml-2 text-[var(--warning)]">{session.control.recovery.state === "waiting-for-native-exit" ? "Claude Code has control" : session.control.recovery.state === "needs-attention" ? "needs attention" : `${session.control.recovery.state.replaceAll("-", " ")} · attempt ${session.control.recovery.attempt}`}</span>}{!archived && session.control.coordination.mode === "shared" && <span className="mt-1 block font-sans text-meta-sm text-[var(--text-muted)]">Use Codex CLI and web together. The first surface to answer a question or approval wins.</span>}</FactRow></div></FactSection>
+      <FactSection title="Where it runs"><div className="mt-1"><FactRow label="Host">{session.hostLabel}{session.hostId !== session.hostLabel ? <span className="ml-2 text-[var(--text-muted)]">{session.hostId}</span> : null}</FactRow><FactRow label="Repository">{workspace?.repoName ?? "Unknown"}</FactRow><FactRow label="Worktree">{workspace?.worktreePath ?? session.cwd ?? "Unknown"}</FactRow><FactRow label="Branch">{workspace?.detached ? "Detached HEAD" : workspace?.branch ?? "Unknown"}</FactRow>{workspace?.dirtyCount !== null && workspace?.dirtyCount !== undefined && <FactRow label="Changes">{changes === null ? "Clean" : `${workspaceChangeLabel(changes)} uncommitted`}</FactRow>}<FactRow label="Harness"><span className="font-sans font-medium">{HARNESS_LABEL[session.control.plane]}</span>{session.model && <span className="ml-2 text-[var(--text-muted)]">{session.model}</span>}{session.effort && <span className="ml-2 text-[var(--text-muted)]">{session.effort}</span>}</FactRow><FactRow label="Control">{archived ? "Archived · read-only" : session.control.coordination.mode === "shared" ? "Shared CLI + web" : session.control.coordination.mode === "exclusive" ? "One active writer" : "Observation only"}{session.control.recovery && <span className="ml-2 text-[var(--warning)]">{session.control.recovery.state === "needs-attention" ? "needs attention" : `${session.control.recovery.state.replaceAll("-", " ")} · attempt ${session.control.recovery.attempt}`}</span>}{!archived && session.control.coordination.mode === "shared" && <span className="mt-1 block font-sans text-meta-sm text-[var(--text-muted)]">{session.provider === "codex" ? "Use Codex CLI and web together. The first surface to answer a question or approval wins." : "Use Claude Code and web together. Each surface drives its own turns and answers its own approvals. If both send at once, the conversation forks."}</span>}</FactRow></div></FactSection>
       {/*
         Frame 9b marks each sentence with a glyph rather than a character: a
         lime tick for offered, an amber question for genuinely unknown, and a
@@ -240,7 +237,7 @@ export function SessionCapabilityPanel({
           Advanced · CLI access
         </CollapsibleTrigger>
         <CollapsibleContent className="pt-1">
-          {attachCommand ? <><div className="mt-3 flex items-start gap-2.5 bg-[var(--surface-raised)] px-[13px] py-3"><pre className="min-w-0 flex-1 whitespace-pre-wrap break-all font-mono text-code leading-[19px] text-[var(--text)]">{attachCommand}</pre><Button variant="ghost" size="icon" data-compact-control className="size-[26px] shrink-0" aria-label={joinsNative ? "Copy Codex CLI join command" : "Copy guarded attach command"} onClick={() => void navigator.clipboard?.writeText(attachCommand)}><Copy size={15} strokeWidth={1.75} /></Button></div>{attachDescription && <p className="mt-2 text-meta-sm text-[var(--text-muted)]">{attachDescription}</p>}<p className="mt-[9px] font-mono text-code-sm leading-[17px] text-[var(--text-muted)]">{ended && session.provider === "claude" ? "resumes the exact conversation in Claude Code; web replies stay unavailable while it runs" : attachRequiresHandoff || handsOffNative ? "running this moves provider control to the CLI" : joinsNative ? "CLI joins; web control stays active" : "copied, not run — the browser never attaches"}</p></> : canRevealAttach ? <Button variant="secondary" size="touch" className="mt-3 border-[var(--border)] px-3" disabled={loadingAttach} onClick={onRevealAttach}>{loadingAttach ? (joinsNative ? "Preparing Codex CLI command…" : "Loading guarded wrapper…") : nativeCommandLabel}</Button> : <p className="mt-3 text-meta-sm text-[var(--text-muted)]">{withheld.get("attach") ?? withheld.get("resume") ?? "This harness does not expose a terminal continuation."}</p>}
+          {attachCommand ? <><div className="mt-3 flex items-start gap-2.5 bg-[var(--surface-raised)] px-[13px] py-3"><pre className="min-w-0 flex-1 whitespace-pre-wrap break-all font-mono text-code leading-[19px] text-[var(--text)]">{attachCommand}</pre><Button variant="ghost" size="icon" data-compact-control className="size-[26px] shrink-0" aria-label={joinsNative ? `Copy ${session.provider === "codex" ? "Codex CLI" : "Claude Code"} join command` : "Copy guarded attach command"} onClick={() => void navigator.clipboard?.writeText(attachCommand)}><Copy size={15} strokeWidth={1.75} /></Button></div>{attachDescription && <p className="mt-2 text-meta-sm text-[var(--text-muted)]">{attachDescription}</p>}<p className="mt-[9px] font-mono text-code-sm leading-[17px] text-[var(--text-muted)]">{joinsNative ? "CLI joins; web control stays active" : "copied, not run — the browser never attaches"}</p></> : canRevealAttach ? <Button variant="secondary" size="touch" className="mt-3 border-[var(--border)] px-3" disabled={loadingAttach} onClick={onRevealAttach}>{loadingAttach ? (joinsNative ? "Preparing join command…" : "Loading guarded wrapper…") : nativeCommandLabel}</Button> : <p className="mt-3 text-meta-sm text-[var(--text-muted)]">{withheld.get("attach") ?? withheld.get("resume") ?? "Agent Manager has no terminal command for this session."}</p>}
           {attachError && <p className="mt-2 text-code-sm text-[var(--warning)]">{attachError}</p>}
         </CollapsibleContent>
       </Collapsible>

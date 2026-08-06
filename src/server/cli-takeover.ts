@@ -60,7 +60,20 @@ export interface LocalCliProcessIdentity {
 }
 
 export type LocalCliInspection =
-  | { state: "running"; identity: LocalCliProcessIdentity }
+  | {
+      state: "running";
+      identity: LocalCliProcessIdentity;
+      /**
+       * Every live process that proved this exact conversation, when a scan
+       * found more than one. A joined Claude session legitimately has two: the
+       * operator's terminal and Agent Manager's own SDK child. Absent means the
+       * caller pinned a single PID and never enumerated.
+       *
+       * `identity` stays the primary — the interactive terminal when there is
+       * one, because that is the process an operator is looking at.
+       */
+      owners?: readonly LocalCliProcessIdentity[] | undefined;
+    }
   | {
       state: "pending";
       /**
@@ -414,8 +427,16 @@ export class CliTakeoverCoordinator {
     this.#signalJournal = options.signalJournal ?? new MemorySignalJournal();
   }
 
+  /**
+   * Takeover is Codex-only now. A Claude conversation is joined instead: a
+   * second SDK query opens alongside whatever else is writing, so there is
+   * nothing to stop and nothing to hand over. A standalone Codex process still
+   * has to migrate once, because a Codex rollout is a flat event log with no
+   * parent pointers and cannot represent two concurrent writers.
+   */
   canOffer(session: SessionView): boolean {
     return !this.#disposed
+      && session.provider !== "claude"
       && !this.#hasBlockingRollbackQuarantine(session.id)
       && this.#hasTranscriptVerifier(session)
       && session.hostId === "local"
@@ -441,7 +462,13 @@ export class CliTakeoverCoordinator {
       && session.parentId === null
       && typeof session.cwd === "string"
       && session.cwd.length > 0
-      && (session.runtimePid ?? session.pid) === null
+      /*
+        A live process used to disqualify resume outright, which is what forced
+        an operator to kill their own terminal before the cockpit would write.
+        Claude may now join one; Codex still requires the loaded thread to be
+        free, and `#assertResumeOwnerPolicy` is what proves either case.
+      */
+      && (session.provider === "claude" || (session.runtimePid ?? session.pid) === null)
       && this.#options.canAdopt(session.provider);
   }
 
@@ -1167,10 +1194,39 @@ export class CliTakeoverCoordinator {
     }
   }
 
+  /**
+   * What resume is allowed to find already running.
+   *
+   * Codex is unchanged: the owner set must be empty, because a second concurrent
+   * writer on one rollout cannot be represented and so must not be created.
+   *
+   * Claude joins instead. The relaxation is narrow and deliberate — we stop
+   * refusing *because a process exists*, and keep refusing whenever we cannot
+   * prove *which* conversation that process holds. `findAssociated` still has to
+   * return a clean association for every live owner it finds: the registry's
+   * sessionId, pid, procStart and cwd must all match, or it answers `mismatch`
+   * and this throws exactly as before.
+   */
   async #assertResumeOwnerPolicy(
     session: SessionView,
     signal: AbortSignal,
   ): Promise<void> {
+    if (session.provider === "claude") {
+      if (!this.#inspector.findAssociated) return;
+      const inspected = await phaseTimeout(
+        () => this.#inspector.findAssociated!({ ...session, pid: null, runtimePid: null }),
+        signal,
+        this.#inspectionTimeoutMs,
+        "Claude join owner-set validation",
+      );
+      // `running` is the joined case and is now allowed. `pending` and
+      // `mismatch` still fail closed — they mean the identity is unproven, not
+      // that a peer is present.
+      if (inspected.state === "pending" || inspected.state === "mismatch") {
+        throw new Error(inspected.reason);
+      }
+      return;
+    }
     await this.#assertStandaloneOwnerSet(
       session,
       null,
@@ -1845,7 +1901,19 @@ export class SystemLocalCliProcessInspector implements LocalCliProcessInspector 
     if (entries.length > 512) {
       return { state: "mismatch", reason: "Claude's live registry is too large to inspect safely" };
     }
-    let owner: LocalCliInspection | null = null;
+    /*
+      This used to answer `mismatch: "Multiple Claude processes claim the same
+      session"` on the second live owner — which is exactly the state a joined
+      session is in, so it made joining unrepresentable rather than unsafe. Two
+      owners are now enumerated instead of refused.
+
+      What did not change is the per-owner proof. Every entry still has to match
+      the exact conversation (`sessionId`), agree with its own filename (`pid`),
+      sit in the same workspace (`cwd`), and pass the full `inspect` association;
+      one bad claimant still fails the whole scan closed. We stopped refusing
+      because a process exists, not because we stopped checking which it is.
+    */
+    const owners: LocalCliProcessIdentity[] = [];
     for (const entry of entries) {
       if (!entry.isFile() || !/^\d+\.json$/u.test(entry.name)) continue;
       const pid = Number(entry.name.slice(0, -5));
@@ -1864,12 +1932,13 @@ export class SystemLocalCliProcessInspector implements LocalCliProcessInspector 
       if (inspected.state === "exited") continue;
       if (inspected.state === "mismatch") return inspected;
       if (inspected.state === "pending") return inspected;
-      if (owner !== null) {
-        return { state: "mismatch", reason: "Multiple Claude processes claim the same session" };
-      }
-      owner = inspected;
+      owners.push(inspected.identity);
     }
-    return owner ?? { state: "exited" };
+    if (owners.length === 0) return { state: "exited" };
+    // The interactive terminal is the process the operator is looking at, so it
+    // is the one a single-identity caller should be handed.
+    const primary = owners.find((owner) => owner.interactive === true) ?? owners[0]!;
+    return { state: "running", identity: primary, owners };
   }
 
   #findAssociatedCodex(session: SessionView): LocalCliInspection {

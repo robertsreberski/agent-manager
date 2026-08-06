@@ -21,7 +21,6 @@ export type AttachTarget =
       sessionId: string;
       cwd: string;
       claudeExecutable: string;
-      handoffReady: boolean;
     };
 
 export interface AttachSpec {
@@ -79,9 +78,10 @@ export function buildAttachSpec(target: AttachTarget): AttachSpec {
         cwd: target.cwd,
       };
     case "claude":
-      if (!target.handoffReady) {
-        throw new Error("Claude session has not been safely handed off from the manager");
-      }
+      /*
+        No handoff gate: `claude --resume` runs beside the manager's own query
+        rather than replacing it, exactly as the Codex `--remote` join does.
+      */
       return {
         executable: assertPinnedExecutable(target.claudeExecutable),
         args: ["--resume", assertProviderIdentifier(target.sessionId, "Claude session id")],

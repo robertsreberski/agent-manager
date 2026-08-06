@@ -155,10 +155,7 @@ import {
   persistDiscoveredWorkspaces,
   setupNearbyWorkspaces,
 } from "./setup-workspaces.ts";
-import {
-  deferManagedRecovery,
-  ManagedRecoveryCoordinator,
-} from "./managed-recovery.ts";
+import { ManagedRecoveryCoordinator } from "./managed-recovery.ts";
 import type { RemoteHostRegistry } from "./remote-host-registry.ts";
 import {
   localDirectoryCompletions,
@@ -222,12 +219,7 @@ const remoteHostCreateSchema = z.object({
     .max(512)
     .refine((value) => !/[\u0000-\u001f\u007f]/u.test(value), "SSH target contains control characters"),
 }).strict();
-const managedOwnershipSchema = z.enum([
-  "shared",
-  "manager-exclusive",
-  "handoff-prepared",
-  "native-exclusive",
-]);
+const managedOwnershipSchema = z.enum(["shared"]);
 const managedControlSchema = z.enum(["active", "stopped"]);
 const managedCodexIdentityComponentSchema = z.string()
   .min(1)
@@ -237,34 +229,6 @@ const managedCodexIdentityComponentSchema = z.string()
     "Codex identity contains control characters",
   )
   .nullable();
-const managedNativeOwnerSchema = z.object({
-  pid: z.number().int().positive(),
-  uid: z.number().int().nonnegative(),
-  executable: z.literal("claude"),
-  startedAt: z.string().refine((value) => Number.isFinite(Date.parse(value))),
-  providerSessionId: z.string().min(1).max(512),
-  cwd: z.string().min(1).max(32_768),
-  associationPath: z.string().min(1).max(32_768).optional(),
-  executablePath: z.string().min(1).max(32_768).optional(),
-  ppid: z.number().int().nonnegative().optional(),
-  processGroupId: z.number().int().positive().optional(),
-  foregroundProcessGroupId: z.number().int().optional(),
-  tty: z.string().min(1).max(256).optional(),
-  providerStartedAtMs: z.number().int().nonnegative().nullable().optional(),
-  interactive: z.boolean().optional(),
-  members: z.array(z.object({
-    pid: z.number().int().positive(),
-    ppid: z.number().int().nonnegative(),
-    processGroupId: z.number().int().positive(),
-    foregroundProcessGroupId: z.number().int(),
-    tty: z.string().min(1).max(256),
-    startedAt: z.string().refine((value) => Number.isFinite(Date.parse(value))),
-    startedAtMs: z.number().int().nonnegative(),
-    executablePath: z.string().min(1).max(32_768),
-    executableDevice: z.number().int().nonnegative(),
-    executableInode: z.number().int().nonnegative(),
-  }).strict()).max(32).optional(),
-}).strict();
 const bootstrapSchema = z.object({ secret: z.string().min(32).max(256) }).strict();
 
 const NO_STORE = "no-store";
@@ -647,12 +611,8 @@ function managedRecoveryRecords(database: ManagerDatabase, provider: Provider): 
     const sandbox = sandboxPolicySchema.nullable().safeParse(persisted.metadata.sandbox ?? null);
     const name = persisted.metadata.name;
     const model = persisted.metadata.model;
-    const defaultOwnership = provider === "codex" ? "shared" : "manager-exclusive";
     const ownership = managedOwnershipSchema.safeParse(
-      persisted.metadata.ownership ?? defaultOwnership,
-    );
-    const nativeOwner = managedNativeOwnerSchema.nullable().safeParse(
-      persisted.metadata.nativeOwner ?? null,
+      persisted.metadata.ownership ?? "shared",
     );
     const managerControl = managedControlSchema.safeParse(
       persisted.metadata.managerControl ?? (provider === "codex" ? "active" : undefined),
@@ -678,17 +638,9 @@ function managedRecoveryRecords(database: ManagerDatabase, provider: Provider): 
       && profile.success
       && effort.success
       && ownership.success
-      && nativeOwner.success
       && managerControl.success
       && sandbox.success
-      && (provider === "codex"
-        ? ownership.data === "shared"
-          && nativeOwner.data === null
-          && persisted.metadata.managerControl === undefined
-        : ownership.data !== "shared")
-      && (ownership.data === "native-exclusive"
-        ? nativeOwner.data !== null
-        : nativeOwner.data === null)
+      && (provider !== "codex" || persisted.metadata.managerControl === undefined)
       && Number.isFinite(Date.parse(persisted.createdAt))
       && Number.isFinite(Date.parse(persisted.updatedAt));
     if (
@@ -698,7 +650,6 @@ function managedRecoveryRecords(database: ManagerDatabase, provider: Provider): 
       || !profile.success
       || !effort.success
       || !ownership.success
-      || !nativeOwner.success
       || !managerControl.success
     ) {
       diagnostics.push({
@@ -721,7 +672,6 @@ function managedRecoveryRecords(database: ManagerDatabase, provider: Provider): 
       effort: effort.data,
       createdAt: persisted.createdAt,
       ownership: ownership.data,
-      nativeOwner: nativeOwner.data,
       ...(provider === "claude" ? { managerControl: managerControl.data } : {}),
       ...(provider === "codex" && providerTreeId?.success && providerParentThreadId?.success
         ? {
@@ -756,17 +706,11 @@ function managedRecoveryPlaceholder(
   recovery: SessionControlRecovery,
   previous: SessionView | null = null,
 ): SessionRecord {
-  const nativeClaudeOwner = record.provider === "claude"
-    && record.ownership === "native-exclusive";
-  const ambiguousClaudeHandoff = record.provider === "claude"
-    && record.ownership === "handoff-prepared";
-  const waitingForNativeExit = recovery.state === "waiting-for-native-exit";
   const missingCodexBaseline = codexIdentityBaselineMissing(record);
   const reason = recovery.state === "reconnecting"
     ? `${record.provider === "claude" ? "Claude" : "Codex"} control is reconnecting; history remains available.`
     : recovery.error ?? "Provider control is temporarily unavailable; history remains available.";
   const capabilities: SessionRecord["control"]["capabilities"] = recovery.state === "reconnecting"
-      || waitingForNativeExit
     ? []
     : missingCodexBaseline
     ? ["resume"]
@@ -791,11 +735,11 @@ function managedRecoveryPlaceholder(
     cwd: record.workspacePath,
     kind: previous?.kind ?? "interactive",
     archived: false,
-    presence: nativeClaudeOwner ? "live" : "recent",
-    status: nativeClaudeOwner || ambiguousClaudeHandoff ? "waiting" : previous?.status ?? "idle",
+    presence: "recent",
+    status: previous?.status ?? "idle",
     providerStatus: recovery.state,
-    pid: record.nativeOwner?.pid ?? previous?.pid ?? null,
-    runtimePid: record.nativeOwner?.pid ?? previous?.runtimePid ?? null,
+    pid: previous?.pid ?? null,
+    runtimePid: previous?.runtimePid ?? null,
     startedAt: record.createdAt,
     updatedAt: new Date().toISOString(),
     childSummary: previous?.childSummary ?? emptyChildSummary(),
@@ -829,18 +773,19 @@ function managedRecoveryPlaceholder(
         ? "resume-only"
         : record.provider === "codex"
         ? "codex-private"
-        : nativeClaudeOwner
-        ? "resume-only"
-        : ambiguousClaudeHandoff
-        ? "observe-only"
         : "claude-sdk",
-      authority: nativeClaudeOwner ? "foreign" : "none",
+      authority: "none",
       coordination: providerControlCoordination(record.provider),
       recovery,
       capabilities,
       withheld: RECOVERY_WITHHELD_CAPABILITIES
         .filter((capability) => !capabilities.includes(capability))
         .map((capability) => ({ capability, reason })),
+      /*
+        A recovering placeholder has no live provider connection, so it has
+        proven no writer. Claiming a peer here would outlive the evidence.
+      */
+      peers: [],
       takeover: null,
     },
     workspaceIdentity: previous?.workspaceIdentity ?? null,
@@ -975,96 +920,15 @@ export async function createAgentManagerServer(
     options.cliTakeoverTimings?.pollIntervalMs ?? 250,
   );
 
-  /**
-   * Resolve a provider owner when the PID was not durably reported. A single
-   * empty registry/process scan is not evidence of absence: startup and the
-   * native wrapper handoff both have a short interval where the child exists
-   * before its provider association is published. Once a concrete process is
-   * observed, every later read is fenced to that exact identity.
-   */
-  const awaitAssociatedCliOwner = async (
-    session: SessionView,
-    signal: AbortSignal,
-  ): Promise<LocalCliInspection> => {
-    if (!cliProcessInspector.findAssociated) {
-      return { state: "mismatch", reason: "Provider owner discovery is unavailable" };
-    }
-    const deadline = Date.now() + cliIdentityInspectionTimeoutMs;
-    let expected: LocalCliProcessIdentity | undefined;
-    let latest: LocalCliInspection = { state: "exited" };
-    while (true) {
-      signal.throwIfAborted();
-      latest = expected
-        ? await cliProcessInspector.inspect({
-            ...session,
-            pid: expected.pid,
-            runtimePid: expected.pid,
-          }, expected)
-        : await cliProcessInspector.findAssociated({
-            ...session,
-            pid: null,
-            runtimePid: null,
-          });
-      signal.throwIfAborted();
-      if (latest.state === "running") {
-        if (!expected) return latest;
-        // A pending registry gave us a process pin, not proof that it is the
-        // conversation's only standalone owner. Re-run the complete catalog
-        // scan at the transition to ready before accepting it.
-        const ownerSet = await cliProcessInspector.findAssociated({
-          ...session,
-          pid: null,
-          runtimePid: null,
-        });
-        signal.throwIfAborted();
-        if (
-          ownerSet.state === "running"
-          && localCliProcessIdentityMatches(ownerSet.identity, latest.identity)
-        ) return ownerSet;
-        if (ownerSet.state === "mismatch" || ownerSet.state === "pending") return ownerSet;
-        return {
-          state: "mismatch",
-          reason: "The pinned provider process disappeared during final owner-set validation",
-        };
-      }
-      if (latest.state === "mismatch") return latest;
-      if (latest.state === "pending") expected ??= latest.identity;
-      // Once an exact pin disappears, absence is conclusive. Before a pin is
-      // available, require the complete bounded observation window.
-      if (latest.state === "exited" && expected) return latest;
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) return latest;
-      await abortableDelay(Math.min(cliIdentityPollIntervalMs, remaining), signal);
-    }
-  };
+  /*
+    `awaitAssociatedCliOwner` and `awaitPinnedCliOwner` are gone with the handoff
+    lifecycle. They existed to wait out a native wrapper's child PID before
+    ownership could be reconciled or reclaimed; nothing waits for a native
+    process now. `cliProcessInspector.findAssociated` remains the single
+    identity-proving read, called directly where a decision needs it.
+  */
 
-  /** Wait for a just-spawned PID's provider registry without ever following PID reuse. */
-  const awaitPinnedCliOwner = async (
-    session: SessionView,
-    pid: number,
-    signal: AbortSignal,
-    pinnedIdentity?: LocalCliProcessIdentity,
-  ): Promise<LocalCliInspection> => {
-    const deadline = Date.now() + cliIdentityInspectionTimeoutMs;
-    let expected = pinnedIdentity;
-    let latest: LocalCliInspection = { state: "exited" };
-    while (true) {
-      signal.throwIfAborted();
-      latest = await cliProcessInspector.inspect({
-        ...session,
-        pid,
-        runtimePid: pid,
-      }, expected);
-      signal.throwIfAborted();
-      if (latest.state === "running" || latest.state === "mismatch" || latest.state === "exited") {
-        return latest;
-      }
-      expected ??= latest.identity;
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) return latest;
-      await abortableDelay(Math.min(cliIdentityPollIntervalMs, remaining), signal);
-    }
-  };
+  /** Codex standalone migration still persists its takeover across phases. */
   interface TakeoverPersistenceTransition {
     prior: ManagedSessionMetadata | null;
     provider: Provider;
@@ -1554,29 +1418,6 @@ export async function createAgentManagerServer(
       }
     });
   };
-  interface NativeHandoff {
-    handoffId: string;
-    spawnNonce: string;
-    provider: Provider;
-    providerSessionId: string;
-    timer: NodeJS.Timeout;
-    preparationController: AbortController | null;
-    status: "preparing" | "prepared" | "authorized" | "attached" | "reclaiming" | "degraded";
-    providerNotified: boolean;
-    providerAttached: boolean;
-    pid: number | null;
-    wrapperPid: number | null;
-    wrapperMonitor: NodeJS.Timeout | null;
-    childMonitor: NodeJS.Timeout | null;
-    reconciliationController: AbortController | null;
-    reclaimPromise: Promise<void> | null;
-    providerReclaimPromise: Promise<SessionView | null> | null;
-    terminalKind: "exit" | "failure" | null;
-    exitCode: number | null;
-    reclaimCompleted: boolean;
-    reclaimedView: SessionView | null;
-  }
-  const nativeHandoffs = new Map<string, NativeHandoff>();
   const remoteSessionIds = new Map<string, Set<string>>();
   const syncRemoteHostDefinitions = (): void => {
     const definitions = options.remoteHostRegistry?.list()
@@ -1756,130 +1597,14 @@ export async function createAgentManagerServer(
     concurrency: 4,
     attemptTimeoutMs: MANAGED_SESSION_RECOVERY_TIMEOUT_MS,
     recover: async (record, signal) => {
-      if (
-        record.provider === "claude"
-        && (record.ownership === "manager-exclusive" || record.ownership === "handoff-prepared")
-        && cliProcessInspector.findAssociated
-      ) {
-        const observed = state.get(record.managerSessionId)
-          ?? managedRecoveryPlaceholder(record, {
-            state: "reconnecting",
-            attempt: 1,
-            startedAt: new Date().toISOString(),
-            deadlineAt: null,
-            nextRetryAt: null,
-            error: null,
-          });
-        const inspection = await awaitAssociatedCliOwner(observed, signal);
-        if (inspection.state === "mismatch" || inspection.state === "pending") {
-          throw new Error(`Claude ownership could not be fenced safely: ${inspection.reason}`);
-        }
-        if (inspection.state === "running") {
-          if (
-            inspection.identity.executable !== "claude"
-            || inspection.identity.providerSessionId !== record.providerThreadId
-            || inspection.identity.cwd !== record.workspacePath
-          ) {
-            throw new Error("Claude ownership probe returned a different provider identity");
-          }
-          const nativeOwner = {
-            ...inspection.identity,
-            executable: "claude" as const,
-          };
-          const persisted = database.listManagedSessions().find(
-            (candidate) => candidate.id === record.managerSessionId,
-          );
-          if (!persisted) throw new Error("the durable Claude identity disappeared during ownership fencing");
-          database.upsertManagedSession({
-            ...persisted,
-            metadata: {
-              ...persisted.metadata,
-              ownership: "native-exclusive",
-              nativeOwner,
-              handoffId: null,
-            },
-            updatedAt: new Date().toISOString(),
-          });
-          record.ownership = "native-exclusive";
-          record.nativeOwner = nativeOwner;
-          return deferManagedRecovery(
-            2_000,
-            "An exact Claude process already owns this conversation; web control will reconnect after it exits",
-          );
-        }
-        if (record.ownership === "handoff-prepared") {
-          // The service or authorized wrapper can disappear after the SDK has
-          // released control but before a child PID is durably reported. A
-          // complete bounded owner scan proving absence makes that state
-          // recoverable instead of permanently poisoning the conversation.
-          const persisted = database.listManagedSessions().find(
-            (candidate) => candidate.id === record.managerSessionId,
-          );
-          if (!persisted) throw new Error("the durable Claude identity disappeared during handoff recovery");
-          database.upsertManagedSession({
-            ...persisted,
-            metadata: {
-              ...persisted.metadata,
-              ownership: "manager-exclusive",
-              nativeOwner: null,
-              handoffId: null,
-            },
-            updatedAt: new Date().toISOString(),
-          });
-          record.ownership = "manager-exclusive";
-          record.nativeOwner = null;
-        }
-      }
-      if (
-        record.provider === "claude"
-        && record.ownership === "native-exclusive"
-      ) {
-        if (!record.nativeOwner) {
-          throw new Error(
-            "Claude native ownership is missing its exact process identity; history is intact, but automatic control recovery is fail-closed",
-          );
-        }
-        const observed = state.get(record.managerSessionId)
-          ?? managedRecoveryPlaceholder(record, {
-            state: "reconnecting",
-            attempt: 1,
-            startedAt: new Date().toISOString(),
-            deadlineAt: null,
-            nextRetryAt: null,
-            error: null,
-          });
-        const inspection = await awaitPinnedCliOwner(
-          observed,
-          record.nativeOwner.pid,
-          signal,
-          record.nativeOwner,
-        );
-        if (inspection.state === "running") {
-          return deferManagedRecovery(
-            2_000,
-            "Claude Code still has exclusive control; web control will reconnect after that exact process exits",
-          );
-        }
-        if (inspection.state === "mismatch" || inspection.state === "pending") {
-          throw new Error(`Claude native ownership could not be revalidated: ${inspection.reason}`);
-        }
-        const persisted = database.listManagedSessions().find(
-          (candidate) => candidate.id === record.managerSessionId,
-        );
-        if (!persisted) throw new Error("the durable Claude identity disappeared during recovery");
-        database.upsertManagedSession({
-          ...persisted,
-          metadata: {
-            ...persisted.metadata,
-            ownership: "manager-exclusive",
-            nativeOwner: null,
-            handoffId: null,
-          },
-          updatedAt: new Date().toISOString(),
-        });
-        record.ownership = "manager-exclusive";
-        record.nativeOwner = null;
-      }
+      /*
+        Claude recovery used to fence against a native owner before it could
+        restore web control: scan for an exact live process, persist
+        `native-exclusive` ownership, and park in a healthy wait until that
+        process exited. Shared join removes the premise. A live native CLI is a
+        peer, not an obstacle, so recovery goes straight to the provider restore
+        and the SDK query opens alongside whatever else is running.
+      */
       const adapter = adapters[record.provider];
       const restore = adapter?.restoreManagedSessions;
       if (!restore) {
@@ -1934,14 +1659,7 @@ export async function createAgentManagerServer(
         });
         return;
       }
-      const placeholder = managedRecoveryPlaceholder(record, recovery, current);
-      // A proven native Claude owner is a healthy exclusive-owner state, not
-      // a dead-end recovery failure. Keep automatic reclaim active by default,
-      // but also expose the normal identity-checked takeover transaction so
-      // the operator can finish the transfer entirely from the browser.
-      state.upsert(recovery.state === "waiting-for-native-exit"
-        ? cliTakeover.decorate(placeholder)
-        : placeholder);
+      state.upsert(managedRecoveryPlaceholder(record, recovery, current));
     },
   });
   restartManagedRecoveryAfterTakeover = (sessionId): void => {
@@ -3005,17 +2723,7 @@ export async function createAgentManagerServer(
   app.get("/api/v1/sessions/:id/attach", async (request) => {
     const session = state.get(routeSessionId(request));
     if (!session) throw new ApiError(404, "SESSION_NOT_FOUND", "session was not found");
-    const requiresActiveHandoff = session.provider === "claude"
-      && session.control.plane === "claude-sdk"
-      && session.control.authority === "manager"
-      && session.control.coordination.nativeAttach === "handoff";
-    if (isRemoteSession(session)) {
-      const remote = await remoteHosts.attach(session.id);
-      return {
-        ...remote,
-        requiresHandoff: requiresActiveHandoff,
-      };
-    }
+    if (isRemoteSession(session)) return await remoteHosts.attach(session.id);
     let instruction: AttachInstruction | null = null;
     if (
       session.control.authority === "manager"
@@ -3024,30 +2732,26 @@ export async function createAgentManagerServer(
         || session.control.capabilities.includes("resume")
       )
     ) {
-      // The browser may only advertise the owner-socket wrapper. Returning a
-      // raw provider command here would let a copied command bypass the
-      // native handoff state machine and race the manager for ownership.
+      /*
+        The browser only ever gets the owner-socket wrapper. That used to be
+        about ownership — a copied raw command could bypass the handoff state
+        machine — and it still holds for a plainer reason: the exact executable,
+        thread id and socket are the manager's to resolve, not the browser's.
+      */
       instruction = {
         kind: "manager-cli",
         argv: ["agent-manager", "attach", session.id],
         cwd: session.cwd,
-        warning: session.control.coordination.nativeAttach === "join"
+        warning: session.provider === "codex"
           ? "Run locally to join this shared Codex App Server; CLI and web controls remain active together."
-          : requiresActiveHandoff
-          ? "Run locally to perform a guarded exclusive ownership handoff through Agent Manager."
-          : session.provider === "claude"
-          ? "Run locally to resume this exact Claude conversation; web replies remain unavailable while it runs."
-          : "Run locally to resume this exact provider conversation through Agent Manager.",
+          : "Run locally to join this exact Claude conversation; web control stays active, and if both surfaces send at once the conversation forks.",
       };
     } else {
       if (session.terminal?.attachAvailable) {
         instruction = tmuxAttachInstruction(session.terminal, session.cwd);
       }
     }
-    return {
-      instruction,
-      requiresHandoff: instruction !== null && requiresActiveHandoff,
-    };
+    return { instruction };
   });
 
   app.get("/api/v1/events", {
@@ -3769,12 +3473,6 @@ export async function createAgentManagerServer(
         if (!session.control.capabilities.includes(capability)) {
           throw new ApiError(409, "CAPABILITY_UNAVAILABLE", `${capability} is unavailable for this session`);
         }
-        if (
-          session.control.coordination.mode === "exclusive"
-          && nativeHandoffs.has(id)
-        ) {
-          throw new ApiError(409, "NATIVE_CONTROLLER_ACTIVE", "a native provider client owns this session");
-        }
         if (!leases.verify(id, request.headers["x-control-lease"], principal(authSession))) {
           throw new ApiError(409, "LEASE_INVALID", "writable control lease is missing or invalid");
         }
@@ -3846,45 +3544,24 @@ export async function createAgentManagerServer(
             return { status: "succeeded" as const };
           }
           if (action.type === "take-control") {
-            let interruptedRecovery: ManagedSessionRecoveryRecord | null = null;
+            /*
+              Takeover no longer interrupts a recovery poll. It used to have to:
+              a proven native Claude owner parked recovery in a healthy wait, and
+              starting takeover had to stop that poll before it raced adoption.
+              With shared join nothing waits for a native owner, so the only
+              remaining takeover is Codex standalone migration and there is no
+              recovery state to unwind first.
+            */
             try {
-              let takeoverSession = session;
-              if (session.control.recovery?.state === "waiting-for-native-exit") {
-                // Once the browser deliberately starts takeover, the takeover
-                // coordinator owns the exact PID/session fence. Stop the
-                // background recovery poll first so it cannot race adoption,
-                // then remove only its presentation state. Persisted native
-                // ownership remains intact until provider adoption commits.
-                interruptedRecovery = managedRecoveryRecords(database, session.provider).records.find(
-                  (record) => record.managerSessionId === session.id,
-                ) ?? null;
-                if (!interruptedRecovery || !managedRecovery.cancel(session.id)) {
-                  throw new Error("The exact native-owner recovery identity is no longer available");
-                }
-                managedRecoveryTakeovers.set(session.id, interruptedRecovery);
-                takeoverSession = {
-                  ...session,
-                  control: {
-                    ...session.control,
-                    recovery: null,
-                  },
-                };
-                state.upsert(cliTakeover.decorate(takeoverSession));
-              }
               return {
                 status: "succeeded" as const,
                 result: await cliTakeover.begin(
-                  takeoverSession,
+                  session,
                   action.method,
                   action.takeoverId,
                 ),
               };
             } catch (error) {
-              if (interruptedRecovery) {
-                cliTakeover.dismissFailed(session.id);
-                managedRecoveryTakeovers.delete(session.id);
-                managedRecovery.start([interruptedRecovery]);
-              }
               return {
                 status: "failed" as const,
                 error: {
@@ -4223,14 +3900,6 @@ export async function createAgentManagerServer(
       claudeHookBridge.shutdown();
       setupHooks.clear();
       const takeoverShutdown = cliTakeover.dispose();
-      for (const handoff of nativeHandoffs.values()) {
-        clearTimeout(handoff.timer);
-        handoff.preparationController?.abort(new Error("server shutdown"));
-        handoff.reconciliationController?.abort(new Error("server shutdown"));
-        if (handoff.wrapperMonitor) clearInterval(handoff.wrapperMonitor);
-        if (handoff.childMonitor) clearInterval(handoff.childMonitor);
-      }
-      nativeHandoffs.clear();
       try {
         database.markInterruptedDispatchesUnknown();
         database.recoverCreateSessionIntents();
@@ -4309,216 +3978,18 @@ export async function createAgentManagerServer(
     await cleanupResources();
   });
 
-  const handoffDiagnostic = (sessionId: string, message: string): void => {
-    state.addDiagnostic({
-      provider: "system",
-      level: "error",
-      message: `Native handoff for ${sessionId}: ${message}`,
-    });
-  };
-
-  const requireNativeHandoff = (sessionId: string, handoffId: string) => {
-    const handoff = nativeHandoffs.get(sessionId);
-    if (!handoff || handoff.handoffId !== handoffId) {
-      throw new Error("native handoff is stale");
-    }
-    return handoff;
-  };
-
-  const auditHandoff = (
-    sessionId: string,
-    phase: "attempt" | "outcome" | "lifecycle",
-    outcome: string,
-    details: Record<string, string | number | boolean | null> = {},
-  ): void => {
-    database.auditOperation({
-      actor: localOwnerActor,
-      operation: "native.handoff",
-      targetId: sessionId,
-      phase,
-      outcome,
-      details,
-    });
-  };
-
-  const persistClaudeOwnership = (
-    sessionId: string,
-    ownership: "manager-exclusive" | "handoff-prepared" | "native-exclusive",
-    details: {
-      handoffId?: string | null;
-      nativeOwner?: ManagedSessionRecoveryRecord["nativeOwner"];
-    } = {},
-  ): void => {
-    const persisted = database.listManagedSessions().find(
-      (record) => record.id === sessionId && record.provider === "claude",
-    );
-    if (!persisted) throw new Error("durable Claude ownership record is unavailable");
-    database.upsertManagedSession({
-      ...persisted,
-      metadata: {
-        ...persisted.metadata,
-        ownership,
-        handoffId: details.handoffId ?? null,
-        nativeOwner: details.nativeOwner ?? null,
-      },
-      updatedAt: new Date().toISOString(),
-    });
-  };
-
-  type NativeTerminalTransition = "exited" | "failed" | "timeout" | "pid-exit";
-  const clearNativeHandoffMonitors = (handoff: NativeHandoff): void => {
-    clearTimeout(handoff.timer);
-    handoff.preparationController?.abort(new Error("native handoff preparation ended"));
-    handoff.preparationController = null;
-    handoff.reconciliationController?.abort(new Error("native handoff reconciliation ended"));
-    handoff.reconciliationController = null;
-    if (handoff.wrapperMonitor) {
-      clearInterval(handoff.wrapperMonitor);
-      handoff.wrapperMonitor = null;
-    }
-    if (handoff.childMonitor) {
-      clearInterval(handoff.childMonitor);
-      handoff.childMonitor = null;
-    }
-  };
-
-  const completeNativeReclaim = (
-    sessionId: string,
-    handoff: NativeHandoff,
-    view: SessionView | null,
-  ): void => {
-    if (handoff.reclaimCompleted) return;
-    if (handoff.provider === "claude") {
-      try {
-        persistClaudeOwnership(sessionId, "manager-exclusive");
-      } catch {
-        handoff.status = "degraded";
-        handoffDiagnostic(
-          sessionId,
-          "provider control returned, but durable ownership could not be committed; writes remain fail-closed",
-        );
-        return;
-      }
-    }
-    handoff.reclaimCompleted = true;
-    handoff.reclaimedView = view;
-    if (view) state.upsert(withLocalEditorCapability(view, editorLauncher !== null));
-    try {
-      auditHandoff(sessionId, "outcome", "reclaimed", { provider: handoff.provider });
-    } catch {
-      handoffDiagnostic(sessionId, "reclaim succeeded but its outcome audit could not be appended");
-    }
-    clearNativeHandoffMonitors(handoff);
-    if (nativeHandoffs.get(sessionId) === handoff) nativeHandoffs.delete(sessionId);
-  };
-
-  const finishNativeHandoff = (
-    sessionId: string,
-    handoffId: string,
-    transition: NativeTerminalTransition,
-    exitCode: number | null = null,
-  ): Promise<void> => {
-    const handoff = requireNativeHandoff(sessionId, handoffId);
-    if (handoff.status === "reclaiming" && handoff.reclaimPromise) {
-      return handoff.reclaimPromise;
-    }
-    clearNativeHandoffMonitors(handoff);
-    if (!handoff.terminalKind) {
-      handoff.terminalKind = handoff.providerAttached
-        || transition === "exited"
-        || transition === "pid-exit"
-        ? "exit"
-        : "failure";
-      handoff.exitCode = exitCode;
-    }
-    handoff.status = "reclaiming";
-    const reclaim = (async () => {
-      const adapter = adapters[handoff.provider];
-      try {
-        if (!handoff.providerReclaimPromise) {
-          try {
-            auditHandoff(sessionId, "lifecycle", "reclaim-attempt", {
-              transition,
-              provider: handoff.provider,
-            });
-          } catch {
-            handoffDiagnostic(sessionId, "reclaim is proceeding after its lifecycle audit failed");
-          }
-        }
-        if (!handoff.providerNotified) {
-          // Provider lifecycle transitions may not be idempotent. Record the
-          // single attempt before invoking it and never replay it after an
-          // ambiguous throw.
-          handoff.providerNotified = true;
-          try {
-            if (handoff.terminalKind === "exit") {
-              adapter?.markCliExited?.(
-                handoff.providerSessionId,
-                handoff.handoffId,
-                handoff.exitCode,
-              );
-            } else {
-              adapter?.markCliAttachFailed?.(
-                handoff.providerSessionId,
-                handoff.handoffId,
-                "native attach did not complete",
-              );
-            }
-          } catch {
-            handoffDiagnostic(sessionId, "provider lifecycle notification failed; reclaim will still be attempted");
-          }
-        }
-        if (!handoff.providerReclaimPromise) {
-          const providerReclaim = adapter?.reclaimFromCli
-            ? Promise.resolve().then(() =>
-                adapter.reclaimFromCli!(handoff.providerSessionId, handoff.handoffId)
-              )
-            : Promise.resolve(null);
-          handoff.providerReclaimPromise = providerReclaim;
-          void providerReclaim.then(
-            (view) => completeNativeReclaim(sessionId, handoff, view),
-            () => {
-              if (nativeHandoffs.get(sessionId) !== handoff) return;
-              handoff.status = "degraded";
-              handoffDiagnostic(
-                sessionId,
-                "provider reclaim failed; cockpit writes remain disabled without replaying the transition",
-              );
-            },
-          );
-        }
-        const sharedReclaim = handoff.providerReclaimPromise;
-        if (!sharedReclaim) throw new Error("native handoff reclaim did not initialize");
-        const reclaimedView = await bounded(
-          sharedReclaim,
-          shutdownTimeoutMs,
-          "native handoff reclaim",
-        );
-        completeNativeReclaim(sessionId, handoff, reclaimedView);
-      } catch {
-        if (nativeHandoffs.get(sessionId) === handoff && !handoff.reclaimCompleted) {
-          handoff.status = "degraded";
-          handoffDiagnostic(
-            sessionId,
-            "reclaim is unresolved; cockpit writes remain disabled while the original transition is observed",
-          );
-          try {
-            auditHandoff(sessionId, "outcome", "reclaim-degraded", {
-              provider: handoff.provider,
-            });
-          } catch {
-            // The durable preparation attempt remains available.
-          }
-        }
-        throw new Error("native handoff reclaim failed");
-      } finally {
-        handoff.reclaimPromise = null;
-      }
-    })();
-    handoff.reclaimPromise = reclaim;
-    return reclaim;
-  };
-
+  /**
+   * Optional native access. Both providers hand over a command and keep web
+   * control live: Codex joins the manager-owned App Server socket, Claude opens
+   * a second SDK-equivalent resume beside the manager's own query.
+   *
+   * This replaces ~700 lines of exclusive-handoff lifecycle — reservation and
+   * spawn nonce, authorized-wrapper and child PID monitors, unreported-child
+   * reconciliation, ownership persistence, audit trail, and bounded reclaim —
+   * all of which existed to move Claude's single writer to a terminal and take
+   * it back after that process exited. Nothing transfers ownership now, so there
+   * is no lifecycle to track and no reclaim to attempt.
+   */
   const nativeAttach = async (sessionId: string): Promise<AttachInstruction> => {
     const session = state.get(sessionId);
     if (!session) throw new Error("session not found");
@@ -4528,334 +3999,16 @@ export async function createAgentManagerServer(
     ) {
       throw new Error("session does not advertise native attach or resume");
     }
-    if (nativeHandoffs.has(sessionId)) throw new Error("native handoff is already active");
     const adapter = adapters[session.provider];
-    // Codex App Server is a multi-client control plane. Joining its exact
-    // manager-owned socket is not an ownership handoff and must never release
-    // the browser lease or disable web mutations.
-    if (session.control.coordination.nativeAttach === "join" && adapter?.getAttachInstruction) {
-      const instruction = await adapter.getAttachInstruction(session, {
-        actor: localOwnerActor,
-        requestId: randomUUID(),
-        signal: new AbortController().signal,
-        workspace: null,
-      });
-      if (!instruction || instruction.kind !== "codex-remote") {
-        throw new Error("shared native join is unavailable");
-      }
-      return instruction;
-    }
-    const reservationId = randomUUID();
-    const spawnNonce = randomUUID();
-    const preparationController = new AbortController();
-    const timer = setTimeout(() => {
-      const pending = nativeHandoffs.get(sessionId);
-      if (!pending || pending.handoffId !== reservationId || pending.status !== "preparing") return;
-      pending.preparationController?.abort(new Error("native handoff preparation timed out"));
-    }, 30_000);
-    timer.unref();
-    const handoff: NativeHandoff = {
-      handoffId: reservationId,
-      spawnNonce,
-      provider: session.provider,
-      providerSessionId: session.providerThreadId,
-      timer,
-      preparationController,
-      status: "preparing",
-      providerNotified: false,
-      providerAttached: false,
-      pid: null,
-      wrapperPid: null,
-      wrapperMonitor: null,
-      childMonitor: null,
-      reconciliationController: null,
-      reclaimPromise: null,
-      providerReclaimPromise: null,
-      terminalKind: null,
-      exitCode: null,
-      reclaimCompleted: false,
-      reclaimedView: null,
-    };
-    nativeHandoffs.set(sessionId, handoff);
-    const priorManagedRecord = session.provider === "claude"
-      ? database.listManagedSessions().find((record) => record.id === sessionId) ?? null
-      : null;
-    try {
-      if (session.provider === "claude") {
-        persistClaudeOwnership(sessionId, "handoff-prepared", { handoffId: reservationId });
-      }
-      auditHandoff(sessionId, "attempt", "prepare", { provider: session.provider });
-    } catch {
-      clearTimeout(timer);
-      nativeHandoffs.delete(sessionId);
-      if (priorManagedRecord) database.upsertManagedSession(priorManagedRecord);
-      throw new Error("native handoff audit failed");
-    }
-
-    let instruction: AttachInstruction | null = null;
-    try {
-      if (adapter?.getAttachInstruction) {
-        instruction = await boundedProviderLookup(
-          (signal) => adapter.getAttachInstruction!(session, {
-            actor: localOwnerActor,
-            requestId: reservationId,
-            signal,
-            workspace: null,
-          }),
-          preparationController.signal,
-          30_000,
-          "native handoff preparation",
-        );
-      } else if (session.terminal?.attachAvailable) {
-        instruction = tmuxAttachInstruction(session.terminal, session.cwd);
-      }
-    } catch {
-      clearTimeout(handoff.timer);
-      preparationController.abort(new Error("native handoff preparation failed"));
-      handoff.preparationController = null;
-      const current = state.get(sessionId);
-      if (current?.control.authority === "foreign") {
-        handoff.status = "degraded";
-        await finishNativeHandoff(sessionId, reservationId, "failed").catch(() => undefined);
-      } else {
-        nativeHandoffs.delete(sessionId);
-        if (priorManagedRecord) database.upsertManagedSession(priorManagedRecord);
-      }
-      throw new Error("attach unavailable");
-    }
-    if (!instruction) {
-      clearTimeout(handoff.timer);
-      nativeHandoffs.delete(sessionId);
-      if (priorManagedRecord) database.upsertManagedSession(priorManagedRecord);
-      try {
-        auditHandoff(sessionId, "outcome", "unavailable", { provider: session.provider });
-      } catch {
-        // The durable preparation attempt remains available.
-      }
-      throw new Error("attach unavailable");
-    }
-    if (
-      nativeHandoffs.get(sessionId) !== handoff
-      || handoff.status !== "preparing"
-      || preparationController.signal.aborted
-      || (instruction.handoffId !== undefined && instruction.handoffId !== reservationId)
-    ) {
-      handoff.status = "degraded";
-      await finishNativeHandoff(sessionId, reservationId, "failed").catch(() => undefined);
-      throw new Error("native handoff preparation became stale");
-    }
-    const handoffId = reservationId;
-    handoff.preparationController = null;
-    handoff.status = "prepared";
-    clearTimeout(handoff.timer);
-    handoff.timer = setTimeout(() => {
-      const pending = nativeHandoffs.get(sessionId);
-      if (!pending || pending.handoffId !== handoffId || pending.status !== "prepared") return;
-      void finishNativeHandoff(sessionId, handoffId, "timeout").catch(() => undefined);
-    }, 30_000);
-    handoff.timer.unref();
-    leases.forceRelease(sessionId);
-    try {
-      auditHandoff(sessionId, "outcome", "prepared", { provider: session.provider });
-    } catch {
-      handoffDiagnostic(sessionId, "prepared successfully but its outcome audit could not be appended");
-    }
-    return { ...instruction, handoffId, spawnNonce };
-  };
-
-  const monitorNativeChild = (
-    sessionId: string,
-    handoffId: string,
-    pid: number,
-  ): NodeJS.Timeout => {
-    const timer = setInterval(() => {
-      const current = nativeHandoffs.get(sessionId);
-      if (!current || current.handoffId !== handoffId || current.pid !== pid) {
-        clearInterval(timer);
-        return;
-      }
-      try {
-        process.kill(pid, 0);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ESRCH") return;
-        clearInterval(timer);
-        void finishNativeHandoff(
-          sessionId,
-          handoffId,
-          current.providerAttached ? "pid-exit" : "failed",
-        ).catch(() => undefined);
-      }
-    }, 1_000);
-    timer.unref();
-    return timer;
-  };
-
-  const reconcileUnreportedNativeChild = async (
-    sessionId: string,
-    handoffId: string,
-  ): Promise<void> => {
-    const handoff = nativeHandoffs.get(sessionId);
-    if (
-      !handoff
-      || handoff.handoffId !== handoffId
-      || handoff.pid !== null
-      || handoff.reconciliationController
-    ) return;
-    const session = state.get(sessionId);
-    if (!session) {
-      handoffDiagnostic(sessionId, "authorized wrapper exited and the session identity is unavailable");
-      return;
-    }
-    const controller = new AbortController();
-    handoff.reconciliationController = controller;
-    try {
-      const inspection = await awaitAssociatedCliOwner(session, controller.signal);
-      const current = nativeHandoffs.get(sessionId);
-      if (
-        !current
-        || current !== handoff
-        || current.handoffId !== handoffId
-        || current.pid !== null
-      ) return;
-      if (inspection.state === "mismatch" || inspection.state === "pending") {
-        current.status = "degraded";
-        handoffDiagnostic(
-          sessionId,
-          `authorized wrapper exited before reporting its child and ownership could not be reconciled safely: ${inspection.reason}`,
-        );
-        return;
-      }
-      if (inspection.state === "exited") {
-        await finishNativeHandoff(sessionId, handoffId, "failed").catch(() => undefined);
-        return;
-      }
-      if (
-        inspection.identity.executable !== current.provider
-        || inspection.identity.providerSessionId !== current.providerSessionId
-        || inspection.identity.cwd !== session.cwd
-      ) {
-        current.status = "degraded";
-        handoffDiagnostic(sessionId, "authorized wrapper child resolved to a different provider identity");
-        return;
-      }
-      const finalInspection = await cliProcessInspector.inspect({
-        ...session,
-        pid: inspection.identity.pid,
-        runtimePid: inspection.identity.pid,
-      }, inspection.identity);
-      controller.signal.throwIfAborted();
-      if (finalInspection.state === "exited") {
-        await finishNativeHandoff(sessionId, handoffId, "failed").catch(() => undefined);
-        return;
-      }
-      if (finalInspection.state !== "running") {
-        current.status = "degraded";
-        handoffDiagnostic(
-          sessionId,
-          `authorized wrapper child changed during final identity fencing: ${finalInspection.reason}`,
-        );
-        return;
-      }
-
-      current.pid = finalInspection.identity.pid;
-      current.childMonitor = monitorNativeChild(sessionId, handoffId, finalInspection.identity.pid);
-      if (current.provider === "claude") {
-        persistClaudeOwnership(sessionId, "native-exclusive", {
-          handoffId,
-          nativeOwner: {
-            ...finalInspection.identity,
-            executable: "claude",
-          },
-        });
-      }
-      try {
-        auditHandoff(sessionId, "lifecycle", "attach-child-reconciled", {
-          provider: current.provider,
-          pid: finalInspection.identity.pid,
-        });
-      } catch {
-        handoffDiagnostic(sessionId, "reconciled provider child but its lifecycle audit failed");
-      }
-      try {
-        adapters[current.provider]?.markCliAttached?.(
-          current.providerSessionId,
-          current.handoffId,
-          finalInspection.identity.pid,
-        );
-        current.providerAttached = true;
-        current.status = "attached";
-        try {
-          auditHandoff(sessionId, "outcome", "attached-after-wrapper-exit", {
-            provider: current.provider,
-            pid: finalInspection.identity.pid,
-          });
-        } catch {
-          handoffDiagnostic(sessionId, "reconciled provider attachment but its outcome audit failed");
-        }
-      } catch {
-        current.status = "degraded";
-        handoffDiagnostic(
-          sessionId,
-          "reconciled provider child, but the provider attach hook failed; writes remain disabled until it exits",
-        );
-      }
-    } catch (error) {
-      if (controller.signal.aborted) return;
-      const current = nativeHandoffs.get(sessionId);
-      if (!current || current !== handoff || current.handoffId !== handoffId) return;
-      current.status = "degraded";
-      handoffDiagnostic(
-        sessionId,
-        `authorized wrapper child reconciliation failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    } finally {
-      if (handoff.reconciliationController === controller) {
-        handoff.reconciliationController = null;
-      }
-    }
-  };
-
-  const monitorNativeWrapper = (
-    sessionId: string,
-    handoffId: string,
-    wrapperPid: number,
-  ): NodeJS.Timeout => {
-    const timer = setInterval(() => {
-      const current = nativeHandoffs.get(sessionId);
-      if (!current || current.handoffId !== handoffId || current.wrapperPid !== wrapperPid) {
-        clearInterval(timer);
-        return;
-      }
-      try {
-        process.kill(wrapperPid, 0);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ESRCH") return;
-        clearInterval(timer);
-        current.wrapperMonitor = null;
-        current.status = "degraded";
-        clearTimeout(current.timer);
-        handoffDiagnostic(
-          sessionId,
-          current.pid === null
-            ? "authorized wrapper died before reporting the provider child; exact owner reconciliation is in progress"
-            : "authorized wrapper died; ownership remains excluded until the provider child exits",
-        );
-        try {
-          auditHandoff(sessionId, "lifecycle", "wrapper-exited", {
-            provider: current.provider,
-            wrapperPid,
-            childPid: current.pid,
-          });
-        } catch {
-          // The durable preparation attempt remains available.
-        }
-        if (current.pid === null) {
-          void reconcileUnreportedNativeChild(sessionId, handoffId);
-        }
-      }
-    }, 1_000);
-    timer.unref();
-    return timer;
+    if (!adapter?.getAttachInstruction) throw new Error("native join is unavailable");
+    const instruction = await adapter.getAttachInstruction(session, {
+      actor: localOwnerActor,
+      requestId: randomUUID(),
+      signal: new AbortController().signal,
+      workspace: null,
+    });
+    if (!instruction) throw new Error("native join is unavailable");
+    return instruction;
   };
 
   if (options.controlSocketPath) {
@@ -4864,130 +4017,6 @@ export async function createAgentManagerServer(
       bootstrapOrigin: publicOrigin,
       onReloadHooks: reloadHookAuthorizations,
       onAttach: nativeAttach,
-      onAttachAuthorizeSpawn: (sessionId, handoffId, spawnNonce, wrapperPid) => {
-        const handoff = requireNativeHandoff(sessionId, handoffId);
-        if (handoff.status !== "prepared" || handoff.spawnNonce !== spawnNonce) {
-          throw new Error("native handoff pre-spawn authorization is invalid");
-        }
-        try {
-          process.kill(wrapperPid, 0);
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code === "ESRCH") {
-            throw new Error("native attach wrapper is not alive");
-          }
-          throw error;
-        }
-        clearTimeout(handoff.timer);
-        handoff.wrapperPid = wrapperPid;
-        handoff.status = "authorized";
-        handoff.wrapperMonitor = monitorNativeWrapper(sessionId, handoffId, wrapperPid);
-        try {
-          auditHandoff(sessionId, "lifecycle", "spawn-authorized", {
-            provider: handoff.provider,
-            wrapperPid,
-          });
-        } catch {
-          handoffDiagnostic(sessionId, "spawn was authorized but its lifecycle audit failed");
-        }
-      },
-      onAttachStarted: async (sessionId, handoffId, spawnNonce, pid) => {
-        const handoff = requireNativeHandoff(sessionId, handoffId);
-        if (handoff.status !== "authorized" || handoff.spawnNonce !== spawnNonce) {
-          throw new Error("native handoff was not authorized for process spawn");
-        }
-        handoff.pid = pid;
-        handoff.childMonitor = monitorNativeChild(sessionId, handoffId, pid);
-        if (handoff.provider === "claude") {
-          const current = state.get(sessionId);
-          if (!current) throw new Error("native Claude session state disappeared");
-          const inspectionController = new AbortController();
-          handoff.reconciliationController = inspectionController;
-          let inspection: LocalCliInspection;
-          try {
-            inspection = await awaitPinnedCliOwner(
-              current,
-              pid,
-              inspectionController.signal,
-            );
-            if (inspection.state === "running" && cliProcessInspector.findAssociated) {
-              const ownerSet = await awaitAssociatedCliOwner(current, inspectionController.signal);
-              if (
-                ownerSet.state !== "running"
-                || !localCliProcessIdentityMatches(ownerSet.identity, inspection.identity)
-              ) {
-                inspection = ownerSet.state === "mismatch" || ownerSet.state === "pending"
-                  ? ownerSet
-                  : {
-                      state: "mismatch",
-                      reason: "the spawned Claude process is not the conversation's sole standalone owner",
-                    };
-              }
-            }
-          } finally {
-            if (handoff.reconciliationController === inspectionController) {
-              handoff.reconciliationController = null;
-            }
-          }
-          if (
-            inspection.state !== "running"
-            || inspection.identity.executable !== "claude"
-            || inspection.identity.pid !== pid
-            || inspection.identity.providerSessionId !== handoff.providerSessionId
-            || inspection.identity.cwd !== current.cwd
-          ) {
-            handoff.status = "degraded";
-            throw new Error(
-              inspection.state === "mismatch" || inspection.state === "pending"
-                ? inspection.reason
-                : "the spawned Claude process identity could not be proven",
-            );
-          }
-          persistClaudeOwnership(sessionId, "native-exclusive", {
-            handoffId,
-            nativeOwner: {
-              ...inspection.identity,
-              executable: "claude",
-            },
-          });
-        }
-        try {
-          auditHandoff(sessionId, "lifecycle", "attach-started", {
-            provider: handoff.provider,
-            pid,
-          });
-        } catch {
-          handoffDiagnostic(sessionId, "provider child started but its lifecycle audit failed");
-        }
-        try {
-          adapters[handoff.provider]?.markCliAttached?.(
-            handoff.providerSessionId,
-            handoff.handoffId,
-            pid,
-          );
-          handoff.providerAttached = true;
-          handoff.status = "attached";
-        } catch {
-          handoff.status = "degraded";
-          handoffDiagnostic(sessionId, "provider attach hook failed; cockpit writes remain disabled");
-          try {
-            auditHandoff(sessionId, "outcome", "attach-hook-failed", {
-              provider: handoff.provider,
-            });
-          } catch {
-            // The durable lifecycle attempt remains available.
-          }
-          throw new Error("provider attach hook failed");
-        }
-        try {
-          auditHandoff(sessionId, "outcome", "attached", { provider: handoff.provider });
-        } catch {
-          handoffDiagnostic(sessionId, "provider attached but its outcome audit failed");
-        }
-      },
-      onAttachExited: (sessionId, handoffId, exitCode) =>
-        finishNativeHandoff(sessionId, handoffId, "exited", exitCode),
-      onAttachFailed: (sessionId, handoffId) =>
-        finishNativeHandoff(sessionId, handoffId, "failed"),
     });
   }
 

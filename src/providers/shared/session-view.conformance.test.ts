@@ -217,6 +217,7 @@ test("the conformance assertions accept a well-formed managed view", () => {
       withheld: CONTROL_CAPABILITIES
         .filter((capability) => !GRANTED.has(capability) && !DEFERRED_TO_LATER_LAYERS.has(capability))
         .map((capability) => ({ capability, reason: "Not available in this fixture" })),
+      peers: [],
       takeover: null,
     },
     workspaceIdentity: null,

@@ -7,7 +7,6 @@ import test from "node:test";
 import { AuthManager } from "./auth.ts";
 import {
   requestAttachFromControlSocket,
-  requestAttachStartedFromControlSocket,
   requestHooksReloadFromControlSocket,
   startOwnerControlSocket,
 } from "./control-socket.ts";
@@ -26,7 +25,6 @@ function delay(ms: number): Promise<void> {
 test("attach preparation and identity proof may outlive the ordinary socket deadline", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "am-control-deadline-"));
   const socketPath = join(root, "runtime", "control.sock");
-  let attachStarted = false;
   const server = await startOwnerControlSocket(socketPath, {
     auth: authManager(),
     bootstrapOrigin: "http://localhost:43127",
@@ -40,34 +38,15 @@ test("attach preparation and identity proof may outlive the ordinary socket dead
         warning: null,
       };
     },
-    async onAttachStarted(sessionId, handoffId, spawnNonce, pid) {
-      assert.deepEqual(
-        [sessionId, handoffId, spawnNonce, pid],
-        ["claude:session-1", "handoff-1", "spawn-nonce-00000001", 1234],
-      );
-      await delay(2_100);
-      attachStarted = true;
-    },
   });
   t.after(async () => {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     rmSync(root, { recursive: true, force: true });
   });
 
-  const [prepared, started] = await Promise.all([
-    requestAttachFromControlSocket(socketPath, "claude:session-1"),
-    requestAttachStartedFromControlSocket(
-      socketPath,
-      "claude:session-1",
-      "handoff-1",
-      "spawn-nonce-00000001",
-      1234,
-    ),
-  ]);
+  const prepared = await requestAttachFromControlSocket(socketPath, "claude:session-1");
 
   assert.deepEqual(prepared.instruction.argv, ["claude", "--resume", "session-1"]);
-  assert.deepEqual(started, { ok: true });
-  assert.equal(attachStarted, true);
 });
 
 test("an ordinary control command that stalls is still bounded", async (t) => {

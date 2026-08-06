@@ -72,6 +72,7 @@ function session() {
       recovery: null,
       capabilities: ["queue", "set-profile"],
       withheld: [],
+      peers: [],
       takeover: null,
     },
     workspaceIdentity: null,

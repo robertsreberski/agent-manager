@@ -601,10 +601,9 @@ export class CockpitApi {
     const value = await this.request<unknown>(
       `/api/v1/sessions/${encodeURIComponent(id)}/attach`,
     );
-    const { instruction, requiresHandoff } = parseResponse(
+    const { instruction } = parseResponse(
       z.object({
         instruction: attachInstructionSchema.nullable(),
-        requiresHandoff: z.boolean(),
       }).strict(),
       value,
       "attach",
@@ -615,7 +614,6 @@ export class CockpitApi {
         kind: "none",
         command: null,
         description: null,
-        requiresHandoff: false,
         argv: [],
         cwd: null,
       };
@@ -625,7 +623,6 @@ export class CockpitApi {
       kind: instruction.kind,
       command: shellDisplay(instruction.argv),
       description: instruction.warning,
-      requiresHandoff,
       argv: [...instruction.argv],
       cwd: instruction.cwd,
     };

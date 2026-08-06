@@ -239,7 +239,7 @@ export function redactedPreview(action: SessionAction): string {
   }
 }
 
-export const DATABASE_SCHEMA_VERSION = 6 as const;
+export const DATABASE_SCHEMA_VERSION = 7 as const;
 
 export class IncompatibleDatabaseError extends Error {
   readonly code = "INCOMPATIBLE_DATABASE";

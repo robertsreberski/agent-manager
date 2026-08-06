@@ -48,7 +48,7 @@ const session = {
   effort: { value: "high" },
   profile: { value: "ask-first" },
   sandbox: { value: null },
-  control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [], takeover: null },
+  control: { plane: "observe-only", authority: "none", capabilities: [], withheld: [], peers: [], takeover: null },
 } as unknown as SessionView;
 
 function tool(id: string, name: string, seq: number, turnId: string | null): ActivityItem {
@@ -99,6 +99,7 @@ describe("thread-level transport and archive states", () => {
         recovery: null,
         capabilities: ["queue", "attach"],
         withheld: [],
+        peers: [],
         takeover: null,
       },
     } as SessionView;
@@ -151,10 +152,11 @@ describe("thread-level transport and archive states", () => {
       control: {
         plane: "resume-only",
         authority: "none",
-        coordination: { mode: "exclusive", nativeAttach: "handoff", responseResolution: "single-controller" },
+        coordination: { mode: "shared", nativeAttach: "join", responseResolution: "single-controller" },
         recovery: null,
         capabilities: ["resume", "attach"],
         withheld: [],
+        peers: [],
         takeover: null,
       },
     } as SessionView;

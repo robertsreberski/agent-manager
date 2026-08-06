@@ -79,6 +79,7 @@ function managedSession(overrides: Partial<SessionView> = {}): SessionView {
       recovery: null,
       capabilities: ["queue", "set-model"],
       withheld: [],
+      peers: [],
       takeover: null,
     },
     workspaceIdentity: null,
@@ -147,6 +148,7 @@ test("serves an authenticated Codex catalog with provider-declared model efforts
       recovery: null,
       capabilities: ["set-model"],
       withheld: [],
+      peers: [],
       takeover: null,
     },
   });
@@ -216,6 +218,7 @@ test("serves the catalog to a manager-owned session that cannot currently set a 
       recovery: null,
       capabilities: ["queue", "interrupt"],
       withheld: [{ capability: "set-model", reason: "Available when the Codex turn is idle" }],
+      peers: [],
       takeover: null,
     },
   });
@@ -535,6 +538,7 @@ test("reports remote, foreign, unsupported, and failed catalogs as explicitly un
       recovery: null,
       capabilities: ["set-model"],
       withheld: [],
+      peers: [],
       takeover: null,
     },
   });

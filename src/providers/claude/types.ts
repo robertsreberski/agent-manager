@@ -189,32 +189,11 @@ export interface ClaudeStagedMessage {
   enqueuedAt: string;
 }
 
-export type ClaudeCliHandoffState = "prepared" | "attached" | "exited";
-
-export interface ClaudeCliHandoff {
-  id: string;
-  state: ClaudeCliHandoffState;
-  sessionId: string;
-  cwd: string;
-  command: {
-    executable: string;
-    args: ["--resume", string];
-    cwd: string;
-  };
-  preparedAt: string;
-  attachedAt: string | null;
-  exitedAt: string | null;
-  wrapperPid: number | null;
-  exitCode: number | null;
-  error: string | null;
-}
-
 export interface ClaudeManagedSessionSnapshot {
   localId: string;
   sessionId: string | null;
   resumedFrom: string | null;
   cwd: string;
-  owner: "manager" | "native";
   activity: ClaudeActivity;
   mode: ClaudePermissionMode;
   desiredMode: ClaudePermissionMode;
@@ -230,7 +209,6 @@ export interface ClaudeManagedSessionSnapshot {
   outstandingMessageIds: string[];
   stillQueuedMessageIds: string[];
   queueKnowledge: "known" | "unknown";
-  handoff: ClaudeCliHandoff | null;
   lastError: string | null;
   generation: number;
   startedAt: string;

@@ -53,6 +53,7 @@ function session(overrides: Partial<SessionView> = {}): SessionView {
       recovery: null,
       capabilities: ["queue", "attach"],
       withheld: [],
+      peers: [],
       takeover: null,
     },
     workspaceIdentity: null,
@@ -173,7 +174,7 @@ test("reports unknown, remote, foreign, unsupported and failed account facts tru
   const sessions = [
     session({ id: "remote:codex:r", hostId: "remote", providerThreadId: "r" }),
     session({ id: "local:codex:f", providerThreadId: "f", control: { ...observeOnlyControl(), plane: "resume-only", authority: "foreign", capabilities: ["resume"] } }),
-    session({ id: "local:claude:c", provider: "claude", providerThreadId: "c", control: { plane: "claude-sdk", authority: "manager", coordination: providerControlCoordination("claude"), recovery: null, capabilities: [], withheld: [], takeover: null } }),
+    session({ id: "local:claude:c", provider: "claude", providerThreadId: "c", control: { plane: "claude-sdk", authority: "manager", coordination: providerControlCoordination("claude"), recovery: null, capabilities: [], withheld: [], peers: [], takeover: null } }),
     session({ id: "local:codex:n", providerThreadId: "n" }),
   ];
   const backend = await createAgentManagerServer({

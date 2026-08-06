@@ -138,7 +138,6 @@ export function attachSpecFromInstruction(
         claudeExecutable: executables.claude,
         sessionId: assertProviderIdentifier(sessionId, "Claude session id"),
         cwd,
-        handoffReady: true,
       });
     }
   }

@@ -14,6 +14,8 @@ interface AvailableTranscriptObservation {
   source: TranscriptReadResult["transcript"]["source"];
   truncated: boolean;
   items: TranscriptItem[];
+  /** Two writers answered the same message; these items are one branch. */
+  forked: boolean;
 }
 
 interface UnavailableTranscriptObservation {
@@ -204,6 +206,30 @@ function unavailableActivity(reason: TranscriptUnavailableReason): ActivityItemD
   };
 }
 
+/**
+ * States that two writers answered the same message, so the chain shown is one
+ * branch of several.
+ *
+ * Without this the fork is silent and looks like a malfunction: the reader walks
+ * one root-to-latest path, so the rendered history flips to whichever branch
+ * appended last and trips an unexplained `branch-change` reset on every poll.
+ * Naming it is the honest minimum — the cockpit still cannot show both branches.
+ */
+function forkedActivity(): ActivityItemDraft {
+  return {
+    kind: "lifecycle",
+    id: "transcript:fork",
+    event: "warning",
+    level: "warning",
+    title: "This conversation forked",
+    details: "Two surfaces answered the same message, so this conversation has more than one branch. Agent Manager is showing the most recently written one.",
+    state: "complete",
+    source: "transcript",
+    confidence: "inferred",
+    exposure: "transcript-derived",
+  };
+}
+
 function sameUnavailableActivity(
   item: ActivityItem,
   draft: ActivityItemDraft,
@@ -327,6 +353,7 @@ export class SelectedTranscriptActivityObserver {
           source: null,
           itemCount: 0,
           reason: "unreadable",
+          forked: false,
         },
       };
     }
@@ -336,6 +363,7 @@ export class SelectedTranscriptActivityObserver {
           source: result.transcript.source,
           truncated: result.transcript.truncated,
           items: result.items,
+          forked: result.transcript.forked,
         }
       : {
           state: "unavailable",
@@ -390,7 +418,14 @@ export class SelectedTranscriptActivityObserver {
     this.#hub.reconcileTranscript(
       observation.session.id,
       observation.session.provider,
-      next.items.map(activityDraft),
+      /*
+        The fork fact travels with the transcript items rather than beside them,
+        so one reconcile owns the whole projection and a linear read clears the
+        warning without a second pass.
+      */
+      next.forked
+        ? [...next.items.map(activityDraft), forkedActivity()]
+        : next.items.map(activityDraft),
       next.truncated,
       reason,
     );

@@ -66,7 +66,7 @@ test("archive routes stay separate from active state while exposing history and 
     read(session) {
       assert.equal(session.providerThreadId, archived.providerThreadId);
       return {
-        transcript: { state: "available", source: "codex-rollout", truncated: false, itemCount: 1, reason: null },
+        transcript: { state: "available", source: "codex-rollout", truncated: false, itemCount: 1, reason: null, forked: false },
         items: [{
           kind: "message",
           id: "archived-message",
@@ -340,6 +340,7 @@ test("archived transcript polling retains its selected identity when catalog rea
           truncated: false,
           itemCount: 1,
           reason: null,
+          forked: false,
         },
         items: [{
           kind: "message",

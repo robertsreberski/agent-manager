@@ -3,10 +3,7 @@ import test from "node:test";
 
 import type { SessionControlRecovery } from "../shared/session.ts";
 import type { ManagedSessionRecoveryRecord } from "./contracts.ts";
-import {
-  deferManagedRecovery,
-  ManagedRecoveryCoordinator,
-} from "./managed-recovery.ts";
+import { ManagedRecoveryCoordinator } from "./managed-recovery.ts";
 
 function record(id: string): ManagedSessionRecoveryRecord {
   return {
@@ -22,10 +19,6 @@ function record(id: string): ManagedSessionRecoveryRecord {
     createdAt: "2026-08-05T10:00:00.000Z",
   };
 }
-
-test("managed recovery deferral always carries a useful ownership reason", () => {
-  assert.match(deferManagedRecovery(1, "   ").reason, /native CLI owner/u);
-});
 
 async function eventually(assertion: () => void): Promise<void> {
   const deadline = Date.now() + 1_000;
@@ -218,79 +211,5 @@ test("cancel fences all later state from an in-flight provider operation", async
   await new Promise((resolve) => setTimeout(resolve, 10));
   assert.equal(states.length, stateCountAtCancel);
   assert.notEqual(states.at(-1), null);
-  await coordinator.dispose();
-});
-
-test("cancel clears a deferred retry without a timer ghost", async () => {
-  let calls = 0;
-  const states: Array<SessionControlRecovery | null> = [];
-  const coordinator = new ManagedRecoveryCoordinator({
-    recover: async () => {
-      calls += 1;
-      return deferManagedRecovery(20, "native owner remains active");
-    },
-    onState: (_candidate, recovery) => states.push(recovery),
-  });
-
-  coordinator.start([record("deferred-cancel")]);
-  await eventually(() => assert.equal(states.at(-1)?.state, "waiting-for-native-exit"));
-  assert.equal(states.at(-1)?.deadlineAt, null);
-  assert.equal(states.at(-1)?.nextRetryAt, null);
-  const stateCountAtCancel = states.length;
-  assert.equal(coordinator.cancel("local:claude:deferred-cancel"), true);
-  await new Promise((resolve) => setTimeout(resolve, 40));
-  assert.equal(calls, 1);
-  assert.equal(states.length, stateCountAtCancel);
-  await coordinator.dispose();
-});
-
-test("deferral waits without consuming the provider failure retry budget", async () => {
-  let calls = 0;
-  const states: Array<SessionControlRecovery | null> = [];
-  const coordinator = new ManagedRecoveryCoordinator({
-    attemptTimeoutMs: 100,
-    retryDelaysMs: [1],
-    recover: async () => {
-      calls += 1;
-      if (calls <= 2) {
-        return deferManagedRecovery(1, "exact native owner is still running");
-      }
-      if (calls === 3) throw new Error("one transient provider failure");
-    },
-    onState: (_candidate, recovery) => states.push(recovery),
-  });
-
-  coordinator.start([record("native-owner")]);
-  await eventually(() => assert.equal(states.at(-1), null));
-  assert.equal(calls, 4);
-  assert.equal(
-    states.some((state) => state?.error === "exact native owner is still running"),
-    true,
-  );
-  const waitingStates = states.filter(
-    (state): state is SessionControlRecovery => state?.state === "waiting-for-native-exit",
-  );
-  assert.ok(waitingStates.length >= 1);
-  assert.deepEqual(
-    [...new Set(waitingStates.map((state) => state.attempt))],
-    [1],
-    "healthy ownership polling must not churn the failure attempt number",
-  );
-  assert.deepEqual(
-    [...new Set(waitingStates.map((state) => state.startedAt))],
-    [waitingStates[0]!.startedAt],
-    "healthy ownership polling retains one stable waiting period",
-  );
-  assert.equal(
-    states.filter((state) => state?.state === "reconnecting" && state.attempt === 1).length,
-    1,
-    "internal ownership polls do not republish reconnecting state",
-  );
-  assert.equal(
-    states.find((state) => state?.state === "retrying")?.attempt,
-    1,
-    "deferrals do not consume the provider failure attempt number",
-  );
-  assert.equal(coordinator.has("local:claude:native-owner"), false);
   await coordinator.dispose();
 });

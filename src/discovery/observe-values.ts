@@ -14,6 +14,7 @@ import {
   unknownSandbox,
   type Provider,
   type SessionControl,
+  type SessionControlPeer,
   type SessionRecord,
 } from "../core/types.ts";
 import { sessionRecordId } from "../shared/session.ts";
@@ -74,6 +75,42 @@ export function observedResumeControl(provider: Provider): SessionControl {
       attach: DEFERRED,
       resume: true,
     }),
+    // No provider process is loaded, so there is no writer to enumerate.
+    peers: [],
+    takeover: null,
+  };
+}
+
+/**
+ * Why a live conversation the manager only watches refuses a write.
+ *
+ * The remedy is named, as with the observed case, and it is deliberately not
+ * "take control": joining does not stop the process that is already running, and
+ * copy that implied otherwise is what made operators think they had to kill
+ * their own terminal first.
+ */
+export const JOINABLE_REASON =
+  "Agent Manager is observing this session. Join it to reply here.";
+
+/**
+ * A live Claude conversation Agent Manager can open its own SDK query against
+ * without displacing the process already writing it. Authority is `foreign`
+ * because another controller genuinely holds it right now; `resume` is the
+ * action that makes the cockpit a second one.
+ */
+export function observedJoinControl(peers: SessionControlPeer[]): SessionControl {
+  return {
+    plane: "resume-only",
+    authority: "foreign",
+    coordination: providerControlCoordination("claude"),
+    recovery: null,
+    ...resolveControlCapabilities({
+      ...allCapabilities(JOINABLE_REASON),
+      ...deferredToLaterLayers(),
+      attach: DEFERRED,
+      resume: true,
+    }),
+    peers,
     takeover: null,
   };
 }

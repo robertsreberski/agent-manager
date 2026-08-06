@@ -404,9 +404,7 @@ export class ClaudeActivityProjector {
           event: snapshot.activity === "failed" ? "error" : "status",
           level: snapshot.activity === "failed" ? "error" : "info",
           title: `Claude session ${snapshot.activity.replaceAll("_", " ")}`,
-          details: snapshot.owner === "native"
-            ? "The native Claude CLI owns this session."
-            : null,
+          details: null,
           state,
           source: "provider-api",
           confidence: "exact",

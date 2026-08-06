@@ -77,6 +77,7 @@ function sessionRecord() {
       recovery: null,
       capabilities: ["queue", "set-profile"],
       withheld: [],
+      peers: [],
       takeover: null,
     },
     workspaceIdentity: null,
@@ -144,6 +145,7 @@ describe("CockpitApi", () => {
             recovery: null,
             capabilities: [],
             withheld: [],
+            peers: [],
             takeover: null,
           },
         }],
@@ -182,6 +184,7 @@ describe("CockpitApi", () => {
             recovery: null,
             capabilities: [],
             withheld: [],
+            peers: [],
             takeover: null,
           },
         },
@@ -203,7 +206,6 @@ describe("CockpitApi", () => {
         cwd: "/tmp/work tree",
         warning: null,
       },
-      requiresHandoff: false,
     }), { status: 200, headers: { "content-type": "application/json" } })));
     const api = new CockpitApi({ csrfToken: "csrf", actor: "Local" });
 
@@ -230,7 +232,6 @@ describe("CockpitApi", () => {
         cwd: null,
         warning: "Run from a terminal with SSH access to Build host.",
       },
-      requiresHandoff: true,
     }), { status: 200, headers: { "content-type": "application/json" } })));
     const api = new CockpitApi({ csrfToken: "csrf", actor: "Local" });
 
@@ -238,7 +239,6 @@ describe("CockpitApi", () => {
       available: true,
       kind: "ssh",
       argv,
-      requiresHandoff: true,
       cwd: null,
     }));
   });
@@ -251,13 +251,11 @@ describe("CockpitApi", () => {
         cwd: "/workspace",
         warning: "Join the shared Codex server.",
       },
-      requiresHandoff: false,
     }), { status: 200, headers: { "content-type": "application/json" } })));
     const api = new CockpitApi({ csrfToken: "csrf", actor: "Local" });
 
     await expect(api.attach("local:codex:thread-1")).resolves.toMatchObject({
       kind: "manager-cli",
-      requiresHandoff: false,
     });
   });
 

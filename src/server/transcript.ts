@@ -58,6 +58,17 @@ export interface TranscriptAvailability {
   source: TranscriptSource | null;
   itemCount: number;
   reason: TranscriptUnavailableReason | null;
+  /**
+   * Two writers answered the same message, so this conversation has more than one
+   * branch and the items below are only the most recently written one.
+   *
+   * A Claude transcript is a `uuid`/`parentUuid` DAG, and two clients sending at
+   * once parent onto the same node — the well-formed two-branch shape
+   * `--fork-session` produces. The reader walks one root-to-latest path, so
+   * without this flag a fork is invisible: the rendered chain silently flips to
+   * whichever branch appended last.
+   */
+  forked: boolean;
 }
 
 export interface TranscriptReadResult {
@@ -178,6 +189,7 @@ interface FileWalkResult {
 interface ParsedItems {
   items: TranscriptItem[];
   truncated: boolean;
+  forked?: boolean;
 }
 
 class TranscriptReadFailure extends Error {
@@ -232,6 +244,7 @@ function unavailable(reason: TranscriptUnavailableReason): TranscriptReadResult 
       source: null,
       itemCount: 0,
       reason,
+      forked: false,
     },
   };
 }
@@ -240,6 +253,7 @@ function available(
   provider: Provider,
   items: TranscriptItem[],
   truncated: boolean,
+  forked = false,
 ): TranscriptReadResult {
   return {
     items,
@@ -249,6 +263,7 @@ function available(
       source: providerSource(provider),
       itemCount: items.length,
       reason: null,
+      forked,
     },
   };
 }
@@ -917,6 +932,8 @@ function codexItems(
   }
   const capped = capItems(settleToolCalls(items));
   truncated ||= capped.truncated;
+  // Codex rollouts are a flat event log with no parent pointers, so a fork is
+  // not representable in one file and is never reported here.
   return { items: capped.items, truncated };
 }
 
@@ -943,7 +960,7 @@ function claudeChain(
   tail: JsonlTail,
   session: SessionIdentity,
   isChild: boolean,
-): { records: JsonlRecord[]; truncated: boolean } {
+): { records: JsonlRecord[]; truncated: boolean; forked: boolean } {
   const agentIds = new Set<string>();
   for (const record of tail.records) {
     const agentId = stringValue(record.object.agentId);
@@ -963,9 +980,17 @@ function claudeChain(
   const includedUuids = new Set<string>();
   let foundIdentity = false;
   let truncated = tail.truncated;
+  let forked = false;
 
   for (const segment of segments) {
     const byUuid = new Map<string, JsonlRecord>();
+    /*
+      Sibling counts per parent, restricted to identity-matching records. A parent
+      with more than one such child is a fork: two writers answered the same
+      message. Only the chosen chain's parents are consulted, so an unrelated
+      branch elsewhere in the file is not reported as this conversation forking.
+    */
+    const childCounts = new Map<string, number>();
     let latest: JsonlRecord | null = null;
     for (const record of segment.records) {
       const uuid = stringValue(record.object.uuid);
@@ -973,7 +998,11 @@ function claudeChain(
         if (byUuid.has(uuid)) truncated = true;
         byUuid.set(uuid, record);
       }
-      if (matchesClaudeIdentity(record.object, session, isChild)) latest = record;
+      if (matchesClaudeIdentity(record.object, session, isChild)) {
+        latest = record;
+        const parentUuid = stringValue(record.object.parentUuid);
+        if (parentUuid) childCounts.set(parentUuid, (childCounts.get(parentUuid) ?? 0) + 1);
+      }
     }
     if (!latest) continue;
     foundIdentity = true;
@@ -989,6 +1018,7 @@ function claudeChain(
       }
       visited.add(uuid);
       segmentRecords.push(cursor);
+      if ((childCounts.get(uuid) ?? 0) > 1) forked = true;
       const parentUuid = stringValue(cursor.object.parentUuid);
       if (!parentUuid) break;
       const parent = byUuid.get(parentUuid);
@@ -1032,7 +1062,7 @@ function claudeChain(
     records.splice(0, records.length, ...oldest, ...newest);
     truncated = true;
   }
-  return { records, truncated };
+  return { records, truncated, forked };
 }
 
 function textBlocks(content: unknown): string[] {
@@ -1184,6 +1214,7 @@ function claudeItems(
   const toolIndex = new Map<string, number>();
   let activeTurnId: string | null = null;
   let truncated = chain.truncated;
+  const forked = chain.forked;
 
   for (const record of chain.records) {
     // A result can only complete a tool call when both records belong to one
@@ -1258,7 +1289,7 @@ function claudeItems(
   }
   const capped = capItems(settleToolCalls(items));
   truncated ||= capped.truncated;
-  return { items: capped.items, truncated };
+  return { items: capped.items, truncated, forked };
 }
 
 function stateDatabaseCandidates(codexHome: RootInfo, uid: number): string[] {
@@ -1552,7 +1583,7 @@ export class LocalSessionTranscriptReader implements SessionTranscriptReader {
         session,
         claude.isChild,
       );
-      return available("claude", parsed.items, parsed.truncated);
+      return available("claude", parsed.items, parsed.truncated, parsed.forked ?? false);
     } catch (error) {
       return unavailable(
         error instanceof TranscriptReadFailure ? error.reason : "unreadable",

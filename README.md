@@ -13,17 +13,17 @@ inferences remain visibly inferred.
 | Session origin | Observation | Semantic control |
 | --- | --- | --- |
 | Manager-owned Claude SDK | Exact SDK stream | Queue, pinned steer, interrupt, exact requests, model/effort/profile, close |
-| External Claude CLI | Exact installed HTTP-hook events plus bounded transcript fallback | Live held `PermissionRequest` before takeover; exact SDK control only after an exclusive identity-checked handoff |
+| External Claude CLI | Exact installed HTTP-hook events plus bounded transcript fallback | Live held `PermissionRequest`; exact SDK control after an identity-checked join that leaves the running controller alone |
 | Managed Codex | Exact pinned private app-server stream (`codex-private`) | Shared provider methods; cockpit and native `--remote` CLI peers may use one conversation, with first exact response winning |
-| Standalone Codex CLI | Trusted command-hook events plus bounded discovery fallback | Read-only until one safe exit/adoption onto `codex-private`; then web and CLI may remain active together |
+| Standalone Codex CLI | Bounded discovery fallback | Read-only until one safe exit/adoption onto `codex-private`; then web and CLI may remain active together |
 | tmux/resume/observe-only | Bounded evidence with source/confidence | Native preview/attach/resume only when exact; otherwise read-only |
 
 The live capability list is authoritative. Provider/version or transport failure withdraws the
 affected actions and explains why. Codex execution-environment IDs are peer-presence facts, not
 writer locks; a healthy manager-owned Codex thread stays writable when another native peer
-joins. Claude remains exclusive and withholds manager writes until handoff succeeds. Agent
-Manager never fakes a user turn through hook side channels, terminal keystrokes, or
-`thread/inject_items`.
+joins. A Claude session is shared too: the cockpit and a terminal may both write, and each answers
+only its own requests. Agent Manager never fakes a user turn through hook side channels, terminal
+keystrokes, or `thread/inject_items`.
 
 Agent Manager launches and owns its pinned private Codex app-server. It does not silently
 connect to, trust, upgrade, restart, stop, or mutate the user-global experimental daemon; the
@@ -148,39 +148,46 @@ agent-manager hooks install --provider codex --scope user
 ```
 
 The CLI shows an exact diff and asks before editing. Claude uses a token-authenticated loopback
-HTTP handler. Codex uses a pinned command shim and remains `awaiting trust` until the user trusts
-its exact hash in Codex `/hooks`. A newly installed Claude handler is `installed, not seen yet`
-until a later session event reaches it. Project scope is available but warns that the endpoint
-is machine-local.
+HTTP handler; a newly installed handler is `installed, not seen yet` until a later session event
+reaches it. Project scope is available but warns that the endpoint is machine-local. There is no
+Codex hook plane.
 
 Held external Claude decisions are limited to exact `PermissionRequest` events. If Agent Manager
 times out or exits, the hook returns an empty successful response and the native Claude prompt
 continues. Hook installation never grants queue, steer, interrupt, settings, or process ownership.
-Codex hooks likewise grant observation, not shared-server membership; takeover is the separate
-identity-checked migration boundary.
+The Codex command-hook plane was retired: it could never gate anything, so it only ever reduced
+capabilities. Codex takeover remains the separate identity-checked migration boundary.
 
 ## Advanced native attach and remote hosts
 
-Normal continuation uses **Resume here** in the web app. It first proves that no standalone
-provider owner can race the resume, reopens the exact provider identity and workspace, persists
-manager ownership, and only then publishes write capabilities. A failure rolls the provisional
-provider client back while leaving history and the prior read-only session intact.
+Normal continuation uses **Join here** for a live Claude session and **Resume here** for a dormant
+one. Either way Agent Manager reopens the exact provider identity and workspace, persists manager
+ownership, and only then publishes write capabilities; a failure rolls the provisional provider
+client back while leaving history and the prior read-only session intact.
+
+Joining does not stop what is already running. A live Claude conversation gets a second controller
+— the terminal session keeps working, and both surfaces can write. If both send at once the
+conversation forks, which is the same two-branch shape `--fork-session` produces; the cockpit says
+so and shows the most recently written branch. Codex is different, and not by choice: a rollout is
+a flat event log with no parent pointers, so two writers cannot be told apart afterwards and a
+standalone Codex process still migrates once.
 
 `attach` is an advanced escape hatch, collapsed under **Advanced · CLI access** in the web app.
 The browser receives only an owner-socket wrapper, never a
 raw provider command. Commands are a closed argv union, use pinned executables with
-`shell: false`, and preserve provider-specific coordination: Codex joins the manager-owned
-private server, while Claude performs an exclusive handoff. Codex environment IDs are not
-treated as controller ambiguity. There is no browser terminal or tmux `send-keys` fallback.
+`shell: false`, and hand over a command rather than ownership: Codex joins the manager-owned
+private server, and Claude opens a second controller on the same conversation. Web control stays
+active in both cases. Codex environment IDs are not treated as controller ambiguity. There is no
+browser terminal or tmux `send-keys` fallback.
 
-For a CLI that began outside Agent Manager, guided takeover waits for the operator to exit and is
+For a standalone **Codex** CLI, guided takeover waits for the operator to exit and is
 cancellable. The graceful path first pins the exact process and returns a server-issued takeover
 ID; only a second action carrying that ID may signal. It then revalidates uid, executable, PID start
 identity, provider identity, transcript/registry association, and workspace before sending
 exactly one `SIGTERM`; it never uses `SIGKILL`, repeated signals, shell commands, or terminal key
 injection. Write capabilities appear only after exact provider adoption succeeds. Recovery is
-bounded, never replays mutations, reports an exact native Claude owner as healthy rather than
-failed, and exposes a manual retry only when it is safe.
+bounded, never replays mutations, and exposes a manual retry only when it is safe. Claude sessions
+have no takeover path at all — there is nothing to stop.
 
 Remote hosts are registered and removed in **Setup and integrations**. The web
 form accepts a label and SSH target, refreshes host/workspace state immediately,
@@ -208,8 +215,13 @@ Manager never binds directly to a LAN or tailnet address and never uses Funnel.
 - Browser mutations are cookie + CSRF + generation + idempotency protected. Short writer leases
   are automatic between cockpit windows. They do not turn a native Codex peer into a foreign
   controller; provider request races use first-response-wins reconciliation.
-- Claude takeover is exclusive. Codex takeover is only the one-time migration of a standalone
-  process; after adoption, native CLI and web are supported concurrent peers.
+- Claude has no takeover: a live session is joined, and the process already writing it is never
+  signalled. Codex takeover is only the one-time migration of a standalone process, required
+  because its rollout format cannot represent two writers; after adoption, native CLI and web are
+  supported concurrent peers.
+- A shared Claude conversation can fork when both surfaces send at once. Agent Manager publishes
+  that fact and names the branch it is showing; it never silently presents one branch as the whole
+  history.
 - Session creation and ambiguous dispatch are never blindly replayed.
 - Elicitation forms remain visible but non-respondable until all provider shapes can be encoded
   faithfully.

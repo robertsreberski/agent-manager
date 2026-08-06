@@ -17,19 +17,11 @@ const ATTACH_PREPARATION_TIMEOUT_MS = 35_000;
 // both scans; timing out the wrapper while the owner is still validating would
 // create an avoidable uncertain-cleanup state. Pre-spawn authorization stays
 // on the ordinary short deadline.
-const ATTACH_LIFECYCLE_TIMEOUT_MS = 15_000;
 const instanceLeaseSockets = new WeakMap<Server, Set<Socket>>();
 const instanceLeaseClosures = new WeakMap<Server, Promise<void>>();
 
 function requestTimeoutMs(command: unknown): number {
   if (command === "attach") return ATTACH_PREPARATION_TIMEOUT_MS;
-  if (
-    command === "attach-started"
-    || command === "attach-exited"
-    || command === "attach-failed"
-  ) {
-    return ATTACH_LIFECYCLE_TIMEOUT_MS;
-  }
   return ORDINARY_REQUEST_TIMEOUT_MS;
 }
 
@@ -46,24 +38,6 @@ export interface OwnerControlSocketHandlers {
   /** Reloads one-way provider-hook authorization digests from the owned database. */
   onReloadHooks?: () => void | Promise<void>;
   onAttach?: (sessionId: string) => Promise<AttachInstruction>;
-  onAttachAuthorizeSpawn?: (
-    sessionId: string,
-    handoffId: string,
-    spawnNonce: string,
-    wrapperPid: number,
-  ) => void | Promise<void>;
-  onAttachStarted?: (
-    sessionId: string,
-    handoffId: string,
-    spawnNonce: string,
-    pid: number,
-  ) => void | Promise<void>;
-  onAttachExited?: (
-    sessionId: string,
-    handoffId: string,
-    exitCode: number | null,
-  ) => void | Promise<void>;
-  onAttachFailed?: (sessionId: string, handoffId: string, error: string) => void | Promise<void>;
 }
 
 function currentUid(): number {
@@ -358,71 +332,13 @@ export async function startOwnerControlSocket(
           void handlers.onAttach(request.sessionId)
             .then((instruction) => socket.end(`${JSON.stringify({ instruction })}\n`))
             .catch(() => socket.end(`${JSON.stringify({ error: "attach-unavailable" })}\n`));
-        } else if (
-          request.command === "attach-authorize-spawn"
-          && typeof request.sessionId === "string"
-          && typeof request.handoffId === "string"
-          && typeof request.spawnNonce === "string"
-          && request.spawnNonce.length >= 16
-          && request.spawnNonce.length <= 256
-          && typeof request.wrapperPid === "number"
-          && Number.isSafeInteger(request.wrapperPid)
-          && request.wrapperPid > 0
-          && handlers.onAttachAuthorizeSpawn
-        ) {
-          void Promise.resolve(handlers.onAttachAuthorizeSpawn(
-            request.sessionId,
-            request.handoffId,
-            request.spawnNonce,
-            request.wrapperPid,
-          ))
-            .then(() => socket.end(`${JSON.stringify({ ok: true })}\n`))
-            .catch(() => socket.end(`${JSON.stringify({ error: "attach-lifecycle-failed" })}\n`));
-        } else if (
-          request.command === "attach-started"
-          && typeof request.sessionId === "string"
-          && typeof request.handoffId === "string"
-          && typeof request.spawnNonce === "string"
-          && request.spawnNonce.length >= 16
-          && request.spawnNonce.length <= 256
-          && typeof request.pid === "number"
-          && Number.isSafeInteger(request.pid)
-          && request.pid > 0
-          && handlers.onAttachStarted
-        ) {
-          void Promise.resolve(handlers.onAttachStarted(
-            request.sessionId,
-            request.handoffId,
-            request.spawnNonce,
-            request.pid,
-          ))
-            .then(() => socket.end(`${JSON.stringify({ ok: true })}\n`))
-            .catch(() => socket.end(`${JSON.stringify({ error: "attach-lifecycle-failed" })}\n`));
-        } else if (
-          request.command === "attach-exited"
-          && typeof request.sessionId === "string"
-          && typeof request.handoffId === "string"
-          && (request.exitCode === null || (typeof request.exitCode === "number" && Number.isInteger(request.exitCode)))
-          && handlers.onAttachExited
-        ) {
-          void Promise.resolve(handlers.onAttachExited(
-            request.sessionId,
-            request.handoffId,
-            request.exitCode as number | null,
-          ))
-            .then(() => socket.end(`${JSON.stringify({ ok: true })}\n`))
-            .catch(() => socket.end(`${JSON.stringify({ error: "attach-lifecycle-failed" })}\n`));
-        } else if (
-          request.command === "attach-failed"
-          && typeof request.sessionId === "string"
-          && typeof request.handoffId === "string"
-          && typeof request.error === "string"
-          && request.error.length <= 1_024
-          && handlers.onAttachFailed
-        ) {
-          void Promise.resolve(handlers.onAttachFailed(request.sessionId, request.handoffId, request.error))
-            .then(() => socket.end(`${JSON.stringify({ ok: true })}\n`))
-            .catch(() => socket.end(`${JSON.stringify({ error: "attach-lifecycle-failed" })}\n`));
+        /*
+          The four attach lifecycle commands are gone with the exclusive handoff
+          they served: authorize-spawn, started, exited and failed reported an
+          authorized wrapper's progress so ownership could be reclaimed after the
+          native CLI exited. A joined CLI transfers nothing, so `attach` hands
+          over a command and the transport has nothing further to track.
+        */
         } else {
           socket.end(`${JSON.stringify({ error: "unsupported-command" })}\n`);
         }
@@ -494,66 +410,6 @@ export function requestAttachFromControlSocket(
   return requestOwnerControlSocket<{ instruction: AttachInstruction }>(path, {
     command: "attach",
     sessionId,
-  });
-}
-
-export function requestAttachStartedFromControlSocket(
-  path: string,
-  sessionId: string,
-  handoffId: string,
-  spawnNonce: string,
-  pid: number,
-): Promise<{ ok: true }> {
-  return requestOwnerControlSocket<{ ok: true }>(path, {
-    command: "attach-started",
-    sessionId,
-    handoffId,
-    spawnNonce,
-    pid,
-  });
-}
-
-export function requestAttachAuthorizeSpawnFromControlSocket(
-  path: string,
-  sessionId: string,
-  handoffId: string,
-  spawnNonce: string,
-  wrapperPid: number,
-): Promise<{ ok: true }> {
-  return requestOwnerControlSocket<{ ok: true }>(path, {
-    command: "attach-authorize-spawn",
-    sessionId,
-    handoffId,
-    spawnNonce,
-    wrapperPid,
-  });
-}
-
-export function requestAttachExitedFromControlSocket(
-  path: string,
-  sessionId: string,
-  handoffId: string,
-  exitCode: number | null,
-): Promise<{ ok: true }> {
-  return requestOwnerControlSocket<{ ok: true }>(path, {
-    command: "attach-exited",
-    sessionId,
-    handoffId,
-    exitCode,
-  });
-}
-
-export function requestAttachFailedFromControlSocket(
-  path: string,
-  sessionId: string,
-  handoffId: string,
-  error: string,
-): Promise<{ ok: true }> {
-  return requestOwnerControlSocket<{ ok: true }>(path, {
-    command: "attach-failed",
-    sessionId,
-    handoffId,
-    error: error.slice(0, 1_024),
   });
 }
 

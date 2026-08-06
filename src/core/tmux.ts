@@ -377,6 +377,10 @@ export function attachTmuxTerminals(
           recovery: null,
           capabilities: ["preview", "attach"] as const,
           withheld: record.control.withheld,
+          // A pane match proves a terminal, not a provider writer. Peer
+          // enumeration stays with the projector that read the provider's own
+          // registry.
+          peers: record.control.peers,
           takeover: record.control.takeover,
         }
       : record.control;

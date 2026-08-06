@@ -58,23 +58,21 @@ Pending holds are never persisted or replayed.
 No Claude hook return is used to queue, steer, end, or inject an operator message. In particular,
 `Stop` plus `reason`/`additionalContext` is a system-side instruction, not a user turn.
 
-## Codex command-hook bridge
+## Codex command-hook bridge — retired
 
-Codex `0.146.x` hooks currently execute trusted **command** handlers. HTTP handlers are not
-supported, and parsed `prompt`/`agent` handlers are skipped. Agent Manager installs a pinned
-absolute command shim with `shell: false`; the shim reads the Codex stdin payload and posts it to
-a separate loopback route/token. It never reuses the Claude parser or response builder.
+This plane no longer exists. Its shim discarded every response by construction ("observation-only
+until Codex response authority is proven live"), so it could only ever *reduce* a session's
+capabilities: for manager-owned threads it bailed out immediately because the App Server already
+delivers exact events, and for external threads it duplicated what the discovery sweep already
+enumerates. The six modules, the ops install/config pair, the generated shim and its trust flow,
+the `codex_hook_installs` table, and the `codex-hook-bridge` control plane were removed, along
+with the Codex halves of setup, the CLI, and the hooks E2E gate.
 
-- Non-managed hooks require explicit trust through Codex's `/hooks` interface. Installation
-  reports awaiting-trust until the exact hook hash is trusted; a changed command/config hash
-  returns to that state.
-- Use only documented Codex event fields: `session_id`, `transcript_path`, `cwd`,
-  `hook_event_name`, `model`, turn ID, and event-specific tool/request fields.
-- Codex `PreToolUse` can return allow/deny, not `ask`. `PermissionRequest` can return allow,
-  deny, or no decision. Advertise `respond` only for a request type verified in the pinned live
-  probe and only while its command invocation is held.
-- Hook observation supplements ordinary non-daemon CLI sessions. It does not imply app-server
-  queue, steer, interrupt, settings, archive, or delete authority.
+Startup sweeps what it installed, because this wrote into a file the operator also edits by hand:
+`sweepRetiredCodexHooks` removes only handlers whose command is our own generated shim, preserves
+the surrounding JSONC byte for byte, drops an event key only when we solely occupied it, and
+deletes the shim. It takes its home directory as an argument rather than reading `homedir()`.
+
 
 ## Activity projection and source arbitration
 
@@ -83,6 +81,13 @@ provenance, provider IDs when available, and redaction. Typical mappings are ses
 lifecycle, user prompts/messages, tool start/completion/failure, permission attention,
 subagents, tasks/todos, compaction, and warnings. Unsupported/unknown events become bounded
 diagnostic lifecycle items, not guessed semantic content.
+
+Source arbitration is de-duplication, not ownership. The manager's own SDK child inherits the owner
+marker and its global hook is a duplicate of what the SDK stream already reports, so it stays a
+quiet no-op. Every other hook is accepted — **including a markerless one on a session the manager
+also holds.** That is a peer turn from the operator's terminal, and it used to be read as an
+`ownership-conflict` that tore down the manager's query: joining "worked" until its owner typed.
+Dropping such an event would also leave the cockpit blind to half of a shared conversation.
 
 There is one visible timeline:
 
@@ -96,7 +101,7 @@ There is one visible timeline:
 ## Acceptance criteria
 
 1. Install/status/uninstall preserves unrelated settings, shows a diff, is idempotent, and
-   correctly reports Claude active versus installed-unseen and Codex awaiting-trust.
+   correctly reports Claude active versus installed-unseen.
 2. A disposable external Claude session emits exact activity and one `PermissionRequest` can be
    allowed/denied from the cockpit; unanswered/server-killed requests fall through promptly.
 3. Claude `PreToolUse`, elicitation, Stop, and arbitrary text never become response/steer paths.

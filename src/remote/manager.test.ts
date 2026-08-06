@@ -84,6 +84,7 @@ function remoteSession() {
       recovery: null,
       capabilities: ["steer"],
       withheld: [],
+      peers: [],
       takeover: null,
     },
     workspaceIdentity: {

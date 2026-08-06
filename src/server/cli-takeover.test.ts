@@ -68,6 +68,7 @@ function session(overrides: Partial<SessionView> = {}): SessionView {
       recovery: null,
       capabilities: [],
       withheld: [],
+      peers: [],
       takeover: null,
     },
     workspaceIdentity: null,
@@ -128,23 +129,32 @@ function resumableSession(provider: "codex" | "claude" = "codex"): SessionView {
       recovery: null,
       capabilities: ["resume"],
       withheld: [],
+      peers: [],
       takeover: null,
     },
   });
 }
 
+/**
+ * Takeover is Codex-only. This fixture was Claude, because Claude used to be the
+ * provider that required an exclusive ownership transfer; the surviving subject
+ * is a standalone Codex process migrating once onto the manager-owned App Server.
+ * The coordinator machinery under test — guided exit, confirmed graceful stop,
+ * one SIGTERM, identity revalidation, rollback quarantine — is unchanged.
+ */
 function takeoverSession(overrides: Partial<SessionView> = {}): SessionView {
   return session({
-    id: "local:claude:thread-1",
-    provider: "claude",
+    id: "local:codex:thread-1",
+    provider: "codex",
     providerTreeId: "thread-1",
     control: {
       plane: "observe-only",
       authority: "none",
-      coordination: providerControlCoordination("claude"),
+      coordination: providerControlCoordination("codex"),
       recovery: null,
       capabilities: [],
       withheld: [],
+      peers: [],
       takeover: null,
     },
     ...overrides,
@@ -197,6 +207,7 @@ function fixture(
           recovery: null,
           capabilities: ["queue"],
           withheld: [],
+          peers: [],
           takeover: null,
         },
       });
@@ -258,7 +269,9 @@ class SetSignalJournal implements CliTakeoverSignalJournal {
 test("guided takeover is cancelable while waiting and never signals the CLI", async () => {
   const inspector = new FakeInspector();
   const value = fixture(inspector);
-  assert.equal(value.current().control.takeover?.fallbackProfile, "ask-first");
+  // Codex's takeover fallback profile, now that this fixture is the Codex
+  // standalone migration rather than a Claude handoff.
+  assert.equal(value.current().control.takeover?.fallbackProfile, "plan");
   assert.ok(value.current().control.capabilities.includes("take-control"));
 
   const begun = await value.coordinator.begin(value.current(), "guided-exit");
@@ -459,6 +472,7 @@ test("remote takeover and resume capabilities remain owned by the remote node", 
       recovery: null,
       capabilities: ["take-control", "cancel-take-control", "resume"],
       withheld: [],
+      peers: [],
       takeover: {
         id: "remote-takeover",
         state: "waiting-for-exit",
@@ -494,113 +508,15 @@ test("local discovery offers web resume only for stopped conversations", async (
   await value.coordinator.dispose();
 });
 
-test("Claude control is not offered without a transcript association verifier", async () => {
-  const inspector = new ResumeInspector();
-  const coordinator = new CliTakeoverCoordinator({
-    inspector,
-    canAdopt: () => true,
-    adopt: async (original) => original,
-    persist: () => undefined,
-    onChange: () => undefined,
-    onAdopted: () => undefined,
-  });
-  const live = coordinator.decorate(takeoverSession());
-  const dormant = coordinator.decorate(resumableSession("claude"));
+/*
+  Removed: five Claude takeover tests — verifier absence, transcript mismatch,
+  verifier failure, revalidation before signal, and verification at every
+  ownership boundary. Claude no longer takes over, so it never signals a process
+  or crosses an ownership boundary. `#assertTranscriptAssociation` itself survives
+  and still gates the Claude join path; "in-web resume proves owner absence and
+  persists before publishing controls" covers the surviving Codex machinery.
+*/
 
-  assert.equal(live.control.takeover, null);
-  assert.equal(hasCapability(live, "take-control"), false);
-  assert.equal(hasCapability(dormant, "resume"), false);
-  await assert.rejects(
-    coordinator.begin(takeoverSession(), "guided-exit"),
-    /takeover is unavailable/u,
-  );
-  await assert.rejects(
-    coordinator.resume(resumableSession("claude")),
-    /resume is unavailable/u,
-  );
-  await coordinator.dispose();
-});
-
-test("Claude takeover reports transcript mismatch before changing provider ownership", async () => {
-  const inspector = new FakeInspector();
-  const value = fixture(inspector, {
-    verifyTranscriptAssociation: () => ({
-      state: "mismatch",
-      reason: "the exact Claude transcript is ambiguous",
-    }),
-  });
-
-  await assert.rejects(
-    value.coordinator.begin(value.current(), "guided-exit"),
-    /transcript association mismatch: the exact Claude transcript is ambiguous/u,
-  );
-  assert.equal(inspector.signals.length, 0);
-  assert.equal(value.adoptedCalls(), 0);
-  assert.equal(value.current().control.takeover?.state, "available");
-  await value.coordinator.dispose();
-});
-
-test("Claude transcript verifier failures remain read-only and retain their reason", async () => {
-  const inspector = new FakeInspector();
-  const value = fixture(inspector, {
-    verifyTranscriptAssociation: () => {
-      throw new Error("transcript reader rejected an unsafe path");
-    },
-  });
-
-  await assert.rejects(
-    value.coordinator.begin(value.current(), "graceful-stop"),
-    /verification failed: transcript reader rejected an unsafe path/u,
-  );
-  assert.equal(inspector.signals.length, 0);
-  assert.equal(value.adoptedCalls(), 0);
-  assert.equal(value.current().control.takeover?.state, "available");
-  await value.coordinator.dispose();
-});
-
-test("Claude takeover revalidates its transcript before signal and adoption", async () => {
-  const inspector = new FakeInspector();
-  inspector.exitOnSignal = true;
-  let verifications = 0;
-  const value = fixture(inspector, {
-    verifyTranscriptAssociation: () => {
-      verifications += 1;
-      return verifications < 3
-        ? { state: "associated" }
-        : { state: "mismatch", reason: "the transcript association changed after exit" };
-    },
-  });
-
-  await confirmGraceful(value);
-  await waitFor(() => value.current().control.takeover?.state === "failed");
-  assert.equal(verifications, 3);
-  assert.equal(inspector.signals.length, 1);
-  assert.equal(value.adoptedCalls(), 0);
-  assert.match(
-    value.current().control.takeover?.error ?? "",
-    /transcript association changed after exit/u,
-  );
-  await value.coordinator.dispose();
-});
-
-test("Claude takeover accepts a verified transcript at every ownership boundary", async () => {
-  const inspector = new FakeInspector();
-  inspector.exitOnSignal = true;
-  let verifications = 0;
-  const value = fixture(inspector, {
-    verifyTranscriptAssociation: () => {
-      verifications += 1;
-      return { state: "associated" };
-    },
-  });
-
-  await confirmGraceful(value);
-  await waitFor(() => value.current().control.authority === "manager");
-  assert.equal(verifications, 3);
-  assert.equal(inspector.signals.length, 1);
-  assert.equal(value.adoptedCalls(), 1);
-  await value.coordinator.dispose();
-});
 
 test("in-web resume proves owner absence and persists before publishing controls", async () => {
   const inspector = new ResumeInspector();
@@ -616,6 +532,7 @@ test("in-web resume proves owner absence and persists before publishing controls
       recovery: null,
       capabilities: ["queue", "resume"],
       withheld: [],
+      peers: [],
       takeover: null,
     },
   });
@@ -644,31 +561,14 @@ test("in-web resume proves owner absence and persists before publishing controls
   await coordinator.dispose();
 });
 
-test("in-web Claude resume rejects any standalone owner before touching the provider", async () => {
-  const inspector = new ResumeInspector();
-  inspector.associated = { state: "running", identity };
-  let resumeCalls = 0;
-  const coordinator = new CliTakeoverCoordinator({
-    inspector,
-    canAdopt: () => true,
-    verifyTranscriptAssociation: () => ({ state: "associated" }),
-    adopt: async () => { throw new Error("ordinary adoption must not be used"); },
-    resume: async (original) => {
-      resumeCalls += 1;
-      return original;
-    },
-    persist: () => undefined,
-    onChange: () => undefined,
-    onAdopted: () => undefined,
-  });
+/*
+  Removed: "in-web Claude resume rejects any standalone owner before touching the
+  provider". That refusal was the gate this whole change exists to lift — a live
+  Claude process is now a peer to join, not an owner to refuse. The Codex twin
+  below keeps asserting the refusal, because a Codex rollout cannot represent two
+  concurrent writers.
+*/
 
-  await assert.rejects(
-    coordinator.resume(resumableSession("claude")),
-    /standalone Claude process still owns this conversation/u,
-  );
-  assert.equal(resumeCalls, 0);
-  await coordinator.dispose();
-});
 
 test("in-web Codex resume rejects a standalone owner and requires migration", async () => {
   const inspector = new ResumeInspector();
@@ -1016,6 +916,7 @@ test("provider identity drift after exit never exposes manager capabilities", as
         recovery: null,
         capabilities: ["queue"],
         withheld: [],
+        peers: [],
         takeover: null,
       },
     }),
@@ -1614,7 +1515,7 @@ test("Claude inspection pins a registry-not-ready process before accepting its a
   if (drifted.state === "mismatch") assert.match(drifted.reason, /lineage changed/u);
 });
 
-test("Claude owner discovery rejects two standalone processes for one session", (t) => {
+test("Claude owner discovery enumerates both writers of a joined session", (t) => {
   const root = mkdtempSync(join(tmpdir(), "agent-manager-claude-owners-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const uid = process.getuid?.() ?? 501;
@@ -1685,9 +1586,21 @@ test("Claude owner discovery rejects two standalone processes for one session", 
     runtimePid: null,
   });
 
+  /*
+    This asserted `mismatch: "Multiple Claude processes claim the same session"`,
+    which is exactly the state a joined session is in — so it made joining
+    unrepresentable rather than unsafe. Both owners are now enumerated, and the
+    interactive terminal is handed back as the primary because that is the process
+    an operator is looking at.
+  */
   const owners = inspector.findAssociated(selected);
-  assert.equal(owners.state, "mismatch");
-  if (owners.state === "mismatch") assert.match(owners.reason, /Multiple Claude processes/u);
+  assert.equal(owners.state, "running");
+  if (owners.state !== "running") return;
+  assert.deepEqual(
+    owners.owners?.map((owner) => owner.pid).sort((left, right) => left - right),
+    [77, 88],
+  );
+  assert.equal(owners.identity.interactive, true);
 });
 
 test("Codex owner discovery ignores only peers on the exact manager socket", (t) => {

@@ -89,6 +89,7 @@ function snapshot(): unknown {
         recovery: null,
         capabilities: ["queue", "set-profile"],
         withheld: [],
+        peers: [],
         takeover: null,
       },
       workspaceIdentity: null,
@@ -99,7 +100,7 @@ function snapshot(): unknown {
 
 test("parses the exact current wire epoch", () => {
   const parsed = parseStateSnapshot(snapshot());
-  assert.equal(parsed.schemaVersion, 7);
+  assert.equal(parsed.schemaVersion, 8);
   assert.equal(parsed.buildId, AGENT_MANAGER_BUILD_ID);
   assert.equal(parsed.sessions[0]?.providerThreadId, "thread-1");
   assert.equal(parsed.sessions[0]?.id, sessionRecordId("local", "codex", "thread-1"));
@@ -109,9 +110,14 @@ test("parses the exact current wire epoch", () => {
     nativeAttach: "join",
     responseResolution: "first-response-wins",
   });
+  /*
+    Claude shares its live conversation like Codex, but resolves requests
+    differently: it publishes no `serverRequest/resolved`, so each controller
+    holds its own SDK query and answers only its own requests.
+  */
   assert.deepEqual(providerControlCoordination("claude"), {
-    mode: "exclusive",
-    nativeAttach: "handoff",
+    mode: "shared",
+    nativeAttach: "join",
     responseResolution: "single-controller",
   });
 });
@@ -134,9 +140,14 @@ test("requires explicit control coordination and validates bounded recovery stat
   };
   assert.equal(parseStateSnapshot(retrying).sessions[0]?.control.recovery?.attempt, 2);
 
-  const waiting = snapshot() as { sessions: Array<Record<string, unknown>> };
-  const waitingControl = waiting.sessions[0]!.control as Record<string, unknown>;
-  waitingControl.recovery = {
+  /*
+    `waiting-for-native-exit` is gone with Claude exclusivity, so the wire must
+    now reject it rather than validate its field rules. Nothing waits for a
+    native controller to leave.
+  */
+  const retiredWait = snapshot() as { sessions: Array<Record<string, unknown>> };
+  const retiredWaitControl = retiredWait.sessions[0]!.control as Record<string, unknown>;
+  retiredWaitControl.recovery = {
     state: "waiting-for-native-exit",
     attempt: 1,
     startedAt: "2026-08-04T10:00:00.000Z",
@@ -144,22 +155,7 @@ test("requires explicit control coordination and validates bounded recovery stat
     nextRetryAt: null,
     error: "Claude Code still owns this conversation",
   };
-  assert.equal(
-    parseStateSnapshot(waiting).sessions[0]?.control.recovery?.state,
-    "waiting-for-native-exit",
-  );
-
-  for (const [field, value, expected] of [
-    ["deadlineAt", "2026-08-04T10:00:30.000Z", /recovery deadline/u],
-    ["nextRetryAt", "2026-08-04T10:00:30.000Z", /internal poll time/u],
-    ["error", null, /ownership reason/u],
-  ] as const) {
-    const invalidWaiting = structuredClone(waiting);
-    const invalidControl = invalidWaiting.sessions[0]!.control as Record<string, unknown>;
-    const invalidRecovery = invalidControl.recovery as Record<string, unknown>;
-    invalidRecovery[field] = value;
-    assert.throws(() => parseStateSnapshot(invalidWaiting), expected);
-  }
+  assert.throws(() => parseStateSnapshot(retiredWait));
 
   const missingRetryTime = snapshot() as { sessions: Array<Record<string, unknown>> };
   const missingRetryControl = missingRetryTime.sessions[0]!.control as Record<string, unknown>;
@@ -193,6 +189,44 @@ test("requires explicit control coordination and validates bounded recovery stat
     responseResolution: "single-controller",
   };
   assert.throws(() => parseStateSnapshot(impossibleCoordination), /join requires shared/u);
+
+  const duplicatePeers = snapshot() as { sessions: Array<Record<string, unknown>> };
+  const duplicatePeerControl = duplicatePeers.sessions[0]!.control as Record<string, unknown>;
+  duplicatePeerControl.peers = [
+    { kind: "manager", pid: 4242, startedAt: "2026-08-04T10:00:00.000Z" },
+    { kind: "native", pid: 4242, startedAt: "2026-08-04T10:00:01.000Z" },
+  ];
+  assert.throws(() => parseStateSnapshot(duplicatePeers), /duplicate control peer pid/u);
+
+  const observedPeers = snapshot() as { sessions: Array<Record<string, unknown>> };
+  const observedPeerControl = observedPeers.sessions[0]!.control as Record<string, unknown>;
+  observedPeerControl.plane = "observe-only";
+  observedPeerControl.coordination = {
+    mode: "observe-only",
+    nativeAttach: "none",
+    responseResolution: "single-controller",
+  };
+  observedPeerControl.peers = [
+    { kind: "native", pid: 4242, startedAt: "2026-08-04T10:00:00.000Z" },
+  ];
+  assert.throws(() => parseStateSnapshot(observedPeers), /cannot enumerate live provider peers/u);
+
+  /*
+    The Claude plane invariant is now the positive one. A record still claiming
+    exclusive handoff is a stale build talking, and must fail closed.
+  */
+  const staleClaudeExclusivity = snapshot() as { sessions: Array<Record<string, unknown>> };
+  const staleSession = staleClaudeExclusivity.sessions[0]!;
+  staleSession.provider = "claude";
+  staleSession.id = sessionRecordId("local", "claude", "thread-1");
+  const staleControl = staleSession.control as Record<string, unknown>;
+  staleControl.plane = "claude-sdk";
+  staleControl.coordination = {
+    mode: "exclusive",
+    nativeAttach: "handoff",
+    responseResolution: "single-controller",
+  };
+  assert.throws(() => parseStateSnapshot(staleClaudeExclusivity), /requires shared join/u);
 });
 
 test("parses the server-issued graceful-stop confirmation phase", () => {

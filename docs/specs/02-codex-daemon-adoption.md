@@ -71,9 +71,15 @@ explicitly probed contract; it is not a fallback path.
 
 ## Standalone CLI migration
 
-A Codex CLI that started on its own connection cannot be rebound in place. Hook, process,
-registry, and transcript evidence remain observation-only until one safe migration puts the
-same exact provider thread on Agent Manager's private server.
+A Codex CLI that started on its own connection cannot be rebound in place, and — the load-bearing
+half — two Codex processes cannot write one rollout at all: the format has no parent pointers and
+gives content records no turn identity, so concurrent writers interleave unrecoverably and break
+Codex's own next resume. The measurement is recorded in the appendix. Hook, process, registry, and
+transcript evidence therefore remain observation-only until one safe migration puts the same exact
+provider thread on Agent Manager's private server.
+
+This is why Codex keeps a migration while Claude does not. Claude's transcript is a
+`uuid`/`parentUuid` DAG, so a second writer forks legibly and is joined instead.
 
 The default `guided-exit` flow waits up to five minutes for the operator to exit the standalone
 CLI and can be cancelled. `graceful-stop` is a server-enforced two-action flow: the first action
@@ -102,7 +108,7 @@ advanced optional peer path, not a prerequisite for web control.
 ## Recovery and deployment
 
 Wire schema 5 publishes `coordination = shared / join / first-response-wins` for managed Codex.
-`SessionControl.recovery` truthfully reports `reconnecting`, `waiting-for-native-exit`, `retrying`, or `needs-attention`
+`SessionControl.recovery` truthfully reports `reconnecting`, `retrying`, or `needs-attention`
 with attempt number and bounded timing/error fields. Automatic reconnect/retry is bounded; a
 further safe manual attempt requires the `retry-control` capability. Recovery re-lists, verifies,
 and re-subscribes, but never replays sends, turns, answers, interrupts, settings, or lifecycle

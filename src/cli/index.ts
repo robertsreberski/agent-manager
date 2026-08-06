@@ -46,10 +46,6 @@ import {
 } from "../ops/hooks.ts";
 import {
   requestAttachFromControlSocket,
-  requestAttachExitedFromControlSocket,
-  requestAttachFailedFromControlSocket,
-  requestAttachAuthorizeSpawnFromControlSocket,
-  requestAttachStartedFromControlSocket,
   requestBootstrapFromControlSocket,
   requestHooksReloadFromControlSocket,
   type BootstrapTokenReply,
@@ -145,22 +141,6 @@ export interface CliDependencies {
   startServer(options: { host: "127.0.0.1"; port: number }): Promise<StartedServer>;
   requestBootstrap(path: string): Promise<BootstrapTokenReply>;
   requestAttach(path: string, sessionId: string): Promise<{ instruction: AttachInstruction }>;
-  requestAttachAuthorizeSpawn(
-    path: string,
-    sessionId: string,
-    handoffId: string,
-    spawnNonce: string,
-    wrapperPid: number,
-  ): Promise<{ ok: true }>;
-  requestAttachStarted(
-    path: string,
-    sessionId: string,
-    handoffId: string,
-    spawnNonce: string,
-    pid: number,
-  ): Promise<{ ok: true }>;
-  requestAttachExited(path: string, sessionId: string, handoffId: string, exitCode: number | null): Promise<{ ok: true }>;
-  requestAttachFailed(path: string, sessionId: string, handoffId: string, error: string): Promise<{ ok: true }>;
   executeAttach(spec: AttachSpec): Promise<number>;
   executeLifecycleAttach(spec: AttachSpec, lifecycle: AttachLifecycle): Promise<number>;
   openBrowser(url: string): Promise<void>;
@@ -510,10 +490,6 @@ function defaultDependencies(): CliDependencies {
     startServer: defaultStartServer,
     requestBootstrap: requestBootstrapFromControlSocket,
     requestAttach: requestAttachFromControlSocket,
-    requestAttachAuthorizeSpawn: requestAttachAuthorizeSpawnFromControlSocket,
-    requestAttachStarted: requestAttachStartedFromControlSocket,
-    requestAttachExited: requestAttachExitedFromControlSocket,
-    requestAttachFailed: requestAttachFailedFromControlSocket,
     executeAttach,
     executeLifecycleAttach,
     openBrowser: defaultOpenBrowser,
@@ -679,94 +655,26 @@ async function dispatch(argv: readonly string[], deps: CliDependencies): Promise
       await runNodeBridge({ controlSocketPath: deps.controlSocketPath });
       return 0;
     case "attach": {
+      /*
+        `attach` hands over a provider command and nothing else. It used to drive
+        an ownership handoff: authorize the spawn with a nonce, report the child's
+        pid, then report its exit so the manager could reclaim the session. A
+        joined CLI runs beside the manager's own writer, so there is no ownership
+        to authorize and no exit to report.
+      */
       const reply = await deps.requestAttach(deps.controlSocketPath, command.sessionId);
-      const handoffId = reply.instruction.handoffId;
-      const spawnNonce = reply.instruction.spawnNonce;
-      let spec: AttachSpec;
-      let workingDirectoryWarning: string | null = null;
-      try {
-        if (reply.instruction.kind === "manager-cli") {
-          throw new Error("Manager CLI attach instructions are browser-only");
-        }
-        spec = attachSpecFromInstruction(reply.instruction, deps.serviceExecutables());
-        const recovered = recoverCodexAttachWorkingDirectory(
-          reply.instruction,
-          spec,
-          deps.currentDirectory,
-        );
-        spec = recovered.spec;
-        workingDirectoryWarning = recovered.warning;
-      } catch (error) {
-        if (handoffId) {
-          await deps.requestAttachFailed(
-            deps.controlSocketPath,
-            command.sessionId,
-            handoffId,
-            errorMessage(error),
-          ).catch(() => undefined);
-        }
-        throw error;
+      if (reply.instruction.kind === "manager-cli") {
+        throw new Error("Manager CLI attach instructions are browser-only");
       }
+      let spec = attachSpecFromInstruction(reply.instruction, deps.serviceExecutables());
+      const recovered = recoverCodexAttachWorkingDirectory(
+        reply.instruction,
+        spec,
+        deps.currentDirectory,
+      );
+      spec = recovered.spec;
       if (reply.instruction.warning) writeLine(deps.stderr, reply.instruction.warning);
-      if (workingDirectoryWarning) writeLine(deps.stderr, workingDirectoryWarning);
-      if (reply.instruction.kind === "claude-resume" && !handoffId) {
-        throw new Error("Claude attach instruction is missing its ownership handoff id");
-      }
-      if (handoffId) {
-        if (!spawnNonce) {
-          await deps.requestAttachFailed(
-            deps.controlSocketPath,
-            command.sessionId,
-            handoffId,
-            "attach instruction is missing its pre-spawn nonce",
-          ).catch(() => undefined);
-          throw new Error("Attach instruction is missing its pre-spawn authorization nonce");
-        }
-        try {
-          await deps.requestAttachAuthorizeSpawn(
-            deps.controlSocketPath,
-            command.sessionId,
-            handoffId,
-            spawnNonce,
-            process.pid,
-          );
-        } catch (error) {
-          await deps.requestAttachFailed(
-            deps.controlSocketPath,
-            command.sessionId,
-            handoffId,
-            `pre-spawn authorization failed: ${errorMessage(error)}`,
-          ).catch(() => undefined);
-          throw error;
-        }
-        return await deps.executeLifecycleAttach(spec, {
-          started: async (pid) => {
-            await deps.requestAttachStarted(
-              deps.controlSocketPath,
-              command.sessionId,
-              handoffId,
-              spawnNonce,
-              pid,
-            );
-          },
-          exited: async (exitCode) => {
-            await deps.requestAttachExited(
-              deps.controlSocketPath,
-              command.sessionId,
-              handoffId,
-              exitCode,
-            );
-          },
-          failed: async (message) => {
-            await deps.requestAttachFailed(
-              deps.controlSocketPath,
-              command.sessionId,
-              handoffId,
-              message,
-            );
-          },
-        });
-      }
+      if (recovered.warning) writeLine(deps.stderr, recovered.warning);
       return await deps.executeAttach(spec);
     }
     case "doctor": {

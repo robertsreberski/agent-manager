@@ -230,9 +230,6 @@ test("end closes only the owned SDK query and discards manager-side staging", as
   assert.deepEqual(session.snapshot.stagedMessages, []);
   assert.deepEqual(session.snapshot.outstandingMessageIds, []);
   assert.throws(() => session.send("must not run"), /no live Agent SDK consumer/);
-  const handoff = await session.prepareCliHandoff("resume-after-end");
-  assert.deepEqual(handoff.command.args, ["--resume", "session-1"]);
-  assert.equal(session.snapshot.owner, "native");
   await session.dispose();
 });
 
@@ -472,7 +469,6 @@ test("prepares an exact dormant resume without mutating or replaying the dormant
   await new Promise<void>((resolve) => setImmediate(resolve));
 
   assert.equal(dormant.snapshot.activity, "closed");
-  assert.equal(dormant.snapshot.owner, "manager");
   assert.equal(resumed.snapshot.activity, "idle");
   assert.equal(resumed.snapshot.sessionId, "dormant-session");
   assert.equal(query.params.options.resume, "dormant-session");
@@ -545,40 +541,17 @@ test("aborting a dormant resume closes only the provisional writer", async () =>
   assert.equal(runtime.queries[0]?.closeCalls, 1);
   assert.equal(runtime.queries[0]?.params.options.abortController.signal.aborted, true);
   assert.equal(dormant.snapshot.activity, "closed");
-  assert.equal(dormant.snapshot.owner, "manager");
   await dormant.dispose();
 });
 
-test("dormant resume fails closed if ownership changes during provider initialization", async () => {
-  const runtime = new FakeRuntime();
-  runtime.autoInitialize = false;
-  runtime.initializationHangs = true;
-  const dormant = ClaudeManagedSession.dormant(runtime, {
-    sessionId: "ownership-race",
-    cwd: "/workspace",
-    mode: "default",
-  });
-  const pending = dormant.resumeDormantExact({
-    sessionId: "ownership-race",
-    cwd: "/workspace",
-    mode: "default",
-  });
-  await eventually(() => runtime.queries.length === 1);
-  await dormant.prepareCliHandoff("concurrent-native-resume");
-  runtime.queries[0]?.emit({
-    type: "system",
-    subtype: "init",
-    session_id: "ownership-race",
-    claude_code_version: CLAUDE_CODE_VERSION,
-    model: "default-model",
-    permissionMode: "default",
-  });
-
-  await assert.rejects(pending, /ownership changed during resume/u);
-  assert.equal(runtime.queries[0]?.closeCalls, 1);
-  assert.equal(dormant.snapshot.owner, "native");
-  await dormant.dispose();
-});
+/*
+  Removed: "dormant resume fails closed if ownership changes during provider
+  initialization". Its premise was that a native CLI could take ownership while a
+  dormant resume was initializing, which it drove with `prepareCliHandoff`.
+  Nothing transfers ownership away from the manager now, so the race it fenced
+  cannot occur. The remaining identity fences — session id, workspace, generation
+  — are covered by "dormant resume rejects workspace and provider identity drift".
+*/
 
 test("withdraws the input consumer when the Agent SDK stream closes", async () => {
   const runtime = new FakeRuntime();
@@ -837,113 +810,6 @@ test("retains elicitation requests and cancels them on abort", async () => {
   await session.dispose();
 });
 
-test("hands off with the configured executable only after the owned query settles", async () => {
-  const runtime = new FakeRuntime();
-  runtime.claudeCodeExecutable = "/opt/agent-manager/bin/claude";
-  const session = await ClaudeManagedSession.start(runtime, {
-    cwd: "/workspace",
-    mode: "default",
-  });
-  const firstQuery = runtime.queries[0];
-  assert.ok(firstQuery);
-  firstQuery.emit({
-    type: "system",
-    subtype: "session_state_changed",
-    state: "idle",
-    session_id: "session-1",
-  });
-  await eventually(() => session.snapshot.activity === "idle");
-
-  const handoff = await session.prepareCliHandoff();
-  assert.deepEqual(handoff.command, {
-    executable: "/opt/agent-manager/bin/claude",
-    args: ["--resume", "session-1"],
-    cwd: "/workspace",
-  });
-  assert.equal(firstQuery.closed, true);
-  assert.equal(firstQuery.closeCalls, 1);
-  assert.equal(
-    firstQuery.params.options.pathToClaudeCodeExecutable,
-    "/opt/agent-manager/bin/claude",
-  );
-  assert.equal(session.snapshot.owner, "native");
-  assert.throws(() => session.send("unsafe"), /native CLI/);
-
-  session.markCliAttached(handoff.id, 4242);
-  await assert.rejects(session.reclaimFromCli(handoff.id), /expected exited/);
-  session.markCliExited(handoff.id, 0);
-  runtime.autoInitialize = false;
-  runtime.initializationHangs = true;
-  const reclaim = session.reclaimFromCli(handoff.id);
-  await eventually(() => runtime.queries.length === 2);
-  assert.equal(session.snapshot.owner, "native");
-  assert.equal(session.snapshot.activity, "native");
-  runtime.queries[1]?.emit({
-    type: "system",
-    subtype: "init",
-    session_id: "session-1",
-    claude_code_version: CLAUDE_CODE_VERSION,
-    model: "default-model",
-    permissionMode: "default",
-    capabilities: ["interrupt_receipt_v1"],
-  });
-  await reclaim;
-
-  assert.equal(runtime.queries.length, 2);
-  assert.equal(runtime.queries[1]?.params.options.resume, "session-1");
-  assert.equal(session.snapshot.owner, "manager");
-  assert.equal(session.snapshot.sessionId, "session-1");
-  assert.equal(session.snapshot.handoff, null);
-  await session.dispose();
-});
-
-test("cancelled handoff cleanup cannot overlap the resumed manager writer", async () => {
-  const runtime = new FakeRuntime();
-  const session = await ClaudeManagedSession.start(runtime, {
-    cwd: "/workspace",
-    mode: "default",
-  });
-  const firstQuery = runtime.queries[0];
-  assert.ok(firstQuery);
-  firstQuery.emit({
-    type: "system",
-    subtype: "session_state_changed",
-    state: "idle",
-    session_id: "session-1",
-  });
-  await eventually(() => session.snapshot.activity === "idle");
-
-  // Simulate an SDK query whose close request has been accepted but whose
-  // async iterator has not yet ended. The request timeout may cancel the
-  // handoff waiter, but that must not make the old writer safe to overlap.
-  firstQuery.closeEndsOutput = false;
-  const controller = new AbortController();
-  const preparing = session.prepareCliHandoff("delayed-close", controller.signal);
-  await eventually(() => firstQuery.closed && session.snapshot.owner === "native");
-  controller.abort(new Error("handoff request timed out"));
-  await assert.rejects(preparing, /handoff request timed out/u);
-  assert.equal(runtime.queries.length, 1);
-  assert.equal(session.snapshot.handoff?.state, "prepared");
-
-  session.markCliAttachFailed("delayed-close", "native launch was cancelled");
-  const reclaiming = session.reclaimFromCli("delayed-close");
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.equal(
-    runtime.queries.length,
-    1,
-    "reclaim must wait for the old SDK consumer instead of creating a second writer",
-  );
-  assert.equal(session.snapshot.owner, "native");
-
-  firstQuery.output.close();
-  await reclaiming;
-  assert.equal(runtime.queries.length, 2);
-  assert.equal(runtime.queries[1]?.params.options.resume, "session-1");
-  assert.equal(session.snapshot.owner, "manager");
-  assert.equal(session.snapshot.handoff, null);
-  await session.dispose();
-});
-
 test("settles idle from a terminal result only after all tracked work drains", async () => {
   const runtime = new FakeRuntime();
   const session = await ClaudeManagedSession.start(runtime, {
@@ -968,7 +834,6 @@ test("settles idle from a terminal result only after all tracked work drains", a
     session_id: "session-1",
   });
   await eventually(() => session.snapshot.activity === "running");
-  await assert.rejects(session.prepareCliHandoff(), /idle session/);
 
   query.emit({
     type: "result",
@@ -978,7 +843,6 @@ test("settles idle from a terminal result only after all tracked work drains", a
   });
   await eventually(() => session.snapshot.outstandingMessageIds.length === 1);
   assert.equal(session.snapshot.activity, "running");
-  await assert.rejects(session.prepareCliHandoff(), /idle session/);
 
   // The installed streaming SDK does not consistently emit a later idle
   // state. The terminal result is therefore the safe fallback once the final
@@ -990,7 +854,6 @@ test("settles idle from a terminal result only after all tracked work drains", a
     session_id: "session-1",
   });
   await eventually(() => session.snapshot.activity === "idle");
-  await session.prepareCliHandoff();
   await session.dispose();
 });
 

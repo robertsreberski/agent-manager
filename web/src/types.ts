@@ -119,7 +119,6 @@ export interface AttachInstruction {
   kind: "tmux" | "codex-remote" | "claude-resume" | "manager-cli" | "ssh" | "none";
   command: string | null;
   description: string | null;
-  requiresHandoff: boolean;
   argv: string[];
   cwd: string | null;
 }

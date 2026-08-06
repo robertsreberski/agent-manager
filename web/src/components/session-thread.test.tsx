@@ -9,9 +9,11 @@ const sharedCoordination = {
   nativeAttach: "join",
   responseResolution: "first-response-wins",
 } as const;
-const exclusiveCoordination = {
-  mode: "exclusive",
-  nativeAttach: "handoff",
+const sharedClaudeCoordination = {
+  mode: "shared",
+  nativeAttach: "join",
+  // Claude has no `serverRequest/resolved`, so each controller answers only its
+  // own requests and there is nothing to arbitrate.
   responseResolution: "single-controller",
 } as const;
 const observeCoordination = {
@@ -278,7 +280,10 @@ describe("SessionThreadComposer", () => {
     expect(onCancelTakeControl).toHaveBeenCalledWith("takeover-confirmation-1");
   });
 
-  it("keeps Claude exclusive while offering browser safe-stop escalation and cancellation", async () => {
+  // Renamed from "keeps Claude exclusive …": a live external Claude session is
+  // no longer exclusive. This still covers the takeover escalation/cancel UI,
+  // which Codex standalone migration keeps using.
+  it("offers browser safe-stop escalation and cancellation during a takeover", async () => {
     const onTakeControl = vi.fn(async () => undefined);
     const onCancelTakeControl = vi.fn(async () => undefined);
     const observed = {
@@ -288,7 +293,7 @@ describe("SessionThreadComposer", () => {
         ...session.control,
         plane: "claude-hook-bridge",
         authority: "foreign",
-        coordination: exclusiveCoordination,
+        coordination: sharedClaudeCoordination,
         capabilities: ["take-control", "cancel-take-control"],
         withheld: [{ capability: "queue", reason: "Claude Code currently owns this conversation." }],
         takeover: {
@@ -321,7 +326,7 @@ describe("SessionThreadComposer", () => {
       onCancelTakeControl={onCancelTakeControl}
     />);
 
-    expect(screen.getByText("Claude Code has control")).toBeInTheDocument();
+    expect(screen.getByText("Claude Code is running")).toBeInTheDocument();
     expect(screen.getByText(/waiting for exclusive access/iu)).toHaveTextContent("Stop the validated Claude Code process safely here");
     const safeStop = screen.getByRole("button", { name: "Stop safely here…" });
     expect(safeStop).toHaveClass("bg-[var(--accent)]");
@@ -370,7 +375,7 @@ describe("SessionThreadComposer", () => {
         ...session.control,
         plane: "claude-sdk",
         authority: "manager",
-        coordination: exclusiveCoordination,
+        coordination: sharedClaudeCoordination,
         capabilities: ["queue", "attach"],
         takeover: null,
       },
@@ -404,7 +409,7 @@ describe("SessionThreadComposer", () => {
         ...session.control,
         plane: "resume-only",
         authority: "none",
-        coordination: exclusiveCoordination,
+        coordination: sharedClaudeCoordination,
         capabilities: ["resume", "attach"],
         takeover: null,
       },
@@ -572,7 +577,7 @@ describe("SessionThreadComposer", () => {
         ...session.control,
         plane: "claude-sdk",
         authority: "none",
-        coordination: exclusiveCoordination,
+        coordination: sharedClaudeCoordination,
         recovery: {
           state: "needs-attention",
           attempt: 3,
@@ -612,30 +617,33 @@ describe("SessionThreadComposer", () => {
     expect(onRetryControl).toHaveBeenCalledOnce();
   });
 
-  it("shows native-owned Claude recovery as healthy exclusive control without retry churn", () => {
-    const waiting = {
+  it("offers a live external Claude session a join, not a takeover", () => {
+    const onResumeInWeb = vi.fn(async () => undefined);
+    /*
+      This replaces two tests that asserted the opposite: that a live native
+      Claude owner parked recovery in a healthy "Claude Code has control" wait,
+      and that the remedy was a takeover which stopped that process. Shared join
+      removed both. A live external session is joinable, so it advertises
+      `resume` with no recovery state at all.
+    */
+    const live = {
       ...session,
       provider: "claude",
+      status: "running",
       control: {
         ...session.control,
         plane: "resume-only",
         authority: "foreign",
-        coordination: exclusiveCoordination,
-        recovery: {
-          state: "waiting-for-native-exit",
-          attempt: 19,
-          startedAt: "2026-08-05T10:00:00.000Z",
-          deadlineAt: null,
-          nextRetryAt: null,
-          error: null,
-        },
-        capabilities: [],
-        withheld: [{ capability: "queue", reason: "Claude Code owns the exact conversation." }],
+        coordination: sharedClaudeCoordination,
+        recovery: null,
+        capabilities: ["resume"],
+        withheld: [{ capability: "queue", reason: "Agent Manager is observing this session. Join it to reply here." }],
+        peers: [],
         takeover: null,
       },
     } as SessionView;
     render(<SessionThreadComposer
-      session={waiting}
+      session={live}
       activity={activity}
       busy={false}
       mutationsReady
@@ -647,71 +655,18 @@ describe("SessionThreadComposer", () => {
       onSetEffort={vi.fn(async () => undefined)}
       modelOptions={[]}
       modelOptionsStatus={null}
-      onRetryControl={vi.fn(async () => undefined)}
+      onResumeInWeb={onResumeInWeb}
     />);
 
-    expect(screen.getByText("Claude Code has control")).toBeInTheDocument();
-    expect(screen.getByText(/Web control reconnects automatically after this exact CLI exits/iu)).toBeInTheDocument();
-    expect(screen.queryByText("attempt 19")).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /retry/iu })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Technical details" })).not.toBeInTheDocument();
-  });
-
-  it("offers a primary browser takeover while native-owned Claude recovery waits", () => {
-    const onTakeControl = vi.fn(async () => undefined);
-    const waiting = {
-      ...session,
-      provider: "claude",
-      control: {
-        ...session.control,
-        plane: "resume-only",
-        authority: "foreign",
-        coordination: exclusiveCoordination,
-        recovery: {
-          state: "waiting-for-native-exit",
-          attempt: 1,
-          startedAt: "2026-08-05T10:00:00.000Z",
-          deadlineAt: null,
-          nextRetryAt: null,
-          error: null,
-        },
-        capabilities: ["take-control"],
-        withheld: [{ capability: "queue", reason: "Claude Code owns the exact conversation." }],
-        takeover: {
-          id: null,
-          state: "available",
-          methods: ["guided-exit", "graceful-stop"],
-          method: null,
-          requestedAt: null,
-          deadlineAt: null,
-          fallbackProfile: "ask-first",
-          error: null,
-        },
-      },
-    } as SessionView;
-    render(<SessionThreadComposer
-      session={waiting}
-      activity={activity}
-      busy={false}
-      mutationsReady
-      onSend={vi.fn(async () => undefined)}
-      onInterrupt={vi.fn(async () => undefined)}
-      onSetProfile={vi.fn(async () => undefined)}
-      onSetSandbox={vi.fn()}
-      onSetModel={vi.fn(async () => undefined)}
-      onSetEffort={vi.fn(async () => undefined)}
-      modelOptions={[]}
-      modelOptionsStatus={null}
-      onTakeControl={onTakeControl}
-    />);
-
-    expect(screen.getByText(/or you can transfer it safely here/iu)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Move Claude Code control here" }));
-    const graceful = screen.getByRole("button", { name: "Prepare graceful Claude Code stop…" });
-    expect(graceful).toHaveClass("bg-[var(--accent)]");
-    fireEvent.click(graceful);
-    expect(onTakeControl).toHaveBeenCalledWith("graceful-stop", undefined);
-    expect(screen.queryByText(/agent-manager attach|claude --resume/iu)).not.toBeInTheDocument();
+    const details = screen.getByRole("button", { name: "Ready to join here" });
+    expect(screen.queryByText(/has control/iu)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Move Claude Code control here/iu })).not.toBeInTheDocument();
+    // The terminal keeps running, and the fork is stated rather than implied.
+    fireEvent.click(details);
+    expect(screen.getByText(/The terminal session keeps running/iu)).toBeInTheDocument();
+    expect(screen.getByText(/the conversation forks/iu)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Join here" }));
+    expect(onResumeInWeb).toHaveBeenCalledOnce();
   });
 
   it("passes a catalog the session cannot write through as a read-only list", () => {
@@ -767,8 +722,11 @@ describe("a managed session with granted model and effort control", () => {
     control: {
       plane: "claude-sdk",
       authority: "manager",
+      coordination: sharedClaudeCoordination,
+      recovery: null,
       capabilities: ["queue", "interrupt", "set-profile", "set-model", "set-effort", "end"],
       withheld: [],
+      peers: [],
       takeover: null,
     },
   } as unknown as SessionView;
@@ -874,7 +832,7 @@ describe("a managed session with granted model and effort control", () => {
 describe("the upgrade path off a read-only session", () => {
   const observed = {
     ...session,
-    control: { plane: "observe-only", authority: "none", coordination: observeCoordination, recovery: null, capabilities: [], withheld: [], takeover: null },
+    control: { plane: "observe-only", authority: "none", coordination: observeCoordination, recovery: null, capabilities: [], withheld: [], peers: [], takeover: null },
   } as unknown as SessionView;
 
   function renderComposer() {

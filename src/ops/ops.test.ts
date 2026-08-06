@@ -186,15 +186,23 @@ test("builds attach commands without a shell", () => {
       cwd: "/tmp/project",
     },
   );
-  assert.throws(
-    () => buildAttachSpec({
+  /*
+    A Claude spec no longer requires a proven handoff: `claude --resume` runs
+    beside the manager's query, exactly as the Codex `--remote` join does. The
+    identity assertions on the executable and session id still apply.
+  */
+  assert.deepEqual(
+    buildAttachSpec({
       kind: "claude",
       sessionId: "session-1",
       cwd: "/tmp/project",
       claudeExecutable: "/opt/bin/claude",
-      handoffReady: false,
     }),
-    /safely handed off/,
+    {
+      executable: "/opt/bin/claude",
+      args: ["--resume", "session-1"],
+      cwd: "/tmp/project",
+    },
   );
 });
 

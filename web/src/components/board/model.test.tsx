@@ -21,6 +21,7 @@ function session(overrides: Partial<CockpitSessionView> & Pick<CockpitSessionVie
       recovery: null,
       capabilities: [],
       withheld: [],
+      peers: [],
       takeover: null,
     },
     profile: null, model: null, effort: null, todo: null, ...overrides,

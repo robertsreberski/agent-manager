@@ -219,15 +219,10 @@ test("deleted working-directory fallback is never applied to Claude or tmux", as
             argv: [SERVICE_EXECUTABLES.claude, "--resume", "session-7"],
             cwd: deletedWorktree,
             warning: null,
-            handoffId: "handoff-7",
-            spawnNonce: "spawn-nonce-00000007",
           },
         };
       },
-      async requestAttachAuthorizeSpawn() {
-        return { ok: true };
-      },
-      async executeLifecycleAttach(spec) {
+      async executeAttach(spec) {
         executed.push(spec);
         return 0;
       },
@@ -263,86 +258,15 @@ test("deleted working-directory fallback is never applied to Claude or tmux", as
   });
 });
 
-test("Claude attach reports actual child lifecycle through the owner socket", async () => {
-  const lifecycle: unknown[][] = [];
-  let genericAttach = false;
-  const exitCode = await runCli(["attach", "claude:session-7"], {
-    serviceExecutables: () => SERVICE_EXECUTABLES,
-    async requestAttach() {
-      return {
-        instruction: {
-          kind: "claude-resume",
-          argv: ["claude", "--resume", "session-7"],
-          cwd: "/tmp/project",
-          warning: null,
-          handoffId: "handoff-7",
-          spawnNonce: "spawn-nonce-00000007",
-        },
-      };
-    },
-    async executeAttach() {
-      genericAttach = true;
-      return 0;
-    },
-    async executeLifecycleAttach(_spec, hooks) {
-      await hooks.started(777);
-      await hooks.exited(4);
-      return 4;
-    },
-    async requestAttachAuthorizeSpawn(...args) {
-      lifecycle.push(["authorized", ...args]);
-      return { ok: true };
-    },
-    async requestAttachStarted(...args) {
-      lifecycle.push(["started", ...args]);
-      return { ok: true };
-    },
-    async requestAttachExited(...args) {
-      lifecycle.push(["exited", ...args]);
-      return { ok: true };
-    },
-    async requestAttachFailed(...args) {
-      lifecycle.push(["failed", ...args]);
-      return { ok: true };
-    },
-    controlSocketPath: "/tmp/control.sock",
-  });
+/*
+  Removed: "Claude attach reports actual child lifecycle through the owner socket"
+  and "Claude attach fails closed when the backend omits lifecycle correlation".
+  Both asserted the ownership-handoff correlation — a handoff id, a one-use spawn
+  nonce, and started/exited/failed reports back over the owner socket. Joining
+  transfers nothing, so `attach` resolves a command and spawns it, and there is no
+  correlation to omit.
+*/
 
-  assert.equal(exitCode, 4);
-  assert.equal(genericAttach, false);
-  assert.deepEqual(lifecycle, [
-    ["authorized", "/tmp/control.sock", "claude:session-7", "handoff-7", "spawn-nonce-00000007", process.pid],
-    ["started", "/tmp/control.sock", "claude:session-7", "handoff-7", "spawn-nonce-00000007", 777],
-    ["exited", "/tmp/control.sock", "claude:session-7", "handoff-7", 4],
-  ]);
-});
-
-test("Claude attach fails closed when the backend omits lifecycle correlation", async () => {
-  const stderr = output();
-  let executed = false;
-  const exitCode = await runCli(["attach", "claude:session-7"], {
-    stderr: stderr.writer,
-    serviceExecutables: () => SERVICE_EXECUTABLES,
-    async requestAttach() {
-      return {
-        instruction: {
-          kind: "claude-resume",
-          argv: ["claude", "--resume", "session-7"],
-          cwd: "/tmp/project",
-          warning: null,
-        },
-      };
-    },
-    async executeLifecycleAttach() {
-      executed = true;
-      return 0;
-    },
-  });
-
-  assert.equal(exitCode, 1);
-  assert.equal(executed, false);
-  assert.match(stderr.read(), /missing its ownership handoff id/);
-});
 
 test("attach refuses an arbitrary control-socket command without spawning it", async () => {
   const stderr = output();

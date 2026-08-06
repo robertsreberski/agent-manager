@@ -8,7 +8,6 @@ import {
   CLAUDE_CODE_VERSION,
   type ClaudeActivity,
   type ClaudeCanUseToolOptions,
-  type ClaudeCliHandoff,
   type ClaudeElicitationRequest,
   type ClaudeElicitationResult,
   type ClaudeEffortLevel,
@@ -97,17 +96,6 @@ function nonEmptyText(text: string, field: string): string {
   return text;
 }
 
-function cloneHandoff(handoff: ClaudeCliHandoff | null): ClaudeCliHandoff | null {
-  if (!handoff) return null;
-  return {
-    ...handoff,
-    command: {
-      ...handoff.command,
-      args: [...handoff.command.args],
-    },
-  };
-}
-
 /**
  * Owns exactly one Claude Agent SDK Query. It never discovers, adopts, or
  * resumes an arbitrary live Claude process; callers must supply a manager-owned
@@ -144,7 +132,6 @@ export class ClaudeManagedSession {
   #generation = 0;
   #sessionId: string | null = null;
   #resumedFrom: string | null = null;
-  #owner: "manager" | "native" = "manager";
   #providerActivity: ClaudeActivity = "starting";
   #mode: ClaudePermissionMode;
   #desiredMode: ClaudePermissionMode;
@@ -155,8 +142,6 @@ export class ClaudeManagedSession {
   #capabilities: string[] = [];
   #canSteer = false;
   #queueKnowledge: "known" | "unknown" = "known";
-  #handoff: ClaudeCliHandoff | null = null;
-  #handoffDisconnect: Promise<void> | null = null;
   #lastError: string | null = null;
   #updatedAt: string;
   #disposed = false;
@@ -285,12 +270,10 @@ export class ClaudeManagedSession {
       throw new Error("Claude dormant resume workspace does not match");
     }
     if (
-      this.#owner !== "manager"
-      || this.#providerActivity !== "closed"
+      this.#providerActivity !== "closed"
       || this.#query !== null
       || this.#inbox !== null
       || this.#queryAbortController !== null
-      || this.#handoff !== null
       || this.#pending.size > 0
       || this.#stagedMessages.length > 0
       || this.#outstandingMessageIds.size > 0
@@ -335,10 +318,8 @@ export class ClaudeManagedSession {
         || this.#generation !== generation
         || this.#sessionId !== sessionId
         || this.#config.cwd !== cwd
-        || this.#owner !== "manager"
         || this.#providerActivity !== "closed"
         || this.#query !== null
-        || this.#handoff !== null
       ) {
         throw new Error("Claude dormant ownership changed during resume");
       }
@@ -360,19 +341,15 @@ export class ClaudeManagedSession {
     const pendingRequests = [...this.#pending.values()]
       .map((item) => structuredClone(item.public))
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
-    const activity =
-      this.#owner === "native"
-        ? "native"
-        : pendingRequests.length > 0
-          ? "requires_action"
-          : this.#providerActivity;
+    const activity = pendingRequests.length > 0
+      ? "requires_action"
+      : this.#providerActivity;
 
     return {
       localId: this.#localId,
       sessionId: this.#sessionId,
       resumedFrom: this.#resumedFrom,
       cwd: this.#config.cwd,
-      owner: this.#owner,
       activity,
       mode: this.#mode,
       desiredMode: this.#desiredMode,
@@ -388,7 +365,6 @@ export class ClaudeManagedSession {
       outstandingMessageIds: [...this.#outstandingMessageIds],
       stillQueuedMessageIds: [...this.#stillQueuedMessageIds],
       queueKnowledge: this.#queueKnowledge,
-      handoff: cloneHandoff(this.#handoff),
       lastError: this.#lastError,
       generation: this.#generation,
       startedAt: this.#startedAt,
@@ -607,128 +583,14 @@ export class ClaudeManagedSession {
     throw new Error(`Response ${response.decision} cannot answer a permission`);
   }
 
-  async prepareCliHandoff(
-    handoffId = this.#runtime.randomUUID(),
-    signal?: AbortSignal,
-  ): Promise<ClaudeCliHandoff> {
-    this.#assertManagerControl();
-    signal?.throwIfAborted();
-    if (!this.#sessionId) throw new Error("Claude session has not initialized");
-    const terminalConsumer =
-      (this.#providerActivity === "closed" || this.#providerActivity === "failed")
-      && this.#query === null
-      && this.#inbox === null;
-    if (this.snapshot.activity !== "idle" && !terminalConsumer) {
-      throw new Error("Claude CLI handoff requires an idle session");
-    }
-    if (this.#pending.size > 0) {
-      throw new Error("Claude CLI handoff cannot abandon pending requests");
-    }
-    if (
-      this.#outstandingMessageIds.size > 0 ||
-      this.#stillQueuedMessageIds.size > 0 ||
-      (this.#inbox?.bufferedCount ?? 0) !== 0 ||
-      this.#stagedMessages.length > 0 ||
-      this.#queueKnowledge !== "known"
-    ) {
-      throw new Error("Claude CLI handoff requires a known-empty input queue");
-    }
-
-    const now = this.#runtime.now().toISOString();
-    this.#handoff = {
-      id: handoffId,
-      state: "prepared",
-      sessionId: this.#sessionId,
-      cwd: this.#config.cwd,
-      command: {
-        executable: this.#config.claudeCodeExecutable
-          ?? this.#runtime.claudeCodeExecutable
-          ?? "claude",
-        args: ["--resume", this.#sessionId],
-        cwd: this.#config.cwd,
-      },
-      preparedAt: now,
-      attachedAt: null,
-      exitedAt: null,
-      wrapperPid: null,
-      exitCode: null,
-      error: null,
-    };
-    this.#owner = "native";
-    const disconnect = this.#disconnectQuery(new Error("Claude ownership transferred to the native CLI"));
-    this.#handoffDisconnect = disconnect;
-    // Publish foreign authority before waiting for provider cleanup. A timeout
-    // can now only initiate reclaim; it can never restore a stale writable
-    // manager projection while this disconnect completes in the background.
-    this.#touch();
-    await waitWithSignal(disconnect, signal);
-    signal?.throwIfAborted();
-    if (this.#handoffDisconnect === disconnect) this.#handoffDisconnect = null;
-    return cloneHandoff(this.#handoff) as ClaudeCliHandoff;
-  }
-
-  markCliAttached(handoffId: string, wrapperPid: number): void {
-    const handoff = this.#requireHandoff(handoffId, "prepared");
-    if (!Number.isInteger(wrapperPid) || wrapperPid <= 0) {
-      throw new Error("wrapperPid must be a positive integer");
-    }
-    handoff.state = "attached";
-    handoff.wrapperPid = wrapperPid;
-    handoff.attachedAt = this.#runtime.now().toISOString();
-    this.#touch();
-  }
-
-  markCliExited(handoffId: string, exitCode: number | null): void {
-    const handoff = this.#handoff;
-    if (!handoff || handoff.id !== handoffId) {
-      throw new Error(`Unknown Claude CLI handoff ${handoffId}`);
-    }
-    if (handoff.state !== "attached") {
-      throw new Error("Only an attached Claude CLI handoff can exit");
-    }
-    handoff.state = "exited";
-    handoff.exitCode = exitCode;
-    handoff.exitedAt = this.#runtime.now().toISOString();
-    this.#touch();
-  }
-
-  markCliAttachFailed(handoffId: string, error: string): void {
-    const handoff = this.#requireHandoff(handoffId, "prepared");
-    handoff.state = "exited";
-    handoff.error = nonEmptyText(error, "handoff error");
-    handoff.exitedAt = this.#runtime.now().toISOString();
-    this.#touch();
-  }
-
-  async reclaimFromCli(handoffId: string, signal?: AbortSignal): Promise<void> {
-    const handoff = this.#requireHandoff(handoffId, "exited");
-    const sessionId = handoff.sessionId;
-    // Keep native/foreign authority published until the resumed SDK stream has
-    // proven the exact provider identity and version through init.
-    this.#providerActivity = "starting";
-    this.#lastError = null;
-    this.#touch();
-    try {
-      const disconnect = this.#handoffDisconnect;
-      if (disconnect) {
-        await waitWithSignal(disconnect, signal);
-        if (this.#handoffDisconnect === disconnect) this.#handoffDisconnect = null;
-      }
-      signal?.throwIfAborted();
-      await this.#connect(sessionId, undefined, signal);
-      this.#handoff = null;
-      this.#owner = "manager";
-      this.#touch();
-    } catch (error) {
-      this.#owner = "native";
-      this.#handoff = handoff;
-      this.#providerActivity = "failed";
-      this.#lastError = error instanceof Error ? error.message : String(error);
-      this.#touch();
-      throw error;
-    }
-  }
-
+  /*
+    The CLI handoff machinery is gone. It existed to move exclusive ownership to
+    a native `claude --resume` and take it back after that process exited:
+    prepareCliHandoff / markCliAttached / markCliExited / markCliAttachFailed /
+    reclaimFromCli. Shared join means a native CLI runs alongside the manager's
+    query instead of replacing it, so there is no ownership to transfer and no
+    exit to wait for. `#owner` is structurally "manager" for the same reason.
+  */
   dispose(): Promise<void> {
     if (this.#disposePromise) return this.#disposePromise;
     this.#disposed = true;
@@ -938,7 +800,7 @@ export class ClaudeManagedSession {
         this.#ready.reject(error);
         throw error;
       }
-      if (this.#owner === "manager" && !this.#disposed) {
+      if (!this.#disposed) {
         this.#deactivateConsumer(query, epoch);
         this.#providerActivity = "closed";
         this.#abortAllPending();
@@ -947,7 +809,7 @@ export class ClaudeManagedSession {
     } catch (error) {
       if (epoch !== this.#epoch) return;
       this.#ready.reject(error);
-      if (this.#owner === "manager" && !this.#disposed) {
+      if (!this.#disposed) {
         this.#deactivateConsumer(query, epoch);
         this.#providerActivity = "failed";
         this.#lastError = error instanceof Error ? error.message : String(error);
@@ -1088,7 +950,7 @@ export class ClaudeManagedSession {
     input: Record<string, unknown>,
     options: ClaudeCanUseToolOptions,
   ): Promise<ClaudePermissionResult> {
-    if (epoch !== this.#epoch || this.#owner !== "manager") {
+    if (epoch !== this.#epoch) {
       return Promise.resolve({
         behavior: "deny",
         message: "Agent Manager no longer owns this Claude session",
@@ -1204,7 +1066,7 @@ export class ClaudeManagedSession {
     request: ClaudeElicitationRequest,
     signal: AbortSignal,
   ): Promise<ClaudeElicitationResult> {
-    if (epoch !== this.#epoch || this.#owner !== "manager" || signal.aborted) {
+    if (epoch !== this.#epoch || signal.aborted) {
       return Promise.resolve({ action: "decline" });
     }
     const id = `elicitation:${request.elicitationId ?? this.#runtime.randomUUID()}`;
@@ -1318,11 +1180,12 @@ export class ClaudeManagedSession {
     }
   }
 
+  /*
+    Nothing takes control away from the manager any more, so the only reason a
+    manager operation can be refused is that this session has been disposed.
+  */
   #assertManagerControl(): void {
     if (this.#disposed) throw new Error("Claude managed session is disposed");
-    if (this.#owner !== "manager") {
-      throw new Error("Claude session is controlled by the native CLI");
-    }
   }
 
   #requireLiveConsumer(): {
@@ -1352,22 +1215,6 @@ export class ClaudeManagedSession {
       && (this.#inbox?.bufferedCount ?? 0) === 0
       && this.#queueKnowledge === "known"
       && this.#backgroundTaskIds.size === 0;
-  }
-
-  #requireHandoff(
-    id: string,
-    state: ClaudeCliHandoff["state"],
-  ): ClaudeCliHandoff {
-    const handoff = this.#handoff;
-    if (!handoff || handoff.id !== id) {
-      throw new Error(`Unknown Claude CLI handoff ${id}`);
-    }
-    if (handoff.state !== state) {
-      throw new Error(
-        `Claude CLI handoff ${id} is ${handoff.state}, expected ${state}`,
-      );
-    }
-    return handoff;
   }
 
   #disconnectQuery(reason: unknown): Promise<void> {

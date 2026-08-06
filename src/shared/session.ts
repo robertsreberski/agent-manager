@@ -332,7 +332,27 @@ export interface SessionControlCoordination {
   responseResolution: ResponseResolution;
 }
 
-/** Canonical live-control semantics for each provider. */
+/**
+ * Canonical live-control semantics for each provider.
+ *
+ * Both providers share their live conversation, and neither requires the other
+ * controller to exit. They differ in how a request is resolved, because that
+ * difference is a provider mechanism rather than a preference:
+ *
+ * - Codex publishes `serverRequest/resolved`, so a cockpit client and a native
+ *   `--remote` peer can see the same request and race to answer it. The first
+ *   exact response wins and every other projection goes stale.
+ * - Claude has no equivalent event. Each controller holds its own SDK query and
+ *   its own permission callbacks, so two surfaces never see the same request and
+ *   there is nothing to arbitrate. `single-controller` states that a request has
+ *   exactly one controller who may answer it — not that the session has one
+ *   writer.
+ *
+ * A Claude session that both surfaces drive at once forks: the two user messages
+ * parent onto the same transcript node, which is the well-formed two-branch DAG
+ * `--fork-session` already produces. That is surfaced, not prevented; see the
+ * fork lifecycle item in the activity projector.
+ */
 export function providerControlCoordination(
   provider: Provider,
 ): SessionControlCoordination {
@@ -343,15 +363,19 @@ export function providerControlCoordination(
         responseResolution: "first-response-wins",
       }
     : {
-        mode: "exclusive",
-        nativeAttach: "handoff",
+        mode: "shared",
+        nativeAttach: "join",
         responseResolution: "single-controller",
       };
 }
 
+/**
+ * `waiting-for-native-exit` is gone with Claude exclusivity. Nothing waits for a
+ * native controller to leave any more, so there is no healthy indefinite wait to
+ * represent; every remaining state is a bounded transient or a dead end.
+ */
 export type SessionControlRecoveryState =
   | "reconnecting"
-  | "waiting-for-native-exit"
   | "retrying"
   | "needs-attention";
 
@@ -371,6 +395,23 @@ export interface WithheldCapability {
   reason: string;
 }
 
+/**
+ * One live process writing this conversation. Peer presence is an observational
+ * fact, exactly as a Codex execution-environment ID is: it never grants or
+ * revokes a capability, and authorization keeps reading `capabilities` alone.
+ *
+ * This is a list rather than a second `runtimePid` because a shared session
+ * genuinely has more than one writer, and the cockpit has to be able to say how
+ * many. Overloading the single-valued pid fields would make the takeover
+ * inspector's process anchor mean two different things depending on the plane.
+ */
+export interface SessionControlPeer {
+  /** `manager` is Agent Manager's own SDK child; `native` is an operator's CLI. */
+  kind: "manager" | "native";
+  pid: number;
+  startedAt: string;
+}
+
 export interface SessionControl {
   plane: ControlPlane;
   /** Which controller currently has authority to write to the harness. */
@@ -382,6 +423,11 @@ export interface SessionControl {
   capabilities: ControlCapability[];
   /** Display-only explanations. Authorization reads capabilities, never this list. */
   withheld: WithheldCapability[];
+  /**
+   * Every live writer this build can prove, empty when there is only one. Not an
+   * ownership token; see `SessionControlPeer`.
+   */
+  peers: SessionControlPeer[];
   /** Null when this session is already manager-owned or cannot be adopted safely. */
   takeover: SessionTakeover | null;
 }
@@ -590,6 +636,7 @@ export function observeOnlyControl(): SessionControl {
       attach: DEFERRED,
       resume: DEFERRED,
     }),
+    peers: [],
     takeover: null,
   };
 }

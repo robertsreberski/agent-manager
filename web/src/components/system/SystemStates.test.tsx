@@ -50,6 +50,7 @@ function cockpitSession(overrides: Partial<CockpitSessionView> = {}): CockpitSes
       recovery: null,
       capabilities: ["queue", "set-profile", "attach"],
       withheld: [{ capability: "set-model", reason: "This provider cannot change models mid-session." }],
+      peers: [],
       takeover: null,
     },
     profile: "execute",
@@ -128,7 +129,7 @@ describe("SessionCapabilityPanel", () => {
 
   it("keeps unknown facts unknown and never calls a zero-dirty worktree dirty", () => {
     const { rerender } = render(<SessionCapabilityPanel
-      session={cockpitSession({ workspaceIdentity: null, cwd: null, profile: null, model: null, effort: null, control: { plane: "observe-only", authority: "none", coordination: { mode: "observe-only", nativeAttach: "none", responseResolution: "single-controller" }, recovery: null, capabilities: [], withheld: [], takeover: null } })}
+      session={cockpitSession({ workspaceIdentity: null, cwd: null, profile: null, model: null, effort: null, control: { plane: "observe-only", authority: "none", coordination: { mode: "observe-only", nativeAttach: "none", responseResolution: "single-controller" }, recovery: null, capabilities: [], withheld: [], peers: [], takeover: null } })}
       facts={{ sessionId: "local:codex:managed-1", generation: 1, turnUsage: null, account: { available: false, reason: "unsupported-provider" } }}
       factsStatus="loaded"
     />);
@@ -150,7 +151,7 @@ describe("SessionCapabilityPanel", () => {
     expect(onRevealAttach).toHaveBeenCalledOnce();
     fireEvent.click(screen.getByRole("button", { name: "Advanced · CLI access" }));
 
-    rerender(<SessionCapabilityPanel session={cockpitSession()} facts={facts} factsStatus="loaded" attachCommand="codex resume managed-1 --remote unix:///tmp/codex.sock" attachDescription="Join the managed Codex App Server." attachRequiresHandoff={false} onRevealAttach={onRevealAttach} />);
+    rerender(<SessionCapabilityPanel session={cockpitSession()} facts={facts} factsStatus="loaded" attachCommand="codex resume managed-1 --remote unix:///tmp/codex.sock" attachDescription="Join the managed Codex App Server." onRevealAttach={onRevealAttach} />);
     expect(screen.queryByText("codex resume managed-1 --remote unix:///tmp/codex.sock")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Advanced · CLI access" }));
     expect(screen.getByText("codex resume managed-1 --remote unix:///tmp/codex.sock")).toBeInTheDocument();
@@ -167,38 +168,48 @@ describe("SessionCapabilityPanel", () => {
       recovery: null,
       capabilities: ["take-control"],
       withheld: [],
+      peers: [],
       takeover: null,
     } as CockpitSessionView["control"];
     const { rerender } = render(<SessionCapabilityPanel session={cockpitSession({ provider: "codex", control: foreign })} facts={facts} factsStatus="loaded" />);
     expect(screen.getByText("Migrate once to shared CLI + web control")).toBeInTheDocument();
 
+    /*
+      Claude used to read "Move exclusive Claude Code control to the web app".
+      Only Codex migrates now, so both providers get the same sentence — and a
+      Claude session should not be offering takeover at all.
+    */
     rerender(<SessionCapabilityPanel session={cockpitSession({ provider: "claude", control: foreign })} facts={facts} factsStatus="loaded" />);
-    expect(screen.getByText("Move exclusive Claude Code control to the web app")).toBeInTheDocument();
+    expect(screen.getByText("Migrate once to shared CLI + web control")).toBeInTheDocument();
+    expect(screen.queryByText(/exclusive Claude Code control/iu)).not.toBeInTheDocument();
   });
 
-  it("describes a dormant Claude wrapper as resume, not an active-writer handoff", () => {
+  it("describes a dormant Claude wrapper as a join command, not an ownership handoff", () => {
     const dormant = cockpitSession({
       provider: "claude",
       activity: "completed",
       control: {
         plane: "resume-only",
         authority: "none",
-        coordination: { mode: "exclusive", nativeAttach: "handoff", responseResolution: "single-controller" },
+        coordination: { mode: "shared", nativeAttach: "join", responseResolution: "single-controller" },
         recovery: null,
         capabilities: ["resume"],
         withheld: [],
+        peers: [],
         takeover: null,
       },
     });
     const { rerender } = render(<SessionCapabilityPanel session={dormant} facts={facts} factsStatus="loaded" onRevealAttach={vi.fn()} />);
     fireEvent.click(screen.getByRole("button", { name: "Advanced · CLI access" }));
-    expect(screen.getByRole("button", { name: "Show Claude Code resume command" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Show Claude Code join command" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Advanced · CLI access" }));
 
-    rerender(<SessionCapabilityPanel session={dormant} facts={facts} factsStatus="loaded" attachCommand="agent-manager attach exact-claude" attachRequiresHandoff />);
+    rerender(<SessionCapabilityPanel session={dormant} facts={facts} factsStatus="loaded" attachCommand="agent-manager attach exact-claude" />);
     fireEvent.click(screen.getByRole("button", { name: "Advanced · CLI access" }));
-    expect(screen.getByText("resumes the exact conversation in Claude Code; web replies stay unavailable while it runs")).toBeInTheDocument();
-    expect(screen.queryByText("running this moves provider control to the CLI")).not.toBeInTheDocument();
+    // The old copy promised web replies would stop. They do not.
+    expect(screen.getByText("CLI joins; web control stays active")).toBeInTheDocument();
+    expect(screen.queryByText(/moves provider control to the CLI/iu)).not.toBeInTheDocument();
+    expect(screen.queryByText(/web replies stay unavailable/iu)).not.toBeInTheDocument();
   });
 
   it("renders every archived capability as definitively unavailable", () => {

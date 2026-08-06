@@ -216,6 +216,7 @@ function externalCodexSession(): SessionView {
       recovery: null,
       capabilities: [],
       withheld: [],
+      peers: [],
       takeover: null,
     },
     workspaceIdentity: null,

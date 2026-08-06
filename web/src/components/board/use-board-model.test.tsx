@@ -28,6 +28,7 @@ function session(id: string, updatedAt: string, activity: CockpitSessionView["ac
       recovery: null,
       capabilities: [],
       withheld: [],
+      peers: [],
       takeover: null,
     },
     profile: null,

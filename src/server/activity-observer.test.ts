@@ -70,7 +70,11 @@ function externalSession(): SessionView {
   };
 }
 
-function available(items: TranscriptItem[], truncated = false): TranscriptReadResult {
+function available(
+  items: TranscriptItem[],
+  truncated = false,
+  forked = false,
+): TranscriptReadResult {
   return {
     items,
     transcript: {
@@ -79,6 +83,7 @@ function available(items: TranscriptItem[], truncated = false): TranscriptReadRe
       source: "codex-rollout",
       itemCount: items.length,
       reason: null,
+      forked,
     },
   };
 }
@@ -199,6 +204,7 @@ test("projects transcript failure reasons into the sole activity timeline", () =
             source: null,
             itemCount: 0,
             reason,
+            forked: false,
           },
         };
       },
@@ -235,6 +241,7 @@ test("replaces an unavailable lifecycle fact when transcript content appears", (
       source: null,
       itemCount: 0,
       reason: "not-found",
+      forked: false,
     },
   };
   const observer = new SelectedTranscriptActivityObserver({
@@ -274,6 +281,7 @@ test("a transient transcript read failure preserves already reconciled history",
       source: null,
       itemCount: 0,
       reason: "unreadable",
+      forked: false,
     },
   };
   observer.seedOnce(session);
@@ -317,6 +325,7 @@ test("reselecting during a transient transcript failure retains history and one 
       source: null,
       itemCount: 0,
       reason: "unreadable",
+      forked: false,
     },
   };
 
@@ -560,7 +569,7 @@ test("reports an unreadable transcript instead of presenting silence", () => {
       read() {
         return {
           items: [],
-          transcript: { state: "unavailable", truncated: false, source: null, itemCount: 0, reason: "not-found" },
+          transcript: { state: "unavailable", truncated: false, source: null, itemCount: 0, reason: "not-found", forked: false },
         };
       },
     },
@@ -606,4 +615,46 @@ test("the retention boundary is stated once, and only when something is missing"
 
   unsubscribe();
   hub.dispose();
+});
+
+test("a forked transcript states so once, and a linear read clears it", () => {
+  const hub = new ActivityHub();
+  const session = externalSession();
+  let forked = true;
+  const observer = new SelectedTranscriptActivityObserver({
+    hub,
+    reader: {
+      read() {
+        return available([{
+          kind: "message",
+          id: "message-1",
+          role: "assistant",
+          text: "Shared reply",
+          createdAt: "2026-08-03T00:00:01.000Z",
+          status: "complete",
+          label: null,
+          turnId: null,
+          memoryCitation: null,
+        }], false, forked);
+      },
+    },
+  });
+
+  const forkItems = () => (hub.snapshot(session.id)?.items ?? [])
+    .filter((item) => item.id === "transcript:fork");
+
+  observer.hydrate(session);
+  assert.equal(forkItems().length, 1);
+  const first = forkItems()[0];
+  assert.equal(first?.kind === "lifecycle" ? first.title : null, "This conversation forked");
+
+  // Repolling the same forked transcript must not stack duplicates.
+  observer.hydrate(session);
+  observer.hydrate(session);
+  assert.equal(forkItems().length, 1);
+
+  // A later linear read removes the warning rather than leaving it stuck.
+  forked = false;
+  observer.hydrate(session);
+  assert.deepEqual(forkItems(), []);
 });

@@ -526,6 +526,7 @@ test("Codex verifies the selected UUID against session metadata", () => {
       source: null,
       itemCount: 0,
       reason: "unsupported",
+      forked: false,
     },
   });
 });
@@ -552,6 +553,9 @@ test("Claude follows the latest parentUuid branch and renders only human-visible
   const result = new LocalSessionTranscriptReader({ claudeHome: fixture.home }).read(claudeRootSession());
   assert.equal(result.transcript.state, "available");
   assert.equal(result.transcript.source, "claude-transcript");
+  // `u1` has two identity-matching children here, which is structurally a fork:
+  // the abandoned branch is real history this chain does not show.
+  assert.equal(result.transcript.forked, true);
   assert.deepEqual(
     result.items.flatMap((item) => (item.kind === "message" ? [{ id: item.id, role: item.role, text: item.text }] : [])),
     [
@@ -561,6 +565,63 @@ test("Claude follows the latest parentUuid branch and renders only human-visible
       { id: "claude:a2:text:0", role: "assistant", text: "Done" },
     ],
   );
+});
+
+test("a linear Claude transcript reports no fork", () => {
+  const fixture = claudeHome();
+  const project = join(fixture.projects, "-fixture-project");
+  mkdirSync(project);
+  writeFileSync(join(project, `${CLAUDE_ID}.jsonl`), jsonl([
+    claudeRow({ uuid: "u1", type: "user", content: "Hello" }),
+    claudeRow({ uuid: "a1", parentUuid: "u1", type: "assistant", content: [{ type: "text", text: "Answer" }], messageId: "msg-one" }),
+  ]));
+
+  const result = new LocalSessionTranscriptReader({ claudeHome: fixture.home }).read(claudeRootSession());
+  assert.equal(result.transcript.forked, false);
+});
+
+test("two writers answering one message fork, and the newest branch is shown", () => {
+  /*
+    The shape a joined session produces when both surfaces send at once: two user
+    messages parent onto the same assistant reply, which is the well-formed
+    two-branch DAG `--fork-session` already produces. The reader walks one
+    root-to-latest path, so append order decides which branch is rendered — and
+    that flip is exactly what the fork flag exists to explain.
+  */
+  const rows = (webFirst: boolean) => {
+    const terminal = [
+      claudeRow({ uuid: "t-user", parentUuid: "a1", type: "user", content: "From the terminal" }),
+      claudeRow({ uuid: "t-reply", parentUuid: "t-user", type: "assistant", content: [{ type: "text", text: "Terminal answer" }], messageId: "msg-terminal" }),
+    ];
+    const web = [
+      claudeRow({ uuid: "w-user", parentUuid: "a1", type: "user", content: "From the web" }),
+      claudeRow({ uuid: "w-reply", parentUuid: "w-user", type: "assistant", content: [{ type: "text", text: "Web answer" }], messageId: "msg-web" }),
+    ];
+    return [
+      claudeRow({ uuid: "u1", type: "user", content: "Shared start" }),
+      claudeRow({ uuid: "a1", parentUuid: "u1", type: "assistant", content: [{ type: "text", text: "Shared reply" }], messageId: "msg-shared" }),
+      ...(webFirst ? [...web, ...terminal] : [...terminal, ...web]),
+    ];
+  };
+
+  for (const webFirst of [true, false]) {
+    const fixture = claudeHome();
+    const project = join(fixture.projects, "-fixture-project");
+    mkdirSync(project);
+    writeFileSync(join(project, `${CLAUDE_ID}.jsonl`), jsonl(rows(webFirst)));
+
+    const result = new LocalSessionTranscriptReader({ claudeHome: fixture.home }).read(claudeRootSession());
+    assert.equal(result.transcript.forked, true, `fork must be reported (webFirst=${String(webFirst)})`);
+    const texts = result.items.flatMap((item) => (item.kind === "message" ? [item.text] : []));
+    // Whichever branch was written last is the one rendered; the other is absent.
+    assert.deepEqual(
+      texts,
+      webFirst
+        ? ["Shared start", "Shared reply", "From the terminal", "Terminal answer"]
+        : ["Shared start", "Shared reply", "From the web", "Web answer"],
+      `the last-written branch must win (webFirst=${String(webFirst)})`,
+    );
+  }
 });
 
 test("Claude resolves a nested individual subagent transcript and rejects parent hydration", () => {

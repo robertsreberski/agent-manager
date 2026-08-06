@@ -184,7 +184,7 @@ function stoppedRecoveryRecord(
     model: "opus",
     effort: "high",
     createdAt: "2026-08-03T08:00:00.000Z",
-    ownership: "manager-exclusive",
+    ownership: "shared",
     managerControl: "stopped",
     ...overrides,
   };
@@ -253,6 +253,7 @@ async function externalClaudeView(runtime: BridgeRuntime): Promise<SessionView> 
       recovery: null,
       capabilities: [],
       withheld: view.control.withheld,
+      peers: [],
       takeover: null,
     },
   };
@@ -489,7 +490,7 @@ test("expires a hung model lookup and permits a clean provider retry", async () 
   adapter.dispose();
 });
 
-test("rejects a delayed model catalog after native ownership transfer", async () => {
+test("a join command does not invalidate a delayed model catalog, but ending the query does", async () => {
   const runtime = new BridgeRuntime();
   const changes: SessionView[] = [];
   const adapter = new ClaudeProviderControlAdapter({
@@ -525,11 +526,28 @@ test("rejects a delayed model catalog after native ownership transfer", async ()
     resolveModels = resolve;
   });
   query.supportedModelsOverride = () => deferredModels;
+  /*
+    This required the opposite: asking for a native command transferred ownership,
+    so an in-flight catalog lookup had to be thrown away. A join command changes
+    nothing, so the lookup must now succeed.
+  */
   const lookup = adapter.getSettingsOptions(idle, context());
-  const handoff = await adapter.getAttachInstruction(idle, context());
-  assert.equal(handoff?.kind, "claude-resume");
+  const instruction = await adapter.getAttachInstruction(idle, context());
+  assert.equal(instruction?.kind, "claude-resume");
   resolveModels([{ value: "sonnet", displayName: "Sonnet", description: "Balanced" }]);
-  await assert.rejects(lookup, /live manager-owned SDK query|changed during settings lookup/);
+  const options = await lookup;
+  assert.deepEqual(options.models?.map((model) => model.value), ["sonnet"]);
+
+  // The guard itself still holds: a catalog that resolves after its query has
+  // ended must not be published.
+  let resolveSecond!: (models: ClaudeModelInfo[]) => void;
+  query.supportedModelsOverride = () => new Promise<ClaudeModelInfo[]>((resolve) => {
+    resolveSecond = resolve;
+  });
+  const afterClose = adapter.getSettingsOptions(idle, context());
+  query.close();
+  resolveSecond([{ value: "sonnet", displayName: "Sonnet", description: "Balanced" }]);
+  await assert.rejects(afterClose, /live manager-owned SDK query|changed during settings lookup/);
   adapter.dispose();
 });
 
@@ -1370,94 +1388,45 @@ test("publishes exact multi-question and approval attention details", async () =
   adapter.dispose();
 });
 
-test("returns the provider handoff id with native Claude attach instructions", async () => {
+test("native Claude attach returns a plain join command and keeps web control", async () => {
   const runtime = new BridgeRuntime();
-  const changes: SessionView[] = [];
   const adapter = new ClaudeProviderControlAdapter({
     runtime,
-    claudeExecutable: "/opt/agent-manager/bin/claude",
     resolveWorkspace: () => "/workspace",
-    onSessionChanged: (session) => changes.push(session),
+    claudeExecutable: "/opt/agent-manager/bin/claude",
   });
-  await adapter.createSession(
-    {
-      provider: "claude",
-      workspaceId: "workspace",
-      initialMessage: "Prepare",
-      profile: "plan",
-      sandbox: null,
-      model: null,
-      effort: null,
-      idempotencyKey: "create-handoff-claude",
-    },
-    context(),
-  );
-  const query = runtime.queries[0];
-  assert.ok(query);
-  await eventually(() => query.input.length === 1);
-  query.emit({
-    type: "result",
-    subtype: "success",
-    user_message_uuid: query.input[0]?.uuid,
-    session_id: "managed-claude-1",
-  });
-  query.emit({
-    type: "system",
-    subtype: "session_state_changed",
-    state: "idle",
-    session_id: "managed-claude-1",
-  });
-  await eventually(() => changes.at(-1)?.status === "idle");
-  const view = changes.at(-1);
-  assert.ok(view);
-  const instruction = await adapter.getAttachInstruction(view, context());
-  assert.equal(instruction?.kind, "claude-resume");
+  const created = await adapter.createSession({
+    sandbox: null,
+    provider: "claude",
+    workspaceId: "workspace",
+    initialMessage: "Join, do not hand over",
+    profile: "execute",
+    model: null,
+    effort: null,
+    idempotencyKey: "create-join-instruction-claude",
+  }, context());
+
+  /*
+    This replaces "returns the provider handoff id with native Claude attach
+    instructions". That test required the opposite of the product: asking for a
+    native command disconnected the manager's query, published `authority:
+    "foreign"`, emptied every capability, and returned a `handoffId` the CLI had
+    to report back through. Now the command is just a command.
+  */
+  const instruction = await adapter.getAttachInstruction!(created, context());
   assert.deepEqual(instruction?.argv, [
     "/opt/agent-manager/bin/claude",
     "--resume",
     "managed-claude-1",
   ]);
-  assert.equal(
-    query.params.options.pathToClaudeCodeExecutable,
-    "/opt/agent-manager/bin/claude",
-  );
-  assert.equal(typeof instruction?.handoffId, "string");
-  assert.ok((instruction?.handoffId?.length ?? 0) > 0);
-  const nativeOwned = changes.at(-1);
-  assert.ok(nativeOwned);
-  assert.equal(nativeOwned.control.authority, "foreign");
-  assert.deepEqual(nativeOwned.control.capabilities, []);
-  assert.match(
-    nativeOwned.control.withheld.find(({ capability }) => capability === "resume")?.reason ?? "",
-    /already owns this session/,
-  );
-  const handoffId = instruction?.handoffId;
-  assert.ok(handoffId);
-  adapter.markCliAttached("managed-claude-1", handoffId, 4242);
-  adapter.markCliExited("managed-claude-1", handoffId, 0);
-  runtime.autoInitialize = false;
-  runtime.initializationHangs = true;
-  const reclaim = adapter.reclaimFromCli("managed-claude-1", handoffId);
-  await eventually(() => runtime.queries.length === 2);
-  assert.equal(
-    changes.at(-1)?.control.authority,
-    "foreign",
-    "write authority stays withdrawn until exact provider init",
-  );
-  runtime.queries[1]?.emit({
-    type: "system",
-    subtype: "init",
-    session_id: "managed-claude-1",
-    claude_code_version: CLAUDE_CODE_VERSION,
-    model: "default-model",
-    permissionMode: "plan",
-    capabilities: ["interrupt_receipt_v1"],
-  });
-  const reclaimed = await reclaim;
-  assert.equal(reclaimed.control.authority, "manager");
-  assert.ok(reclaimed.control.capabilities.includes("queue"));
+  assert.equal(instruction?.kind, "claude-resume");
+  assert.match(instruction?.warning ?? "", /forks/u);
+  const after = adapter.getManagedSession("managed-claude-1");
+  assert.equal(after?.control.authority, "manager", "asking for a command changes nothing");
+  assert.equal(after?.control.capabilities.includes("queue"), true);
   await adapter.dispose();
 });
+
 
 test("restores only exact persisted Claude identities with their profile, model, and effort", async () => {
   const runtime = new BridgeRuntime();
@@ -1520,7 +1489,7 @@ test("restores deliberately stopped Claude control without opening an SDK query"
     model: "opus",
     effort: "high",
     createdAt: "2026-08-03T08:00:00.000Z",
-    ownership: "manager-exclusive",
+    ownership: "shared",
     managerControl: "stopped",
   };
 
@@ -1586,10 +1555,15 @@ test("in-web resume stays dormant until commit, then atomically publishes one ex
   );
   assert.equal(changes.length, publishedBeforeResume);
   assert.equal(hookSourceArbiter.shouldPollTranscript(record.providerThreadId), true);
+  /*
+    Native resume used to be blocked here: an uncommitted SDK owner would have
+    raced a native CLI for exclusive ownership. Nothing races now — a CLI launched
+    mid-adoption simply becomes another writer — so the command stays available
+    while the durable commit is still pending.
+  */
   assert.equal(
-    await adapter.getAttachInstruction(dormant, context()),
-    null,
-    "native resume must be blocked while an SDK owner awaits commit",
+    (await adapter.getAttachInstruction(dormant, context()))?.kind,
+    "claude-resume",
   );
   await assert.rejects(
     adapter.resumeSession(dormant, "plan", context()),
@@ -1799,7 +1773,15 @@ test("unexpected stream close atomically retires the writer and reports managed 
   assert.equal(rejected.status, "failed");
   assert.match(rejected.error?.message ?? "", /does not own the Claude SDK query/);
 
-  assert.equal(await adapter.getAttachInstruction(changes.at(-1)!, context()), null);
+  /*
+    A retired writer used to make the native command unavailable, because asking
+    for one meant preparing an ownership handoff and there was no live query to
+    hand over. The command is now just a command, and the conversation still
+    exists on disk, so it stays offerable — which is the whole point of the
+    resume-only projection.
+  */
+  const stillOpenable = await adapter.getAttachInstruction(changes.at(-1)!, context());
+  assert.deepEqual(stillOpenable?.argv, ["claude", "--resume", "managed-claude-1"]);
   await adapter.dispose();
 });
 
@@ -1842,7 +1824,7 @@ test("unexpected provider failure atomically retires the writer and reports mana
   await adapter.dispose();
 });
 
-test("markerless hook conflict withdraws manager writes while manager-origin hooks stay ignored", async () => {
+test("a native peer turn leaves the joined manager query alive and writable", async () => {
   const runtime = new BridgeRuntime();
   const arbiter = new ClaudeHookSourceArbiter();
   const losses: string[] = [];
@@ -1879,14 +1861,24 @@ test("markerless hook conflict withdraws manager writes while manager-origin hoo
   assert.deepEqual(losses, []);
   assert.notEqual(adapter.getManagedSession("managed-claude-1"), null);
 
+  /*
+    The inverse of what this test used to assert, and the single most important
+    behaviour in the shared-join change. A markerless hook is the operator's own
+    terminal taking a turn. It used to answer `ownership-conflict` and dispose the
+    manager's query, so a joined session died the moment its owner typed — and
+    only when the HTTP hook happened to be installed, which is why it passed
+    every unit test while being broken in every real session.
+  */
   assert.deepEqual(arbiter.accept(hook), {
-    accepted: false,
-    reason: "ownership-conflict",
+    accepted: true,
+    suppressTranscriptPolling: true,
   });
-  assert.deepEqual(losses, ["ownership-conflict"]);
-  assert.equal(adapter.getManagedSession("managed-claude-1"), null);
-  assert.equal(runtime.queries[0]?.params.options.abortController.signal.aborted, true);
-  assert.equal(runtime.queries[0]?.closeCalls, 1);
+  assert.deepEqual(losses, [], "a peer turn is not a managed-session loss");
+  const joined = adapter.getManagedSession("managed-claude-1");
+  assert.notEqual(joined, null, "web control survives a native peer turn");
+  assert.equal(joined?.control.capabilities.includes("queue"), true);
+  assert.equal(runtime.queries[0]?.params.options.abortController.signal.aborted, false);
+  assert.equal(runtime.queries[0]?.closeCalls, 0);
   await adapter.dispose();
 });
 
@@ -2179,7 +2171,7 @@ test("external Claude adoption resumes the exact identity and stays unpublished 
   await adapter.dispose();
 });
 
-test("a native hook during first adoption aborts the reserved SDK writer without suppressing the hook", async () => {
+test("a native hook during first adoption no longer aborts the joining writer", async () => {
   const runtime = new BridgeRuntime();
   const external = await externalClaudeView(runtime);
   const changes: SessionView[] = [];
@@ -2205,22 +2197,23 @@ test("a native hook during first adoption aborts the reserved SDK writer without
     onActivity: (sessionId, mutation) => activity.push({ sessionId, mutation }),
   });
 
-  await assert.rejects(
-    adapter.adoptExternalSession(external, "ask-first", context()),
-    /native Claude owner appeared during web adoption/u,
-  );
+  /*
+    This test previously required the opposite: a native hook mid-adoption
+    cancelled the reservation and aborted the SDK writer, because under
+    exclusivity a second writer appearing meant adoption was racing an owner.
+    Joining one is the intended outcome, so adoption is fenced by identity alone
+    and a concurrent native turn is just a peer turn.
+  */
+  const adopted = await adapter.adoptExternalSession(external, "ask-first", context());
+  assert.equal(adopted.providerThreadId, external.providerThreadId);
   assert.deepEqual(decisions, [{ accepted: true, suppressTranscriptPolling: true }]);
-  assert.equal(runtime.queries.at(-1)?.closeCalls, 1);
-  assert.equal(runtime.queries.at(-1)?.params.options.abortController.signal.aborted, true);
-  assert.equal(adapter.getManagedSession(external.providerThreadId), null);
-  assert.deepEqual(changes, []);
-  assert.deepEqual(activity, []);
+  assert.equal(runtime.queries.at(-1)?.closeCalls, 0);
+  assert.equal(runtime.queries.at(-1)?.params.options.abortController.signal.aborted, false);
   assert.equal(hookSourceArbiter.lastHookAt(external.providerThreadId), 42);
-  assert.equal(hookSourceArbiter.shouldPollTranscript(external.providerThreadId), false);
-  assert.throws(
-    () => adapter.commitExternalAdoption(external.providerThreadId),
-    /Unknown managed Claude session/u,
-  );
+  // Adoption stays unpublished until its managed identity is durable, so the
+  // committed session is what proves the writer survived the peer turn.
+  adapter.commitExternalAdoption(external.providerThreadId);
+  assert.ok(adapter.getManagedSession(external.providerThreadId));
   await adapter.dispose();
 });
 
@@ -2316,20 +2309,26 @@ test("external adoption retains identity after rejected close and retries cleanu
   assert.ok(query);
   query.closeErrors.push(new Error("external close rejected"));
 
-  assert.equal(hookSourceArbiter.accept(
-    nativeStopHook(external.providerThreadId, "reject-external-close"),
-  ).accepted, true);
+  /*
+    A native hook used to trigger this cleanup, because it withdrew the manager's
+    writer. It no longer withdraws anything, so the remaining way a provisional
+    adoption is cleaned up — explicit cancellation — is what drives the rejected
+    close here. The quarantine-and-retry behaviour under test is unchanged.
+  */
+  // Attach the handler at creation: the close rejects before the later await.
+  const cancelled = adapter.abortExternalAdoption(external.providerThreadId).catch(() => undefined);
   await eventually(() => query.closeCalls === 1);
   assert.equal(query.closeCalls, 1);
   await assert.rejects(
     adapter.adoptExternalSession(external, "ask-first", context()),
-    /already in progress/u,
+    /already in progress|quarantined during cleanup/u,
   );
   assert.throws(
     () => adapter.commitExternalAdoption(external.providerThreadId),
     /quarantined during cleanup/u,
   );
 
+  await cancelled;
   await adapter.abortExternalAdoption(external.providerThreadId);
   assert.equal(query.closeCalls, 2);
   const retry = await adapter.adoptExternalSession(external, "ask-first", context());
@@ -2351,6 +2350,8 @@ test("dormant resume retains one quarantined cleanup while provider close hangs"
   assert.ok(query);
   query.closeEndsOutput = false;
 
+  // Accepting a native peer turn no longer changes control state; the explicit
+  // cancellations below are what exercise the hanging close.
   assert.equal(hookSourceArbiter.accept(
     nativeStopHook(record.providerThreadId, "hang-dormant-close"),
   ).accepted, true);
@@ -2396,14 +2397,14 @@ test("dormant resume retains identity after rejected close and retries cleanup s
   assert.ok(query);
   query.closeErrors.push(new Error("dormant close rejected"));
 
-  assert.equal(hookSourceArbiter.accept(
-    nativeStopHook(record.providerThreadId, "reject-dormant-close"),
-  ).accepted, true);
+  // Same retarget as the external twin: cleanup is driven by explicit
+  // cancellation now that a native peer turn withdraws nothing.
+  const cancelled = adapter.abortExternalAdoption(record.providerThreadId).catch(() => undefined);
   await eventually(() => query.closeCalls === 1);
   assert.equal(query.closeCalls, 1);
   await assert.rejects(
     adapter.resumeSession(dormant, "plan", context()),
-    /awaiting durable commit/u,
+    /awaiting durable commit|quarantined during cleanup/u,
   );
   assert.throws(
     () => adapter.commitExternalAdoption(record.providerThreadId),
@@ -2411,6 +2412,7 @@ test("dormant resume retains identity after rejected close and retries cleanup s
   );
   assert.equal(adapter.getManagedSession(record.providerThreadId)?.status, "completed");
 
+  await cancelled;
   await adapter.abortExternalAdoption(record.providerThreadId);
   assert.equal(query.closeCalls, 2);
   const retry = await adapter.resumeSession(dormant, "plan", context());

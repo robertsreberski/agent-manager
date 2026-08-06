@@ -26,6 +26,7 @@ function session(id: string, capabilities: CockpitSessionView["control"]["capabi
       recovery: null,
       capabilities,
       withheld: [],
+      peers: [],
       takeover: null,
     },
     profile: null,

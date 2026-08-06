@@ -97,6 +97,7 @@ function claudeTmuxSession(providerThreadId = "claude-external"): SessionRecord 
       recovery: null,
       capabilities: ["preview", "attach"],
       withheld: [],
+      peers: [],
       takeover: null,
     },
   };

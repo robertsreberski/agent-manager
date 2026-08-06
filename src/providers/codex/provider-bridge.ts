@@ -1480,6 +1480,13 @@ export class CodexProviderBridge implements ProviderControlAdapter {
                 ...deferredToLaterLayers(),
               } as CapabilityRulings,
         ),
+        /*
+          Codex peers are execution environments on the shared app-server, not
+          local processes this bridge can name a pid for. Execution-environment
+          notifications remain observational peer presence and never reach the
+          published peer list, which is about proven local writers.
+        */
+        peers: [],
         takeover: null,
       },
       workspaceIdentity: structuredClone(this.#workspaceIdentities.get(cwd) ?? null),

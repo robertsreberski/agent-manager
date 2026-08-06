@@ -27,6 +27,7 @@ function session(overrides: Partial<BoardSession> & Pick<BoardSession, "id">): B
       recovery: null,
       capabilities: [],
       withheld: [],
+      peers: [],
       takeover: null,
     },
     profile: null,

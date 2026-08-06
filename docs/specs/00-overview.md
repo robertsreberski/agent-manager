@@ -60,7 +60,7 @@ a routine ownership control.
 | --- | --- | --- |
 | 0 | 00–03, appendix | Correct protocol facts; run the isolated Codex gate before freezing contracts |
 | 1 | 01, 04, 13 | One strict shared wire schema, cold reset, discovery/workspace model, structural deletions |
-| 2 | 02, 03 | Codex controller path, Claude and Codex hook bridges, controller arbitration |
+| 2 | 02, 03 | Codex controller path, Claude hook bridge, controller arbitration |
 | 3 | 12, 05, 06, 07 | Design system, board/drawer/thread, drafts/composer, questions/approvals |
 | 4 | 08–11 | Plans/todos, diffs, palette/lifecycle/notifications, system states/mobile/first run |
 | 5 | 13 | Dependency and package pruning, exact clean build, simple local deployment, final verification |

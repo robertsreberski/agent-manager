@@ -296,10 +296,6 @@ export interface AttachInstruction {
   argv: string[];
   cwd: string | null;
   warning: string | null;
-  /** Correlates a provider ownership handoff with the native wrapper process. */
-  handoffId?: string;
-  /** One-use owner-socket capability required before any provider process spawn. */
-  spawnNonce?: string;
 }
 
 export interface SessionModelOption {
@@ -486,10 +482,6 @@ export interface ProviderControlAdapter {
     session: SessionView,
     context: RequestContext,
   ): Promise<AvailableSessionAccountFacts>;
-  markCliAttached?(sessionId: string, handoffId: string, wrapperPid: number): void;
-  markCliExited?(sessionId: string, handoffId: string, exitCode: number | null): void;
-  markCliAttachFailed?(sessionId: string, handoffId: string, error: string): void;
-  reclaimFromCli?(sessionId: string, handoffId: string): Promise<SessionView>;
   dispose?(): void | Promise<void>;
 }
 
@@ -514,42 +506,17 @@ export interface ManagedSessionRecoveryRecord {
    */
   providerTreeId?: string | null;
   providerParentThreadId?: string | null;
-  /** Durable provider-specific ownership state; absent records predate wire 5. */
-  ownership?: "shared" | "manager-exclusive" | "handoff-prepared" | "native-exclusive";
+  /*
+    Every managed session is shared now. The exclusive Claude states —
+    `manager-exclusive`, `handoff-prepared`, `native-exclusive` — described a
+    single writer being moved to and from a native CLI, which no longer happens.
+  */
+  ownership?: "shared";
   /**
    * Claude-only control intent. `stopped` reconstructs a resumable closed view
    * without automatically opening an Agent SDK query after service restart.
    */
   managerControl?: "active" | "stopped";
-  /** Exact native owner identity retained only for exclusive Claude handoff. */
-  nativeOwner?: {
-    pid: number;
-    uid: number;
-    executable: "claude";
-    startedAt: string;
-    providerSessionId: string;
-    cwd: string;
-    associationPath?: string | undefined;
-    executablePath?: string | undefined;
-    ppid?: number | undefined;
-    processGroupId?: number | undefined;
-    foregroundProcessGroupId?: number | undefined;
-    tty?: string | undefined;
-    providerStartedAtMs?: number | null | undefined;
-    interactive?: boolean | undefined;
-    members?: ReadonlyArray<{
-      pid: number;
-      ppid: number;
-      processGroupId: number;
-      foregroundProcessGroupId: number;
-      tty: string;
-      startedAt: string;
-      startedAtMs: number;
-      executablePath: string;
-      executableDevice: number;
-      executableInode: number;
-    }> | undefined;
-  } | null;
 }
 
 export interface ManagedSessionRecoveryFailure {

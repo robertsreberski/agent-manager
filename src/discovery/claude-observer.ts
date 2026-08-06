@@ -19,6 +19,7 @@ import {
   type Diagnostic,
   type ProcessInfo,
   type Runtime,
+  type SessionControlPeer,
   type SessionRecord,
   type SessionStatus,
 } from "../core/types.ts";
@@ -29,6 +30,7 @@ import {
   normalizedText,
   number,
   object,
+  observedJoinControl,
   observedResumeControl,
   string,
   type JsonObject,
@@ -132,12 +134,21 @@ function claudeStatus(value: unknown, live: boolean): SessionStatus {
   return live ? "running" : "unknown";
 }
 
+/**
+ * Live registry entries grouped by conversation.
+ *
+ * This was `Map<sessionId, JsonObject>`, so a joined session — two live
+ * processes writing one conversation — silently collapsed to whichever entry
+ * `readdirSync` happened to yield last, and the published pid, status, model and
+ * effort came from an arbitrary one of the two. Every writer is kept now, and
+ * callers choose deliberately which one speaks for the session.
+ */
 function validClaudeRegistry(
   runtime: Runtime,
   processes: ReadonlyMap<number, ProcessInfo>,
-): Map<string, JsonObject> {
+): Map<string, JsonObject[]> {
   const directory = join(runtime.env.CLAUDE_CONFIG_DIR ?? join(runtime.homeDir, ".claude"), "sessions");
-  const result = new Map<string, JsonObject>();
+  const result = new Map<string, JsonObject[]>();
   let entries: string[];
   try {
     entries = readdirSync(directory).filter((name) => name.endsWith(".json")).slice(0, MAX_PROVIDER_ROWS);
@@ -152,12 +163,41 @@ function validClaudeRegistry(
       if (pid === null || !sessionId) continue;
       const process = processes.get(pid);
       if (!process || !commandIsClaude(process)) continue;
-      result.set(sessionId, value as JsonObject);
+      const writers = result.get(sessionId);
+      if (writers) writers.push(value as JsonObject);
+      else result.set(sessionId, [value as JsonObject]);
     } catch {
       // A partially-written or stale registry entry is not live evidence.
     }
   }
   return result;
+}
+
+/**
+ * Which live writer speaks for the session's published facts.
+ *
+ * The operator's own terminal, when there is one: that is the surface they are
+ * looking at, so its status and settings are the ones that should not surprise
+ * them. `entrypoint` is an environment passthrough rather than something the CLI
+ * derives, so this is a presentation preference and never a trust decision.
+ */
+function primaryClaudeWriter(writers: readonly JsonObject[]): JsonObject | null {
+  return writers.find((writer) => writer.entrypoint === "cli") ?? writers[0] ?? null;
+}
+
+/** Live writers as published peer facts. Observational, never authorization. */
+function claudePeers(writers: readonly JsonObject[], now: number): SessionControlPeer[] {
+  const peers: SessionControlPeer[] = [];
+  for (const writer of writers) {
+    const pid = number(writer.pid);
+    if (pid === null || pid <= 0 || peers.some((peer) => peer.pid === pid)) continue;
+    peers.push({
+      kind: writer.entrypoint === "cli" ? "native" : "manager",
+      pid,
+      startedAt: iso(number(writer.startedAt) ?? now, now),
+    });
+  }
+  return peers;
 }
 
 export function discoverClaude(
@@ -193,7 +233,8 @@ export function discoverClaude(
     const value = object(raw);
     const id = string(value?.sessionId);
     if (!value || !id) continue;
-    const liveValue = registry.get(id) ?? null;
+    const writers = registry.get(id) ?? [];
+    const liveValue = primaryClaudeWriter(writers);
     const live = liveValue !== null;
     const startedAt = number(value.startedAt) ?? number(liveValue?.startedAt) ?? now;
     if (!live && startedAt < cutoff) continue;
@@ -251,18 +292,40 @@ export function discoverClaude(
           respondable: false,
         },
       }] : [],
-      ...(!live && cwd ? { control: observedResumeControl("claude") } : {}),
+      /*
+        A dormant conversation is resumable; a live one is now joinable. Only
+        the second is new: a live external Claude session used to publish
+        observe-only, which is what made the cockpit refuse every write and offer
+        to stop the operator's process as the remedy.
+      */
+      ...(cwd
+        ? {
+            control: live
+              ? observedJoinControl(claudePeers(writers, now))
+              : observedResumeControl("claude"),
+          }
+        : {}),
     });
   }
-  for (const [id, value] of registry) {
+  /*
+    Live writers `claude agents` did not list. Grouping the registry by
+    conversation is what keeps a joined session one card here: Agent Manager's
+    own SDK child resumes the same `sessionId` as the terminal it joined, so both
+    entries land in one group rather than producing a second board card for our
+    own process.
+  */
+  for (const [id, writers] of registry) {
     if (byId.has(id)) continue;
+    const value = primaryClaudeWriter(writers);
+    if (!value) continue;
     const pid = number(value.pid);
+    const cwd = string(value.cwd);
     const status = claudeStatus(value.status, true);
     const effortValue = string(value.effort);
     byId.set(id, {
       ...baseRecord("claude", id, now),
       name: normalizedText(value.name),
-      cwd: string(value.cwd),
+      cwd,
       kind: value.entrypoint === "sdk-cli" ? "batch" : "interactive",
       presence: "live",
       status,
@@ -290,6 +353,7 @@ export function discoverClaude(
           respondable: false,
         },
       }] : [],
+      ...(cwd ? { control: observedJoinControl(claudePeers(writers, now)) } : {}),
     });
   }
   return {

@@ -74,7 +74,6 @@ interface DormantResumeProvisional {
   name: string | null;
   committable: boolean;
   cleanup: Promise<void> | null;
-  releaseReservation: () => void;
 }
 
 interface ExternalAdoptionProvisional {
@@ -82,18 +81,20 @@ interface ExternalAdoptionProvisional {
   name: string | null;
   committable: boolean;
   cleanup: Promise<void> | null;
-  releaseReservation: () => void;
 }
 
 interface ProvisionalInFlight {
   controller: AbortController;
-  releaseReservation: () => void;
 }
 
+/*
+  `ownership-conflict` is gone. It described a native writer appearing on a
+  session the manager also held, which is now an ordinary peer rather than a
+  reason to retire our query.
+*/
 export type ClaudeManagedSessionLossReason =
   | "unexpected-close"
-  | "unexpected-failure"
-  | "ownership-conflict";
+  | "unexpected-failure";
 
 /*
   A backstop against a settings lookup that never settles, not the deadline a
@@ -177,45 +178,6 @@ function activityStatus(snapshot: ClaudeManagedSessionSnapshot): SessionStatus {
     case "native":
       return "unknown";
   }
-}
-
-function nativeHandoffReadiness(
-  snapshot: ClaudeManagedSessionSnapshot,
-): { ready: boolean; reason: string } {
-  if (snapshot.owner !== "manager") {
-    return {
-      ready: false,
-      reason: "The native Claude CLI already owns this session; another resume would race it",
-    };
-  }
-  if (
-    snapshot.activity !== "idle"
-    && snapshot.activity !== "closed"
-    && snapshot.activity !== "failed"
-  ) {
-    return {
-      ready: false,
-      reason: "Native handoff requires an idle or ended Claude session",
-    };
-  }
-  if (snapshot.pendingRequests.length > 0) {
-    return {
-      ready: false,
-      reason: "Native handoff cannot abandon a pending Claude request",
-    };
-  }
-  if (
-    snapshot.stagedMessages.length > 0
-    || snapshot.outstandingMessageIds.length > 0
-    || snapshot.stillQueuedMessageIds.length > 0
-    || snapshot.queueKnowledge !== "known"
-  ) {
-    return {
-      ready: false,
-      reason: "Native handoff requires a provider-confirmed empty Claude input queue",
-    };
-  }
-  return { ready: true, reason: "Native handoff is ready" };
 }
 
 function actionFailure(code: string, message: string): ActionDispatchResult {
@@ -563,7 +525,6 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
   readonly #dormantResumes = new Map<string, DormantResumeProvisional>();
   readonly #adopting = new Map<string, ProvisionalInFlight>();
   readonly #externalAdoptions = new Map<string, ExternalAdoptionProvisional>();
-  #unsubscribeOwnershipConflicts: () => void = () => undefined;
   #draftSettingsLookup: Promise<SessionSettingsOptions> | null = null;
   #runtime: Promise<ClaudeSdkRuntime> | null = null;
   #disposed = false;
@@ -582,9 +543,6 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
     );
     this.#workspaceIdentityResolver = options.workspaceIdentityResolver
       ?? new WorkspaceIdentityResolver({ totalBudgetMs: this.#workspaceIdentityBudgetMs });
-    this.#unsubscribeOwnershipConflicts = options.hookSourceArbiter?.onOwnershipConflict(
-      ({ sessionId }) => this.#handleOwnershipConflict(sessionId),
-    ) ?? (() => undefined);
   }
 
   /**
@@ -680,30 +638,13 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
     const providerSessionId = view.providerThreadId;
     const controller = new AbortController();
     const releaseRequest = forwardAbort(context.signal, controller);
-    let releaseReservation = (): void => undefined;
-    const inFlight: ProvisionalInFlight = {
-      controller,
-      releaseReservation: () => releaseReservation(),
-    };
+    const inFlight: ProvisionalInFlight = { controller };
     this.#adopting.set(providerSessionId, inFlight);
-    releaseReservation = this.#options.hookSourceArbiter?.reserveManagerAdoption(
-      providerSessionId,
-      () => {
-        const error = new Error("A native Claude owner appeared during web adoption");
-        if (!controller.signal.aborted) controller.abort(error);
-        const provisional = this.#externalAdoptions.get(providerSessionId);
-        if (provisional) {
-          provisional.committable = false;
-          void this.#cleanupProvisional(
-            this.#externalAdoptions,
-            providerSessionId,
-            provisional,
-          ).catch(() => undefined);
-        }
-      },
-    ) ?? (() => undefined);
-
-    let retainedReservation = false;
+    /*
+      A native hook arriving mid-adoption used to abort it: under exclusivity a
+      second writer appearing meant the adoption was racing an owner. Joining one
+      is now the intended outcome, so adoption is fenced by identity alone.
+    */
     try {
       controller.signal.throwIfAborted();
       await this.#resolveWorkspaceIdentity(cwd);
@@ -776,9 +717,7 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
           name: view.name,
           committable: true,
           cleanup: null,
-          releaseReservation,
         });
-        retainedReservation = true;
         return this.#toSessionView({
           session,
           name: view.name,
@@ -795,7 +734,6 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
       }
     } finally {
       releaseRequest();
-      if (!retainedReservation) releaseReservation();
       if (this.#adopting.get(providerSessionId) === inFlight) {
         this.#adopting.delete(providerSessionId);
       }
@@ -837,7 +775,6 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
     if (
       !entry.published
       || !entry.ended
-      || snapshot.owner !== "manager"
       || snapshot.activity !== "closed"
       || snapshot.sessionId !== view.providerThreadId
       || snapshot.cwd !== view.cwd
@@ -854,29 +791,8 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
 
     const controller = new AbortController();
     const releaseRequest = forwardAbort(context.signal, controller);
-    let releaseReservation = (): void => undefined;
-    const inFlight: ProvisionalInFlight = {
-      controller,
-      releaseReservation: () => releaseReservation(),
-    };
+    const inFlight: ProvisionalInFlight = { controller };
     this.#resuming.set(view.providerThreadId, inFlight);
-    releaseReservation = this.#options.hookSourceArbiter?.reserveManagerAdoption(
-      view.providerThreadId,
-      () => {
-        const error = new Error("A native Claude owner appeared during web resume");
-        if (!controller.signal.aborted) controller.abort(error);
-        const provisional = this.#dormantResumes.get(view.providerThreadId);
-        if (provisional) {
-          provisional.committable = false;
-          void this.#cleanupProvisional(
-            this.#dormantResumes,
-            view.providerThreadId,
-            provisional,
-          ).catch(() => undefined);
-        }
-      },
-    ) ?? (() => undefined);
-    let retainedReservation = false;
     try {
       const desiredMode = profileMode(profile);
       const desiredEffort = view.effort.value
@@ -939,9 +855,7 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
           name: entry.name,
           committable: true,
           cleanup: null,
-          releaseReservation,
         });
-        retainedReservation = true;
         return this.#toSessionView({
           ...entry,
           session,
@@ -955,7 +869,6 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
       }
     } finally {
       releaseRequest();
-      if (!retainedReservation) releaseReservation();
       if (this.#resuming.get(view.providerThreadId) === inFlight) {
         this.#resuming.delete(view.providerThreadId);
       }
@@ -1174,37 +1087,35 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
     }
   }
 
+  /**
+   * Optional native access, mirroring the Codex `--remote` join command: it
+   * hands over a command, not ownership.
+   *
+   * This used to prepare a handoff — disconnect the manager's query, publish
+   * foreign authority, hand back a `handoffId`, and wait for the spawned CLI to
+   * exit before reclaiming. None of that is needed to run `claude --resume`
+   * beside a live manager query, so the whole lifecycle is gone and this is a
+   * plain command again.
+   */
   async getAttachInstruction(
     view: SessionView,
     context: RequestContext,
   ): Promise<AttachInstruction | null> {
     if (context.signal.aborted) return null;
-    if (
-      this.#resuming.has(view.providerThreadId)
-      || this.#dormantResumes.has(view.providerThreadId)
-    ) {
-      // A provisional SDK owner already exists. Native resume must stay
-      // unavailable until that owner is either committed or rolled back.
-      return null;
-    }
+    if (!view.cwd) return null;
     const entry = this.#entries.get(view.providerThreadId);
-    if (!entry) return null;
-    const snapshot = entry.session.snapshot;
-    if (!nativeHandoffReadiness(snapshot).ready) return null;
-    const handoff = await entry.session.prepareCliHandoff(context.requestId, context.signal);
-    if (context.signal.aborted) {
-      entry.session.markCliAttachFailed(handoff.id, "Native handoff preparation was cancelled");
-      // Do not start an unbounded replacement SDK writer after the caller's
-      // deadline. Leave the exact handoff fail-closed for managed recovery.
-      await entry.session.reclaimFromCli(handoff.id, context.signal).catch(() => undefined);
-      context.signal.throwIfAborted();
-    }
+    const sessionId = entry?.session.snapshot.sessionId ?? view.providerThreadId;
+    const runtime = await this.#getRuntime();
+    if (context.signal.aborted) return null;
     return {
       kind: "claude-resume",
-      argv: [handoff.command.executable, ...handoff.command.args],
-      cwd: handoff.command.cwd,
-      handoffId: handoff.id,
-      warning: "Starting this command transfers exclusive write ownership to Claude CLI until it exits.",
+      argv: [
+        this.#options.claudeExecutable ?? runtime.claudeCodeExecutable ?? "claude",
+        "--resume",
+        sessionId,
+      ],
+      cwd: view.cwd,
+      warning: "Run locally to join this exact Claude conversation. Web control stays active; if both surfaces send at once, the conversation forks.",
     };
   }
 
@@ -1280,32 +1191,6 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
     return options;
   }
 
-  markCliAttached(sessionId: string, handoffId: string, wrapperPid: number): void {
-    this.#requireEntry(sessionId).session.markCliAttached(handoffId, wrapperPid);
-  }
-
-  markCliExited(
-    sessionId: string,
-    handoffId: string,
-    exitCode: number | null,
-  ): void {
-    this.#requireEntry(sessionId).session.markCliExited(handoffId, exitCode);
-  }
-
-  markCliAttachFailed(sessionId: string, handoffId: string, error: string): void {
-    this.#requireEntry(sessionId).session.markCliAttachFailed(handoffId, error);
-  }
-
-  async reclaimFromCli(sessionId: string, handoffId: string): Promise<SessionView> {
-    const entry = this.#requireEntry(sessionId);
-    await this.#runConnectingOperation(undefined, (signal) =>
-      entry.session.reclaimFromCli(handoffId, signal)
-    );
-    if (this.#disposed) throw new Error("Claude provider adapter is disposed");
-    this.#options.hookSourceArbiter?.markManagerOwned(sessionId);
-    return this.#toSessionView(entry, entry.session.snapshot);
-  }
-
   getManagedSession(sessionId: string): SessionView | null {
     const entry = this.#entries.get(sessionId);
     return entry ? this.#toSessionView(entry, entry.session.snapshot) : null;
@@ -1323,14 +1208,12 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
         this.#entries.has(sessionId)
         || snapshot.sessionId !== sessionId
         || snapshot.resumedFrom !== sessionId
-        || snapshot.owner !== "manager"
         || snapshot.activity === "closed"
         || snapshot.activity === "failed"
       ) {
         throw new Error("Claude provisional adoption is no longer a live exact owner");
       }
       this.#externalAdoptions.delete(sessionId);
-      external.releaseReservation();
       try {
         this.#registerSession(external.session, external.name, false);
         const active = this.#requireEntry(sessionId);
@@ -1355,7 +1238,6 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
         snapshot.sessionId !== sessionId
         || snapshot.resumedFrom !== sessionId
         || snapshot.cwd !== provisional.dormant.session.snapshot.cwd
-        || snapshot.owner !== "manager"
         || snapshot.activity === "closed"
         || snapshot.activity === "failed"
       ) {
@@ -1366,7 +1248,6 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
       // missing entry or interleave a second writer between the durable commit
       // and the provider ownership swap.
       this.#dormantResumes.delete(sessionId);
-      provisional.releaseReservation();
       this.#entries.delete(sessionId);
       this.#settingsLookups.delete(provisional.dormant);
       provisional.dormant.unsubscribe();
@@ -1394,7 +1275,6 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
       if (!adopting.controller.signal.aborted) {
         adopting.controller.abort(new Error("Claude provisional adoption was cancelled"));
       }
-      adopting.releaseReservation();
     }
     const external = this.#externalAdoptions.get(sessionId);
     if (external) {
@@ -1427,8 +1307,6 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
       return;
     }
     this.#disposed = true;
-    this.#unsubscribeOwnershipConflicts();
-    this.#unsubscribeOwnershipConflicts = () => undefined;
     this.#lifetime.abort(new Error("Claude provider adapter was disposed"));
     for (const controller of this.#connecting.keys()) {
       if (!controller.signal.aborted) {
@@ -1440,14 +1318,12 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
       if (!resuming.controller.signal.aborted) {
         resuming.controller.abort(new Error("Claude provider adapter was disposed"));
       }
-      resuming.releaseReservation();
     }
     this.#resuming.clear();
     for (const adopting of this.#adopting.values()) {
       if (!adopting.controller.signal.aborted) {
         adopting.controller.abort(new Error("Claude provider adapter was disposed"));
       }
-      adopting.releaseReservation();
     }
     this.#adopting.clear();
     for (const [sessionId, external] of this.#externalAdoptions) {
@@ -1586,8 +1462,7 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
     }
     const snapshot = entry.session.snapshot;
     if (
-      snapshot.owner !== "manager"
-      || snapshot.activity === "closed"
+      snapshot.activity === "closed"
       || snapshot.activity === "failed"
       || snapshot.activity === "native"
     ) {
@@ -1658,15 +1533,13 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
       session: ClaudeManagedSession;
       committable: boolean;
       cleanup: Promise<void> | null;
-      releaseReservation: () => void;
-    },
+        },
   >(
     provisionals: Map<string, T>,
     sessionId: string,
     provisional: T,
   ): Promise<void> {
     provisional.committable = false;
-    provisional.releaseReservation();
     if (provisional.cleanup) return provisional.cleanup;
 
     let tracked!: Promise<void>;
@@ -1729,8 +1602,7 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
     const initialSnapshot = session.snapshot;
     this.#options.hookSourceArbiter?.markManagerOwned(
       id,
-      initialSnapshot.owner === "manager"
-        && initialSnapshot.activity !== "closed"
+      initialSnapshot.activity !== "closed"
         && initialSnapshot.activity !== "failed",
     );
     const unsubscribeMessages = session.onMessage((message) => {
@@ -1741,7 +1613,6 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
       if (
         !this.#disposed
         && !entry.ended
-        && snapshot.owner === "manager"
         && (snapshot.activity === "closed" || snapshot.activity === "failed")
       ) {
         this.#retireLostEntry(
@@ -1753,8 +1624,7 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
       }
       this.#options.hookSourceArbiter?.markManagerOwned(
         id,
-        snapshot.owner === "manager"
-          && snapshot.activity !== "closed"
+        snapshot.activity !== "closed"
           && snapshot.activity !== "failed",
       );
       if (!entry.published) return;
@@ -1769,26 +1639,6 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
       unsubscribeSession();
     };
     return this.#toSessionView(entry, session.snapshot);
-  }
-
-  #handleOwnershipConflict(providerSessionId: string): void {
-    if (this.#disposed) return;
-    const resuming = this.#resuming.get(providerSessionId);
-    if (resuming && !resuming.controller.signal.aborted) {
-      resuming.controller.abort(new Error("A native Claude owner appeared during web resume"));
-    }
-    const provisional = this.#dormantResumes.get(providerSessionId);
-    if (provisional) {
-      provisional.committable = false;
-      void this.#cleanupProvisional(
-        this.#dormantResumes,
-        providerSessionId,
-        provisional,
-      ).catch(() => undefined);
-    }
-    const entry = this.#entries.get(providerSessionId);
-    if (!entry || entry.ended) return;
-    this.#retireLostEntry(providerSessionId, entry, "ownership-conflict");
   }
 
   #retireLostEntry(
@@ -1833,20 +1683,22 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
     const providerSessionId = snapshot.sessionId ?? snapshot.localId;
     const id = sessionRecordId("local", "claude", providerSessionId);
     const status = activityStatus(snapshot);
-    const managerControls = snapshot.owner === "manager";
-    const writableManagerControls = managerControls
-      && snapshot.activity !== "closed"
+    /*
+      The manager owns its own query unconditionally now: nothing transfers
+      ownership away, so the only thing that can end writes is the query itself
+      closing or failing.
+    */
+    const writableManagerControls = snapshot.activity !== "closed"
       && snapshot.activity !== "failed";
-    const handoffReadiness = nativeHandoffReadiness(snapshot);
-    const canAttach = handoffReadiness.ready;
-    const canResume = !writableManagerControls && handoffReadiness.ready;
+    // Native access is always available: it hands over a command, not ownership.
+    const canAttach = true;
+    const canResume = !writableManagerControls;
     /*
       One ruling per control, so the published capability and withheld lists are
       derived from the same answer instead of being maintained beside each other.
     */
-    const noWrites = snapshot.owner === "native"
-      ? "The native Claude CLI currently owns this session"
-      : "The Claude SDK query has ended; resume it before changing the session";
+    const noWrites =
+      "The Claude SDK query has ended; resume it before changing the session";
     const writable = (granted: boolean, reason: string): CapabilityRuling =>
       writableManagerControls ? (granted ? true : reason) : noWrites;
     const rulings = {
@@ -1863,12 +1715,10 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
       "set-effort": writable(true, noWrites),
       "remove-queued": writable(snapshot.stagedMessages.length > 0, "There are no staged messages"),
       end: writable(true, noWrites),
-      attach: canAttach ? true : handoffReadiness.reason,
+      attach: canAttach,
       resume: canResume
         ? true
-        : writableManagerControls
-        ? "Resume is available only after the managed Claude query ends"
-        : handoffReadiness.reason,
+        : "Resume is available only after the managed Claude query ends",
       // Exact facts about the harness, not conditions that could later clear.
       "set-sandbox": "Claude has no sandbox setting",
       archive: "Claude does not expose session archive",
@@ -1889,7 +1739,7 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
       status,
       providerStatus: snapshot.activity,
       pid: null,
-      runtimePid: snapshot.handoff?.wrapperPid ?? null,
+      runtimePid: null,
       startedAt: snapshot.startedAt,
       updatedAt: snapshot.updatedAt,
       source: "claude-sdk",
@@ -1924,10 +1774,17 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
       })),
       control: {
         plane: writableManagerControls ? "claude-sdk" : "resume-only",
-        authority: managerControls ? "manager" : "foreign",
+        authority: "manager",
         coordination: providerControlCoordination("claude"),
         recovery: null,
         ...resolveControlCapabilities(rulings),
+        /*
+          The SDK snapshot knows nothing about process identity — it holds a
+          Query, not a pid. Peers are enumerated by the layer that reads
+          Claude's own live registry and can prove which pid holds which
+          session, so this projection publishes none and the server decorates.
+        */
+        peers: [],
         takeover: null,
       },
       workspaceIdentity: structuredClone(

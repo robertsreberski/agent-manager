@@ -21,7 +21,6 @@ export type ExecutionProfile =
 
 export type ControlPlane =
   | "codex-private"
-  | "codex-hook-bridge"
   | "claude-sdk"
   | "claude-hook-bridge"
   | "tmux-attach"
@@ -53,9 +52,9 @@ export type ControlCapability =
 ownership, not exclusive thread ownership: Agent Manager owns one pinned app-server and its
 socket, while multiple cockpit clients and native Codex CLI peers may use the same provider
 thread on that server. `codex-app-server` is protocol terminology, not a second plane label.
-`codex-hook-bridge` observes a standalone official CLI session before its optional one-time
-migration to the private server and may answer only request shapes the installed/trusted Codex
-hook actually exposes.
+The Codex command-hook plane was retired: its shim discarded every response by construction, so
+it could only ever reduce capabilities — the App Server already delivers exact events for managed
+threads, and the discovery sweep already enumerates external ones.
 
 `SessionControl` contains `plane`, one authority state (`manager | foreign | none`), required
 provider coordination semantics, bounded recovery state, the exact capability list, optional
@@ -67,13 +66,15 @@ The required coordination shape is provider-specific:
 
 ```ts
 interface SessionControlCoordination {
+  // `exclusive` is retained in the union but no live plane publishes it: both
+  // managed planes are shared. It remains rejectable rather than silently valid.
   mode: "shared" | "exclusive" | "observe-only";
   nativeAttach: "join" | "handoff" | "none";
   responseResolution: "first-response-wins" | "single-controller";
 }
 
 interface SessionControlRecovery {
-  state: "reconnecting" | "waiting-for-native-exit" | "retrying" | "needs-attention";
+  state: "reconnecting" | "retrying" | "needs-attention";
   attempt: number;
   startedAt: string;
   deadlineAt: string | null;
@@ -93,16 +94,23 @@ interface SessionTakeover {
 }
 ```
 
-Managed Codex is `shared / join / first-response-wins`; managed Claude is
-`exclusive / handoff / single-controller`. Observe-only projections use
-`observe-only / none / single-controller`. `recovery` is null while provider control is healthy
+Both managed planes are `shared / join`. They differ only in `responseResolution`, and that
+difference is a provider mechanism rather than a preference: managed Codex is
+`shared / join / first-response-wins` because `serverRequest/resolved` lets two peers race the
+same request, while managed Claude is `shared / join / single-controller` because it publishes no
+such event — each controller holds its own SDK query and answers only its own requests, so there
+is nothing to arbitrate. `single-controller` means one answerer per request, never one writer per
+session. Observe-only projections use `observe-only / none / single-controller`.
+
+`peers` publishes the live writers this build can prove, and is empty when there is one. It is
+observational: authorization reads `capabilities`, never peer presence. `recovery` is null while provider control is healthy
 or no recovery has run. A failed bounded recovery retains transcript access and advertises
-`retry-control` only when another safe attempt is available. Recovery never replays work.
-`waiting-for-native-exit` is the stable healthy Claude-exclusive state: it has no public retry
-deadline or attempt churn, and web control reconnects after the exact pinned CLI exits.
-`reconnecting` and `retrying` must leave their transient phase by the published deadline; an
-expired attempt becomes `needs-attention` with a concrete error and retry/native guidance, never
-an indefinite “recovering” or generic read-only state.
+`retry-control` only when another safe attempt is available. Recovery never replays work. Every
+recovery state is a bounded transient or a dead end: `reconnecting` and `retrying` must leave
+their transient phase by the published deadline, and an expired attempt becomes
+`needs-attention` with a concrete error and retry/native guidance, never an indefinite
+“recovering” or generic read-only state. There is no healthy indefinite wait, because nothing
+waits for a native controller to exit.
 
 `resume` is a semantic web mutation, distinct from `attach`. It requires the normal browser
 lease, generation and idempotency fences, a complete no-owner scan, exact provider and workspace
@@ -110,7 +118,7 @@ validation, and a provider transaction that stays unpublished until its managed 
 durable. `attach` remains optional advanced native access. Remote `resume` and takeover actions
 are proxied to the node that owns the provider boundary rather than reinterpreted locally.
 
-Wire schema 6 is one strict cutover for these fields and for the required per-session
+Wire schema 8 is one strict cutover for these fields and for the required per-session
 `sandbox`. The envelope includes the required
 schema/build identity. A mismatch returns a typed upgrade error and closes the stream. The PWA
 hard-reloads; a remote node reports that it needs updating. There are no aliases or compatibility
@@ -135,9 +143,8 @@ authority ambiguity, transport loss, or a provider method being absent. It never
 | Plane | queue/steer | interrupt | respond | profile/model/effort | native/takeover | lifecycle |
 | --- | --- | --- | --- | --- | --- | --- |
 | `codex-private` | provider | provider | first exact response wins | experimental update, next-turn fallback; idle-only UI | CLI joins the same private server; standalone migration when required | provider RPCs only |
-| `codex-hook-bridge` | never before adoption | never before adoption | trusted hook shapes only | never before adoption | guided exit or confirmed graceful migration when identity is provable | never fabricate |
-| `claude-sdk` | queue; steer only when pinned | yes | SDK callbacks, single controller | SDK `setModel`, effort flag, permission mode | exclusive handoff/resume | `Query.close()` for manager-owned end |
-| `claude-hook-bridge` | never | never | `PermissionRequest` only | never | guided exit or confirmed graceful exclusive handoff | never fabricate |
+| `claude-sdk` | queue; steer only when pinned | yes | SDK callbacks, one answerer per request | SDK `setModel`, effort flag, permission mode | CLI joins the same conversation as a second controller; no takeover | `Query.close()` for manager-owned end |
+| `claude-hook-bridge` | never | never | `PermissionRequest` only | never | join; no handoff | never fabricate |
 | `tmux-attach` | never | never | never | never | preview/attach | none |
 | `resume-only` | never | never | never | never | attach/resume | none |
 | `observe-only` | never | never | never | never | none | none |
@@ -198,9 +205,14 @@ changes use its real live methods while the UI honours adapter-level capability 
 - When cockpit and native Codex peers can answer the same exact provider request, the provider's
   `serverRequest/resolved` event is authoritative: the first valid response wins, every other
   projection becomes stale, and no answer is replayed.
-- Claude uses exclusive arbitration. A native attach is a handoff, and manager write
-  capabilities appear only after the previous CLI controller has exited and the exact session
-  has been resumed successfully. Hook observation and held approvals are not shared ownership.
+- Claude has no cross-surface arbitration, because it publishes no equivalent of
+  `serverRequest/resolved`. Each controller holds its own SDK query and its own permission
+  callbacks, so two surfaces never see the same request. Manager write capabilities appear once
+  the exact session identity is revalidated and its own query is live — the other controller is
+  never asked to exit. Two surfaces sending at once fork the conversation; the fork is published
+  as a lifecycle warning naming the branch shown, never silently rendered as one history.
+  A native-origin hook-held request stays visible and non-respondable, because answering it from
+  the cockpit would race the terminal with no resolved event and no replay.
 - A standalone Codex CLI connected elsewhere also requires one safe, identity-checked exit and
   adoption before it becomes a peer on the manager-owned private server. Once adopted, native
   CLI and web use are shared; takeover is not repeated for every client.
@@ -226,7 +238,9 @@ changes use its real live methods while the UI honours adapter-level capability 
    thread; exact responses reconcile first-winner outcomes without replay or duplicate prompts.
 7. `codex-private` is the only managed Codex plane in production code and tests; neither a
    `codex-daemon` nor a `codex-app-server` plane label remains.
-8. Claude proves exclusive handoff and never exposes simultaneous controllers. A standalone
-   Codex process proves one-time migration before the resumed thread accepts shared CLI/web peers.
-9. Wire 5 requires valid coordination and recovery shapes, rejects old aliases, renders bounded
+8. Claude admits a second controller without stopping the first, proves exact session/workspace
+   identity before publishing its own query, and publishes a fork rather than hiding one. A
+   standalone Codex process still proves one-time migration, because its rollout format cannot
+   represent two concurrent writers.
+9. Wire 8 requires valid coordination, peer and recovery shapes, rejects old aliases, renders bounded
    recovery truthfully, and gates manual retry through `retry-control`.

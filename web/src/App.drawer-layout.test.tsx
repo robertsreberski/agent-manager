@@ -207,7 +207,7 @@ describe("cockpit shell layout", () => {
       ...selectedSession,
       archived: true,
       status: "completed",
-      control: { plane: "observe-only", authority: "none", coordination: { mode: "observe-only", nativeAttach: "none", responseResolution: "single-controller" }, recovery: null, capabilities: [], withheld: [], takeover: null },
+      control: { plane: "observe-only", authority: "none", coordination: { mode: "observe-only", nativeAttach: "none", responseResolution: "single-controller" }, recovery: null, capabilities: [], withheld: [], peers: [], takeover: null },
     } as SessionView;
     cockpit.sessions = [];
     cockpit.displaySessions = [archived];

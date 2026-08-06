@@ -146,6 +146,7 @@ test("route takeover publishes manager controls only after durable provider adop
           recovery: null,
           capabilities: ["queue"],
           withheld: [],
+          peers: [],
           takeover: null,
         },
       });
@@ -163,6 +164,7 @@ test("route takeover publishes manager controls only after durable provider adop
           recovery: null,
           capabilities: ["queue"],
           withheld: [],
+          peers: [],
           takeover: null,
         },
       });
@@ -321,6 +323,7 @@ test("a late provider promotion never restores the prior database identity or ab
       recovery: null,
       capabilities: ["resume"],
       withheld: [],
+      peers: [],
       takeover: null,
     },
   });
@@ -335,6 +338,7 @@ test("a late provider promotion never restores the prior database identity or ab
       recovery: null,
       capabilities: ["queue", "resume"],
       withheld: [],
+      peers: [],
       takeover: null,
     },
   });
@@ -444,6 +448,7 @@ test("retry-control retries quarantined cleanup before managed recovery and neve
       recovery: null,
       capabilities: ["resume"],
       withheld: [],
+      peers: [],
       takeover: null,
     },
   });
@@ -458,6 +463,7 @@ test("retry-control retries quarantined cleanup before managed recovery and neve
       recovery: null,
       capabilities: ["queue"],
       withheld: [],
+      peers: [],
       takeover: null,
     },
   });
@@ -575,6 +581,7 @@ test("web resume proves no CLI owner and publishes controls only after durable p
       recovery: null,
       capabilities: ["resume"],
       withheld: [],
+      peers: [],
       takeover: null,
     },
   });
@@ -595,6 +602,7 @@ test("web resume proves no CLI owner and publishes controls only after durable p
       recovery: null,
       capabilities: ["queue", "steer", "interrupt", "resume"],
       withheld: [],
+      peers: [],
       takeover: null,
     },
   });
@@ -640,6 +648,7 @@ test("web resume proves no CLI owner and publishes controls only after durable p
             truncated: false,
             itemCount: 0,
             reason: null,
+            forked: false,
           },
         };
       },

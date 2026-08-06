@@ -16,8 +16,6 @@ import type { FastifyRequest } from "fastify";
 import { AuthManager } from "./auth.ts";
 import {
   assertOwnerRuntimeDirectory,
-  requestAttachAuthorizeSpawnFromControlSocket,
-  requestAttachStartedFromControlSocket,
   requestBootstrapFromControlSocket,
   closeOwnerInstanceLease,
   probeOwnerSocket,
@@ -209,16 +207,9 @@ test("owner control socket rejects unsafe parents and validates socket permissio
     assert.throws(() => assertOwnerRuntimeDirectory(linked), /real directory/);
 
     const socketPath = join(runtime, "control.sock");
-    const attachLifecycle: unknown[][] = [];
     const server = await startOwnerControlSocket(socketPath, {
       auth,
       bootstrapOrigin: "http://localhost:43127",
-      onAttachAuthorizeSpawn: (...args) => {
-        attachLifecycle.push(["authorize", ...args]);
-      },
-      onAttachStarted: (...args) => {
-        attachLifecycle.push(["started", ...args]);
-      },
     });
     assert.equal(lstatSync(runtime).mode & 0o777, 0o700);
     assert.equal(lstatSync(socketPath).mode & 0o777, 0o600);
@@ -230,25 +221,6 @@ test("owner control socket rejects unsafe parents and validates socket permissio
       }),
       /owner control socket is already active/,
     );
-    await requestAttachAuthorizeSpawnFromControlSocket(
-      socketPath,
-      "claude:session-1",
-      "handoff-1",
-      "spawn-nonce-00000001",
-      process.pid,
-    );
-    await requestAttachStartedFromControlSocket(
-      socketPath,
-      "claude:session-1",
-      "handoff-1",
-      "spawn-nonce-00000001",
-      1234,
-    );
-    assert.deepEqual(attachLifecycle, [
-      ["authorize", "claude:session-1", "handoff-1", "spawn-nonce-00000001", process.pid],
-      ["started", "claude:session-1", "handoff-1", "spawn-nonce-00000001", 1234],
-    ]);
-
     chmodSync(socketPath, 0o644);
     await assert.rejects(requestBootstrapFromControlSocket(socketPath), /mode 0600/);
     chmodSync(socketPath, 0o600);

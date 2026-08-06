@@ -75,17 +75,19 @@ completed verification:
 
 | Spec | Contract to verify | Required evidence |
 | --- | --- | --- |
-| 01 | Every `SessionControl` carries a valid provider-specific `coordination` shape and nullable bounded `recovery`; old wire shapes fail closed | strict shared-schema tests across server/web/remote fixtures, plus a real mismatched wire 4 ↔ wire 5 connection |
-| 01 | Managed Codex is `shared / join / first-response-wins`; managed Claude is `exclusive / handoff / single-controller` | adapter projection tests and cockpit action-copy checks for both providers |
-| 01 | Manual provider recovery is advertised and accepted only through `retry-control`; exact native Claude ownership is a healthy stable wait; no recovery replays an action | failure-injection tests covering reconnecting, waiting-for-native-exit, retrying, needs-attention, explicit retry, and idempotency logs |
+| 01 | Every `SessionControl` carries a valid provider-specific `coordination` shape, a truthful `peers` list, and nullable bounded `recovery`; old wire shapes fail closed | strict shared-schema tests across server/web/remote fixtures, plus a real mismatched wire 7 ↔ wire 8 connection |
+| 01 | Both managed planes are `shared / join`; Codex resolves requests `first-response-wins`, Claude `single-controller`, and a stale `exclusive / handoff` Claude record fails closed | adapter projection tests, the wire plane invariant, and cockpit action-copy checks for both providers |
+| 01 | Manual provider recovery is advertised and accepted only through `retry-control`; every recovery state is bounded and no recovery replays an action | failure-injection tests covering reconnecting, retrying, needs-attention, explicit retry, and idempotency logs |
+| 01 | A joined Claude session survives a native peer turn, and a fork is published rather than silently rendered as one history | markerless-hook-on-manager-owned test, fork detection with branch-flip assertion, and one idempotent `transcript:fork` lifecycle item |
 | 02 | A native Codex `--remote` peer and cockpit client use one private-server thread concurrently; environment IDs remain observational | disposable two-client app-server probe covering send, steer, interrupt, request resolution, disconnect, and rejoin |
 | 02 | First exact Codex response wins without duplicate requests or replay | two-client request race plus `serverRequest/resolved` timeline assertion |
-| 02 | Standalone Codex migration is one-time and identity checked; Claude takeover remains exclusive | guided cancel, server-issued two-action graceful confirmation, one-SIGTERM, PID reuse, identity/workspace drift, timeout, restart recovery, and duplicate-owner rejection tests |
+| 02 | Standalone Codex migration is one-time and identity checked; Claude offers no takeover at all and is joined instead | guided cancel, server-issued two-action graceful confirmation, one-SIGTERM, PID reuse, identity/workspace drift, timeout, restart recovery, and duplicate-owner rejection tests, all on Codex fixtures |
+| 02 | Codex cannot be joined because its rollout cannot represent two writers | recorded format measurement in the appendix: no parent pointers, 3/68 records carrying `turn_id`, and `forked_from_id` proving a file-level fork primitive |
 | 02 | The mismatched user-global experimental daemon is neither trusted nor mutated | process/socket provenance assertions and deploy/runtime audit proving only the pinned private child is addressed |
 
 ## Not audited
 
 Specs 01–02 have an updated contract and the explicit pending gates above, but have not yet been
-re-audited against wire 5. Specs 03–04 (hook bridge, workspace model), 06, 11, and the remaining
+re-audited against wire 8. Specs 03–04 (hook bridge, workspace model), 06, 11, and the remaining
 criteria of 05 and 07–10 were not walked criterion by criterion in this pass. The defects that
 were found and fixed against them are recorded in the branch history rather than here.

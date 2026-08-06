@@ -1,35 +1,19 @@
 import type { SessionControlRecovery } from "../shared/session.ts";
 import type { ManagedSessionRecoveryRecord } from "./contracts.ts";
 
-export interface ManagedRecoveryDeferral {
-  readonly kind: "defer";
-  readonly retryAfterMs: number;
-  readonly reason: string;
-}
-
-/**
- * Ask the coordinator to wait and inspect the same identity again without
- * consuming a provider-failure retry. This is intended for valid transitional
- * states such as an exact, persisted native owner that is still running.
- */
-export function deferManagedRecovery(
-  retryAfterMs: number,
-  reason: string | null = null,
-): ManagedRecoveryDeferral {
-  const ownershipReason = reason?.trim()
-    || "Waiting for the exact native CLI owner to exit before restoring web control";
-  return {
-    kind: "defer",
-    retryAfterMs: boundedDelay(retryAfterMs),
-    reason: boundedError(ownershipReason),
-  };
-}
-
+/*
+  The deferral mechanism is gone with Claude exclusivity. It existed for exactly
+  one situation — an exact native CLI owner still running, which had to be waited
+  out rather than retried — and shared join means nothing waits for a native
+  controller to leave. Every remaining recovery outcome is a success or a bounded
+  provider failure, so `recover` returns void and the coordinator has no
+  "healthy indefinite wait" to publish.
+*/
 export interface ManagedRecoveryCoordinatorOptions {
   recover(
     record: ManagedSessionRecoveryRecord,
     signal: AbortSignal,
-  ): Promise<void | ManagedRecoveryDeferral>;
+  ): Promise<void>;
   onState(
     record: ManagedSessionRecoveryRecord,
     recovery: SessionControlRecovery | null,
@@ -89,8 +73,6 @@ interface RecoveryTarget {
   runningGeneration: number | null;
   rerunRequested: boolean;
   retryTimer: NodeJS.Timeout | null;
-  waitingStartedAt: number | null;
-  waitingReason: string | null;
 }
 
 interface ActiveController {
@@ -149,8 +131,6 @@ export class ManagedRecoveryCoordinator {
         runningGeneration: null,
         rerunRequested: false,
         retryTimer: null,
-        waitingStartedAt: null,
-        waitingReason: null,
       };
       this.#targets.set(record.managerSessionId, target);
       this.#enqueue(target);
@@ -176,8 +156,6 @@ export class ManagedRecoveryCoordinator {
     target.generation += 1;
     target.attempts = 0;
     target.failureAttempts = 0;
-    target.waitingStartedAt = null;
-    target.waitingReason = null;
     if (target.retryTimer) {
       clearTimeout(target.retryTimer);
       target.retryTimer = null;
@@ -324,8 +302,7 @@ export class ManagedRecoveryCoordinator {
     this.#controllers.set(target.record.managerSessionId, active);
     const started = this.#now();
     if (
-      target.waitingStartedAt === null
-      && !this.#publish(target, generation, {
+      !this.#publish(target, generation, {
         state: "reconnecting",
         attempt,
         startedAt: new Date(started).toISOString(),
@@ -343,17 +320,12 @@ export class ManagedRecoveryCoordinator {
     timeout.unref();
 
     try {
-      const result = await settleOnAbort(
+      await settleOnAbort(
         () => this.#options.recover(target.record, controller.signal),
         controller.signal,
       );
       controller.signal.throwIfAborted();
       if (!this.#isCurrent(target, generation)) return;
-
-      if (isManagedRecoveryDeferral(result)) {
-        this.#scheduleDeferred(target, generation, attempt, started, result);
-        return;
-      }
 
       // Delete before publishing so a synchronous observer cannot retry a
       // target that has already recovered. The generation was fenced above.
@@ -361,8 +333,6 @@ export class ManagedRecoveryCoordinator {
       this.#options.onState(target.record, null);
     } catch (error) {
       if (!this.#isCurrent(target, generation)) return;
-      target.waitingStartedAt = null;
-      target.waitingReason = null;
       target.failureAttempts += 1;
       const message = boundedError(error);
       const retryDelay = this.#retryDelaysMs[target.failureAttempts - 1];
@@ -383,46 +353,6 @@ export class ManagedRecoveryCoordinator {
       if (this.#controllers.get(target.record.managerSessionId) === active) {
         this.#controllers.delete(target.record.managerSessionId);
       }
-    }
-  }
-
-  #scheduleDeferred(
-    target: RecoveryTarget,
-    generation: number,
-    attempt: number,
-    started: number,
-    result: ManagedRecoveryDeferral,
-  ): void {
-    if (!this.#isCurrent(target, generation)) return;
-
-    // A verified native owner is a healthy coordination state, not a failed
-    // provider attempt. Keep the public attempt number and start time stable
-    // across the bounded internal ownership polls.
-    target.attempts = Math.max(0, target.attempts - 1);
-    const waitingStartedAt = target.waitingStartedAt ?? started;
-    const shouldPublish = target.waitingStartedAt === null
-      || target.waitingReason !== result.reason;
-    target.waitingStartedAt = waitingStartedAt;
-    target.waitingReason = result.reason;
-
-    const delay = boundedDelay(result.retryAfterMs);
-    target.retryTimer = setTimeout(() => {
-      target.retryTimer = null;
-      if (!this.#isCurrent(target, generation)) return;
-      this.#enqueue(target);
-      this.#pump();
-    }, delay);
-    target.retryTimer.unref();
-
-    if (shouldPublish) {
-      this.#publish(target, generation, {
-        state: "waiting-for-native-exit",
-        attempt,
-        startedAt: new Date(waitingStartedAt).toISOString(),
-        deadlineAt: null,
-        nextRetryAt: null,
-        error: result.reason,
-      });
     }
   }
 
@@ -453,15 +383,6 @@ export class ManagedRecoveryCoordinator {
       error,
     });
   }
-}
-
-function isManagedRecoveryDeferral(
-  value: void | ManagedRecoveryDeferral,
-): value is ManagedRecoveryDeferral {
-  return value !== undefined
-    && value.kind === "defer"
-    && Number.isFinite(value.retryAfterMs)
-    && value.retryAfterMs > 0;
 }
 
 function boundedDelay(value: number): number {

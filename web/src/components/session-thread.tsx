@@ -202,7 +202,6 @@ function SessionDetails({ session, remote, facts, factsStatus, attachInstruction
             factsStatus={factsStatus}
             attachCommand={attachCommand}
             attachDescription={attachInstruction?.description ?? null}
-            attachRequiresHandoff={attachInstruction?.requiresHandoff ?? false}
             attachError={attachError}
             loadingAttach={loadingAttach}
             onRevealAttach={onRevealAttach}
@@ -574,12 +573,11 @@ export function SessionThreadComposer({
     : null;
   const takeover = session.control.takeover;
   const recovery = session.control.recovery;
-  const waitingForNativeExit = recovery?.state === "waiting-for-native-exit";
   const deadlineCopy = useRelativeDeadline(recovery
-    ? (waitingForNativeExit ? null : recovery.state === "retrying" ? recovery.nextRetryAt : recovery.deadlineAt)
+    ? (recovery.state === "retrying" ? recovery.nextRetryAt : recovery.deadlineAt)
     : takeover?.deadlineAt ?? null);
-  const sharedCodex = session.provider === "codex" && session.control.coordination.mode === "shared";
-  const managedSharedCodex = sharedCodex
+  const shared = session.control.coordination.mode === "shared";
+  const managedShared = shared
     && session.control.authority === "manager"
     && (canQueue || canSteer);
   const canTakeControl = session.control.capabilities.includes("take-control")
@@ -611,7 +609,7 @@ export function SessionThreadComposer({
   // observe-only. The target of takeover is nevertheless the manager-owned,
   // multi-client Codex server, so migration copy must follow the provider and
   // offered action rather than misreading current coordination as exclusive.
-  const codexSharedTarget = managedSharedCodex
+  const codexSharedTarget = (managedShared && session.provider === "codex")
     || (session.provider === "codex"
       && session.control.authority === "foreign"
       && (canTakeControl || activeTakeover || takeover?.state === "failed"));
@@ -627,11 +625,21 @@ export function SessionThreadComposer({
     && !activeTakeover
     && (!session.control.capabilities.includes("take-control") || takeover?.state === "failed")
     && onResumeInWeb !== undefined;
+  /*
+    "Join" is only truthful where two controllers can actually coexist, and that
+    is Claude alone: a Codex rollout is a flat event log with no parent pointers,
+    so a second concurrent writer cannot be represented and a standalone Codex
+    process still migrates. A dormant thread has no writer to join either.
+  */
+  const joinsLiveController = canResumeHere
+    && session.provider === "claude"
+    && session.control.authority === "foreign";
   const canRetryControl = session.control.capabilities.includes("retry-control")
     && recovery !== null
-    && !waitingForNativeExit
     && onRetryControl !== undefined;
-  const canShowTakeControl = canTakeControl && (!recovery || waitingForNativeExit);
+  // Every remaining recovery state is a real in-flight repair, so takeover no
+  // longer has a healthy wait to appear alongside.
+  const canShowTakeControl = canTakeControl && !recovery;
   async function beginTakeover(method: TakeoverMethod, takeoverId?: string) {
     if (!onTakeControl) return;
     setTakeoverBusy(true);
@@ -696,9 +704,7 @@ export function SessionThreadComposer({
   const showControlStatus = Boolean(noWriteReason || recovery || canTakeControl || canResumeHere || takeoverFailed || resumeError);
   const routineControlStatus = !recovery && !takeoverFailed && !resumeError && canResumeHere;
   const statusTitle = recovery
-    ? recovery.state === "waiting-for-native-exit"
-      ? "Claude Code has control"
-      : recovery.state === "reconnecting"
+    ? recovery.state === "reconnecting"
       ? `Reconnecting ${providerLabel(session)} control`
       : recovery.state === "retrying"
         ? `${providerLabel(session)} control will retry`
@@ -706,20 +712,18 @@ export function SessionThreadComposer({
     : takeoverFailed
       ? "Web control was not connected"
     : canResumeHere
-      ? "Ready to resume here"
+      ? joinsLiveController ? "Ready to join here" : "Ready to resume here"
       : session.provider === "codex" && session.control.authority === "foreign"
         ? "Codex CLI is running"
+      // A live external Claude session is joinable now, so it is running
+      // alongside the cockpit rather than holding control away from it.
       : session.provider === "claude" && session.control.authority === "foreign"
-          ? "Claude Code has control"
+          ? "Claude Code is running"
           : hookSetupMissing
             ? "Live observation only"
             : "Messages unavailable";
   const statusDetail = recovery
-    ? recovery.state === "waiting-for-native-exit"
-      ? canShowTakeControl
-        ? "Web control reconnects automatically after this exact CLI exits, or you can transfer it safely here. History and exact live activity remain available."
-        : "Web control reconnects automatically after this exact CLI exits. History and exact live activity remain available here."
-      : recovery.state === "needs-attention"
+    ? recovery.state === "needs-attention"
       ? "Agent Manager could not restore web control. Your conversation history is safe."
       : recovery.state === "retrying"
         ? "History remains available while Agent Manager waits for the next automatic attempt."
@@ -727,7 +731,12 @@ export function SessionThreadComposer({
     : takeoverFailed
       ? "The conversation history is preserved. Retry the provider-specific migration here; optional CLI access remains under Advanced session facts."
     : canResumeHere
-      ? "Continue this exact provider conversation in Agent Manager. No terminal command is required."
+      ? joinsLiveController
+        // Naming what does *not* happen is the point: the previous copy read as
+        // a transfer, and an operator with a terminal open needs to know it
+        // keeps running.
+        ? "Join this exact conversation in Agent Manager. The terminal session keeps running; if you both send at once, the conversation forks."
+        : "Continue this exact provider conversation in Agent Manager. No terminal command is required."
       : noWriteReason;
   return (
     <div className="grid min-w-0 max-w-full gap-3" data-session-thread-composer>
@@ -756,11 +765,11 @@ export function SessionThreadComposer({
             ) : (
               <strong className="font-medium text-[var(--text-secondary)]">{statusTitle}</strong>
             )}
-            {recovery && recovery.state !== "needs-attention" && recovery.state !== "waiting-for-native-exit" && <span aria-hidden="true">·</span>}
-            {recovery && recovery.state !== "needs-attention" && recovery.state !== "waiting-for-native-exit" && <span>attempt {recovery.attempt}</span>}
+            {recovery && recovery.state !== "needs-attention" && <span aria-hidden="true">·</span>}
+            {recovery && recovery.state !== "needs-attention" && <span>attempt {recovery.attempt}</span>}
             {deadlineCopy && <><span aria-hidden="true">·</span><span>{deadlineCopy}</span></>}
             {canRetryControl && <><span aria-hidden="true">·</span><button type="button" data-compact-control="height" className="underline underline-offset-2" disabled={!mutationsReady || recoveryBusy} onClick={() => void retryControl()}>{recoveryBusy ? "Retrying web control…" : "Retry web control"}</button></>}
-            {canResumeHere && <Button variant="primary" size="sm" data-compact-control disabled={!mutationsReady || busy || resumeBusy} onClick={() => void resumeHere()}><RotateCcw size={12} aria-hidden="true" />{resumeBusy ? "Resuming…" : "Resume here"}</Button>}
+            {canResumeHere && <Button variant="primary" size="sm" data-compact-control disabled={!mutationsReady || busy || resumeBusy} onClick={() => void resumeHere()}><RotateCcw size={12} aria-hidden="true" />{resumeBusy ? (joinsLiveController ? "Joining…" : "Resuming…") : joinsLiveController ? "Join here" : "Resume here"}</Button>}
             {hookSetupMissing && !recovery && <><span aria-hidden="true">·</span><button type="button" data-read-only-explainer data-compact-control="height" className="underline underline-offset-2" onClick={onOpenSetup}>Enable live activity</button></>}
             {canShowTakeControl && <><span aria-hidden="true">·</span><button type="button" data-compact-control="height" className="underline underline-offset-2" disabled={!mutationsReady || busy || takeoverBusy} onClick={() => setTakeoverMenuOpen((open) => !open)}>{takeoverFailed ? (codexSharedTarget ? "Retry shared-control migration" : "Retry moving Claude control") : codexSharedTarget ? "Migrate to shared web + CLI" : "Move Claude Code control here"}</button></>}
           </div>
@@ -768,7 +777,7 @@ export function SessionThreadComposer({
             <CollapsibleContent className="grid gap-1.5 pl-3 text-[var(--text-muted)]" data-control-detail-content>
               <p data-control-detail>{statusDetail}</p>
               {recovery?.state === "retrying" && recovery.nextRetryAt && <p>Agent Manager will retry automatically; the transcript remains available now.</p>}
-              {recovery?.error && !waitingForNativeExit && <Collapsible><CollapsibleTrigger data-compact-control className="cursor-pointer underline underline-offset-2">Technical details</CollapsibleTrigger><CollapsibleContent><pre className="mt-1 whitespace-pre-wrap break-words bg-[var(--surface-raised)] p-2 font-mono text-code-xs text-[var(--text-muted)]" data-recovery-technical-details>{recovery.error}</pre></CollapsibleContent></Collapsible>}
+              {recovery?.error && <Collapsible><CollapsibleTrigger data-compact-control className="cursor-pointer underline underline-offset-2">Technical details</CollapsibleTrigger><CollapsibleContent><pre className="mt-1 whitespace-pre-wrap break-words bg-[var(--surface-raised)] p-2 font-mono text-code-xs text-[var(--text-muted)]" data-recovery-technical-details>{recovery.error}</pre></CollapsibleContent></Collapsible>}
             </CollapsibleContent>
           )}
           {recoveryError && <p className="text-[var(--warning)]" data-recovery-error>{recoveryError}</p>}

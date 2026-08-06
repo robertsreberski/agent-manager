@@ -85,6 +85,7 @@ function session(overrides: Partial<SessionView> = {}): SessionView {
       recovery: null,
       capabilities: [],
       withheld: [],
+      peers: [],
       takeover: null,
     },
     workspaceIdentity: null,
