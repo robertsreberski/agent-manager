@@ -31,7 +31,7 @@ export const setupHookStateSchema = z.enum([
 ]);
 
 export const setupHookOfferSchema = z.object({
-  provider: z.enum(["claude", "codex"]),
+  provider: z.literal("claude"),
   state: setupHookStateSchema,
   settingsPath: z.string().min(1),
   command: z.string().min(1),
@@ -54,13 +54,13 @@ export const setupHookOfferSchema = z.object({
 });
 
 export const setupHookApplyRequestSchema = z.object({
-  provider: z.enum(["claude", "codex"]),
+  provider: z.literal("claude"),
   previewId: z.string().uuid(),
   confirmed: z.literal(true),
 }).strict();
 
 export const setupHookApplyResponseSchema = z.object({
-  provider: z.enum(["claude", "codex"]),
+  provider: z.literal("claude"),
   outcome: z.enum(["applied", "already-applied"]),
   hook: setupHookOfferSchema,
 }).strict();
@@ -76,9 +76,13 @@ export const setupHostProbeSchema = z.object({
 
 export const setupReadModelSchema = z.object({
   nearby: z.array(setupNearbyWorkspaceSchema).max(32),
+  /*
+    Claude only. The Codex command-hook plane is retired: its shim could never
+    gate anything, and the App Server already reports exact events for managed
+    threads, so there is nothing left for an operator to install.
+  */
   hooks: z.object({
     claude: setupHookOfferSchema,
-    codex: setupHookOfferSchema,
   }).strict(),
   hosts: z.array(setupHostProbeSchema).max(32),
 }).strict();

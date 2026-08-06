@@ -9,7 +9,6 @@ import test from "node:test";
 import type { ActivityItem } from "../activity/index.ts";
 import type { SessionRecord } from "../core/types.ts";
 import type { DiscoveryWorkerMessage, WorkerPort } from "../discovery/index.ts";
-import { digestCodexHookToken } from "../providers/codex/codex-hook-auth.ts";
 import { digestHookBearerToken } from "../providers/hooks/auth.ts";
 import {
   observeOnlyControl,
@@ -24,7 +23,6 @@ import { unknownSandbox } from "../shared/session.ts";
 const HOST = "127.0.0.1:43127";
 const ORIGIN = "http://127.0.0.1:43127";
 const CLAUDE_TOKEN = "claude-server-hook-token-with-more-than-thirty-two-characters";
-const CODEX_TOKEN = "codex-server-hook-token-with-more-than-thirty-two-characters";
 
 function session(provider: "claude" | "codex", providerThreadId: string): SessionRecord {
   return {
@@ -140,17 +138,6 @@ function claudeStop(providerSessionId = "claude-external") {
   };
 }
 
-function codexSessionStart(providerSessionId = "codex-external") {
-  return {
-    session_id: providerSessionId,
-    transcript_path: "/tmp/codex-external.jsonl",
-    cwd: "/tmp",
-    hook_event_name: "SessionStart",
-    model: "gpt-5.6-codex",
-    permission_mode: "default",
-    turn_id: null,
-  };
-}
 
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {
   const deadline = Date.now() + 2_000;
@@ -238,21 +225,6 @@ function persistClaude(database: ManagerDatabase, token = CLAUDE_TOKEN): void {
   });
 }
 
-function persistCodex(database: ManagerDatabase, token = CODEX_TOKEN): void {
-  const shimPath = "/Users/test/Library/Application Support/agent-manager/hooks/codex-hook.mjs";
-  database.upsertCodexHookInstallRecord({
-    id: "codex-install",
-    provider: "codex",
-    schemaVersion: 1,
-    tokenDigest: digestCodexHookToken(token),
-    createdAt: "2026-08-04T12:00:00.000Z",
-    settingsPath: "/Users/test/.codex/hooks.json",
-    shimPath,
-    endpoint: "http://127.0.0.1:43127/api/v1/hooks/codex",
-    command: `'${shimPath}'`,
-    shimDigest: `sha256:${"c".repeat(64)}`,
-  });
-}
 
 test("server holds exact Claude permission attention and dispatches persistent browser approval", async (t) => {
   const database = new ManagerDatabase();
@@ -577,87 +549,7 @@ test("external Claude permissions fail open immediately when no authenticated co
   assert.equal(backend.state.get(id)?.control.plane, "observe-only");
 });
 
-test("recent Codex hook evidence selects the foreign hook plane and expires to observe-only", async (t) => {
-  const database = new ManagerDatabase();
-  persistCodex(database);
-  const id = sessionRecordId("local", "codex", "codex-external");
-  const backend = await createAgentManagerServer({
-    discovery: false,
-    staticDir: false,
-    database,
-    codexHookFreshnessMs: 25,
-    initialSessions: [session("codex", "codex-external")],
-  });
-  t.after(() => backend.close());
-  await backend.app.ready();
 
-  const reply = await backend.app.inject({
-    method: "POST",
-    url: "/api/v1/hooks/codex",
-    headers: {
-      host: HOST,
-      authorization: `Bearer ${CODEX_TOKEN}`,
-      "content-type": "application/json",
-    },
-    payload: codexSessionStart(),
-  });
-  assert.equal(reply.statusCode, 200, reply.body);
-  assert.deepEqual(reply.json(), {});
-  assert.deepEqual(backend.state.get(id)?.control, {
-    ...observeOnlyControl(),
-    plane: "codex-hook-bridge",
-    authority: "foreign",
-  });
-  assert.ok(backend.activityHub.snapshot(id)?.items.some(
-    (item) => item.kind === "lifecycle" && item.title === "External Codex session started",
-  ));
-  assert.ok(database.getCodexHookInstallRecord("/Users/test/.codex/hooks.json")?.lastSeenAt);
-  await waitFor(
-    () => backend.state.get(id)?.control.plane === "observe-only",
-    "stale Codex hook evidence to expire",
-  );
-  assert.deepEqual(backend.state.get(id)?.control, observeOnlyControl());
-});
-
-test("Codex hook evidence never promotes a manager-owned private session", async (t) => {
-  const database = new ManagerDatabase();
-  persistCodex(database);
-  const id = sessionRecordId("local", "codex", "codex-private");
-  const managed: SessionRecord = {
-    ...session("codex", "codex-private"),
-    control: {
-      plane: "codex-private",
-      authority: "manager",
-      coordination: providerControlCoordination("codex"),
-      recovery: null,
-      capabilities: ["queue", "interrupt"],
-      withheld: [],
-      takeover: null,
-    },
-  };
-  const backend = await createAgentManagerServer({
-    discovery: false,
-    staticDir: false,
-    database,
-    initialSessions: [managed],
-  });
-  t.after(() => backend.close());
-  await backend.app.ready();
-
-  const reply = await backend.app.inject({
-    method: "POST",
-    url: "/api/v1/hooks/codex",
-    headers: {
-      host: HOST,
-      authorization: `Bearer ${CODEX_TOKEN}`,
-      "content-type": "application/json",
-    },
-    payload: codexSessionStart("codex-private"),
-  });
-  assert.equal(reply.statusCode, 200, reply.body);
-  assert.deepEqual(backend.state.get(id)?.control, managed.control);
-  assert.equal(backend.activityHub.snapshot(id), null);
-});
 
 test("owner reload rotates provider digests and releases holds from the removed token", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "agent-manager-hook-reload-"));
@@ -768,13 +660,12 @@ test("authenticated provider hooks trigger one coalesced discovery scan", async 
   const worker = new FakeWorker();
   const backend = await createAgentManagerServer({
     staticDir: false,
-    codexHookAuthorizationRecords: [{
-      id: "codex-install",
-      provider: "codex",
-      tokenDigest: digestCodexHookToken(CODEX_TOKEN),
+    claudeHookAuthorizationRecords: [{
+      id: "claude-install",
+      provider: "claude",
+      tokenDigest: digestHookBearerToken(CLAUDE_TOKEN),
       createdAt: "2026-08-04T12:00:00.000Z",
-      settingsPath: "/Users/test/.codex/hooks.json",
-      shimPath: "/Users/test/codex-hook.mjs",
+      settingsPath: "/Users/test/.claude/settings.json",
     }],
     discovery: {
       intervalMs: 60_000,
@@ -788,13 +679,13 @@ test("authenticated provider hooks trigger one coalesced discovery scan", async 
 
   const hook = await backend.app.inject({
     method: "POST",
-    url: "/api/v1/hooks/codex",
+    url: "/api/v1/hooks/claude",
     headers: {
       host: HOST,
-      authorization: `Bearer ${CODEX_TOKEN}`,
+      authorization: `Bearer ${CLAUDE_TOKEN}`,
       "content-type": "application/json",
     },
-    payload: codexSessionStart(),
+    payload: claudeStop(),
   });
   assert.equal(hook.statusCode, 200, hook.body);
   assert.equal(worker.requests.length, 1, "active scan is coalesced instead of overlapped");

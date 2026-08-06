@@ -155,6 +155,11 @@ export function defaultPaths(homeDirectory = homedir(), uid = process.getuid?.()
     databaseFile: join(dataDirectory, "state.sqlite"),
     auditFile: join(dataDirectory, "audit.jsonl"),
     runtimeDirectory,
+    /*
+      A containment assertion, not a socket that is ever bound: only the parent
+      directory of this path is validated. The private app-server socket the
+      supervisor actually binds is CODEX_PRIVATE_SOCKET_NAME, one level deeper.
+    */
     codexSocket: join(runtimeDirectory, "codex.sock"),
   };
 }

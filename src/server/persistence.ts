@@ -51,21 +51,6 @@ export interface ClaudeHookInstallRecord {
   lastSeenAt: string | null;
 }
 
-/** Observation-only Codex command-hook authorization and integrity metadata. */
-export interface CodexHookInstallRecord {
-  id: string;
-  provider: "codex";
-  schemaVersion: 1;
-  tokenDigest: string;
-  createdAt: string;
-  settingsPath: string;
-  shimPath: string;
-  endpoint: string;
-  command: string;
-  shimDigest: string;
-  lastSeenAt: string | null;
-}
-
 export interface PersistedAction {
   id: string;
   sessionId: string;
@@ -174,44 +159,6 @@ function assertClaudeHookInstallRecord(
     || endpoint.password.length > 0
   ) {
     throw new Error("Claude hook install endpoint must be the loopback hook route");
-  }
-}
-
-function assertCodexHookInstallRecord(
-  input: Omit<CodexHookInstallRecord, "lastSeenAt">,
-): void {
-  if (
-    input.provider !== "codex"
-    || input.schemaVersion !== 1
-    || !/^[A-Za-z0-9._:-]{1,256}$/u.test(input.id)
-    || !/^sha256:[a-f0-9]{64}$/u.test(input.tokenDigest)
-    || !/^sha256:[a-f0-9]{64}$/u.test(input.shimDigest)
-    || !Number.isFinite(Date.parse(input.createdAt))
-    || input.command.length === 0
-    || input.command.length > 32_768
-    || /[\u0000-\u001f\u007f]/u.test(input.command)
-    || ![input.settingsPath, input.shimPath].every((path) =>
-      path.startsWith("/") && path.length <= 32_768 && !path.includes("\0")
-    )
-  ) {
-    throw new Error("Codex hook install record is invalid");
-  }
-  let endpoint: URL;
-  try {
-    endpoint = new URL(input.endpoint);
-  } catch {
-    throw new Error("Codex hook install endpoint is invalid");
-  }
-  if (
-    endpoint.protocol !== "http:"
-    || !["127.0.0.1", "[::1]", "localhost"].includes(endpoint.hostname)
-    || endpoint.pathname !== "/api/v1/hooks/codex"
-    || endpoint.search.length > 0
-    || endpoint.hash.length > 0
-    || endpoint.username.length > 0
-    || endpoint.password.length > 0
-  ) {
-    throw new Error("Codex hook install endpoint must be the loopback hook route");
   }
 }
 
@@ -392,19 +339,6 @@ export class ManagerDatabase {
         settings_path TEXT NOT NULL UNIQUE,
         endpoint TEXT NOT NULL,
         created_hooks_property INTEGER NOT NULL CHECK (created_hooks_property IN (0, 1)),
-        last_seen_at TEXT
-      ) STRICT;
-      CREATE TABLE IF NOT EXISTS codex_hook_installs (
-        id TEXT PRIMARY KEY,
-        provider TEXT NOT NULL CHECK (provider = 'codex'),
-        schema_version INTEGER NOT NULL CHECK (schema_version = 1),
-        token_digest TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        settings_path TEXT NOT NULL UNIQUE,
-        shim_path TEXT NOT NULL UNIQUE,
-        endpoint TEXT NOT NULL,
-        command TEXT NOT NULL,
-        shim_digest TEXT NOT NULL,
         last_seen_at TEXT
       ) STRICT;
       CREATE TABLE IF NOT EXISTS queued_actions (
@@ -756,94 +690,35 @@ export class ManagerDatabase {
     return Number(result.changes) > 0;
   }
 
-  listCodexHookInstallRecords(): CodexHookInstallRecord[] {
-    const rows = this.#database.prepare(`
-      SELECT id, provider, schema_version, token_digest, created_at,
-             settings_path, shim_path, endpoint, command, shim_digest, last_seen_at
-      FROM codex_hook_installs ORDER BY created_at, id
-    `).all() as unknown as Record<string, unknown>[];
-    return rows.map((row) => {
-      const record: CodexHookInstallRecord = {
-        id: asString(row.id),
-        provider: "codex",
-        schemaVersion: 1,
-        tokenDigest: asString(row.token_digest),
-        createdAt: asString(row.created_at),
-        settingsPath: asString(row.settings_path),
-        shimPath: asString(row.shim_path),
-        endpoint: asString(row.endpoint),
-        command: asString(row.command),
-        shimDigest: asString(row.shim_digest),
-        lastSeenAt: row.last_seen_at === null ? null : asString(row.last_seen_at),
-      };
-      assertCodexHookInstallRecord(record);
-      if (record.lastSeenAt !== null && !Number.isFinite(Date.parse(record.lastSeenAt))) {
-        throw new Error("Persisted Codex hook last-seen timestamp is invalid");
-      }
-      return record;
-    });
-  }
-
-  getCodexHookInstallRecord(settingsPath: string): CodexHookInstallRecord | null {
-    return this.listCodexHookInstallRecords().find(
-      (record) => record.settingsPath === settingsPath,
-    ) ?? null;
-  }
-
-  upsertCodexHookInstallRecord(
-    input: Omit<CodexHookInstallRecord, "lastSeenAt">,
-  ): CodexHookInstallRecord {
-    assertCodexHookInstallRecord(input);
-    this.#database.prepare(`
-      INSERT INTO codex_hook_installs (
-        id, provider, schema_version, token_digest, created_at, settings_path,
-        shim_path, endpoint, command, shim_digest, last_seen_at
-      ) VALUES (?, 'codex', 1, ?, ?, ?, ?, ?, ?, ?, NULL)
-      ON CONFLICT(settings_path) DO UPDATE SET
-        id = excluded.id,
-        token_digest = excluded.token_digest,
-        created_at = excluded.created_at,
-        shim_path = excluded.shim_path,
-        endpoint = excluded.endpoint,
-        command = excluded.command,
-        shim_digest = excluded.shim_digest,
-        last_seen_at = CASE
-          WHEN codex_hook_installs.id = excluded.id
-            AND codex_hook_installs.token_digest = excluded.token_digest
-            AND codex_hook_installs.shim_digest = excluded.shim_digest
-          THEN codex_hook_installs.last_seen_at
-          ELSE NULL
-        END
-    `).run(
-      input.id,
-      input.tokenDigest,
-      input.createdAt,
-      input.settingsPath,
-      input.shimPath,
-      input.endpoint,
-      input.command,
-      input.shimDigest,
-    );
-    const stored = this.getCodexHookInstallRecord(input.settingsPath);
-    if (!stored) throw new Error("Codex hook install record disappeared during upsert");
-    return stored;
-  }
-
-  removeCodexHookInstallRecord(id: string): boolean {
-    const result = this.#database.prepare(
-      "DELETE FROM codex_hook_installs WHERE id = ?",
-    ).run(id);
-    return Number(result.changes) > 0;
-  }
-
-  markCodexHookSeen(id: string, at = new Date().toISOString()): boolean {
-    if (!Number.isFinite(Date.parse(at))) throw new Error("Codex hook last-seen timestamp is invalid");
-    const result = this.#database.prepare(`
-      UPDATE codex_hook_installs
-      SET last_seen_at = ?
-      WHERE id = ? AND (last_seen_at IS NULL OR last_seen_at < ?)
-    `).run(at, id, at);
-    return Number(result.changes) > 0;
+  /**
+   * Read and forget the retired Codex command-hook installs.
+   *
+   * The plane is gone, but its rows are the only record of the project-scoped
+   * files it wrote, so startup cleanup drains them exactly once and drops the
+   * table with them. Absent on a fresh database, and absent on every start
+   * after the first — both are success, not failure.
+   */
+  takeRetiredCodexHookInstalls(): readonly {
+    settingsPath: string;
+    shimPath: string;
+    command: string;
+  }[] {
+    let rows: Record<string, unknown>[] = [];
+    try {
+      rows = this.#database.prepare(
+        "SELECT settings_path, shim_path, command FROM codex_hook_installs",
+      ).all() as unknown as Record<string, unknown>[];
+    } catch {
+      // Already dropped by an earlier start, or never created.
+      return [];
+    }
+    const records = rows.map((row) => ({
+      settingsPath: asString(row.settings_path),
+      shimPath: asString(row.shim_path),
+      command: asString(row.command),
+    }));
+    this.#database.exec("DROP TABLE IF EXISTS codex_hook_installs");
+    return records;
   }
 
   beginCreateSessionIntent(input: {

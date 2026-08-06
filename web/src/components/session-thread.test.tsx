@@ -179,7 +179,7 @@ describe("SessionThreadComposer", () => {
       ...session,
       control: {
         ...session.control,
-        plane: "codex-hook-bridge",
+        plane: "observe-only",
         authority: "foreign",
         coordination: observeCoordination,
         capabilities: ["take-control", "resume"],
@@ -236,7 +236,7 @@ describe("SessionThreadComposer", () => {
       ...session,
       control: {
         ...session.control,
-        plane: "codex-hook-bridge",
+        plane: "observe-only",
         authority: "foreign",
         coordination: sharedCoordination,
         capabilities: ["take-control", "cancel-take-control"],
@@ -474,7 +474,7 @@ describe("SessionThreadComposer", () => {
       ...session,
       control: {
         ...session.control,
-        plane: "codex-hook-bridge",
+        plane: "observe-only",
         authority: "foreign",
         coordination: sharedCoordination,
         capabilities: ["take-control", "resume", "attach"],
@@ -522,7 +522,7 @@ describe("SessionThreadComposer", () => {
       ...session,
       control: {
         ...session.control,
-        plane: "codex-hook-bridge",
+        plane: "observe-only",
         authority: "foreign",
         coordination: observeCoordination,
         capabilities: ["take-control", "cancel-take-control", "attach"],

@@ -45,17 +45,6 @@ import {
   type ClaudeHookOperationResult,
 } from "../ops/hooks.ts";
 import {
-  runCodexHookOperation,
-  type CodexHookInstallRecord,
-  type CodexHookOperationDependencies,
-  type CodexHookOperationInput,
-  type CodexHookOperationResult,
-} from "../ops/codex-hooks.ts";
-import {
-  probeCodexHookStatus,
-  type CodexHookStatus,
-} from "../providers/codex/codex-hook.ts";
-import {
   requestAttachFromControlSocket,
   requestAttachExitedFromControlSocket,
   requestAttachFailedFromControlSocket,
@@ -151,15 +140,6 @@ export interface CliDependencies {
   saveClaudeHookRecord(record: ClaudeHookInstallRecord): void;
   removeClaudeHookRecord(recordId: string): void;
   claudeHookLastSeen(recordId: string): string | null;
-  operateCodexHook(
-    input: CodexHookOperationInput,
-    dependencies: CodexHookOperationDependencies,
-  ): Promise<CodexHookOperationResult>;
-  loadCodexHookRecord(settingsPath: string): CodexHookInstallRecord | null;
-  saveCodexHookRecord(record: CodexHookInstallRecord): void;
-  removeCodexHookRecord(recordId: string): void;
-  codexHookLastSeen(recordId: string): string | null;
-  codexHookStatus(settingsPath: string, expectedCommand: string): Promise<CodexHookStatus>;
   reloadHookAuthorizations(path: string): Promise<{ ok: true }>;
   confirmHookChange(): Promise<boolean>;
   startServer(options: { host: "127.0.0.1"; port: number }): Promise<StartedServer>;
@@ -514,45 +494,6 @@ function defaultDependencies(): CliDependencies {
         database.close();
       }
     },
-    operateCodexHook: runCodexHookOperation,
-    loadCodexHookRecord: (settingsPath) => {
-      const database = new ManagerDatabase(paths.databaseFile);
-      try {
-        return database.getCodexHookInstallRecord(settingsPath);
-      } finally {
-        database.close();
-      }
-    },
-    saveCodexHookRecord: (record) => {
-      const database = new ManagerDatabase(paths.databaseFile);
-      try {
-        database.upsertCodexHookInstallRecord(record);
-      } finally {
-        database.close();
-      }
-    },
-    removeCodexHookRecord: (recordId) => {
-      const database = new ManagerDatabase(paths.databaseFile);
-      try {
-        database.removeCodexHookInstallRecord(recordId);
-      } finally {
-        database.close();
-      }
-    },
-    codexHookLastSeen: (recordId) => {
-      const database = new ManagerDatabase(paths.databaseFile);
-      try {
-        return database.listCodexHookInstallRecords()
-          .find((record) => record.id === recordId)?.lastSeenAt ?? null;
-      } finally {
-        database.close();
-      }
-    },
-    codexHookStatus: (settingsPath, expectedCommand) => probeCodexHookStatus({
-      codexExecutable: resolveServiceExecutables({ nodeExecutable: process.execPath }).codex,
-      cwds: [dirname(dirname(settingsPath))],
-      expectedCommand,
-    }),
     reloadHookAuthorizations: requestHooksReloadFromControlSocket,
     confirmHookChange: async () => {
       if (!process.stdin.isTTY || !process.stderr.isTTY) {
@@ -625,58 +566,6 @@ async function dispatchClaudeHook(
   }
 }
 
-async function dispatchCodexHook(
-  command: Extract<ReturnType<typeof parseCliCommand>, { name: "hooks" }>,
-  deps: CliDependencies,
-): Promise<void> {
-  const common = {
-    operation: command.operation,
-    scope: command.scope,
-    homeDirectory: deps.homeDirectory,
-    ...(command.scope === "project" ? { projectDirectory: deps.currentDirectory } : {}),
-  } as const;
-  const input: CodexHookOperationInput = command.operation === "install"
-    ? {
-        ...common,
-        operation: "install",
-        endpoint: `http://127.0.0.1:${String(deps.loadConfig().backend.port)}/api/v1/hooks/codex`,
-      }
-    : command.operation === "uninstall"
-      ? { ...common, operation: "uninstall" }
-      : { ...common, operation: "status" };
-  const result = await deps.operateCodexHook(input, {
-    loadRecord: deps.loadCodexHookRecord,
-    saveRecord: deps.saveCodexHookRecord,
-    removeRecord: deps.removeCodexHookRecord,
-    trustStatus: deps.codexHookStatus,
-    lastSeenAt: deps.codexHookLastSeen,
-    nodeExecutable: process.execPath,
-    showPreview: (plan) => {
-      const exactDiff = plan.diff.trimEnd();
-      if (exactDiff.length > 0) writeLine(deps.stdout, exactDiff);
-      writeLine(deps.stdout, plan.shimNotice);
-    },
-    confirm: () => command.yes ? true : deps.confirmHookChange(),
-  });
-  writeLine(deps.stdout, `Codex hooks (${command.scope}): ${result.status.state}`);
-  writeLine(deps.stdout, `Settings: ${result.status.settingsPath}`);
-  writeLine(deps.stdout, `Shim: ${result.status.shimPath}`);
-  if (result.status.lastSeenAt) writeLine(deps.stdout, `Last event: ${result.status.lastSeenAt}`);
-  if (result.status.state === "awaiting-trust") {
-    writeLine(deps.stdout, "Open /hooks in Codex and trust the exact Agent Manager command hook.");
-  }
-  if (result.operation !== "status") writeLine(deps.stdout, `Outcome: ${result.outcome}`);
-  if (result.operation !== "status" && result.outcome !== "cancelled") {
-    try {
-      await deps.reloadHookAuthorizations(deps.controlSocketPath);
-    } catch {
-      writeLine(
-        deps.stderr,
-        "Hook settings are saved; start or restart Agent Manager before expecting cockpit events.",
-      );
-    }
-  }
-}
 
 function dependencies(overrides: Partial<CliDependencies>): CliDependencies {
   return { ...defaultDependencies(), ...overrides };
@@ -994,14 +883,14 @@ async function dispatch(argv: readonly string[], deps: CliDependencies): Promise
           "Project hooks point at this machine-local Agent Manager service and will not work on another machine.",
         );
       }
-      if (command.provider === "claude") {
-        await dispatchClaudeHook(command, deps);
-      } else if (command.provider === "codex") {
-        await dispatchCodexHook(command, deps);
-      } else {
-        await dispatchClaudeHook(command, deps);
-        await dispatchCodexHook(command, deps);
+      if (command.provider === "codex") {
+        writeLine(
+          deps.stderr,
+          "Codex hooks are retired. Agent Manager reads Codex sessions through the App Server, and any hooks it installed are removed automatically on start.",
+        );
+        return 1;
       }
+      await dispatchClaudeHook(command, deps);
       return 0;
     }
     case "service": {

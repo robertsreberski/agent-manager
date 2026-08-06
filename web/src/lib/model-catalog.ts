@@ -1,3 +1,36 @@
+import {
+  reasoningEffortsForProvider,
+  type Provider,
+  type ReasoningEffort,
+} from "../../../src/shared/session.ts";
+
+/**
+ * The effort levels a composer may offer, for a draft and a live session alike.
+ *
+ * Three distinct cases, and conflating any two of them hides the control:
+ *
+ * - `undefined` — the catalog has not loaded. Offer nothing; a guess made
+ *   before the provider has answered is not an offer, it is a fabrication.
+ * - a non-empty catalog — the provider has named the levels. Use exactly those.
+ * - an empty loaded catalog — the provider named none that every row agrees on,
+ *   but the harness has still granted the write. A granted `set-effort` is the
+ *   harness's own claim that a level drawn from its provider vocabulary will be
+ *   accepted, so that vocabulary is the honest offer.
+ *
+ * A draft passes `canSetEffort: true`: effort is a field of the create request,
+ * so a session that does not exist yet cannot have refused it.
+ */
+export function composerEffortOptions(
+  provider: Provider | null,
+  catalogEfforts: readonly ReasoningEffort[] | undefined,
+  canSetEffort: boolean,
+): readonly ReasoningEffort[] {
+  if (catalogEfforts === undefined) return [];
+  if (catalogEfforts.length > 0) return catalogEfforts;
+  if (!canSetEffort || provider === null) return [];
+  return reasoningEffortsForProvider(provider);
+}
+
 /**
  * The catalog row that covers a session's model: an exact `value` match, or
  * the alias row whose `resolvedModel` names the same wire id. A session's

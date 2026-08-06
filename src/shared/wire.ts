@@ -366,7 +366,6 @@ export const sessionRecordSchema: z.ZodType<SessionRecord> = z.object({
   control: z.object({
     plane: z.enum([
       "codex-private",
-      "codex-hook-bridge",
       "claude-sdk",
       "claude-hook-bridge",
       "tmux-attach",

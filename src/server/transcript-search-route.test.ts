@@ -71,7 +71,7 @@ function session(overrides: Partial<SessionView> = {}): SessionView {
     terminal: null,
     control: {
       ...observeOnlyControl(),
-      plane: "codex-hook-bridge",
+      plane: "observe-only",
       authority: "foreign",
     },
     workspaceIdentity: null,

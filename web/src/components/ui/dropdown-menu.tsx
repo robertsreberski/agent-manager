@@ -22,7 +22,24 @@ const menuSurface =
   no extra global CSS is needed.
 */
 const menuItem =
-  "relative flex min-h-8 cursor-pointer items-center gap-2 rounded-sm px-2.5 py-1.5 text-meta-sm select-none pointer-coarse:min-h-[var(--touch-target)] data-[highlighted]:bg-[var(--surface-selected)] data-[disabled]:pointer-events-none data-[disabled]:opacity-45 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4";
+  "relative flex min-h-8 cursor-pointer items-center gap-2 rounded-sm px-2.5 py-1.5 text-meta-sm select-none pointer-coarse:min-h-[var(--touch-target)] data-[highlighted]:bg-[var(--surface-selected)] [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4";
+
+/*
+  How a menu item looks when it is refused, kept out of `menuItem` because the
+  two libraries underneath disagree about what "disabled" looks like in the DOM.
+
+  Radix omits `data-disabled` entirely unless the item really is disabled, so a
+  presence selector is exactly right for it. cmdk writes `data-disabled="false"`
+  on every item it renders, and a presence selector matches that too — which
+  greyed out and made unclickable every row of the model picker, on every
+  session, regardless of whether the harness allowed the change. Each consumer
+  now states the form its own library actually emits.
+*/
+export const menuItemDisabledWhenPresent =
+  "data-[disabled]:pointer-events-none data-[disabled]:opacity-45";
+
+export const menuItemDisabledWhenTrue =
+  "data-[disabled=true]:pointer-events-none data-[disabled=true]:opacity-45";
 
 /** R4: red is danger, and only danger. */
 const menuItemDanger =
@@ -73,7 +90,7 @@ function DropdownMenuItem({ className, inset, variant = "default", ...props }: D
       data-slot="dropdown-menu-item"
       data-inset={inset ? "" : undefined}
       data-variant={variant}
-      className={cn(menuItem, menuItemDanger, "data-[inset]:pl-8", className)}
+      className={cn(menuItem, menuItemDisabledWhenPresent, menuItemDanger, "data-[inset]:pl-8", className)}
       {...props}
     />
   );
@@ -87,7 +104,7 @@ function DropdownMenuCheckboxItem({
   return (
     <DropdownMenuPrimitive.CheckboxItem
       data-slot="dropdown-menu-checkbox-item"
-      className={cn(menuItem, "pl-8", className)}
+      className={cn(menuItem, menuItemDisabledWhenPresent, "pl-8", className)}
       {...props}
     >
       <span className="pointer-events-none absolute left-2.5 grid size-4 place-items-center">
@@ -112,7 +129,7 @@ function DropdownMenuRadioItem({
   return (
     <DropdownMenuPrimitive.RadioItem
       data-slot="dropdown-menu-radio-item"
-      className={cn(menuItem, "pl-8", className)}
+      className={cn(menuItem, menuItemDisabledWhenPresent, "pl-8", className)}
       {...props}
     >
       <span className="pointer-events-none absolute left-2.5 grid size-4 place-items-center">
@@ -176,7 +193,7 @@ function DropdownMenuSubTrigger({ className, inset, children, ...props }: Dropdo
     <DropdownMenuPrimitive.SubTrigger
       data-slot="dropdown-menu-sub-trigger"
       data-inset={inset ? "" : undefined}
-      className={cn(menuItem, "data-[inset]:pl-8 data-[state=open]:bg-[var(--surface-selected)]", className)}
+      className={cn(menuItem, menuItemDisabledWhenPresent, "data-[inset]:pl-8 data-[state=open]:bg-[var(--surface-selected)]", className)}
       {...props}
     >
       {children}

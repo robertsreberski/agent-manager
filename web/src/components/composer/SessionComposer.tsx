@@ -69,6 +69,12 @@ export interface SessionComposerProps {
   modelOptions?: readonly ComposerModelOption[];
   modelOptionsStatus?: string | null;
   modelChangeUnavailableReason?: string | null;
+  /**
+   * Lifts the refusal the reason describes. Passed only when the session
+   * actually offers `take-control`, so its presence is the signal that the
+   * disabled rows are recoverable rather than simply unavailable.
+   */
+  onTakeControl?: () => void;
   effortChangeUnavailableReason?: string | null;
   profileChangeUnavailableReason?: string | null;
   sandboxChangeUnavailableReason?: string | null;
@@ -139,7 +145,7 @@ export function SessionComposer(props: SessionComposerProps) {
     sandbox = null,
     settingsIdleOnly = false, draft = false, busy = false,
     onProviderChange, onModelChange, onEffortChange, onProfileChange, onSandboxChange,
-    onReloadModels, onResetSettings, onSearchFiles,
+    onReloadModels, onResetSettings, onSearchFiles, onTakeControl,
   } = props;
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // The only state the composer still keeps for its menus: which one is open.
@@ -459,7 +465,27 @@ export function SessionComposer(props: SessionComposerProps) {
               one. The reason belongs where it can be read, not only on hover.
             */}
             {modelOptions.length > 0 && !onModelChange && modelChangeUnavailableReason && (
-              <p className="px-2.5 py-1.5 text-code-sm text-[var(--text-muted)]" role="status">{modelChangeUnavailableReason}</p>
+              <p className="px-2.5 py-1.5 text-code-sm text-[var(--text-muted)]" role="status">
+                {modelChangeUnavailableReason}
+                {/*
+                  A refusal the operator can lift belongs next to the refusal.
+                  These rows are disabled because Agent Manager does not own the
+                  session, and taking control is the one action that changes
+                  that — leaving them to find it elsewhere is what made a
+                  disabled row look broken.
+                */}
+                {onTakeControl && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    data-compact-control="height"
+                    className="ml-2 px-0 underline"
+                    onClick={() => onTakeControl()}
+                  >
+                    Take control
+                  </Button>
+                )}
+              </p>
             )}
             {onResetSettings && (
               <div className="border-t border-[var(--rule)] p-1">

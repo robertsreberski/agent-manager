@@ -15,6 +15,7 @@ import {
   SetupDialog,
   shouldRetrySettingsLookup,
 } from "./App";
+import { composerEffortOptions } from "./lib/model-catalog";
 
 describe("hostSelectionSummary", () => {
   it("describes the empty filter as the truthful default-all state", () => {
@@ -109,6 +110,68 @@ describe("cockpit presentation contracts", () => {
     expect(modelCatalogEfforts(null, unmarked)).toEqual(["medium", "high"]);
     // A model that is named but absent is unknown, not unspecified.
     expect(modelCatalogEfforts("haiku", unmarked)).toEqual([]);
+  });
+
+  it("lets a model that declares no efforts abstain rather than veto the catalog", () => {
+    /*
+      The real Claude catalog's shape: no row marks itself default, and `haiku`
+      declares no efforts at all because its ModelInfo sets no `supportsEffort`,
+      so `claudeModelOption` omits the field. Counting that silence as a vote
+      for zero levels emptied the intersection and left a fresh Claude draft
+      with no effort control and a meter reading "Unknown".
+    */
+    const claude = {
+      available: true,
+      source: "provider-api",
+      models: [
+        { value: "default", label: "Default", description: null, efforts: ["low", "medium", "high", "xhigh", "max"] },
+        { value: "opus[1m]", label: "Opus", description: null, efforts: ["low", "medium", "high", "xhigh", "max"] },
+        { value: "sonnet", label: "Sonnet", description: null, efforts: ["low", "medium", "high", "xhigh", "max"] },
+        { value: "haiku", label: "Haiku", description: null },
+      ],
+    } satisfies NonNullable<Parameters<typeof modelCatalogEfforts>[1]>;
+    expect(modelCatalogEfforts(null, claude)).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    // The abstaining row is still unknown when named outright: it declared
+    // nothing, and nothing is what it borrows from the rows that did.
+    expect(modelCatalogEfforts("haiku", claude)).toEqual([]);
+
+    // Every row abstaining leaves the catalog with nothing to say. The
+    // composer's capability-gated vocabulary fallback covers that case.
+    const silent = {
+      available: true,
+      source: "provider-api",
+      models: [
+        { value: "one", label: "One", description: null },
+        { value: "two", label: "Two", description: null },
+      ],
+    } satisfies NonNullable<Parameters<typeof modelCatalogEfforts>[1]>;
+    expect(modelCatalogEfforts(null, silent)).toEqual([]);
+  });
+
+  it("carries the real Claude catalog through to a draft's effort control", () => {
+    /*
+      The whole path the bug ran down, in one assertion: the catalog the SDK
+      actually returns (measured — `haiku` reports `supportsEffort: undefined`
+      and `supportedEffortLevels: null`, the other four declare all five levels),
+      through the catalog reader, into the resolver the composer offers from.
+      Either half alone looked correct; only the composition rendered nothing.
+    */
+    const live = {
+      available: true,
+      source: "provider-api",
+      models: [
+        { value: "default", label: "Default", description: null, efforts: ["low", "medium", "high", "xhigh", "max"] },
+        { value: "opus[1m]", label: "Opus", description: null, efforts: ["low", "medium", "high", "xhigh", "max"] },
+        { value: "claude-fable-5[1m]", label: "Fable", description: null, efforts: ["low", "medium", "high", "xhigh", "max"] },
+        { value: "sonnet", label: "Sonnet", description: null, efforts: ["low", "medium", "high", "xhigh", "max"] },
+        { value: "haiku", label: "Haiku", description: null },
+      ],
+    } satisfies NonNullable<Parameters<typeof modelCatalogEfforts>[1]>;
+    const offered = composerEffortOptions("claude", modelCatalogEfforts(null, live), true);
+    expect(offered).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    // Non-empty is the property the control actually gates on: `ModelSelector`
+    // returns null for an empty set, which is how the meter read "Unknown".
+    expect(offered.length).toBeGreaterThan(0);
   });
 
   it("matches a session's wire model id to the alias row that resolves to it", () => {

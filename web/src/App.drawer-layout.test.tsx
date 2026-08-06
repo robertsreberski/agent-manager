@@ -45,7 +45,7 @@ const activity: SessionActivityView = {
   updateCount: 0,
 };
 
-function hookOffer(provider: "claude" | "codex"): SetupHookOffer {
+function hookOffer(provider: "claude"): SetupHookOffer {
   return {
     provider,
     state: "absent",
@@ -61,7 +61,7 @@ function hookOffer(provider: "claude" | "codex"): SetupHookOffer {
 
 const setupModel: SetupReadModel = {
   nearby: [],
-  hooks: { claude: hookOffer("claude"), codex: hookOffer("codex") },
+  hooks: { claude: hookOffer("claude") },
   hosts: [],
 };
 
@@ -129,7 +129,7 @@ const cockpit = {
   loadSessionFacts: vi.fn(async () => undefined),
   loadPlanFile: vi.fn(async () => undefined),
   loadSetup,
-  applySetupHook: vi.fn(async (provider: "claude" | "codex") => ({
+  applySetupHook: vi.fn(async (provider: "claude") => ({
     provider,
     outcome: "applied" as const,
     hook: { ...hookOffer(provider), changed: false, diff: "", previewId: null, expiresAt: null },
@@ -445,7 +445,6 @@ describe("reaching hooks from an observation-only board", () => {
       ...setupModel,
       hooks: {
         claude: { ...hookOffer("claude"), state: "active", changed: false, diff: "", previewId: null, expiresAt: null },
-        codex: { ...hookOffer("codex"), state: "active", changed: false, diff: "", previewId: null, expiresAt: null },
       },
     });
     vi.useFakeTimers({ shouldAdvanceTime: true });

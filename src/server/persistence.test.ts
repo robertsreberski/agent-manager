@@ -5,7 +5,6 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
-import { digestCodexHookToken } from "../providers/codex/codex-hook-auth.ts";
 import { digestHookBearerToken } from "../providers/hooks/auth.ts";
 import type { SessionAction } from "./contracts.ts";
 import {
@@ -125,43 +124,6 @@ test("persists Claude hook authorization as a digest and tracks monotonic livene
     assert.equal(database.listClaudeHookInstallRecords().length, 0);
     database.close();
 
-    assert.equal(readFileSync(path).includes(Buffer.from(bearer)), false);
-  } finally {
-    rmSync(directory, { recursive: true, force: true });
-  }
-});
-
-test("persists Codex hook digests and integrity metadata without its bearer", () => {
-  const directory = mkdtempSync(join(tmpdir(), "agent-manager-codex-hook-db-"));
-  const path = join(directory, "state.sqlite");
-  const bearer = "codex-plaintext-token-that-must-not-enter-agent-manager-state";
-  const digest = digestCodexHookToken(bearer);
-  const shimDigest = `sha256:${"b".repeat(64)}`;
-  try {
-    let database = new ManagerDatabase(path);
-    const stored = database.upsertCodexHookInstallRecord({
-      id: "codex-hook-install-1",
-      provider: "codex",
-      schemaVersion: 1,
-      tokenDigest: digest,
-      createdAt: "2026-08-04T12:00:00.000Z",
-      settingsPath: "/Users/test/.codex/hooks.json",
-      shimPath: "/Users/test/Library/Application Support/agent-manager/hooks/codex-hook.mjs",
-      endpoint: "http://127.0.0.1:43127/api/v1/hooks/codex",
-      command: "'/Users/test/Library/Application Support/agent-manager/hooks/codex-hook.mjs'",
-      shimDigest,
-    });
-    assert.equal(stored.lastSeenAt, null);
-    assert.equal(database.markCodexHookSeen("codex-hook-install-1", "2026-08-04T12:01:00.000Z"), true);
-    database.close();
-
-    database = new ManagerDatabase(path);
-    assert.equal(
-      database.getCodexHookInstallRecord("/Users/test/.codex/hooks.json")?.lastSeenAt,
-      "2026-08-04T12:01:00.000Z",
-    );
-    assert.equal(database.removeCodexHookInstallRecord("codex-hook-install-1"), true);
-    database.close();
     assert.equal(readFileSync(path).includes(Buffer.from(bearer)), false);
   } finally {
     rmSync(directory, { recursive: true, force: true });

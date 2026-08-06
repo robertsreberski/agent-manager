@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { ActivityHub, type ActivityMutation } from "../../activity/index.ts";
+import { assertPublishedSessionView } from "../shared/session-view.conformance.test.ts";
 import type { SessionView } from "../../core/types.ts";
 import type { WorkspaceIdentity } from "../../core/worktree.ts";
 import type { ManagedSessionRecoveryRecord } from "../../server/contracts.ts";
@@ -205,7 +206,7 @@ function externalCodexSession(): SessionView {
     attention: [],
     terminal: null,
     control: {
-      plane: "codex-hook-bridge",
+      plane: "observe-only",
       authority: "foreign",
       coordination: {
         mode: "observe-only",
@@ -2842,6 +2843,56 @@ test("bounds managed recovery to one hundred records and four concurrent reads",
   await adapter.dispose();
 });
 
+test("every managed recovery record lands in exactly one of restored or failures", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("thread/read", (params) =>
+    String(params.threadId) === "recovers-fine"
+      ? threadResultWithIdentity("recovers-fine", null, null)
+      : (() => { throw new Error("provider refused"); })()
+  );
+  transport.handlers.set("thread/resume", (params) =>
+    threadResultWithIdentity(String(params.threadId), null, null)
+  );
+  const bridge = new CodexProviderBridge({ adapter, resolveWorkspace: () => "/workspace" });
+  const record = (threadId: string): ManagedSessionRecoveryRecord => ({
+    managerSessionId: `local:codex:${threadId}`,
+    provider: "codex",
+    providerThreadId: threadId,
+    workspaceId: "workspace-1",
+    workspacePath: "/workspace",
+    name: null,
+    profile: "execute",
+    providerTreeId: null,
+    providerParentThreadId: null,
+    createdAt: "2026-08-03T09:00:00.000Z",
+  });
+  const records = [record("recovers-fine"), record("refused"), record("refused-too")];
+
+  const report = await bridge.restoreManagedSessions(records, new AbortController().signal);
+
+  /*
+    The accounting invariant, not the wording. Assembling `failures` with a
+    truthiness test on the reason silently dropped any record whose reason
+    stringified empty — it appeared in neither list, and the server then blamed
+    the provider for not confirming an identity it had never been asked about.
+  */
+  const accounted = new Set([
+    ...report.restoredSessionIds,
+    ...report.failures.map((failure) => failure.managerSessionId),
+  ]);
+  assert.equal(accounted.size, records.length, "no record may vanish from both lists");
+  for (const entry of records) assert.ok(accounted.has(entry.managerSessionId), entry.managerSessionId);
+  assert.deepEqual(report.restoredSessionIds, ["local:codex:recovers-fine"]);
+  assert.deepEqual(
+    report.failures.map((failure) => failure.providerThreadId).sort(),
+    ["refused", "refused-too"],
+  );
+  for (const failure of report.failures) assert.equal(typeof failure.reason, "string");
+
+  bridge.dispose();
+  await adapter.dispose();
+});
+
 test("settings are idle-only and become effective only after provider notification", async () => {
   const { adapter, transport } = await initializedAdapter();
   transport.handlers.set("thread/start", () => threadResult());
@@ -2871,6 +2922,58 @@ test("settings are idle-only and become effective only after provider notificati
     adapter.setProfile("thread-1", "full-access"),
     /only be changed while the thread is idle/u,
   );
+  await adapter.dispose();
+});
+
+test("model and effort chosen during a turn apply to the next one instead of being refused", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("thread/start", () => threadResult());
+  transport.handlers.set("thread/settings/update", () => ({}));
+  transport.handlers.set("turn/start", () => ({
+    turn: { id: "turn-2", status: "inProgress", items: [] },
+  }));
+  await adapter.startThread({ cwd: "/workspace" });
+  transport.notify("turn/started", {
+    threadId: "thread-1",
+    turn: { id: "turn-running", status: "inProgress", items: [] },
+  });
+
+  // Neither refuses, and neither reaches the provider mid-flight: the running
+  // turn already resolved its model at `turn/start`.
+  await adapter.setModel("thread-1", "gpt-5.6-codex");
+  await adapter.setEffort("thread-1", "xhigh");
+  assert.equal(methodMessages(transport, "thread/settings/update").length, 0);
+
+  const busy = adapter.getThreadState("thread-1");
+  assert.equal(busy?.pendingSettings?.delivery, "next-turn");
+  assert.equal(busy?.pendingSettings?.model, "gpt-5.6-codex");
+  assert.equal(busy?.pendingSettings?.effort, "xhigh");
+  // A pending change never overwrites the provider-confirmed fact: the thread
+  // still reports the model the running turn is actually using.
+  assert.equal(busy?.model, "gpt-5.6");
+  assert.equal(busy?.effort, null);
+
+  // Profile and sandbox are still refused: they govern the approval policy and
+  // containment the running turn is already executing tool calls under.
+  await assert.rejects(
+    adapter.setSandbox("thread-1", { mode: "danger-full-access", networkAccess: true }),
+    /only be changed while the thread is idle/u,
+  );
+
+  transport.notify("turn/completed", {
+    threadId: "thread-1",
+    turn: { id: "turn-running", status: "completed", items: [] },
+  });
+  transport.notify("thread/status/changed", {
+    threadId: "thread-1",
+    status: { type: "idle" },
+  });
+  await adapter.queueMessage("thread-1", "next");
+  await eventually(() => {
+    const start = methodMessages(transport, "turn/start")[0]?.params as JsonObject | undefined;
+    assert.equal(start?.model, "gpt-5.6-codex");
+    assert.equal(start?.effort, "xhigh");
+  });
   await adapter.dispose();
 });
 
@@ -3915,6 +4018,51 @@ test("workspace identity stays null when the bounded git resolution cannot answe
   }, context);
   assert.equal(created.workspaceIdentity, null);
   assert.equal(created.id, "local:codex:thread-1", "creation still succeeds");
+  bridge.dispose();
+  await adapter.dispose();
+});
+
+test("every published Codex view satisfies the cross-provider contract", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("thread/start", () => threadResult());
+  transport.handlers.set("thread/settings/update", () => ({}));
+  transport.handlers.set("turn/start", () => ({
+    turn: { id: "turn-1", status: "inProgress", items: [] },
+  }));
+  const published: SessionView[] = [];
+  const bridge = new CodexProviderBridge({
+    adapter,
+    resolveWorkspace: () => "/workspace",
+    onSessionChanged: (view) => published.push(view),
+  });
+  const created = await bridge.createSession({
+    provider: "codex",
+    workspaceId: "workspace",
+    initialMessage: "Start",
+    profile: "plan",
+    sandbox: null,
+    model: null,
+    effort: null,
+    idempotencyKey: "conformance-codex",
+  }, {
+    actor: { id: "local", kind: "local" as const, displayName: "Local user" },
+    requestId: "conformance-codex",
+    signal: new AbortController().signal,
+    workspace: { id: "workspace", label: "Workspace", path: "/workspace" },
+  });
+  published.push(created);
+
+  // A running turn publishes a different capability ruling than an idle one,
+  // so both states are covered rather than only the one creation lands in.
+  transport.notify("turn/started", {
+    threadId: "thread-1",
+    turn: { id: "turn-running", status: "inProgress", items: [] },
+  });
+  published.push(bridge.toSessionView(adapter.getThreadState("thread-1")!));
+
+  assert.ok(published.length > 1, "the bridge published more than one view");
+  for (const view of published) assertPublishedSessionView(view);
+
   bridge.dispose();
   await adapter.dispose();
 });

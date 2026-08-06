@@ -2,15 +2,6 @@ import { createHash, randomUUID } from "node:crypto";
 
 import { redactActivityText } from "../activity/redaction.ts";
 import {
-  applyCodexHookPlan,
-  inspectCodexHookOperationalStatus,
-  previewCodexHookInstall,
-  readCodexHookSource,
-  type CodexHookInstallRecord,
-  type CodexHookPlan,
-  type CodexHookSource,
-} from "../ops/codex-hooks.ts";
-import {
   applyClaudeHookSettingsPlan,
   inspectClaudeHookOperationalStatus,
   previewClaudeHookInstall,
@@ -20,9 +11,6 @@ import {
   type ClaudeHookSettingsPlan,
   type ClaudeHookSettingsSource,
 } from "../ops/hooks.ts";
-import { generateCodexHookToken } from "../providers/codex/codex-hook-auth.ts";
-import type { CodexHookStatus } from "../providers/codex/codex-hook.ts";
-import { renderCodexHookCommand } from "../providers/codex/codex-hook-shim.ts";
 import { generateHookBearerToken } from "../providers/hooks/auth.ts";
 import type {
   SetupHookApplyResponse,
@@ -34,9 +22,9 @@ const DEFAULT_PREVIEW_TTL_MS = 5 * 60_000;
 const MAX_PREVIEW_TTL_MS = 5 * 60_000;
 const APPLIED_RECEIPT_TTL_MS = 60_000;
 
-type HookProvider = "claude" | "codex";
-type HookPlan = ClaudeHookSettingsPlan | CodexHookPlan;
-type HookInstallRecord = (ClaudeHookInstallRecord | CodexHookInstallRecord) & {
+type HookProvider = "claude";
+type HookPlan = ClaudeHookSettingsPlan;
+type HookInstallRecord = ClaudeHookInstallRecord & {
   lastSeenAt?: string | null;
 };
 
@@ -94,10 +82,6 @@ export interface SetupHookManagerOptions {
   now?: () => Date;
   previewTtlMs?: number;
   onApplied?(): void | Promise<void>;
-  codexTrustStatus?(
-    settingsPath: string,
-    expectedCommand: string,
-  ): CodexHookStatus | null | Promise<CodexHookStatus | null>;
 }
 
 function installCommand(provider: HookProvider): string {
@@ -144,7 +128,6 @@ export class SetupHookManager {
   #now: () => Date;
   #previewTtlMs: number;
   #onApplied: NonNullable<SetupHookManagerOptions["onApplied"]>;
-  #codexTrustStatus: NonNullable<SetupHookManagerOptions["codexTrustStatus"]> | null;
   #previews = new Map<HookProvider, HookPreviewState>();
   #expiryTimers = new Map<HookProvider, NodeJS.Timeout>();
   #operations = new Map<HookProvider, Promise<void>>();
@@ -160,15 +143,10 @@ export class SetupHookManager {
       Math.max(1, options.previewTtlMs ?? DEFAULT_PREVIEW_TTL_MS),
     );
     this.#onApplied = options.onApplied ?? (() => undefined);
-    this.#codexTrustStatus = options.codexTrustStatus ?? null;
   }
 
-  async offers(ownerId: string): Promise<{ claude: SetupHookOffer; codex: SetupHookOffer }> {
-    const [claude, codex] = await Promise.all([
-      this.#serialized("claude", () => this.#claudeOffer(ownerId)),
-      this.#serialized("codex", () => this.#codexOffer(ownerId)),
-    ]);
-    return { claude, codex };
+  async offers(ownerId: string): Promise<{ claude: SetupHookOffer }> {
+    return { claude: await this.#serialized("claude", () => this.#claudeOffer(ownerId)) };
   }
 
   async apply(input: {
@@ -270,7 +248,7 @@ export class SetupHookManager {
     provider: HookProvider,
     ownerId: string,
     previousRecord: HookInstallRecord | null,
-    source: ClaudeHookSettingsSource | CodexHookSource,
+    source: ClaudeHookSettingsSource,
   ): HookPreviewEntry | null {
     const entry = this.#previews.get(provider);
     if (!entry || entry.kind !== "preview") return null;
@@ -290,22 +268,13 @@ export class SetupHookManager {
   }
 
   #sourceMatchesPlan(
-    source: ClaudeHookSettingsSource | CodexHookSource,
+    source: ClaudeHookSettingsSource,
     plan: HookPlan,
     side: "before" | "after",
   ): boolean {
-    if (plan.provider === "claude") {
-      return source.settingsPath === plan.settingsPath
-        && source.settingsText === plan[side]
-        && (side === "after" || source.settingsExisted === plan.beforeExisted);
-    }
-    if (!("shimPath" in source)) return false;
     return source.settingsPath === plan.settingsPath
-      && source.shimPath === plan.shimPath
       && source.settingsText === plan[side]
-      && (side === "after"
-        ? source.shimText === plan.secretShimAfter
-        : source.settingsExisted === plan.beforeExisted && source.shimText === plan.shimBefore);
+      && (side === "after" || source.settingsExisted === plan.beforeExisted);
   }
 
   async #claudeOffer(ownerId: string): Promise<SetupHookOffer> {
@@ -354,66 +323,6 @@ export class SetupHookManager {
     }, entry);
   }
 
-  async #codexOffer(ownerId: string): Promise<SetupHookOffer> {
-    const source = await readCodexHookSource({ scope: "user", homeDirectory: this.#homeDirectory });
-    const record = this.#database.getCodexHookInstallRecord(source.settingsPath);
-    const expectedCommand = record?.command ?? renderCodexHookCommand(source.shimPath);
-    let trust: CodexHookStatus | null = null;
-    if (this.#codexTrustStatus) {
-      try {
-        trust = await this.#codexTrustStatus(source.settingsPath, expectedCommand);
-      } catch {
-        // A provider trust probe cannot make setup facts fail. Configured hooks
-        // remain conservatively untrusted until the exact command is observed.
-      }
-    }
-    const status = inspectCodexHookOperationalStatus({
-      source,
-      record,
-      trust,
-      lastSeenAt: record?.lastSeenAt ?? null,
-    });
-    const current = record !== null
-      && record.endpoint === `${this.#endpointOrigin}/api/v1/hooks/codex`
-      && record.command === renderCodexHookCommand(source.shimPath)
-      && status.configuration?.state === "current";
-    if (current) {
-      return unchangedOffer({
-        provider: "codex",
-        state: status.state,
-        settingsPath: source.settingsPath,
-        notice: status.state === "awaiting-trust"
-          ? "Open /hooks in Codex and trust the exact Agent Manager command hook. Browser installation does not bypass Codex hook trust."
-          : null,
-      });
-    }
-
-    let entry = this.#usablePreview("codex", ownerId, record, source);
-    if (!entry) {
-      const token = generateCodexHookToken();
-      const plan = previewCodexHookInstall({
-        source,
-        endpoint: `${this.#endpointOrigin}/api/v1/hooks/codex`,
-        bearerToken: token,
-        installId: record?.id ?? randomUUID(),
-        nodeExecutable: this.#nodeExecutable,
-        now: this.#now(),
-        ...(record ? { previousRecord: record } : {}),
-      });
-      entry = this.#newPreview("codex", ownerId, plan, record);
-    }
-    const plan = entry.plan as CodexHookPlan;
-    return this.#previewOffer({
-      provider: "codex",
-      state: status.state,
-      settingsPath: source.settingsPath,
-      command: installCommand("codex"),
-      changed: plan.changed,
-      diff: redactActivityText(plan.diff),
-      notice: plan.shimNotice,
-    }, entry);
-  }
-
   #claudePlanSecret(plan: ClaudeHookSettingsPlan): string | null {
     const match = /Bearer ([^"\\\s]+)/u.exec(plan.after);
     return match?.[1] ?? null;
@@ -459,9 +368,7 @@ export class SetupHookManager {
       return {
         provider: input.provider,
         outcome: "already-applied",
-        hook: input.provider === "claude"
-          ? await this.#claudeOffer(input.ownerId)
-          : await this.#codexOffer(input.ownerId),
+        hook: await this.#claudeOffer(input.ownerId),
       };
     }
     if (entry.kind === "applying") {
@@ -478,13 +385,8 @@ export class SetupHookManager {
       if (!(await this.#previewIsCurrent(applying))) {
         throw new SetupHookApplyError("stale", "hook files or install identity changed after preview");
       }
-      if (applying.plan.provider === "claude") {
-        await applyClaudeHookSettingsPlan(applying.plan, { confirmed: true });
-        this.#database.upsertClaudeHookInstallRecord(applying.plan.record);
-      } else {
-        await applyCodexHookPlan(applying.plan, { confirmed: true });
-        this.#database.upsertCodexHookInstallRecord(applying.plan.record);
-      }
+      await applyClaudeHookSettingsPlan(applying.plan, { confirmed: true });
+      this.#database.upsertClaudeHookInstallRecord(applying.plan.record);
       let receipt = this.#receiptFor(applying.plan, applying);
       this.#previews.set(input.provider, receipt);
       this.#scheduleExpiry(input.provider, receipt.previewId, receipt.expiresAtMs);
@@ -492,9 +394,7 @@ export class SetupHookManager {
       await this.#onApplied();
       receipt = { ...receipt, authorizationsReloaded: true };
       this.#previews.set(input.provider, receipt);
-      const hook = input.provider === "claude"
-        ? await this.#claudeOffer(input.ownerId)
-        : await this.#codexOffer(input.ownerId);
+      const hook = await this.#claudeOffer(input.ownerId);
       return { provider: input.provider, outcome: "applied", hook };
     } catch (error) {
       if (!committed) this.#discard(input.provider);
@@ -507,16 +407,9 @@ export class SetupHookManager {
   }
 
   async #previewIsCurrent(entry: HookPreviewEntry): Promise<boolean> {
-    if (entry.provider === "claude") {
-      const plan = entry.plan as ClaudeHookSettingsPlan;
-      const record = this.#database.getClaudeHookInstallRecord(plan.settingsPath);
-      const source = await readClaudeHookSettings(plan.settingsPath);
-      return entry.previousRecordFingerprint === recordFingerprint(record)
-        && this.#sourceMatchesPlan(source, plan, "before");
-    }
-    const plan = entry.plan as CodexHookPlan;
-    const record = this.#database.getCodexHookInstallRecord(plan.settingsPath);
-    const source = await readCodexHookSource({ scope: "user", homeDirectory: this.#homeDirectory });
+    const plan = entry.plan;
+    const record = this.#database.getClaudeHookInstallRecord(plan.settingsPath);
+    const source = await readClaudeHookSettings(plan.settingsPath);
     return entry.previousRecordFingerprint === recordFingerprint(record)
       && this.#sourceMatchesPlan(source, plan, "before");
   }
@@ -530,30 +423,17 @@ export class SetupHookManager {
       expiresAtMs: Math.max(entry.expiresAtMs, this.#nowMs() + APPLIED_RECEIPT_TTL_MS),
       settingsPath: plan.settingsPath,
       settingsDigest: contentDigest(plan.after),
-      shimPath: plan.provider === "codex" ? plan.shimPath : null,
-      shimDigest: plan.provider === "codex" && plan.secretShimAfter !== null
-        ? contentDigest(plan.secretShimAfter)
-        : null,
+      shimPath: null,
+      shimDigest: null,
       recordFingerprint: recordFingerprint(plan.record)!,
       authorizationsReloaded: false,
     };
   }
 
   async #appliedReceiptIsCurrent(receipt: HookAppliedReceipt): Promise<boolean> {
-    if (receipt.provider === "claude") {
-      const record = this.#database.getClaudeHookInstallRecord(receipt.settingsPath);
-      const source = await readClaudeHookSettings(receipt.settingsPath);
-      return recordFingerprint(record) === receipt.recordFingerprint
-        && contentDigest(source.settingsText) === receipt.settingsDigest;
-    }
-    const record = this.#database.getCodexHookInstallRecord(receipt.settingsPath);
-    const source = await readCodexHookSource({ scope: "user", homeDirectory: this.#homeDirectory });
+    const record = this.#database.getClaudeHookInstallRecord(receipt.settingsPath);
+    const source = await readClaudeHookSettings(receipt.settingsPath);
     return recordFingerprint(record) === receipt.recordFingerprint
-      && source.settingsPath === receipt.settingsPath
-      && source.shimPath === receipt.shimPath
-      && contentDigest(source.settingsText) === receipt.settingsDigest
-      && (receipt.shimDigest === null
-        ? source.shimText === null
-        : source.shimText !== null && contentDigest(source.shimText) === receipt.shimDigest);
+      && contentDigest(source.settingsText) === receipt.settingsDigest;
   }
 }

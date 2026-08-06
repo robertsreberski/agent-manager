@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { assertPublishedSessionView } from "../shared/session-view.conformance.test.ts";
 import type { SessionView } from "../../core/types.ts";
 import type { ActivityMutation } from "../../activity/index.ts";
 import type { ManagedSessionRecoveryRecord, RequestContext } from "../../server/contracts.ts";
@@ -200,6 +201,31 @@ function nativeStopHook(sessionId: string, promptId: string) {
     stop_hook_active: false,
   });
 }
+
+test("every published Claude view satisfies the cross-provider contract", async () => {
+  const runtime = new BridgeRuntime();
+  const published: SessionView[] = [];
+  const adapter = new ClaudeProviderControlAdapter({
+    runtime,
+    resolveWorkspace: () => "/workspace",
+    onSessionChanged: (view) => published.push(view),
+  });
+  const created = await adapter.createSession({
+    provider: "claude",
+    workspaceId: "workspace",
+    initialMessage: "Start",
+    profile: "ask-first",
+    sandbox: null,
+    model: "sonnet",
+    effort: "high",
+    idempotencyKey: "conformance-claude",
+  }, context());
+  published.push(created);
+  await adapter.dispose();
+
+  assert.ok(published.length > 0, "the adapter published at least one view");
+  for (const view of published) assertPublishedSessionView(view);
+});
 
 async function externalClaudeView(runtime: BridgeRuntime): Promise<SessionView> {
   const source = new ClaudeProviderControlAdapter({
@@ -1091,7 +1117,7 @@ test("ending manager control preserves the closed session and native resume path
   assert.ok(ended);
   assert.equal(ended.status, "completed");
   assert.equal(ended.control.plane, "resume-only");
-  assert.deepEqual(ended.control.capabilities, ["resume", "attach"]);
+  assert.deepEqual(ended.control.capabilities, ["attach", "resume"]);
   assert.equal(hookSourceArbiter.shouldPollTranscript("managed-claude-1"), true);
   const instruction = await adapter.getAttachInstruction(ended, context());
   assert.equal(instruction?.kind, "claude-resume");
@@ -1145,7 +1171,7 @@ test("refuses to close Claude control until the durable stopped intent commits",
   assert.equal(persistenceAttempts, 2);
   assert.deepEqual(
     adapter.getManagedSession(created.providerThreadId)?.control.capabilities,
-    ["resume", "attach"],
+    ["attach", "resume"],
   );
   await adapter.dispose();
 });
@@ -1520,7 +1546,7 @@ test("restores deliberately stopped Claude control without opening an SDK query"
   assert.equal(restored.profile.value, "plan");
   assert.equal(restored.model.value, "opus");
   assert.equal(restored.effort.value, "high");
-  assert.deepEqual(restored.control.capabilities, ["resume", "attach"]);
+  assert.deepEqual(restored.control.capabilities, ["attach", "resume"]);
 
   const instruction = await adapter.getAttachInstruction(restored, context());
   assert.equal(instruction?.kind, "claude-resume");
@@ -1601,7 +1627,7 @@ test("failed durable activation aborts only the provisional writer and preserves
   const rolledBack = adapter.getManagedSession(record.providerThreadId);
   assert.ok(rolledBack);
   assert.equal(rolledBack.status, "completed");
-  assert.deepEqual(rolledBack.control.capabilities, ["resume", "attach"]);
+  assert.deepEqual(rolledBack.control.capabilities, ["attach", "resume"]);
   assert.equal(changes.length, publishedBeforeResume);
   assert.equal(hookSourceArbiter.shouldPollTranscript(record.providerThreadId), true);
 
@@ -2402,7 +2428,7 @@ test("external Claude adoption rejects provider identity drift without publishin
       type: "system",
       subtype: "init",
       session_id: "different-claude-session",
-      claude_code_version: "2.1.222",
+      claude_code_version: "2.1.223",
       model: "sonnet",
       permissionMode: "default",
       capabilities: ["interrupt_receipt_v1"],

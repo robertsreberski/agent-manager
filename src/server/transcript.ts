@@ -193,6 +193,7 @@ class TranscriptReadFailure extends Error {
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SAFE_PROVIDER_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const MAX_HEADER_BYTES = 256 * 1024;
+const MAX_CODEX_ROLLOUT_MEMO = 64;
 const MAX_WALK_ENTRIES = 50_000;
 const MAX_CHAIN_RECORDS = 20_000;
 const MACHINE_USER_PREFIX = /^<(?:task-notification|local-command-stdout|local-command-stderr|bash-stdout|ci-monitor-event)(?:>|\s)/i;
@@ -1359,7 +1360,17 @@ function codexFile(
   codexHomePath: string,
   sessionId: string,
   uid: number,
-): { root: RootInfo; file: OpenTranscript } {
+  /*
+    A path this same reader already resolved and validated for this session.
+    Resolution is the expensive half — it opens a fresh state database, and can
+    fall back to walking up to MAX_WALK_ENTRIES directory entries — while the
+    selected session is re-read on a sub-second cadence for as long as its
+    drawer is open. A hint is never trusted: it takes the identical confinement
+    and header checks below, and a hint that fails any of them falls through to
+    full resolution rather than failing the read.
+  */
+  hint?: string | undefined,
+): { root: RootInfo; file: OpenTranscript; path: string } {
   if (!UUID_PATTERN.test(sessionId)) failure("unsupported");
   const codexHome = rootInfo(codexHomePath, uid);
   const roots = [
@@ -1367,6 +1378,13 @@ function codexFile(
     optionalChildRootInfo(codexHome, join(codexHome.lexical, "archived_sessions"), uid),
   ].filter((root): root is RootInfo => root !== null);
   if (roots.length === 0) failure("not-found");
+  if (hint !== undefined) {
+    try {
+      return codexFileFromCandidate(roots, sessionId, uid, hint);
+    } catch {
+      // A rotated, archived, or deleted rollout simply re-resolves below.
+    }
+  }
   const databasePath = rolloutFromDatabase(codexHome, uid, sessionId);
   let candidate: string;
   if (databasePath !== null) {
@@ -1382,6 +1400,16 @@ function codexFile(
     if (matches.length !== 1) failure("unsupported");
     candidate = matches[0] as string;
   }
+  return codexFileFromCandidate(roots, sessionId, uid, candidate);
+}
+
+/** Confinement, filename identity, and header identity for one candidate path. */
+function codexFileFromCandidate(
+  roots: readonly RootInfo[],
+  sessionId: string,
+  uid: number,
+  candidate: string,
+): { root: RootInfo; file: OpenTranscript; path: string } {
   const pathId = basename(candidate).match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i)?.[1];
   if (pathId?.toLowerCase() !== sessionId.toLowerCase()) failure("unsupported");
   const absoluteCandidate = resolve(candidate);
@@ -1392,7 +1420,7 @@ function codexFile(
   if (!root) failure("unreadable");
   const file = openTranscript(root, candidate, uid);
   try {
-    if (validHeaderSessionId(file, sessionId)) return { root, file };
+    if (validHeaderSessionId(file, sessionId)) return { root, file, path: absoluteCandidate };
     failure("unsupported");
   } catch (error) {
     try {
@@ -1465,6 +1493,17 @@ export class LocalSessionTranscriptReader implements SessionTranscriptReader {
   readonly #codexHome: string;
   readonly #claudeHome: string;
   readonly #uid: number;
+  /*
+    Rollout paths this reader has already resolved and validated, so a selected
+    session polled every few hundred milliseconds stops re-opening a state
+    database — and re-walking the sessions tree when that database has no row —
+    on every tick. Bounded, because a long-lived manager sees many sessions.
+
+    Only the path is remembered. Every read still re-opens the file and
+    re-checks confinement and header identity, so a stale entry costs one failed
+    open and then re-resolves.
+  */
+  readonly #codexRollouts = new Map<string, string>();
 
   constructor(options: LocalTranscriptReaderOptions = {}) {
     const home = options.homeDir ?? homedir();
@@ -1474,11 +1513,30 @@ export class LocalSessionTranscriptReader implements SessionTranscriptReader {
     this.#uid = options.uid ?? process.getuid?.() ?? -1;
   }
 
+  /** Keep the newest MAX_CODEX_ROLLOUT_MEMO entries, evicting oldest first. */
+  #rememberCodexRollout(sessionId: string, path: string): void {
+    if (this.#codexRollouts.get(sessionId) === path) return;
+    this.#codexRollouts.delete(sessionId);
+    this.#codexRollouts.set(sessionId, path);
+    while (this.#codexRollouts.size > MAX_CODEX_ROLLOUT_MEMO) {
+      const oldest = this.#codexRollouts.keys().next();
+      if (oldest.done) break;
+      this.#codexRollouts.delete(oldest.value);
+    }
+  }
+
   read(session: SessionIdentity): TranscriptReadResult {
     let file: OpenTranscript | null = null;
     try {
       if (session.provider === "codex") {
-        file = codexFile(this.#codexHome, session.providerThreadId, this.#uid).file;
+        const resolved = codexFile(
+          this.#codexHome,
+          session.providerThreadId,
+          this.#uid,
+          this.#codexRollouts.get(session.providerThreadId),
+        );
+        file = resolved.file;
+        this.#rememberCodexRollout(session.providerThreadId, resolved.path);
         const parsed = codexItems(
           readJsonlTail(file),
           file.identity,
