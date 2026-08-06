@@ -47,7 +47,9 @@ export interface QuestionRequestProps {
 export function QuestionRequest({ request, elapsed, disabled = false, onSubmit }: QuestionRequestProps) {
   const phone = usePhoneViewport();
   const exact = isExactRespondableRequest(request);
-  const [open, setOpen] = useState(true);
+  const readOnly = !exact;
+  const codexTranscript = request.source === "transcript" && request.label === "request_user_input";
+  const [open, setOpen] = useState(() => request.state !== "resolved");
   const [active, setActive] = useState(0);
   const [answers, setAnswers] = useState<Record<string, DraftAnswer>>({});
   const [customOpen, setCustomOpen] = useState<Record<string, boolean>>({});
@@ -64,6 +66,10 @@ export function QuestionRequest({ request, elapsed, disabled = false, onSubmit }
       selectedOptions: (answers[item.id]?.selected ?? []).map((id) => item.options.find((option) => option.id === id)?.label ?? id),
     })),
   }), [answers, request.questions]);
+
+  useEffect(() => {
+    setOpen(request.state !== "resolved");
+  }, [request.id, request.state]);
 
   useEffect(() => {
     if (!open || !exact || disabled || !question) return;
@@ -123,44 +129,57 @@ export function QuestionRequest({ request, elapsed, disabled = false, onSubmit }
     }
   }
 
-  if (!exact) {
-    return (
-      <section className="border-l-2 border-dashed border-[var(--accent)] bg-[var(--surface-raised)] px-3 py-2.5" aria-label={`${request.label} needs attention`}>
-        <p className="text-meta font-medium text-[var(--text)]">{request.label}</p>
-        <p className="mt-1 text-meta-sm text-[var(--text-muted)]">This request is inferred or incomplete. Answer it in the native provider interface.</p>
-      </section>
-    );
-  }
-
   // Frame 6a states only the two keys it offers on the open question.
-  const pickHint = !question ? null
+  const pickHint = !exact || !question ? null
     : question.options.length > 0 ? `1–${Math.min(9, question.options.length)} to pick · ↵ to send`
       : "↵ to send";
+  const statusLabel = request.state === "resolved"
+    ? codexTranscript ? "Resolved in Codex" : "Resolved"
+    : exact
+      ? "Needs action"
+      : codexTranscript
+        ? "Observed in Codex"
+        : "Observed request";
 
   return (
-    <section className="min-w-0 max-w-full text-meta" data-request-id={request.id} data-question-shortcut-ready={open && exact && !disabled && !submitting ? "true" : "false"} aria-label={`${request.label} question`}>
+    <section
+      className="min-w-0 max-w-full text-meta"
+      data-request-id={request.id}
+      data-question-read-only={readOnly ? "true" : "false"}
+      data-question-shortcut-ready={open && exact && !disabled && !submitting ? "true" : "false"}
+      aria-label={`${request.label} question`}
+    >
       <Collapsible open={open} onOpenChange={setOpen} className="min-w-0">
         <CollapsibleTrigger asChild>
           <Button variant="ghost" size="touch" className="w-full min-w-0 justify-start gap-2 px-0 py-1.5 text-left text-[var(--accent)] hover:text-[var(--accent)]">
             <AlertCircle size={16} strokeWidth={1.75} className="shrink-0" />
-            <span className="min-w-0 flex-1 truncate text-body-sm">Needs action: <strong className="font-semibold">{request.label}</strong></span>
+            <span className="min-w-0 flex-1 truncate text-body-sm">{statusLabel}: <strong className="font-semibold">{request.label}</strong></span>
             {request.questions.length > 1 && (
-              <span className="flex shrink-0 items-center gap-1.5 font-mono text-code-sm opacity-85" aria-label={`${completedCount} of ${request.questions.length} answered`}>
-                {Math.min(completedCount + 1, request.questions.length)}/{request.questions.length}
-                <span className="flex gap-0.5">
-                  {request.questions.map((item) => <span key={item.id} className={`h-[3px] w-[13px] ${isAnswered(item, answers[item.id]) ? "bg-[var(--accent)]" : "bg-[var(--border-strong)]"}`} />)}
+              exact ? (
+                <span className="flex shrink-0 items-center gap-1.5 font-mono text-code-sm opacity-85" aria-label={`${completedCount} of ${request.questions.length} answered`}>
+                  {Math.min(completedCount + 1, request.questions.length)}/{request.questions.length}
+                  <span className="flex gap-0.5">
+                    {request.questions.map((item) => <span key={item.id} className={`h-[3px] w-[13px] ${isAnswered(item, answers[item.id]) ? "bg-[var(--accent)]" : "bg-[var(--border-strong)]"}`} />)}
+                  </span>
                 </span>
-              </span>
+              ) : <span className="shrink-0 font-mono text-code-sm opacity-85">{request.questions.length} questions</span>
             )}
             {elapsed && <span className="shrink-0 text-meta-sm tabular-nums opacity-70">{elapsed}</span>}
             <ChevronDown size={15} className={`shrink-0 transition-transform ${open ? "rotate-180" : ""}`} />
           </Button>
         </CollapsibleTrigger>
         <CollapsibleContent className="ml-6 grid min-w-0 grid-cols-[minmax(0,1fr)] gap-1.5 pt-0.5 pb-2">
+          {readOnly && (
+            <p className="border-l-2 border-dashed border-[var(--accent)] bg-[var(--surface-raised)] px-3 py-2 text-meta-sm text-[var(--text-muted)]" data-question-read-only-guidance>
+              {request.state === "resolved"
+                ? `Resolved in the ${codexTranscript ? "active Codex surface" : "native provider interface"}. Answers are not shown here.`
+                : `Read only here. Answer this in the ${codexTranscript ? "active Codex surface" : "native provider interface"}.`}
+            </p>
+          )}
           {request.questions.map((item, index) => {
             const answer = answers[item.id];
             const answered = isAnswered(item, answer);
-            if (index !== active) {
+            if (exact && index !== active) {
               return answered && answer ? (
                 <Button key={item.id} variant="ghost" size="sm" data-compact-control className="h-auto min-h-10 w-full items-start justify-start gap-2.5 px-0 py-2 text-left whitespace-normal" onClick={() => setActive(index)}>
                   <Check size={15} strokeWidth={1.75} className="mt-[3px] shrink-0 text-[var(--accent)]" />
@@ -179,7 +198,7 @@ export function QuestionRequest({ request, elapsed, disabled = false, onSubmit }
               );
             }
             const described = item.options.some((option) => option.description);
-            const locked = disabled || submitting;
+            const locked = readOnly || disabled || submitting;
             /*
               Frame 9a-2: a described option is a full-width row and never
               collapses into a pill, because a pill would have to truncate the
@@ -197,8 +216,8 @@ export function QuestionRequest({ request, elapsed, disabled = false, onSubmit }
                   const indicator = described ? "mt-[3px]" : "sr-only";
                   return (
                     <label key={option.id} className={described
-                      ? `flex min-h-[46px] min-w-0 cursor-pointer items-start gap-[11px] px-3 py-2.5 ${selected ? "bg-[var(--wants-field)] outline outline-[var(--wants-outline)]" : "border border-[var(--border)]"}`
-                      : `flex ${phone ? "min-h-[46px]" : "min-h-8"} max-w-full cursor-pointer items-center rounded-full border px-3 text-meta-sm ${selected || option.recommended && !answer ? "border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-ink)]" : "border-[var(--border)]"}`}
+                      ? `flex min-h-[46px] min-w-0 ${readOnly ? "cursor-default" : "cursor-pointer"} items-start gap-[11px] px-3 py-2.5 ${selected ? "bg-[var(--wants-field)] outline outline-[var(--wants-outline)]" : "border border-[var(--border)]"}`
+                      : `flex ${phone ? "min-h-[46px]" : "min-h-8"} max-w-full ${readOnly ? "cursor-default" : "cursor-pointer"} items-center rounded-full border px-3 text-meta-sm ${selected || option.recommended && !answer ? "border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-ink)]" : "border-[var(--border)]"}`}
                     >
                       {item.multiple
                         ? <Checkbox className={indicator} disabled={locked} checked={selected} onCheckedChange={() => choose(item, option.id)} />
@@ -212,7 +231,9 @@ export function QuestionRequest({ request, elapsed, disabled = false, onSubmit }
                   );
                 })}
                 {item.allowFreeText && !described && item.options.length > 0 && (
-                  customOpen[item.id] || Boolean(answer?.custom)
+                  readOnly
+                    ? <input disabled id={`custom-${request.id}-${item.id}`} type={item.secret ? "password" : "text"} autoComplete={item.secret ? "new-password" : undefined} value="" readOnly className={`${phone ? "min-h-[46px]" : "min-h-8"} min-w-32 max-w-full rounded-full border border-dashed border-[var(--border)] bg-transparent px-3 text-meta-sm outline-none placeholder:text-[var(--text-muted)]`} placeholder="Something else…" aria-label={`${item.prompt} custom answer`} />
+                    : customOpen[item.id] || Boolean(answer?.custom)
                     ? <input autoFocus id={`custom-${request.id}-${item.id}`} type={item.secret ? "password" : "text"} autoComplete={item.secret ? "new-password" : undefined} value={answer?.custom ?? ""} onChange={(event) => setCustom(item, event.target.value)} className={`${phone ? "min-h-[46px]" : "min-h-8"} min-w-32 max-w-full rounded-full border border-dashed border-[var(--border)] bg-transparent px-3 text-meta-sm outline-none placeholder:text-[var(--text-muted)] focus:border-[var(--accent)]`} placeholder="Something else…" aria-label={`${item.prompt} custom answer`} />
                     : <Button variant="secondary" size={phone ? "touch" : "sm"} data-compact-control className="rounded-full border-dashed border-[var(--border)] px-3 hover:border-[var(--accent)]" onClick={() => setCustomOpen((current) => ({ ...current, [item.id]: true }))}><span className="text-meta-sm text-[var(--text-muted)]">Something else…</span></Button>
                 )}
@@ -242,17 +263,17 @@ export function QuestionRequest({ request, elapsed, disabled = false, onSubmit }
                 {item.multiple || item.options.length === 0
                   ? <div className={layout}>{rows}</div>
                   : <RadioGroup className={layout} aria-label={item.prompt} disabled={locked} value={answer?.selected[0] ?? ""} onValueChange={(optionId) => choose(item, optionId)}>{rows}</RadioGroup>}
-                <div className="mt-3 flex justify-between">
+                {exact && <div className="mt-3 flex justify-between">
                   <Button variant="ghost" size="sm" data-compact-control disabled={index === 0} className="px-0 disabled:invisible" onClick={() => setActive(index - 1)}>Previous</Button>
                   {index < request.questions.length - 1
                     ? <Button variant="primary" size="sm" data-compact-control disabled={!answered} className={`px-4 font-semibold`} onClick={() => setActive(index + 1)}>Next</Button>
                     : (!phone || request.questions.length === 1) && <Button variant="primary" size="sm" data-compact-control disabled={!complete || submitting} className={`px-4 font-semibold`} onClick={() => void submit()}>Send {request.questions.length > 1 ? `${request.questions.length} answers` : "answer"}</Button>}
-                </div>
+                </div>}
               </fieldset>
             );
           })}
           {!phone && pickHint && <span className="pt-1 font-mono text-code-sm text-[var(--text-muted)]">{pickHint}</span>}
-          {phone && request.questions.length > 1 && (
+          {exact && phone && request.questions.length > 1 && (
             <footer className="question-request__phone-footer" data-phone-sticky-footer aria-label="Question submission">
               <span className="min-w-0 flex-1 font-mono text-meta-sm leading-[1.4] text-[var(--text-muted)]">{remainingCount === 0 ? "All questions answered" : `${remainingCount} ${remainingCount === 1 ? "question" : "questions"} left`}</span>
               {/* The one atomic send on a phone: nothing leaves until every question is answered. */}

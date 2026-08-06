@@ -12,8 +12,12 @@ import { DatabaseSync } from "node:sqlite";
 import test, { afterEach } from "node:test";
 import { ActivityHub } from "../activity/hub.ts";
 import type { SessionView } from "../core/types.ts";
-import { projectCodexNotification } from "../providers/codex/activity-projector.ts";
-import { codexMessageCorrelationId } from "../providers/codex/activity-projector.ts";
+import {
+  codexMessageCorrelationId,
+  codexRequestUserInputCorrelationId,
+  projectCodexNotification,
+  projectCodexServerRequest,
+} from "../providers/codex/activity-projector.ts";
 import { SelectedTranscriptActivityObserver } from "./activity-observer.ts";
 import {
   LocalSessionTranscriptReader,
@@ -180,6 +184,90 @@ test("Codex reads ordered user/assistant response items and ignores provider int
   assert.match(result.items[1]?.id ?? "", /^codex:file:\d+:\d+:\d+$/);
   assert.equal(result.items[0]?.createdAt, "2026-08-03T10:00:01.000Z");
   assert.equal(result.items[0]?.correlationId, "message:user-provider-id");
+});
+
+test("Codex correlates a rollout request_user_input with its exact App Server request", () => {
+  const turnId = "turn-question";
+  const fixture = codexFixture([
+    codexMeta(),
+    {
+      type: "event_msg",
+      timestamp: "2026-08-03T10:00:00Z",
+      payload: { type: "task_started", turn_id: turnId },
+    },
+    {
+      type: "response_item",
+      timestamp: "2026-08-03T10:00:01Z",
+      payload: {
+        type: "function_call",
+        id: "fc_question",
+        call_id: "call_question",
+        name: "request_user_input",
+        arguments: JSON.stringify({
+          questions: [{
+            id: "destination",
+            header: "Destination",
+            question: "Where should we go?",
+            options: [{ label: "Moon cabin", description: "Quiet views." }],
+          }],
+        }),
+      },
+    },
+  ]);
+  const reader = new LocalSessionTranscriptReader({ codexHome: fixture.home });
+  const read = reader.read(codexSession());
+  const tool = toolsOf(read)[0];
+  assert.ok(tool);
+  assert.equal(tool.name, "request_user_input");
+  assert.equal(
+    tool.correlationId,
+    codexRequestUserInputCorrelationId(CODEX_ID, "fc_question"),
+  );
+
+  const managerSessionId = `local:codex:${CODEX_ID}`;
+  const session = {
+    id: managerSessionId,
+    provider: "codex",
+    providerThreadId: CODEX_ID,
+    providerTreeId: CODEX_ID,
+    parentId: null,
+    status: "running",
+  } as SessionView;
+  const hub = new ActivityHub({ streamEpoch: "question-correlation" });
+  const observer = new SelectedTranscriptActivityObserver({ hub, reader });
+  observer.seedOnce(session);
+  const inferred = hub.snapshot(managerSessionId)?.items ?? [];
+  assert.equal(inferred.length, 1);
+  assert.equal(inferred[0]?.kind, "attention");
+  assert.equal(inferred[0]?.source, "transcript");
+
+  const exact = projectCodexServerRequest({
+    id: "rpc-question",
+    method: "item/tool/requestUserInput",
+    emittedAtMs: Date.parse("2026-08-03T10:00:02.000Z"),
+    params: {
+      threadId: CODEX_ID,
+      turnId,
+      itemId: "fc_question",
+      questions: [{
+        id: "destination",
+        header: "Destination",
+        question: "Where should we go?",
+        options: [{ label: "Moon cabin", description: "Quiet views." }],
+      }],
+    },
+  });
+  assert.ok(exact);
+  for (const mutation of exact.mutations) hub.ingest(managerSessionId, "codex", mutation);
+
+  const reconciled = hub.snapshot(managerSessionId)?.items ?? [];
+  assert.equal(reconciled.length, 1, "the exact request replaces its inferred transcript twin");
+  assert.equal(reconciled[0]?.source, "provider-api");
+  assert.equal(reconciled[0]?.confidence, "exact");
+  assert.equal(reconciled[0]?.kind === "attention" ? reconciled[0].respondable : false, true);
+
+  observer.dispose();
+  hub.dispose();
 });
 
 test("Codex transcript separates a trailing memory citation from visible assistant text", () => {

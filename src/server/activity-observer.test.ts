@@ -427,6 +427,118 @@ test("projects transcript tool and reasoning items with transcript-derived prove
   hub.dispose();
 });
 
+test("projects transcript request_user_input as a read-only questionnaire and drops answer output", async () => {
+  const hub = new ActivityHub({ streamEpoch: "observer-codex-question" });
+  const session = externalSession();
+  hub.ensureSession(session.id, session.provider);
+  const pending: TranscriptItem = {
+    kind: "tool",
+    id: "codex:tool:call_question",
+    correlationId: "codex/request-user-input-correlation/external-thread/fc_question",
+    toolCallId: "call_question",
+    name: "request_user_input",
+    arguments: {
+      questions: [
+        {
+          id: "destination",
+          header: "Destination",
+          question: "Where should we go?",
+          isOther: true,
+          options: [{
+            label: "Moon cabin",
+            description: "Quiet views and low gravity.",
+            recommended: true,
+          }],
+        },
+        {
+          id: "token",
+          header: "Credential",
+          question: "Enter the token",
+          isSecret: true,
+        },
+      ],
+    },
+    result: null,
+    isError: false,
+    createdAt: "2026-08-03T00:00:02.000Z",
+    status: "running",
+    turnId: "turn-question",
+  };
+  let current = available([pending]);
+  const observer = new SelectedTranscriptActivityObserver({
+    hub,
+    reader: { read: () => structuredClone(current) },
+    runningPollMs: 100,
+  });
+
+  const release = observer.acquire(session);
+  const waiting = hub.snapshot(session.id)?.items[0];
+  assert.equal(waiting?.kind, "attention");
+  if (waiting?.kind !== "attention") return;
+  assert.equal(waiting.state, "waiting");
+  assert.equal(waiting.title, "request_user_input");
+  assert.equal(waiting.respondable, false);
+  assert.equal(waiting.resolved, false);
+  assert.equal(waiting.source, "transcript");
+  assert.equal(waiting.confidence, "inferred");
+  assert.equal(waiting.exposure, "transcript-derived");
+  assert.equal(waiting.questions[0]?.options[0]?.description, "Quiet views and low gravity.");
+  assert.equal(waiting.questions[0]?.allowFreeText, true);
+  assert.equal(waiting.questions[1]?.isSecret, true);
+
+  current = available([{
+    ...pending,
+    result: JSON.stringify({ answers: { token: { answers: ["do-not-render-this-secret"] } } }),
+    status: "complete",
+  }]);
+  await delay(140);
+  const resolved = hub.snapshot(session.id)?.items[0];
+  assert.equal(resolved?.kind, "attention");
+  assert.equal(resolved?.state, "complete");
+  assert.equal(resolved?.kind === "attention" ? resolved.resolved : false, true);
+  assert.doesNotMatch(JSON.stringify(resolved), /do-not-render-this-secret/u);
+
+  release();
+  observer.dispose();
+  hub.dispose();
+});
+
+test("keeps malformed transcript request_user_input visible as non-respondable attention", () => {
+  const hub = new ActivityHub({ streamEpoch: "observer-codex-question-malformed" });
+  const session = externalSession();
+  hub.ensureSession(session.id, session.provider);
+  const observer = new SelectedTranscriptActivityObserver({
+    hub,
+    reader: {
+      read: () => available([{
+        kind: "tool",
+        id: "codex:tool:call_malformed",
+        toolCallId: "call_malformed",
+        name: "request_user_input",
+        arguments: "not-json",
+        result: null,
+        isError: false,
+        createdAt: "2026-08-03T00:00:02.000Z",
+        status: "running",
+        turnId: "turn-question",
+      }]),
+    },
+  });
+
+  const release = observer.acquire(session);
+  const item = hub.snapshot(session.id)?.items[0];
+  assert.equal(item?.kind, "attention");
+  if (item?.kind === "attention") {
+    assert.deepEqual(item.questions, []);
+    assert.equal(item.summary, "Codex is waiting for input");
+    assert.equal(item.respondable, false);
+  }
+
+  release();
+  observer.dispose();
+  hub.dispose();
+});
+
 test("does not invent a final phase for a complete transcript assistant message", () => {
   const hub = new ActivityHub({ streamEpoch: "observer-message-phase" });
   const session = externalSession();

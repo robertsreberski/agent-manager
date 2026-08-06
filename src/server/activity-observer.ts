@@ -1,6 +1,7 @@
 import type { ActivityItem, ActivityItemDraft, ActivityResetReason } from "../activity/index.ts";
 import { ActivityHub } from "../activity/index.ts";
 import type { SessionView } from "../core/types.ts";
+import { normalizeCodexQuestions } from "../providers/codex/question-normalizer.ts";
 import type {
   SessionTranscriptReader,
   TranscriptItem,
@@ -85,6 +86,47 @@ function activityDraft(item: TranscriptItem): ActivityItemDraft {
     };
   }
   if (item.kind === "tool") {
+    if (item.name === "request_user_input") {
+      const argumentRecord = typeof item.arguments === "object"
+          && item.arguments !== null
+          && !Array.isArray(item.arguments)
+        ? item.arguments
+        : null;
+      const questions = normalizeCodexQuestions(argumentRecord?.questions).map((question) => ({
+        id: question.id,
+        ...(question.header ? { header: question.header } : {}),
+        text: question.text,
+        options: question.options,
+        multiSelect: question.multiSelect,
+        allowFreeText: question.allowFreeText,
+        isSecret: question.isSecret,
+      }));
+      const resolved = item.result !== null || item.status === "complete";
+      return {
+        kind: "attention",
+        id: `${TRANSCRIPT_ID_PREFIX}${item.id}`,
+        correlationId: item.correlationId ?? null,
+        turnId: item.turnId,
+        requestId: item.toolCallId,
+        attentionKind: "question",
+        title: "request_user_input",
+        summary: questions.length > 0 ? null : "Codex is waiting for input",
+        questions,
+        approvalFacts: null,
+        respondable: false,
+        resolved,
+        isSecret: questions.some((question) => question.isSecret),
+        state: item.isError
+          ? "failed"
+          : resolved
+            ? "complete"
+            : item.status === "running"
+              ? "waiting"
+              : "interrupted",
+        ...timing,
+        ...TRANSCRIPT_PROVENANCE,
+      };
+    }
     return {
       kind: "tool",
       id: `${TRANSCRIPT_ID_PREFIX}${item.id}`,

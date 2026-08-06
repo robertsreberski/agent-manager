@@ -740,7 +740,7 @@ export function SessionThreadComposer({
       : noWriteReason;
   return (
     <div className="grid min-w-0 max-w-full gap-3" data-session-thread-composer>
-      {todo && <TodoList list={todoView(todo, session.todoProgress)} canMessage={canQueue} canStop={canStop && mutationsReady} onAsk={() => setText("What is happening with the current todo?")} onStop={() => void onInterrupt()} />}
+      {todo && <TodoList list={todoView(todo, session.todoProgress)} placement="pinned" canMessage={canQueue} canStop={canStop && mutationsReady} onAsk={() => setText("What is happening with the current todo?")} onStop={() => void onInterrupt()} />}
       <QueuedMessageCount count={queued.length} />
       {showControlStatus && (
         <Collapsible

@@ -28,7 +28,10 @@ import {
   type ActivityMemoryCitation,
 } from "../activity/index.ts";
 import { redactActivityText } from "../activity/redaction.ts";
-import { codexMessageCorrelationId } from "../providers/codex/activity-projector.ts";
+import {
+  codexMessageCorrelationId,
+  codexRequestUserInputCorrelationId,
+} from "../providers/codex/activity-projector.ts";
 import type {
   Provider,
   SessionView,
@@ -836,13 +839,16 @@ function codexItems(
       const name = stringValue(payload.name);
       const callId = stringValue(payload.call_id) ?? stringValue(payload.id);
       if (!name || !callId || toolIndex.has(callId)) continue;
+      const providerItemId = stringValue(payload.id);
       toolIndex.set(callId, items.length);
       items.push({
         kind: "tool",
         id: stableItemId("codex", callId, fileIdentity, record.offset, "tool"),
-        correlationId: correlationId("tool", callId),
+        correlationId: name === "request_user_input" && providerItemId
+          ? codexRequestUserInputCorrelationId(sessionId, providerItemId)
+          : correlationId("tool", callId),
         turnId: turnByProviderId.get(callId)
-          ?? (stringValue(payload.id) ? turnByProviderId.get(stringValue(payload.id)!) : undefined)
+          ?? (providerItemId ? turnByProviderId.get(providerItemId) : undefined)
           ?? activeTurnId,
         toolCallId: callId,
         name,

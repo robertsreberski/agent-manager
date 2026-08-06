@@ -106,6 +106,19 @@ export function codexMessageCorrelationId(
   );
 }
 
+/**
+ * Canonical identity for one request_user_input item across the Codex rollout
+ * and App Server surfaces. The rollout's response-item id is the same itemId
+ * the App Server places on its server request, so no prompt text or answer
+ * content needs to participate in reconciliation.
+ */
+export function codexRequestUserInputCorrelationId(
+  threadId: string,
+  itemId: string,
+): string {
+  return scopedId("request-user-input-correlation", threadId, itemId);
+}
+
 function itemActivityId(
   threadId: string,
   turnId: string,
@@ -1265,6 +1278,7 @@ export function projectCodexServerRequest(
   const startedAt = isoFromMilliseconds(request.params.startedAtMs) ??
     notificationTime(request);
   const updatedAt = notificationTime(request) ?? startedAt;
+  const providerItemId = stringValue(request.params.itemId);
   return {
     threadId,
     mutations: [upsert({
@@ -1277,6 +1291,9 @@ export function projectCodexServerRequest(
         updatedAt,
         null,
       ),
+      ...(request.method === "item/tool/requestUserInput" && providerItemId
+        ? { correlationId: codexRequestUserInputCorrelationId(threadId, providerItemId) }
+        : {}),
       requestId: jsonRpcIdKey(request.id),
       attentionKind,
       title,

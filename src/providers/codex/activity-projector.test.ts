@@ -4,6 +4,7 @@ import test from "node:test";
 import type { ActivityItemDraft, ActivityMutation } from "../../activity/index.ts";
 import {
   codexMessageCorrelationId,
+  codexRequestUserInputCorrelationId,
   codexActivityOffset,
   projectCodexNotification,
   projectCodexQueue,
@@ -587,6 +588,10 @@ test("attention preserves provider IDs, marks secrets, resolves, and queue upser
   assert.equal(attention.kind, "attention");
   if (attention.kind === "attention") {
     assert.equal(attention.requestId, "s:ask-1");
+    assert.equal(
+      attention.correlationId,
+      codexRequestUserInputCorrelationId("t", "question-item"),
+    );
     assert.equal(attention.respondable, true);
     assert.equal(attention.isSecret, true);
     assert.equal(attention.questions?.[0]?.isSecret, true);

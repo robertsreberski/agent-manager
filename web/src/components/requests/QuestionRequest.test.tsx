@@ -60,22 +60,54 @@ describe("QuestionRequest", () => {
     expect(screen.queryByText("hidden")).not.toBeInTheDocument();
   });
 
-  it("renders uncertain attention without response controls", () => {
-    for (const inexact of [
-      { ...request, id: null, confidence: "heuristic" as const },
-      { ...request, state: "resolved" as const },
-      { ...request, source: "transcript" as const },
-      { ...request, exposure: "transcript-derived" as const },
-      { ...request, truncated: true },
-      { ...request, respondable: false },
-    ]) {
-      const view = render(<QuestionRequest request={inexact} onSubmit={vi.fn()} />);
-      expect(screen.getByText(/native provider interface/u)).toBeInTheDocument();
-      expect(screen.queryByRole("button", { name: /send/iu })).not.toBeInTheDocument();
-      expect(screen.queryByRole("radio")).not.toBeInTheDocument();
-      expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
-      view.unmount();
-    }
+  it("shows transcript questions read-only and leaves all response paths disabled", () => {
+    const onSubmit = vi.fn();
+    const observed: ExactQuestionRequest = {
+      ...request,
+      source: "transcript",
+      confidence: "inferred",
+      exposure: "transcript-derived",
+      respondable: false,
+    };
+    const { container } = render(<QuestionRequest request={observed} onSubmit={onSubmit} />);
+
+    expect(container.querySelector("[data-question-read-only='true']")).toBeInTheDocument();
+    expect(screen.getByText("Read only here. Answer this in the active Codex surface.")).toBeInTheDocument();
+    expect(screen.getByText("Choose")).toBeInTheDocument();
+    expect(screen.getByText("Secret")).toBeInTheDocument();
+    expect(screen.getByText("A described option")).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /Alpha/u })).toBeDisabled();
+    expect(screen.getByLabelText("Secret custom answer")).toHaveAttribute("type", "password");
+    expect(screen.getByLabelText("Secret custom answer")).toBeDisabled();
+    expect(screen.queryByRole("button", { name: /send/iu })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Next" })).not.toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "1" });
+    fireEvent.keyDown(window, { key: "Enter" });
+    expect(screen.getByRole("radio", { name: /Alpha/u })).not.toBeChecked();
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("collapses a resolved transcript question without echoing answer contents", () => {
+    const observed: ExactQuestionRequest = {
+      ...request,
+      state: "resolved",
+      source: "transcript",
+      confidence: "inferred",
+      exposure: "transcript-derived",
+      respondable: false,
+    };
+    render(<QuestionRequest request={observed} onSubmit={vi.fn()} />);
+
+    const trigger = screen.getByRole("button", { name: /Resolved in Codex: request_user_input/u });
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("Choose")).not.toBeInTheDocument();
+    expect(document.body).not.toHaveTextContent("hidden");
+
+    fireEvent.click(trigger);
+    expect(screen.getByText("Resolved in the active Codex surface. Answers are not shown here.")).toBeInTheDocument();
+    expect(screen.getByText("Choose")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /send/iu })).not.toBeInTheDocument();
   });
 
   it("keeps described options as full-width rows instead of truncating them into pills", () => {
