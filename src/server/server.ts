@@ -84,6 +84,7 @@ import {
   type RemoteHostDefinition,
 } from "../remote/index.ts";
 import { AuthManager, type AuthManagerOptions, type AuthSession } from "./auth.ts";
+import { repairPersistedCodexManagedSessions } from "./codex-managed-metadata.ts";
 import {
   createSessionSchema,
   createWorktreeSchema,
@@ -609,6 +610,11 @@ function managedRecoveryRecords(database: ManagerDatabase, provider: Provider): 
   records: ManagedSessionRecoveryRecord[];
   diagnostics: Diagnostic[];
 } {
+  if (provider === "codex") {
+    // Embedders that do not run the production profile-inference composition
+    // still recover old callback-corrupted rows with the conservative default.
+    repairPersistedCodexManagedSessions(database);
+  }
   const records: ManagedSessionRecoveryRecord[] = [];
   const diagnostics: Diagnostic[] = [];
   for (const stored of database.listManagedSessions()) {

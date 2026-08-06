@@ -15,9 +15,15 @@ import {
 } from "../providers/codex/index.ts";
 import type { Diagnostic } from "../core/types.ts";
 import type { WorkerPort } from "../discovery/index.ts";
+import { resolveCodexExecutionProfiles } from "../discovery/observe.ts";
 import { ensurePrivateRuntimeDirectory, type AgentManagerPaths } from "../ops/config.ts";
 import { sweepRetiredCodexHooks } from "../ops/codex-hooks-cleanup.ts";
 import type { ProviderControlAdapters } from "./contracts.ts";
+import {
+  codexProfileRepairCandidateIds,
+  mergeCodexManagedSessionMetadata,
+  repairPersistedCodexManagedSessions,
+} from "./codex-managed-metadata.ts";
 import { ManagerDatabase } from "./persistence.ts";
 import { LocalPlanFileReader } from "./plan-file.ts";
 import {
@@ -224,6 +230,7 @@ export async function createAgentManagerServer(
   const database = serverOptions.database
     ?? new ManagerDatabase(serverOptions.databasePath ?? paths.databasePath);
   databaseForCleanup = database;
+  const diagnostics: Diagnostic[] = [...(serverOptions.initialDiagnostics ?? [])];
   if (configuredHosts || configuredWorkspaces) {
     const hostIds = new Set((configuredHosts ?? []).map((host) => host.id));
     for (const stored of database.listHosts()) {
@@ -246,12 +253,31 @@ export async function createAgentManagerServer(
       });
     }
   }
+  try {
+    const candidateIds = codexProfileRepairCandidateIds(database);
+    const configuredHome = serverOptions.homeDirectory;
+    const codexHome = configuredHome
+      ? join(configuredHome, ".codex")
+      : process.env.CODEX_HOME ?? join(homedir(), ".codex");
+    const profileHints = resolveCodexExecutionProfiles(candidateIds, codexHome);
+    const repairs = repairPersistedCodexManagedSessions(database, profileHints);
+    for (const repair of repairs) {
+      process.stdout.write(
+        `codex: Repaired persisted Codex manager metadata ${repair.id} (${repair.fields.join(", ")}; profile=${repair.profile})\n`,
+      );
+    }
+  } catch (error) {
+    diagnostics.push({
+      provider: "codex",
+      level: "warning",
+      message: `Persisted Codex manager metadata could not be normalized safely: ${error instanceof Error ? error.message : String(error)}`,
+    });
+  }
   const adapters: ProviderControlAdapters = { ...(serverOptions.adapters ?? {}) };
   const claudeHookSourceArbiter = serverOptions.claudeHookSourceArbiter
     ?? new ClaudeHookSourceArbiter();
   const planFileReader = serverOptions.planFileReader ?? new LocalPlanFileReader({ runtimeDirectory });
   const transcriptReader = serverOptions.transcriptReader ?? new LocalSessionTranscriptReader();
-  const diagnostics: Diagnostic[] = [...(serverOptions.initialDiagnostics ?? [])];
   /*
     The Codex command-hook plane is retired: it could never gate anything, and
     the App Server already reports exact events for managed threads. Sweep what
@@ -358,21 +384,16 @@ export async function createAgentManagerServer(
       },
       onSessionChanged: (session) => {
         if (activeCodexBridge !== codexBridge || adapters.codex !== codexBridge) return;
-        state.upsert(session);
+        const current = state.upsert(session);
         try {
           const persisted = database.listManagedSessions().find(
             (record) => record.id === session.id && record.provider === "codex",
           );
           if (!persisted) return;
-          const nextMetadata = {
-            ...persisted.metadata,
-            name: session.name,
-            profile: session.profile.value,
-            model: session.model.value,
-            effort: session.effort.value,
-            ownership: "shared",
-            recovery: null,
-          };
+          const nextMetadata = mergeCodexManagedSessionMetadata(
+            persisted.metadata,
+            current,
+          );
           if (JSON.stringify(nextMetadata) === JSON.stringify(persisted.metadata)) return;
           database.upsertManagedSession({
             ...persisted,

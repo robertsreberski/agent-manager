@@ -14,6 +14,7 @@ import {
   codexClientInvocation,
   parseCodexOpenFiles,
   parseProcessTable,
+  resolveCodexExecutionProfiles,
   scanObservedSessions,
   selectLatestCodexDatabase,
 } from "./observe.ts";
@@ -467,6 +468,57 @@ test("Codex profile follows approval and the sandbox is evidenced on its own axi
     assert.equal(sessions.get("db-thread")?.profile.source, "provider-cli");
     assert.deepEqual(sessions.get("db-thread")?.sandbox.value, { mode: "read-only", networkAccess: false });
     assert.equal(sessions.get("db-thread")?.sandbox.source, "provider-cli");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("resolves exact persisted Codex profile hints outside the discovery recency window", () => {
+  const root = mkdtempSync(join(tmpdir(), "agent-manager-codex-hints-"));
+  const sqliteDirectory = join(root, "sqlite");
+  mkdirSync(sqliteDirectory);
+  const rollout = join(root, "full-access.jsonl");
+  writeFileSync(rollout, `${JSON.stringify({
+    type: "turn_context",
+    payload: {
+      approval_policy: "never",
+      sandbox_policy: { type: "danger-full-access" },
+      collaboration_mode: { mode: "default" },
+    },
+  })}\n`);
+  const database = new DatabaseSync(join(sqliteDirectory, "state_5.sqlite"));
+  try {
+    database.exec(`
+      CREATE TABLE threads (
+        id TEXT PRIMARY KEY,
+        rollout_path TEXT NOT NULL,
+        sandbox_policy TEXT,
+        approval_mode TEXT
+      )
+    `);
+    const insert = database.prepare(
+      "INSERT INTO threads (id, rollout_path, sandbox_policy, approval_mode) VALUES (?, ?, ?, ?)",
+    );
+    insert.run("rollout-wins", rollout, '{"type":"read-only"}', "on-request");
+    insert.run("provider-fallback", "", '{"type":"workspace-write"}', "on-request");
+    insert.run("no-evidence", "", null, null);
+    insert.run("unrequested", rollout, '{"type":"danger-full-access"}', "never");
+  } finally {
+    database.close();
+  }
+
+  try {
+    const profiles = resolveCodexExecutionProfiles([
+      "rollout-wins",
+      "provider-fallback",
+      "no-evidence",
+      "missing",
+    ], root);
+    assert.equal(profiles.get("rollout-wins"), "full-access");
+    assert.equal(profiles.get("provider-fallback"), "execute");
+    assert.equal(profiles.has("no-evidence"), false);
+    assert.equal(profiles.has("missing"), false);
+    assert.equal(profiles.has("unrequested"), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

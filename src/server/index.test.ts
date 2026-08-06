@@ -12,9 +12,11 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import { createAgentManagerServer } from "./index.ts";
+import { ManagerDatabase } from "./persistence.ts";
 
 test("production composition creates and enforces its private runtime boundary", async () => {
   // Keep Unix-domain socket paths below macOS's short sockaddr_un limit.
@@ -204,6 +206,94 @@ test("composed startup sweeps retired Codex hooks from the configured home, neve
     );
   } finally {
     await backend.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("composed startup infers and repairs callback-corrupted Codex metadata", async () => {
+  const root = mkdtempSync("/tmp/am-codex-metadata-");
+  const home = join(root, "home");
+  const codexHome = join(home, ".codex");
+  const sqliteDirectory = join(codexHome, "sqlite");
+  const workspacePath = join(root, "workspace");
+  const rolloutPath = join(codexHome, "profile.jsonl");
+  mkdirSync(sqliteDirectory, { recursive: true });
+  mkdirSync(workspacePath);
+  writeFileSync(rolloutPath, `${JSON.stringify({
+    type: "turn_context",
+    payload: {
+      approval_policy: "never",
+      sandbox_policy: { type: "danger-full-access" },
+      collaboration_mode: { mode: "default" },
+    },
+  })}\n`);
+  const providerDatabase = new DatabaseSync(join(sqliteDirectory, "state_5.sqlite"));
+  providerDatabase.exec(`
+    CREATE TABLE threads (
+      id TEXT PRIMARY KEY,
+      rollout_path TEXT NOT NULL,
+      sandbox_policy TEXT,
+      approval_mode TEXT
+    )
+  `);
+  providerDatabase.prepare(
+    "INSERT INTO threads (id, rollout_path, sandbox_policy, approval_mode) VALUES (?, ?, ?, ?)",
+  ).run("thread-repair", rolloutPath, '{"type":"read-only"}', "on-request");
+  providerDatabase.close();
+
+  const managerDatabase = new ManagerDatabase(join(root, "state.sqlite"));
+  managerDatabase.addWorkspace({
+    id: "workspace-repair",
+    label: "Repair workspace",
+    path: workspacePath,
+  });
+  managerDatabase.upsertManagedSession({
+    id: "local:codex:thread-repair",
+    provider: "codex",
+    providerSessionId: "thread-repair",
+    workspaceId: "workspace-repair",
+    metadata: {
+      name: "x".repeat(220),
+      profile: null,
+      model: null,
+      effort: null,
+      hostId: "local",
+      ownership: "shared",
+      providerTreeId: "thread-repair",
+      providerParentThreadId: null,
+    },
+    createdAt: "2026-08-03T08:00:00.000Z",
+    updatedAt: "2026-08-03T08:00:00.000Z",
+  });
+
+  let backend: Awaited<ReturnType<typeof createAgentManagerServer>> | null = null;
+  try {
+    backend = await createAgentManagerServer({
+      managedProviders: false,
+      database: managerDatabase,
+      staticDir: false,
+      discovery: false,
+      homeDirectory: home,
+      runtimeDirectory: join(root, "runtime"),
+    });
+    const persisted = managerDatabase.listManagedSessions()[0];
+    assert.ok(persisted);
+    assert.equal(persisted.metadata.profile, "full-access");
+    assert.equal(persisted.metadata.name, null);
+    assert.equal(persisted.metadata.providerTreeId, "thread-repair");
+    const recovering = backend.state.get("local:codex:thread-repair");
+    assert.ok(recovering);
+    assert.equal(recovering.profile.value, "full-access");
+    assert.equal(recovering.source, "managed-recovery");
+    assert.equal(
+      backend.state.snapshot().diagnostics.some((diagnostic) =>
+        diagnostic.message.includes("Skipped invalid persisted Codex manager identity")
+      ),
+      false,
+    );
+  } finally {
+    await backend?.close();
+    if (!backend) managerDatabase.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

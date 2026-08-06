@@ -327,6 +327,45 @@ function queryCodexRows(
   }
 }
 
+function queryCodexProfileRows(
+  databasePath: string,
+  threadIds: readonly string[],
+): CodexRow[] {
+  const ids = [...new Set(threadIds.filter((id) => id.length > 0 && id.length <= 512))]
+    .slice(0, 128);
+  if (ids.length === 0) return [];
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    const columns = sqliteColumns(database, "threads");
+    const column = (name: string, fallback = "NULL") => columns.has(name) ? name : fallback;
+    const placeholders = ids.map(() => "?").join(",");
+    const rows = database.prepare(`
+      SELECT id,
+        ${column("rollout_path", "''")} AS rollout_path,
+        ${column("sandbox_policy")} AS sandbox_policy,
+        ${column("approval_mode")} AS approval_mode
+      FROM threads
+      WHERE id IN (${placeholders})${columns.has("archived") ? " AND archived = 0" : ""}
+    `).all(...ids) as JsonObject[];
+    return rows.map((row) => ({
+      id: String(row.id),
+      rolloutPath: String(row.rollout_path ?? ""),
+      createdAtMs: 0,
+      updatedAtMs: 0,
+      cwd: "",
+      title: null,
+      source: null,
+      threadSource: null,
+      model: null,
+      effort: null,
+      sandboxPolicy: string(row.sandbox_policy),
+      approvalMode: string(row.approval_mode),
+    }));
+  } finally {
+    database.close();
+  }
+}
+
 function readJsonlTail(path: string): JsonObject[] {
   let descriptor: number | null = null;
   try {
@@ -641,6 +680,34 @@ function codexProfile(row: CodexRow): SessionProfile | null {
     return codexProfileEvidence("full-access", "provider-cli", facts);
   }
   return approval || sandbox ? codexProfileEvidence("execute", "provider-cli", facts) : null;
+}
+
+/**
+ * Resolve only the persisted managed thread IDs that need a durable profile.
+ * Unlike discovery this does not inspect processes, tmux, or a recent window.
+ */
+export function resolveCodexExecutionProfiles(
+  threadIds: readonly string[],
+  codexHome: string,
+): ReadonlyMap<string, ExecutionProfile> {
+  const database = latestCodexDatabase(codexHome);
+  if (!database) return new Map();
+  try {
+    const resolved = new Map<string, ExecutionProfile>();
+    for (const row of queryCodexProfileRows(database, threadIds)) {
+      const analysis = analyzeCodexEvents(
+        row.rolloutPath ? readCodexObservation(row.rolloutPath) : [],
+        false,
+      );
+      const profile = analysis.profile ?? codexProfile(row);
+      if (profile?.value) resolved.set(row.id, profile.value);
+    }
+    return resolved;
+  } catch {
+    // Startup repair has a conservative `plan` fallback. A provider database
+    // rotation or future schema must not make Agent Manager itself unavailable.
+    return new Map();
+  }
 }
 
 function rootOf(id: string, parentByChild: ReadonlyMap<string, string>): string {
