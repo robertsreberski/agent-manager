@@ -343,13 +343,22 @@ async function defaultWaitForService(port: number): Promise<void> {
   await waitForStableService(port);
 }
 
-function defaultDependencies(): CliDependencies {
-  const paths = defaultPaths();
+/**
+ * `homeDirectory` is authoritative for every path derived from it.
+ *
+ * These used to be resolved independently — `defaultPaths()` and `homeDirectory`
+ * each reading `homedir()` — so overriding only `homeDirectory` left the config,
+ * database and runtime socket pointed at the operator's real home. A test that
+ * exercised any record-writing path then wrote into live state, which is the same
+ * hazard `sweepRetiredCodexHooks` was given an explicit home argument to avoid.
+ */
+function defaultDependencies(homeDirectory: string = homedir()): CliDependencies {
+  const paths = defaultPaths(homeDirectory);
   const cliEntrypoint = resolve(process.argv[1] ?? fileURLToPath(import.meta.url));
   return {
     stdout: process.stdout,
     stderr: process.stderr,
-    homeDirectory: homedir(),
+    homeDirectory,
     cliEntrypoint,
     controlSocketPath: join(paths.runtimeDirectory, "control.sock"),
     currentDirectory: process.cwd(),
@@ -544,7 +553,7 @@ async function dispatchClaudeHook(
 
 
 function dependencies(overrides: Partial<CliDependencies>): CliDependencies {
-  return { ...defaultDependencies(), ...overrides };
+  return { ...defaultDependencies(overrides.homeDirectory), ...overrides };
 }
 
 function writeLine(writer: TextWriter, value = ""): void {
@@ -626,6 +635,80 @@ function prepareInstalledServiceState(deps: CliDependencies): {
   deps.stopService();
   deps.resetOwnedState();
   return { config: deps.recreateOwnedState(), coldCutover: true };
+}
+
+/**
+ * Give an orphaned Claude hook handler a working token again.
+ *
+ * A cold cutover deletes Agent Manager's database, and the bearer token's digest
+ * lives in it. The handler that sends that token lives in the operator's own
+ * `settings.json`, which the reset deliberately does not touch — so the two
+ * halves of one credential come apart, every hook POST answers 401, and Claude
+ * prints `Stop hook error: HTTP 401` on every turn with nothing naming the
+ * remedy.
+ *
+ * Re-issuing is narrow in what it *triggers* on: only when the settings already
+ * carry a handler we generated and the matching record is gone (`untrusted`). It
+ * never installs where nothing was installed, and a foreign handler is never
+ * rewritten.
+ *
+ * It is not narrow in what it writes. This reuses the ordinary installer rather
+ * than adding a second write path into the operator's settings, so the handler set
+ * also converges on the current build's events instead of staying whatever stale
+ * subset was there — correct after a schema cutover, and safer than hand-editing
+ * one header. The surrounding JSONC still survives byte for byte. The diff is
+ * suppressed because a deploy is not the place to print four hundred lines of
+ * settings, and a failure never fails the deploy — the operator gets the one
+ * command that fixes it instead.
+ */
+async function reissueOrphanedClaudeHook(
+  deps: CliDependencies,
+  config: AgentManagerConfig,
+): Promise<void> {
+  const common = {
+    scope: "user",
+    homeDirectory: deps.homeDirectory,
+  } as const;
+  let orphaned: boolean;
+  try {
+    const status = await deps.operateClaudeHook({ ...common, operation: "status" }, {
+      loadRecord: deps.loadClaudeHookRecord,
+      saveRecord: deps.saveClaudeHookRecord,
+      removeRecord: deps.removeClaudeHookRecord,
+      lastSeenAt: deps.claudeHookLastSeen,
+    });
+    orphaned = status.status.state === "untrusted";
+  } catch {
+    // Unreadable settings are the operator's to resolve; a deploy must not fail
+    // because of them, and inventing a hook state here would be worse.
+    return;
+  }
+  if (!orphaned) return;
+
+  try {
+    await deps.operateClaudeHook({
+      ...common,
+      operation: "install",
+      endpoint: `http://127.0.0.1:${String(config.backend.port)}/api/v1/hooks/claude`,
+    }, {
+      loadRecord: deps.loadClaudeHookRecord,
+      saveRecord: deps.saveClaudeHookRecord,
+      removeRecord: deps.removeClaudeHookRecord,
+      lastSeenAt: deps.claudeHookLastSeen,
+      showPreview: () => undefined,
+      confirm: () => true,
+    });
+    writeLine(
+      deps.stdout,
+      "Reissued the Claude hook token in your user settings; the reset had invalidated the installed one.",
+    );
+  } catch (error) {
+    writeLine(deps.stderr, `Could not reissue the Claude hook token: ${errorMessage(error)}`);
+    writeLine(
+      deps.stderr,
+      "Claude will report HTTP 401 for every hook until you run: agent-manager hooks install --provider claude",
+    );
+  }
 }
 
 async function dispatch(argv: readonly string[], deps: CliDependencies): Promise<number> {
@@ -810,6 +893,13 @@ async function dispatch(argv: readonly string[], deps: CliDependencies): Promise
       }
       const prepared = prepareInstalledServiceState(deps);
       const config = prepared.config;
+      /*
+        Before the replacement service starts, so it reads the fresh record at
+        startup rather than needing a reload afterwards. Only a project-scoped
+        install cannot be healed: the reset destroyed the record of which project
+        directories had one, so there is nothing left to enumerate.
+      */
+      if (prepared.coldCutover) await reissueOrphanedClaudeHook(deps, config);
       const options = serviceOptions(config, deps);
       const destination = deps.installService(options);
       deps.reloadService(destination);

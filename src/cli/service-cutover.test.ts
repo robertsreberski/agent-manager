@@ -171,3 +171,100 @@ test("service install fails closed on an unknown config error", async (t) => {
   assert.equal(readFileSync(paths.configFile, "utf8"), "{ malformed");
   assert.notEqual(fixture.stderr.read(), "");
 });
+
+/** A handler shaped like one we installed, whose durable record the reset removed. */
+function writeOrphanedClaudeHook(home: string, installId: string): string {
+  const settingsPath = join(home, ".claude", "settings.json");
+  mkdirSync(dirname(settingsPath), { recursive: true, mode: 0o700 });
+  writeFileSync(settingsPath, `${JSON.stringify({
+    theme: "dark",
+    hooks: {
+      Stop: [{
+        hooks: [{
+          type: "http",
+          url: "http://127.0.0.1:43127/api/v1/hooks/claude",
+          timeout: 15,
+          headers: {
+            Authorization: "Bearer stale-token-from-before-the-reset",
+            "X-Agent-Manager-Install": installId,
+            "X-Agent-Manager-Owner": "$AGENT_MANAGER_SESSION_OWNER",
+          },
+          allowedEnvVars: ["AGENT_MANAGER_SESSION_OWNER"],
+        }],
+      }],
+    },
+  }, null, 2)}\n`, { mode: 0o600 });
+  return settingsPath;
+}
+
+test("a cold cutover reissues the token of a hook handler it orphaned", async (t) => {
+  const { home, paths } = temporaryPaths(t);
+  mkdirSync(paths.dataDirectory, { recursive: true, mode: 0o700 });
+  writeFileSync(paths.configFile, `${JSON.stringify({ ...defaultConfig(), version: 2 })}\n`, { mode: 0o600 });
+  writeFileSync(paths.databaseFile, "old database", { mode: 0o600 });
+  const settingsPath = writeOrphanedClaudeHook(home, "11111111-2222-3333-4444-555555555555");
+  const before = readFileSync(settingsPath, "utf8");
+  const events: string[] = [];
+  const fixture = serviceDependencies(home, paths, events);
+
+  assert.equal(await runCli(["service", "install"], fixture.overrides), 0);
+
+  /*
+    The whole point: the operator does nothing, and the handler that was about to
+    answer 401 on every turn has a token the recreated database knows.
+  */
+  assert.match(fixture.stdout.read(), /Reissued the Claude hook token/u);
+  const after = readFileSync(settingsPath, "utf8");
+  assert.notEqual(before, after);
+  assert.doesNotMatch(after, /stale-token-from-before-the-reset/u);
+  /*
+    Every handler carries one fresh token. This reuses the ordinary installer, so
+    the handler set also converges on the current build's events rather than
+    staying the stale subset — which is what you want after a schema cutover, and
+    is why the message says reissued rather than claiming a surgical token swap.
+  */
+  const tokens = new Set([...after.matchAll(/"Authorization": "Bearer ([A-Za-z0-9_-]+)"/gu)].map((m) => m[1]));
+  assert.equal(tokens.size, 1, "one token across every handler");
+  assert.ok((tokens.values().next().value ?? "").length >= 16);
+  const installedEvents = Object.keys(JSON.parse(after).hooks);
+  assert.ok(installedEvents.includes("Stop"), "the event the operator already had survives");
+  assert.ok(installedEvents.length > 1, "the handler set converges on the current build");
+  // The operator's unrelated settings are untouched.
+  assert.equal(JSON.parse(after).theme, "dark");
+
+  const database = new DatabaseSync(paths.databaseFile, { readOnly: true });
+  try {
+    const rows = database.prepare("select settings_path from claude_hook_installs").all();
+    assert.equal(rows.length, 1, "the reissued install must be durable before the service starts");
+    assert.equal(rows[0]?.settings_path, settingsPath);
+  } finally {
+    database.close();
+  }
+});
+
+test("a cold cutover installs no hook where the operator never had one", async (t) => {
+  const { home, paths } = temporaryPaths(t);
+  mkdirSync(paths.dataDirectory, { recursive: true, mode: 0o700 });
+  writeFileSync(paths.configFile, `${JSON.stringify({ ...defaultConfig(), version: 2 })}\n`, { mode: 0o600 });
+  writeFileSync(paths.databaseFile, "old database", { mode: 0o600 });
+  const settingsPath = join(home, ".claude", "settings.json");
+  mkdirSync(dirname(settingsPath), { recursive: true, mode: 0o700 });
+  // Someone else's hook, plus unrelated settings. Neither is ours to rewrite.
+  const untouched = `${JSON.stringify({
+    theme: "light",
+    hooks: { Stop: [{ hooks: [{ type: "command", command: "/usr/local/bin/not-ours" }] }] },
+  }, null, 2)}\n`;
+  writeFileSync(settingsPath, untouched, { mode: 0o600 });
+  const fixture = serviceDependencies(home, paths, []);
+
+  assert.equal(await runCli(["service", "install"], fixture.overrides), 0);
+
+  assert.doesNotMatch(fixture.stdout.read(), /Reissued the Claude hook token/u);
+  assert.equal(readFileSync(settingsPath, "utf8"), untouched, "a foreign handler is never rewritten");
+  const database = new DatabaseSync(paths.databaseFile, { readOnly: true });
+  try {
+    assert.deepEqual(database.prepare("select * from claude_hook_installs").all(), []);
+  } finally {
+    database.close();
+  }
+});
