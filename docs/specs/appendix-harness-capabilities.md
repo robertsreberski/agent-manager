@@ -71,7 +71,7 @@ turn ID, and event/tool fields). `PreToolUse` supports allow/deny, not `ask`.
 `PermissionRequest` supports allow/deny/no decision. A command shim may post its stdin payload to
 Agent Manager loopback, but the Claude parser/response schema must not be reused.
 
-## Claude Code 2.1.222 and Agent SDK 0.3.220
+## Claude Code 2.1.223 and Agent SDK 0.3.220
 
 ### Manager-owned SDK query
 
@@ -92,7 +92,7 @@ session/workspace identity must be revalidated, and only a successful SDK resume
 manager writes. A native attach later is another handoff, not a concurrent peer join.
 
 **This is a product decision, not a provider constraint.** A disposable probe against
-`@anthropic-ai/claude-agent-sdk` 0.3.220 and `claude` 2.1.222 measured what a second
+`@anthropic-ai/claude-agent-sdk` 0.3.220 and `claude` 2.1.223 measured what a second
 controller actually does, because the rule had only ever been asserted in the conditional:
 
 - A second `query({ resume })` against a session a live query already holds **succeeds**. It
@@ -127,7 +127,7 @@ A disposable probe verified that a `--bg` hook `session_id` matches the registry
 ### Hooks
 
 Claude supports loopback HTTP hooks and reloads a newly added local-settings handler for later
-events in an already-running `2.1.222` session. The settings edit itself emits no event, so an
+events in an already-running `2.1.223` session. The settings edit itself emits no event, so an
 installation is installed-unseen until the next provider event.
 
 Hook payloads include session/transcript/cwd/event/permission facts plus event-specific prompt,

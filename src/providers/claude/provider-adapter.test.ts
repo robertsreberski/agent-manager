@@ -2428,7 +2428,7 @@ test("external Claude adoption rejects provider identity drift without publishin
       type: "system",
       subtype: "init",
       session_id: "different-claude-session",
-      claude_code_version: "2.1.222",
+      claude_code_version: "2.1.223",
       model: "sonnet",
       permissionMode: "default",
       capabilities: ["interrupt_receipt_v1"],
