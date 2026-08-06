@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { ActivityHub, type ActivityMutation } from "../../activity/index.ts";
+import { assertPublishedSessionView } from "../shared/session-view.conformance.test.ts";
 import type { SessionView } from "../../core/types.ts";
 import type { WorkspaceIdentity } from "../../core/worktree.ts";
 import type { ManagedSessionRecoveryRecord } from "../../server/contracts.ts";
@@ -4017,6 +4018,51 @@ test("workspace identity stays null when the bounded git resolution cannot answe
   }, context);
   assert.equal(created.workspaceIdentity, null);
   assert.equal(created.id, "local:codex:thread-1", "creation still succeeds");
+  bridge.dispose();
+  await adapter.dispose();
+});
+
+test("every published Codex view satisfies the cross-provider contract", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("thread/start", () => threadResult());
+  transport.handlers.set("thread/settings/update", () => ({}));
+  transport.handlers.set("turn/start", () => ({
+    turn: { id: "turn-1", status: "inProgress", items: [] },
+  }));
+  const published: SessionView[] = [];
+  const bridge = new CodexProviderBridge({
+    adapter,
+    resolveWorkspace: () => "/workspace",
+    onSessionChanged: (view) => published.push(view),
+  });
+  const created = await bridge.createSession({
+    provider: "codex",
+    workspaceId: "workspace",
+    initialMessage: "Start",
+    profile: "plan",
+    sandbox: null,
+    model: null,
+    effort: null,
+    idempotencyKey: "conformance-codex",
+  }, {
+    actor: { id: "local", kind: "local" as const, displayName: "Local user" },
+    requestId: "conformance-codex",
+    signal: new AbortController().signal,
+    workspace: { id: "workspace", label: "Workspace", path: "/workspace" },
+  });
+  published.push(created);
+
+  // A running turn publishes a different capability ruling than an idle one,
+  // so both states are covered rather than only the one creation lands in.
+  transport.notify("turn/started", {
+    threadId: "thread-1",
+    turn: { id: "turn-running", status: "inProgress", items: [] },
+  });
+  published.push(bridge.toSessionView(adapter.getThreadState("thread-1")!));
+
+  assert.ok(published.length > 1, "the bridge published more than one view");
+  for (const view of published) assertPublishedSessionView(view);
+
   bridge.dispose();
   await adapter.dispose();
 });

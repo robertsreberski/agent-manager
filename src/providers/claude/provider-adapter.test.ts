@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { assertPublishedSessionView } from "../shared/session-view.conformance.test.ts";
 import type { SessionView } from "../../core/types.ts";
 import type { ActivityMutation } from "../../activity/index.ts";
 import type { ManagedSessionRecoveryRecord, RequestContext } from "../../server/contracts.ts";
@@ -200,6 +201,31 @@ function nativeStopHook(sessionId: string, promptId: string) {
     stop_hook_active: false,
   });
 }
+
+test("every published Claude view satisfies the cross-provider contract", async () => {
+  const runtime = new BridgeRuntime();
+  const published: SessionView[] = [];
+  const adapter = new ClaudeProviderControlAdapter({
+    runtime,
+    resolveWorkspace: () => "/workspace",
+    onSessionChanged: (view) => published.push(view),
+  });
+  const created = await adapter.createSession({
+    provider: "claude",
+    workspaceId: "workspace",
+    initialMessage: "Start",
+    profile: "ask-first",
+    sandbox: null,
+    model: "sonnet",
+    effort: "high",
+    idempotencyKey: "conformance-claude",
+  }, context());
+  published.push(created);
+  await adapter.dispose();
+
+  assert.ok(published.length > 0, "the adapter published at least one view");
+  for (const view of published) assertPublishedSessionView(view);
+});
 
 async function externalClaudeView(runtime: BridgeRuntime): Promise<SessionView> {
   const source = new ClaudeProviderControlAdapter({

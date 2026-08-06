@@ -1,5 +1,4 @@
 import {
-  emptyChildSummary,
   providerControlCoordination,
   providerEffort,
   sessionRecordId,
@@ -38,6 +37,7 @@ import {
   CLAUDE_MANAGER_OWNER_VALUE,
 } from "../hooks/claude-source.ts";
 import { CLAUDE_REASONING_EFFORTS, noSandbox } from "../../shared/session.ts";
+import { managedSessionInvariants } from "../shared/session-view.ts";
 import {
   deferredToLaterLayers,
   resolveControlCapabilities,
@@ -1882,13 +1882,9 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
       providerTreeId: providerSessionId,
       parentId: null,
       providerTurnId: null,
-      depth: 0,
-      hostId: "local",
-      hostLabel: "This Mac",
+      ...managedSessionInvariants(),
       name: entry.name,
       cwd: snapshot.cwd,
-      kind: "interactive",
-      archived: false,
       presence: status === "completed" ? "recent" : "live",
       status,
       providerStatus: snapshot.activity,
@@ -1896,8 +1892,6 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
       runtimePid: snapshot.handoff?.wrapperPid ?? null,
       startedAt: snapshot.startedAt,
       updatedAt: snapshot.updatedAt,
-      childSummary: emptyChildSummary(),
-      statusSource: "provider-api",
       source: "claude-sdk",
       profile: {
         value: profileForClaudePermissionMode(snapshot.mode),
@@ -1915,7 +1909,6 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
         confidence: snapshot.model === null ? "heuristic" : "exact",
       },
       effort: providerEffort("claude", snapshot.effort, "provider-api"),
-      todoProgress: null,
       attention: snapshot.pendingRequests.map((request) => ({
         id: request.id,
         kind:
@@ -1929,7 +1922,6 @@ export class ClaudeProviderControlAdapter implements ProviderControlAdapter {
         confidence: "exact",
         details: attentionDetails(request),
       })),
-      terminal: null,
       control: {
         plane: writableManagerControls ? "claude-sdk" : "resume-only",
         authority: managerControls ? "manager" : "foreign",

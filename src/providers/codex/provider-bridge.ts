@@ -8,6 +8,7 @@ import {
   WorkspaceIdentityResolver,
   type WorkspaceIdentity,
 } from "../../core/worktree.ts";
+import { managedSessionInvariants } from "../shared/session-view.ts";
 import {
   allCapabilities,
   deferredToLaterLayers,
@@ -17,7 +18,6 @@ import {
 } from "../shared/capabilities.ts";
 import {
   DEFAULT_SANDBOX_POLICY,
-  emptyChildSummary,
   providerControlCoordination,
   providerEffort,
   sandboxEquals,
@@ -1407,13 +1407,9 @@ export class CodexProviderBridge implements ProviderControlAdapter {
         ? sessionRecordId("local", "codex", state.parentThreadId)
         : null,
       providerTurnId: state.activeTurnId,
-      depth: 0,
-      hostId: "local",
-      hostLabel: "This Mac",
+      ...managedSessionInvariants(),
       name: metadata.name ?? state.name,
       cwd,
-      kind: "interactive",
-      archived: false,
       presence: liveDetail ? "live" : "recent",
       status: normalizedStatus,
       providerStatus: state.status,
@@ -1421,9 +1417,6 @@ export class CodexProviderBridge implements ProviderControlAdapter {
       runtimePid: null,
       startedAt: metadata.createdAt,
       updatedAt,
-      childSummary: emptyChildSummary(),
-      todoProgress: null,
-      statusSource: "provider-api",
       source: state.source ?? "appServer",
       profile: {
         value: effectiveProfile,
@@ -1447,7 +1440,6 @@ export class CodexProviderBridge implements ProviderControlAdapter {
       },
       effort: providerEffort("codex", effectiveEffort, "provider-api"),
       attention: [...recoveryAttention, ...pendingAttention],
-      terminal: null,
       control: {
         plane: "codex-private",
         authority: "manager",
