@@ -997,3 +997,41 @@ test("symlinks, rollout path escapes, ownership mismatch, and ambiguous Claude i
   assert.equal("path" in ambiguous.transcript, false);
   assert.equal("error" in ambiguous.transcript, false);
 });
+
+test("a repeated Codex read reuses its resolved rollout instead of re-opening the state database", () => {
+  const fixture = codexFixture([codexMeta(), codexMessage("assistant", "First")]);
+  const reader = new LocalSessionTranscriptReader({ codexHome: fixture.home });
+  assert.equal(reader.read(codexSession()).transcript.state, "available");
+
+  /*
+    Removing the state database proves the second read never consulted it. The
+    selected session is polled on a sub-second cadence, so resolving through a
+    fresh DatabaseSync every tick was the dominant cost of an idle drawer.
+  */
+  rmSync(join(fixture.home, "state_5.sqlite"), { force: true });
+  const second = reader.read(codexSession());
+  assert.equal(second.transcript.state, "available");
+  assert.equal(second.items.filter((item) => item.kind === "message").length, 1);
+});
+
+test("a rolled-away Codex rollout re-resolves rather than failing the read", () => {
+  const fixture = codexFixture([codexMeta(), codexMessage("assistant", "First")]);
+  const reader = new LocalSessionTranscriptReader({ codexHome: fixture.home });
+  assert.equal(reader.read(codexSession()).transcript.state, "available");
+
+  // Same session, same identity, new path: the remembered hint is now wrong.
+  const moved = join(fixture.home, "sessions", "2026", "08", "04");
+  mkdirSync(moved, { recursive: true });
+  const movedFile = join(moved, `rollout-2026-08-04T12-00-00-${fixture.sessionId}.jsonl`);
+  writeFileSync(movedFile, jsonl([codexMeta(), codexMessage("assistant", "Moved")], true));
+  rmSync(fixture.file, { force: true });
+  const database = new DatabaseSync(join(fixture.home, "state_5.sqlite"));
+  database.prepare("UPDATE threads SET rollout_path = ? WHERE id = ?").run(movedFile, fixture.sessionId);
+  database.close();
+
+  const second = reader.read(codexSession());
+  assert.equal(second.transcript.state, "available");
+  const messages = second.items.filter((item) => item.kind === "message");
+  assert.equal(messages.length, 1);
+  assert.match(JSON.stringify(messages[0]), /Moved/u);
+});

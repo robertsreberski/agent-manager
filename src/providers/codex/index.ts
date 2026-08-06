@@ -39,6 +39,7 @@ export {
   type MessageTransport,
 } from "./rpc.ts";
 export {
+  CODEX_PRIVATE_SOCKET_NAME,
   CodexAppServerSupervisor,
   probeCodexVersion,
   type CodexAppServerSupervisorOptions,

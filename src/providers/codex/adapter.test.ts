@@ -2842,6 +2842,56 @@ test("bounds managed recovery to one hundred records and four concurrent reads",
   await adapter.dispose();
 });
 
+test("every managed recovery record lands in exactly one of restored or failures", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("thread/read", (params) =>
+    String(params.threadId) === "recovers-fine"
+      ? threadResultWithIdentity("recovers-fine", null, null)
+      : (() => { throw new Error("provider refused"); })()
+  );
+  transport.handlers.set("thread/resume", (params) =>
+    threadResultWithIdentity(String(params.threadId), null, null)
+  );
+  const bridge = new CodexProviderBridge({ adapter, resolveWorkspace: () => "/workspace" });
+  const record = (threadId: string): ManagedSessionRecoveryRecord => ({
+    managerSessionId: `local:codex:${threadId}`,
+    provider: "codex",
+    providerThreadId: threadId,
+    workspaceId: "workspace-1",
+    workspacePath: "/workspace",
+    name: null,
+    profile: "execute",
+    providerTreeId: null,
+    providerParentThreadId: null,
+    createdAt: "2026-08-03T09:00:00.000Z",
+  });
+  const records = [record("recovers-fine"), record("refused"), record("refused-too")];
+
+  const report = await bridge.restoreManagedSessions(records, new AbortController().signal);
+
+  /*
+    The accounting invariant, not the wording. Assembling `failures` with a
+    truthiness test on the reason silently dropped any record whose reason
+    stringified empty — it appeared in neither list, and the server then blamed
+    the provider for not confirming an identity it had never been asked about.
+  */
+  const accounted = new Set([
+    ...report.restoredSessionIds,
+    ...report.failures.map((failure) => failure.managerSessionId),
+  ]);
+  assert.equal(accounted.size, records.length, "no record may vanish from both lists");
+  for (const entry of records) assert.ok(accounted.has(entry.managerSessionId), entry.managerSessionId);
+  assert.deepEqual(report.restoredSessionIds, ["local:codex:recovers-fine"]);
+  assert.deepEqual(
+    report.failures.map((failure) => failure.providerThreadId).sort(),
+    ["refused", "refused-too"],
+  );
+  for (const failure of report.failures) assert.equal(typeof failure.reason, "string");
+
+  bridge.dispose();
+  await adapter.dispose();
+});
+
 test("settings are idle-only and become effective only after provider notification", async () => {
   const { adapter, transport } = await initializedAdapter();
   transport.handlers.set("thread/start", () => threadResult());

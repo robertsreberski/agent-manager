@@ -9,6 +9,7 @@ import {
 } from "../providers/claude/index.ts";
 import { ClaudeHookSourceArbiter } from "../providers/hooks/index.ts";
 import {
+  CODEX_PRIVATE_SOCKET_NAME,
   CodexAppServerSupervisor,
   CodexProviderBridge,
 } from "../providers/codex/index.ts";
@@ -198,7 +199,7 @@ export async function createAgentManagerServer(
     ensurePrivateRuntimeDirectory(runtimeValidationPaths(
       paths.stateDirectory,
       codexRuntimeDirectory,
-      join(codexRuntimeDirectory, "codex-app-server.sock"),
+      join(codexRuntimeDirectory, CODEX_PRIVATE_SOCKET_NAME),
     ));
   }
   // This atomic kernel-owned bind is deliberately the first stateful runtime

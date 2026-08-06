@@ -85,11 +85,41 @@ the manager owns. Steering remains gated by the exact SDK/CLI pins.
 
 An arbitrary interactive Claude terminal session has no local semantic queue/steer/control
 socket Agent Manager can join. Registry/Agent View, process/tmux facts, and transcripts provide
-discovery/observation; running `--resume` while the original CLI remains alive would create a
-second controller and is not adoption. Cloud Remote Control is not a local integration path.
-Claude takeover is therefore exclusive: the original controller must exit first, the exact
+discovery/observation. Cloud Remote Control is not a local integration path.
+
+Claude takeover is exclusive: the original controller must exit first, the exact
 session/workspace identity must be revalidated, and only a successful SDK resume may enable
 manager writes. A native attach later is another handoff, not a concurrent peer join.
+
+**This is a product decision, not a provider constraint.** A disposable probe against
+`@anthropic-ai/claude-agent-sdk` 0.3.220 and `claude` 2.1.222 measured what a second
+controller actually does, because the rule had only ever been asserted in the conditional:
+
+- A second `query({ resume })` against a session a live query already holds **succeeds**. It
+  is not refused, and neither client errors.
+- An SDK query registers in `~/.claude/sessions/<pid>.json` as `kind: "interactive"` — the
+  same kind a terminal session registers. The CLI's own resume guard refuses only sessions
+  whose `kind` is *not* `interactive` (background agents, which have a supported `claude
+  agents` attach), so the provider deliberately permits this.
+- The transcript is not corrupted. Sequential turns from two clients produced one linear
+  chain — the second client's user message correctly parented onto the first client's
+  assistant reply — with no duplicate or dangling `uuid`s.
+- Two *simultaneous* in-flight turns also produced a well-formed transcript, and each client
+  received its own correct reply. They **fork**: both user messages parent onto the same
+  node, yielding the two-branch DAG `--fork-session` already produces.
+
+So exclusivity is not required to protect the transcript. What it buys is a single linear
+conversation. Making Claude `shared / join` like Codex would not risk corruption, but Codex's
+app server *serializes* concurrent turns onto one thread while Claude branches them, so a
+shared Claude session would need turn serialization in the manager — or would have to present
+forks as a first-class outcome. Neither is in scope here; the point of recording this is that
+the constraint is ours to revisit rather than the provider's to enforce.
+
+There is also a per-session cross-session messaging socket (`messagingSocketPath` in the
+registry, with `sendToUdsSocket` / `listLivePeerSessions` in the CLI) that would allow writing
+into a live session with no second controller at all. It is feature-gated: live interactive
+sessions on this machine advertise `peerProtocol: 1` but carry no `messagingSocketPath`.
+Whether it can be enabled for interactive sessions is unprobed.
 
 A disposable probe verified that a `--bg` hook `session_id` matches the registry and
 `claude agents --json --all` session ID. That ID correlates hook events to discovery.

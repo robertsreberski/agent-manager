@@ -10,6 +10,7 @@ import {
 } from "../../core/worktree.ts";
 import {
   DEFAULT_SANDBOX_POLICY,
+  emptyChildSummary,
   providerControlCoordination,
   providerEffort,
   sandboxEquals,
@@ -298,18 +299,6 @@ function sessionStatus(state: CodexThreadState): SessionView["status"] {
   return "unknown";
 }
 
-function emptyChildren(): SessionView["childSummary"] {
-  return {
-    total: 0,
-    running: 0,
-    waiting: 0,
-    idle: 0,
-    completed: 0,
-    failed: 0,
-    interrupted: 0,
-    unknown: 0,
-  };
-}
 
 function mappedCapabilities(
   adapter: CodexManagedAdapter,
@@ -1015,13 +1004,21 @@ export class CodexProviderBridge implements ProviderControlAdapter {
       restoredSessionIds: selected.flatMap((record, index) => (
         restored[index] ? [record.managerSessionId] : []
       )),
-      failures: selected.flatMap((record, index) => failures[index]
-        ? [{
-            managerSessionId: record.managerSessionId,
-            providerThreadId: record.providerThreadId,
-            reason: failures[index],
-          }]
-        : []),
+      /*
+        Absence, not falsiness, decides whether a record failed. `recoveryError`
+        can produce an empty reason — a non-`Error` whose `String()` is "" — and
+        a truthiness test dropped those records from both lists, so the server
+        reported "provider did not confirm the exact managed session identity"
+        instead of the cause it had been handed.
+      */
+      failures: selected.flatMap((record, index) => {
+        const reason = failures[index];
+        return reason === null || reason === undefined ? [] : [{
+          managerSessionId: record.managerSessionId,
+          providerThreadId: record.providerThreadId,
+          reason,
+        }];
+      }),
       truncated: truncatedByRecordLimit,
     };
   }
@@ -1423,7 +1420,7 @@ export class CodexProviderBridge implements ProviderControlAdapter {
       runtimePid: null,
       startedAt: metadata.createdAt,
       updatedAt,
-      childSummary: emptyChildren(),
+      childSummary: emptyChildSummary(),
       todoProgress: null,
       statusSource: "provider-api",
       source: state.source ?? "appServer",

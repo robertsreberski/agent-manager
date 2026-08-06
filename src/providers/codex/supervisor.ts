@@ -302,6 +302,14 @@ function defaultLaunch(
   });
 }
 
+/**
+ * The filename this supervisor binds inside its private runtime directory.
+ * Exported because callers that only assert containment on the directory used
+ * to spell it differently, and a socket path that disagrees with the socket is
+ * a debugging trap waiting to happen.
+ */
+export const CODEX_PRIVATE_SOCKET_NAME = "codex-private.sock";
+
 export class CodexAppServerSupervisor {
   readonly runtimeDir: string;
   readonly socketPath: string;
@@ -342,7 +350,7 @@ export class CodexAppServerSupervisor {
     if (!isAbsolute(options.runtimeDir)) {
       throw new Error("Codex runtime directory must be absolute");
     }
-    const socketName = options.socketName ?? "codex-private.sock";
+    const socketName = options.socketName ?? CODEX_PRIVATE_SOCKET_NAME;
     if (socketName.includes("/") || socketName === "." || socketName === "..") {
       throw new Error("Codex socketName must be a plain filename");
     }
