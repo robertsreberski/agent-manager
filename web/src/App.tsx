@@ -176,8 +176,16 @@ export function effectiveDraftHostId(
 function sharedCatalogEfforts(
   models: readonly { efforts?: readonly ReasoningEffort[] | undefined }[],
 ): readonly ReasoningEffort[] {
-  const [first, ...rest] = models;
-  if (!first?.efforts?.length) return [];
+  /*
+    Only rows that declare levels get a vote. A row with no `efforts` has said
+    nothing about effort — providers omit the field entirely rather than
+    publishing an empty set — and silence is not a claim that zero levels hold.
+    Letting it veto would empty the intersection for every other row: Claude's
+    catalog lists `haiku`, which declares no levels, alongside four models that
+    each accept five.
+  */
+  const [first, ...rest] = models.filter((model) => model.efforts && model.efforts.length > 0);
+  if (!first?.efforts) return [];
   return first.efforts.filter((effort) => rest.every((model) => model.efforts?.includes(effort)));
 }
 
@@ -330,7 +338,7 @@ export type SetupFactsState =
 /** The standalone surface for reviewing and installing local integrations. */
 export function SetupDialog({ setup, onApplyHook, onAddHost, onRemoveHost, onRetry, onClose }: {
   setup: SetupFactsState;
-  onApplyHook?: (provider: "claude" | "codex", previewId: string) => Promise<void>;
+  onApplyHook?: (provider: "claude", previewId: string) => Promise<void>;
   onAddHost: (label: string, target: string) => Promise<void>;
   onRemoveHost: (hostId: string) => Promise<void>;
   onRetry: () => void;
@@ -615,7 +623,7 @@ export default function App() {
       if (setupRequest.current === request) setSetupFacts({ state: "error", value: null, error: errorText(error) });
     });
   }, [cockpit.loadSetup]);
-  const applySetupHook = useCallback(async (provider: "claude" | "codex", previewId: string): Promise<void> => {
+  const applySetupHook = useCallback(async (provider: "claude", previewId: string): Promise<void> => {
     await cockpit.applySetupHook(provider, previewId);
     setupProbes.current = 0;
     refreshSetup();
@@ -659,7 +667,7 @@ export default function App() {
   */
   useEffect(() => {
     if (!setupOpen || setupFacts?.state !== "loaded") return;
-    const unfinished = ([setupFacts.value.hooks.claude, setupFacts.value.hooks.codex] as const)
+    const unfinished = ([setupFacts.value.hooks.claude] as const)
       .some((hook) => hook.state !== "active");
     if (!unfinished || setupProbes.current >= SETUP_REPROBE_LIMIT) return;
     const timer = setTimeout(() => { setupProbes.current += 1; refreshSetup(); }, SETUP_REPROBE_MS);

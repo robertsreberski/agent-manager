@@ -89,7 +89,21 @@ export type ClaudeManagedSessionLossReason =
   | "unexpected-failure"
   | "ownership-conflict";
 
-const CLAUDE_SETTINGS_LOOKUP_TIMEOUT_MS = 2_000;
+/*
+  A backstop against a settings lookup that never settles, not the deadline a
+  caller waits on. The HTTP routes bound their own request
+  (`SETTINGS_OPTIONS_TIMEOUT_MS`, 3s) and return `provider-unavailable` when it
+  expires, so this must sit well above that: a draft catalog read spawns a
+  `claude` subprocess and measures 750-1150ms on a warm machine, and at 2s it
+  was the binding constraint rather than the backstop — a probe merely slowed by
+  a busy manager failed here before the request bound ever applied, leaving the
+  composer with an empty catalog.
+
+  It cannot be the request signal instead. The lookup is shared by every
+  concurrent draft (`#draftSettingsLookup`), so one caller navigating away must
+  not abort a probe the others are still awaiting.
+*/
+const CLAUDE_SETTINGS_LOOKUP_TIMEOUT_MS = 10_000;
 const WORKSPACE_IDENTITY_BUDGET_MS = 2_500;
 const MAX_RECOVERY_RECORDS = 100;
 const RECOVERY_CONCURRENCY = 4;

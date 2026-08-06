@@ -41,7 +41,7 @@ import type {
 } from "../types";
 import { toCockpitSessionView } from "../lib/cockpit-view";
 import type { PlanFileResponse, SelectedSessionFactsResponse } from "../lib/api";
-import { reasoningEffortsForProvider } from "../../../src/shared/session.ts";
+import { composerEffortOptions } from "../lib/model-catalog";
 
 function UserMessage() {
   return (
@@ -683,18 +683,7 @@ export function SessionThreadComposer({
   }
   const unavailableReason = (capability: "set-model" | "set-effort" | "set-profile" | "set-sandbox", fallback: string) =>
     session.control.withheld.find((item) => item.capability === capability)?.reason ?? fallback;
-  /*
-    A granted `set-effort` is the harness's own claim that a write drawn from
-    its provider vocabulary will be accepted, so a loaded catalog row that
-    declares no efforts falls back to that vocabulary rather than hiding the
-    control. An unloaded catalog (`undefined`) or a withheld capability offers
-    nothing the harness has not stated.
-  */
-  const composerEffortOptions = effortOptions === undefined
-    ? []
-    : effortOptions.length > 0 || !canSetEffort
-      ? effortOptions
-      : reasoningEffortsForProvider(session.provider);
+  const effortChoices = composerEffortOptions(session.provider, effortOptions, canSetEffort);
   const takeoverFailed = takeover?.state === "failed";
   const showControlStatus = Boolean(noWriteReason || recovery || canTakeControl || canResumeHere || takeoverFailed || resumeError);
   const routineControlStatus = !recovery && !takeoverFailed && !resumeError && canResumeHere;
@@ -843,7 +832,7 @@ export function SessionThreadComposer({
         effortChangeUnavailableReason={canSetEffort ? null : unavailableReason("set-effort", "This harness does not expose live effort changes.")}
         profileChangeUnavailableReason={canSetProfile ? null : unavailableReason("set-profile", "This harness does not expose live execution-profile changes.")}
         sandboxChangeUnavailableReason={canSetSandbox ? null : unavailableReason("set-sandbox", "This harness does not expose live sandbox changes.")}
-        effortOptions={composerEffortOptions}
+        effortOptions={effortChoices}
         profileOptions={canSetProfile ? PROFILES : session.profile.value ? [session.profile.value] : []}
         busy={busy}
         {...(canSetModel ? { onModelChange: (model: string) => void onSetModel(model) } : {})}

@@ -336,11 +336,25 @@ function mappedCapabilities(
   if (state.activeTurnId && controls.has("turn.interrupt")) result.push("interrupt");
   if (state.pendingRequests.some((request) => request.respondable) &&
       controls.has("request.respond")) result.push("respond");
-  if (!state.activeTurnId && state.status !== "running") {
+  const idle = !state.activeTurnId && state.status !== "running";
+  /*
+    Profile and sandbox stay idle-only: they govern the approval policy and
+    containment the running turn is already executing tool calls under, and must
+    not shift beneath it. Archive and delete stay idle-only because both are
+    destructive against live work.
+
+    Model and effort are different. They select what handles the *next*
+    inference, so a change during a turn is stashed as that turn's successor's
+    override rather than refused. Hiding the control taught the cockpit that a
+    session streaming its first turn had no model choice at all.
+  */
+  if (idle) {
     if (controls.has("profile.set")) result.push("set-profile");
     if (controls.has("sandbox.set")) result.push("set-sandbox");
-    if (controls.has("model.set")) result.push("set-model");
-    if (controls.has("effort.set")) result.push("set-effort");
+  }
+  if (controls.has("model.set")) result.push("set-model");
+  if (controls.has("effort.set")) result.push("set-effort");
+  if (idle) {
     if (controls.has("thread.archive")) result.push("archive");
     if (controls.has("thread.delete")) result.push("delete");
   }
@@ -355,7 +369,9 @@ function withheldCapabilities(
   state: CodexThreadState,
 ): SessionView["control"]["withheld"] {
   if (state.activeTurnId || state.status === "running") {
-    return ["set-profile", "set-sandbox", "set-model", "set-effort", "archive", "delete"].map(
+    // Model and effort are absent here: they are granted during a turn and
+    // applied at the next one, so they are never withheld for being busy.
+    return ["set-profile", "set-sandbox", "archive", "delete"].map(
       (capability) => ({
         capability: capability as SessionView["control"]["withheld"][number]["capability"],
         reason: "Available when the Codex turn is idle",

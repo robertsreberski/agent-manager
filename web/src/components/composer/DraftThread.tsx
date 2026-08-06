@@ -8,6 +8,7 @@ import { FolderPicker } from "./FolderPicker";
 import { SessionComposer, type ComposerModelOption } from "./SessionComposer";
 import { WorktreePicker } from "./WorktreePicker";
 import { recentProjects } from "../../lib/projects";
+import { composerEffortOptions } from "../../lib/model-catalog";
 import { draftTargetReady, type DraftAction, type DraftSession, type WorktreeSelection } from "./draft";
 import { useGitContext } from "./use-git-context";
 
@@ -139,7 +140,7 @@ export function DraftThread({
         modelOptionsStatus={modelOptionsStatus}
         {...(onReloadModels ? { onReloadModels } : {})}
         effort={draft.effort}
-        effortOptions={effortOptions ?? []}
+        effortOptions={composerEffortOptions(draft.provider, effortOptions, true)}
         profile={draft.profile}
         sandbox={draft.sandbox}
         draft

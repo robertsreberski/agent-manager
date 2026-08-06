@@ -205,7 +205,7 @@ function externalCodexSession(): SessionView {
     attention: [],
     terminal: null,
     control: {
-      plane: "codex-hook-bridge",
+      plane: "observe-only",
       authority: "foreign",
       coordination: {
         mode: "observe-only",
@@ -2871,6 +2871,58 @@ test("settings are idle-only and become effective only after provider notificati
     adapter.setProfile("thread-1", "full-access"),
     /only be changed while the thread is idle/u,
   );
+  await adapter.dispose();
+});
+
+test("model and effort chosen during a turn apply to the next one instead of being refused", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("thread/start", () => threadResult());
+  transport.handlers.set("thread/settings/update", () => ({}));
+  transport.handlers.set("turn/start", () => ({
+    turn: { id: "turn-2", status: "inProgress", items: [] },
+  }));
+  await adapter.startThread({ cwd: "/workspace" });
+  transport.notify("turn/started", {
+    threadId: "thread-1",
+    turn: { id: "turn-running", status: "inProgress", items: [] },
+  });
+
+  // Neither refuses, and neither reaches the provider mid-flight: the running
+  // turn already resolved its model at `turn/start`.
+  await adapter.setModel("thread-1", "gpt-5.6-codex");
+  await adapter.setEffort("thread-1", "xhigh");
+  assert.equal(methodMessages(transport, "thread/settings/update").length, 0);
+
+  const busy = adapter.getThreadState("thread-1");
+  assert.equal(busy?.pendingSettings?.delivery, "next-turn");
+  assert.equal(busy?.pendingSettings?.model, "gpt-5.6-codex");
+  assert.equal(busy?.pendingSettings?.effort, "xhigh");
+  // A pending change never overwrites the provider-confirmed fact: the thread
+  // still reports the model the running turn is actually using.
+  assert.equal(busy?.model, "gpt-5.6");
+  assert.equal(busy?.effort, null);
+
+  // Profile and sandbox are still refused: they govern the approval policy and
+  // containment the running turn is already executing tool calls under.
+  await assert.rejects(
+    adapter.setSandbox("thread-1", { mode: "danger-full-access", networkAccess: true }),
+    /only be changed while the thread is idle/u,
+  );
+
+  transport.notify("turn/completed", {
+    threadId: "thread-1",
+    turn: { id: "turn-running", status: "completed", items: [] },
+  });
+  transport.notify("thread/status/changed", {
+    threadId: "thread-1",
+    status: { type: "idle" },
+  });
+  await adapter.queueMessage("thread-1", "next");
+  await eventually(() => {
+    const start = methodMessages(transport, "turn/start")[0]?.params as JsonObject | undefined;
+    assert.equal(start?.model, "gpt-5.6-codex");
+    assert.equal(start?.effort, "xhigh");
+  });
   await adapter.dispose();
 });
 

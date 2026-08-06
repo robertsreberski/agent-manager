@@ -1171,7 +1171,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     this.#assertControl("model.set");
     const normalized = model.trim();
     if (!normalized) throw new Error("Codex model must not be empty");
-    await this.#updateSettings(threadId, { model: normalized }, { model: normalized });
+    await this.#updateSettings(threadId, { model: normalized }, { model: normalized }, true);
   }
 
   async setEffort(
@@ -1181,7 +1181,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     this.#assertControl("effort.set");
     const normalized = effort.trim();
     if (!normalized) throw new Error("Codex effort must not be empty");
-    await this.#updateSettings(threadId, { effort: normalized }, { effort: normalized });
+    await this.#updateSettings(threadId, { effort: normalized }, { effort: normalized }, true);
   }
 
   async removeQueuedMessage(threadId: string, messageId: string): Promise<void> {
@@ -1355,10 +1355,20 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     threadId: string,
     providerSettings: JsonObject,
     pending: Omit<CodexPendingSettings, "delivery">,
+    /**
+     * Whether this setting may be stashed for the next turn instead of being
+     * refused while one is running. Model and effort choose what handles the
+     * *next* inference, so deferring them is exact. Profile and sandbox are
+     * not deferrable: they govern approval policy and containment for tool
+     * calls the running turn is already making, and must not shift underneath
+     * a turn that started under the previous policy.
+     */
+    deferWhileBusy = false,
   ): Promise<void> {
     const state = this.#requireThread(threadId);
     this.#assertThreadWritable(state);
-    if (state.activeTurnId || state.status === "running") {
+    const busy = Boolean(state.activeTurnId) || state.status === "running";
+    if (busy && !deferWhileBusy) {
       throw new Error("Codex settings can only be changed while the thread is idle");
     }
     if (this.#settingsDelivery === "unavailable") {
@@ -1367,19 +1377,25 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
 
     const previousPending = state.pendingSettings;
     const previousOverrides = state.nextTurnOverrides;
+    /*
+      A change made during a turn is never sent mid-flight. The running turn
+      already resolved its model and effort at `turn/start`, and
+      `thread/settings/update` has no defined behaviour against an in-flight
+      turn — so a deferrable change takes the same route an App Server without
+      the settings RPC uses, and applies at the next `turn/start`.
+    */
+    const deferred = busy || this.#settingsDelivery === "next-turn";
     // Settings are two independent axes now, so a sandbox change made while a
     // profile change is still unconfirmed must not discard the profile's
     // pending entry — both have to survive to be confirmed.
     state.pendingSettings = {
       ...(previousPending ?? {}),
       ...pending,
-      delivery: this.#settingsDelivery === "experimental-rpc"
-        ? "experimental-rpc"
-        : "next-turn",
+      delivery: deferred ? "next-turn" : "experimental-rpc",
     };
     this.#touch(state);
 
-    if (this.#settingsDelivery === "next-turn") {
+    if (deferred) {
       state.nextTurnOverrides = {
         ...(state.nextTurnOverrides ?? {}),
         ...providerSettings,
