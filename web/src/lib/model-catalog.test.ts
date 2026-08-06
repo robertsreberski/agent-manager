@@ -3,11 +3,9 @@ import { composerEffortOptions, coveringModelOption } from "./model-catalog";
 import { CLAUDE_REASONING_EFFORTS, CODEX_REASONING_EFFORTS } from "../../../src/shared/session.ts";
 
 describe("composerEffortOptions", () => {
-  it("offers nothing while the catalog has not loaded", () => {
-    // Undefined is "the provider has not answered", which is not the same fact
-    // as "the provider named no levels". Guessing here would fabricate an offer.
-    expect(composerEffortOptions("claude", undefined, true)).toEqual([]);
-    expect(composerEffortOptions("codex", undefined, true)).toEqual([]);
+  it("uses the granted harness vocabulary while the catalog is unavailable", () => {
+    expect(composerEffortOptions("claude", undefined, true)).toEqual(CLAUDE_REASONING_EFFORTS);
+    expect(composerEffortOptions("codex", undefined, true)).toEqual(CODEX_REASONING_EFFORTS);
   });
 
   it("uses exactly the levels a loaded catalog names", () => {

@@ -366,6 +366,41 @@ test("folds MessageDisplay deltas without replaying duplicates", () => {
   assert.deepEqual(projector.project(second).mutations, []);
 });
 
+test("omits routine hook lifecycle rows while preserving semantic content", () => {
+  const projector = new ClaudeHookActivityProjector();
+  const routine: Record<string, unknown>[] = [
+    { ...common("SessionStart"), source: "resume" },
+    { ...common("SessionEnd"), reason: "other" },
+    { ...common("PreCompact"), trigger: "auto" },
+    { ...common("PostCompact") },
+    { ...common("Stop"), stop_hook_active: false },
+  ];
+  for (const input of routine) {
+    assert.deepEqual(
+      projector.project(parseClaudeHookInput(input)).mutations,
+      [],
+      `${String(input.hook_event_name)} is hook plumbing, not timeline content`,
+    );
+  }
+
+  const displayed = projector.project(parseClaudeHookInput({
+    ...common("MessageDisplay"),
+    turn_id: "turn-semantic",
+    message_id: "message-semantic",
+    index: 0,
+    final: true,
+    delta: "Only the message remains.",
+  })).mutations;
+  assert.equal(
+    displayed.some((mutation) => mutation.type === "upsert" && mutation.item.kind === "message"),
+    true,
+  );
+  assert.equal(
+    displayed.some((mutation) => mutation.type === "upsert" && mutation.item.kind === "lifecycle"),
+    false,
+  );
+});
+
 /*
   The reply has to carry the identity every other surface can also compute.
 

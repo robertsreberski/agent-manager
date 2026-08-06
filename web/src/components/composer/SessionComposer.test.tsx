@@ -307,10 +307,10 @@ describe("SessionComposer", () => {
     expect(field.style.minHeight).toBe("24px");
   });
 
-  it("keeps a writable composer at its full typing target", () => {
+  it("keeps an empty writable composer to one line and grows from content", () => {
     renderComposer({});
 
-    expect(screen.getByRole("textbox", { name: "Message" }).style.minHeight).toBe("52px");
+    expect(screen.getByRole("textbox", { name: "Message" }).style.minHeight).toBe("24px");
   });
 
   it("keeps a readable-but-unwritable model catalog inspectable", async () => {

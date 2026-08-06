@@ -63,9 +63,11 @@ import {
   type SetupHarnessProbe,
 } from "../shared/setup.ts";
 import {
+  CLAUDE_REASONING_EFFORTS,
   emptyChildSummary,
   providerControlCoordination,
   sessionRecordId,
+  type ReasoningEffort,
   type SessionControlRecovery,
 } from "../shared/session.ts";
 import { AGENT_MANAGER_BUILD_ID, WIRE_SCHEMA_VERSION } from "../shared/wire.ts";
@@ -328,6 +330,8 @@ export interface AgentManagerServerOptions {
   staticDir?: string | false;
   initialSessions?: readonly SessionRecord[];
   initialDiagnostics?: readonly Diagnostic[];
+  /** Read-only exact transcript fallback used before restoring managed Claude control. */
+  managedClaudeEffortResolver?: (cwd: string, sessionId: string) => ReasoningEffort | null;
   /** Enabled by default; pass false in deterministic unit tests. */
   discovery?: false | Omit<DiscoveryReconcilerOptions, "onUpdate">;
   onShutdown?: () => void | Promise<void>;
@@ -571,7 +575,11 @@ function codexIdentityBaselineMissing(record: ManagedSessionRecoveryRecord): boo
   );
 }
 
-function managedRecoveryRecords(database: ManagerDatabase, provider: Provider): {
+function managedRecoveryRecords(
+  database: ManagerDatabase,
+  provider: Provider,
+  resolveClaudeEffort?: (cwd: string, sessionId: string) => ReasoningEffort | null,
+): {
   records: ManagedSessionRecoveryRecord[];
   diagnostics: Diagnostic[];
 } {
@@ -661,6 +669,22 @@ function managedRecoveryRecords(database: ManagerDatabase, provider: Provider): 
       });
       continue;
     }
+    let recoveryEffort = effort.data;
+    if (provider === "claude" && recoveryEffort === null && resolveClaudeEffort) {
+      try {
+        const candidate = resolveClaudeEffort(workspace.path, persisted.providerSessionId);
+        if (
+          candidate !== null
+          && (CLAUDE_REASONING_EFFORTS as readonly string[]).includes(candidate)
+        ) recoveryEffort = candidate;
+      } catch (error) {
+        diagnostics.push({
+          provider,
+          level: "warning",
+          message: `Claude effort could not be recovered for ${persisted.id}: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
+    }
     records.push({
       managerSessionId: persisted.id,
       provider,
@@ -671,7 +695,7 @@ function managedRecoveryRecords(database: ManagerDatabase, provider: Provider): 
       profile: profile.data,
       sandbox: sandbox.success ? sandbox.data : null,
       model: model as string | null,
-      effort: effort.data,
+      effort: recoveryEffort,
       createdAt: persisted.createdAt,
       ownership: ownership.data,
       ...(provider === "claude" ? { managerControl: managerControl.data } : {}),
@@ -1407,6 +1431,12 @@ export async function createAgentManagerServer(
       client.channel === "global"
       || (client.channel === "activity" && client.sessionId === sessionId)
     );
+  const hasLiveBrowserClient = (authSessionId: string, clientId: string): boolean =>
+    [...sseClients.values()].some((client) =>
+      client.channel === "global"
+      && client.authSessionId === authSessionId
+      && client.clientId === clientId
+    );
   let claudePermissionPresenceCheckScheduled = false;
   scheduleClaudePermissionPresenceCheck = (): void => {
     if (claudePermissionPresenceCheckScheduled) return;
@@ -1549,7 +1579,11 @@ export async function createAgentManagerServer(
   for (const provider of ["codex", "claude"] as const) {
     const providerLabel = provider === "codex" ? "Codex" : "Claude";
     try {
-      const recovery = managedRecoveryRecords(database, provider);
+      const recovery = managedRecoveryRecords(
+        database,
+        provider,
+        options.managedClaudeEffortResolver,
+      );
       for (const diagnostic of recovery.diagnostics) state.addDiagnostic(diagnostic);
       for (const record of recovery.records) {
         if (provider === "codex") {
@@ -3311,9 +3345,31 @@ export async function createAgentManagerServer(
     }
     const body = leaseRequestSchema.parse(request.body);
     const authSession = requireSession(request);
+    const activeOwner = leases.owner(session.id);
+    const suppliedToken = request.headers["x-control-lease"];
+    const exactRenewal = activeOwner !== null
+      && activeOwner.clientId === body.clientId
+      && leases.verify(session.id, suppliedToken, principal(authSession));
+    /*
+      A killed PWA cannot finish its keepalive DELETE. Its short lease then
+      outlives the document and a reopened copy used to accuse itself of being
+      "another browser window". The global SSE is the deciding liveness edge:
+      every mutation-capable cockpit has one, and unlike an activity stream it
+      does not disappear when selection changes. Recover only for the same
+      actor, only when the requesting client is live, and only when the former
+      client is not. A real second window therefore still conflicts.
+    */
+    const recoverOrphan = !body.takeover
+      && !exactRenewal
+      && activeOwner !== null
+      && activeOwner.actorId === authSession.actor.id
+      && hasLiveBrowserClient(authSession.id, body.clientId)
+      && !hasLiveBrowserClient(activeOwner.authSessionId, activeOwner.clientId);
     const renewal = leases.has(session.id);
     const operation = body.takeover
       ? "lease.takeover"
+      : recoverOrphan
+      ? "lease.recover"
       : renewal
       ? "lease.renew"
       : "lease.acquire";
@@ -3327,6 +3383,7 @@ export async function createAgentManagerServer(
         details: {
           renewal,
           takeover: body.takeover,
+          recoveredOrphan: recoverOrphan,
           ttlSeconds: body.ttlSeconds ?? 60,
         },
       });
@@ -3337,9 +3394,9 @@ export async function createAgentManagerServer(
       session.id,
       body.clientId,
       principal(authSession),
-      request.headers["x-control-lease"],
+      suppliedToken,
       body.ttlSeconds === undefined ? undefined : body.ttlSeconds * 1_000,
-      body.takeover,
+      body.takeover || recoverOrphan,
     );
     if (isRemoteSession(session)) {
       try {
@@ -3356,7 +3413,7 @@ export async function createAgentManagerServer(
         targetId: session.id,
         phase: "outcome",
         outcome: "succeeded",
-        details: { renewal, takeover: body.takeover },
+        details: { renewal, takeover: body.takeover, recoveredOrphan: recoverOrphan },
       });
     } catch {
       leases.forceRelease(session.id);
@@ -4100,7 +4157,11 @@ export async function createAgentManagerServer(
       replaceDiscoveredSessions(sessions, diagnostics);
     },
     recoverManagedProvider: (provider) => {
-      const recovery = managedRecoveryRecords(database, provider);
+      const recovery = managedRecoveryRecords(
+        database,
+        provider,
+        options.managedClaudeEffortResolver,
+      );
       for (const diagnostic of recovery.diagnostics) state.addDiagnostic(diagnostic);
       const records = recovery.records.filter((record) => {
         if (provider !== "codex" || !archivedSessions.get(record.managerSessionId)) return true;

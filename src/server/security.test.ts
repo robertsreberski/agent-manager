@@ -72,6 +72,13 @@ test("leases are bound to one auth session and rotate on every renewal", () => {
   const firstPrincipal = { authSessionId: "auth-one", actorId: "same-actor" };
   const secondPrincipal = { authSessionId: "auth-two", actorId: "same-actor" };
   const first = broker.acquire("codex:one", "browser", firstPrincipal);
+  assert.deepEqual(broker.owner("codex:one"), {
+    clientId: "browser",
+    actorId: "same-actor",
+    authSessionId: "auth-one",
+    expiresAt: first.expiresAt,
+  });
+  assert.equal("token" in broker.owner("codex:one")!, false);
 
   assert.throws(
     () => broker.acquire("codex:one", "browser", secondPrincipal, first.token),
@@ -146,6 +153,7 @@ test("leases are bound to one auth session and rotate on every renewal", () => {
   assert.deepEqual(broker.releaseForAuthSession(firstPrincipal.authSessionId), []);
   assert.deepEqual(broker.releaseForAuthSession(secondPrincipal.authSessionId), ["codex:one"]);
   assert.equal(broker.has("codex:one"), false);
+  assert.equal(broker.owner("codex:one"), null);
 });
 
 test("lease release retries are idempotent only after the active lease is gone", () => {

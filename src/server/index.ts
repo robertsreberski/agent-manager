@@ -15,6 +15,7 @@ import {
 } from "../providers/codex/index.ts";
 import type { Diagnostic } from "../core/types.ts";
 import type { WorkerPort } from "../discovery/index.ts";
+import { resolveClaudeTranscriptEffort } from "../discovery/claude-observer.ts";
 import { resolveCodexExecutionProfiles } from "../discovery/observe.ts";
 import { ensurePrivateRuntimeDirectory, type AgentManagerPaths } from "../ops/config.ts";
 import { sweepRetiredCodexHooks } from "../ops/codex-hooks-cleanup.ts";
@@ -185,6 +186,9 @@ export async function createAgentManagerServer(
     ...serverOptions
   } = options;
   const shutdownTimeoutMs = Math.max(250, serverOptions.shutdownTimeoutMs ?? 5_000);
+  const claudeConfigDirectory = serverOptions.homeDirectory !== undefined
+    ? join(serverOptions.homeDirectory, ".claude")
+    : process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude");
   // The raw server owns the enclosing shutdown deadline. Leave it enough time
   // to observe this callback settling and finish its own resource finalizers.
   const shutdownCallbackTimeoutMs = Math.max(100, shutdownTimeoutMs - 100);
@@ -573,6 +577,12 @@ export async function createAgentManagerServer(
         : {}),
       staticDir: serverOptions.staticDir ?? paths.staticDirectory,
       initialDiagnostics: diagnostics,
+      managedClaudeEffortResolver: serverOptions.managedClaudeEffortResolver
+        ?? ((cwd, sessionId) => resolveClaudeTranscriptEffort(
+          claudeConfigDirectory,
+          cwd,
+          sessionId,
+        )),
       discovery,
       ensureManagedProvider: async (provider) => {
         await serverOptions.ensureManagedProvider?.(provider);

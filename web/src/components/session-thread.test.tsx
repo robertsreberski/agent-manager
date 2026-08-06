@@ -735,7 +735,12 @@ describe("a managed session with granted model and effort control", () => {
     { value: "opus", label: "Opus", description: null, resolvedModel: "claude-opus-5", efforts: ["medium", "max"] as const },
   ];
 
-  function renderManaged(overrides: Partial<React.ComponentProps<typeof SessionThreadComposer>> = {}) {
+  function renderManaged(
+    overrides: Partial<React.ComponentProps<typeof SessionThreadComposer>> & {
+      omitEffortOptions?: boolean;
+    } = {},
+  ) {
+    const { omitEffortOptions = false, ...componentOverrides } = overrides;
     const onSetModel = vi.fn(async () => undefined);
     const onSetEffort = vi.fn(async () => undefined);
     render(<SessionThreadComposer
@@ -751,8 +756,8 @@ describe("a managed session with granted model and effort control", () => {
       onSetEffort={onSetEffort}
       modelOptions={catalog}
       modelOptionsStatus={null}
-      effortOptions={["low", "high"]}
-      {...overrides}
+      {...(!omitEffortOptions ? { effortOptions: ["low", "high"] as const } : {})}
+      {...componentOverrides}
     />);
     return { onSetModel, onSetEffort };
   }
@@ -796,6 +801,29 @@ describe("a managed session with granted model and effort control", () => {
     expect(radios.map((radio) => radio.getAttribute("value"))).toEqual(["low", "medium", "high", "xhigh", "max"]);
     fireEvent.click(within(menu).getByRole("radio", { name: /medium/iu }));
     expect(onSetEffort).toHaveBeenCalledWith("medium");
+  });
+
+  it("keeps effort selectable when the model catalog is unavailable", () => {
+    const { onSetEffort } = renderManaged({
+      modelOptions: [],
+      modelOptionsStatus: "The provider model catalog could not be loaded.",
+      omitEffortOptions: true,
+    });
+
+    const menu = openRuntimeMenu();
+    expect(within(menu).getByRole("status")).toHaveTextContent(
+      "The provider model catalog could not be loaded.",
+    );
+    const radios = within(menu).getAllByRole("radio");
+    expect(radios.map((radio) => radio.getAttribute("value"))).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    fireEvent.click(within(menu).getByRole("radio", { name: /xhigh/iu }));
+    expect(onSetEffort).toHaveBeenCalledWith("xhigh");
   });
 
   it("fabricates no effort radios where the capability is withheld", () => {

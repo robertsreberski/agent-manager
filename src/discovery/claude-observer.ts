@@ -11,6 +11,7 @@ import {
 import { basename, join } from "node:path";
 
 import {
+  normalizeProviderReasoningEffort,
   providerEffort,
   unknownEffort,
   unknownModel,
@@ -78,12 +79,19 @@ function transcriptCandidates(
   }).sort((left, right) => right.modifiedAt - left.modifiedAt).map(({ path }) => path);
 }
 
-function transcriptPermissionMode(path: string): string | null {
+interface ClaudeTranscriptSettings {
+  permissionMode: string | null;
+  effort: string | null;
+}
+
+function transcriptSettings(path: string): ClaudeTranscriptSettings {
+  let permissionMode: string | null = null;
+  let effort: string | null = null;
   let descriptor: number | null = null;
   try {
     descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
     const stat = fstatSync(descriptor);
-    if (!stat.isFile()) return null;
+    if (!stat.isFile()) return { permissionMode, effort };
     const size = stat.size;
     const length = Math.min(size, MAX_TRANSCRIPT_TAIL_BYTES);
     const buffer = Buffer.alloc(length);
@@ -96,30 +104,57 @@ function transcriptPermissionMode(path: string): string | null {
       if (!line) continue;
       try {
         const value = object(JSON.parse(line));
-        const mode = string(value?.permissionMode);
-        if (profileForClaudePermissionMode(mode) !== null) return mode;
+        if (permissionMode === null) {
+          const mode = string(value?.permissionMode);
+          if (profileForClaudePermissionMode(mode) !== null) permissionMode = mode;
+        }
+        if (
+          effort === null
+          && value?.type === "assistant"
+          && value.isSidechain !== true
+        ) {
+          const candidate = string(value.effort);
+          if (normalizeProviderReasoningEffort("claude", candidate) !== null) {
+            effort = candidate;
+          }
+        }
+        if (permissionMode !== null && effort !== null) break;
       } catch {
         // A partially-written final transcript row is not evidence.
       }
     }
   } catch {
-    return null;
+    return { permissionMode, effort };
   } finally {
     if (descriptor !== null) closeSync(descriptor);
   }
-  return null;
+  return { permissionMode, effort };
 }
 
-function latestTranscriptPermissionMode(
+function latestTranscriptSettings(
   configDirectory: string,
   cwd: string,
   sessionId: string,
-): string | null {
+): ClaudeTranscriptSettings {
+  const result: ClaudeTranscriptSettings = { permissionMode: null, effort: null };
   for (const path of transcriptCandidates(configDirectory, cwd, sessionId)) {
-    const mode = transcriptPermissionMode(path);
-    if (mode !== null) return mode;
+    const candidate = transcriptSettings(path);
+    result.permissionMode ??= candidate.permissionMode;
+    result.effort ??= candidate.effort;
+    if (result.permissionMode !== null && result.effort !== null) break;
   }
-  return null;
+  return result;
+}
+
+export function resolveClaudeTranscriptEffort(
+  configDirectory: string,
+  cwd: string,
+  sessionId: string,
+) {
+  return normalizeProviderReasoningEffort(
+    "claude",
+    latestTranscriptSettings(configDirectory, cwd, sessionId).effort,
+  );
 }
 
 function claudeStatus(value: unknown, live: boolean): SessionStatus {
@@ -242,12 +277,16 @@ export function discoverClaude(
     const statusValue = liveValue?.status ?? value.state ?? value.status;
     const status = claudeStatus(statusValue, live);
     const directPermissionMode = string(liveValue?.permissionMode ?? value.permissionMode);
-    const transcriptPermissionMode = directPermissionMode === null && cwd
-      ? latestTranscriptPermissionMode(configDirectory, cwd, id)
+    const directEffort = string(liveValue?.effort);
+    const transcriptSettings = cwd && (directPermissionMode === null || directEffort === null)
+      ? latestTranscriptSettings(configDirectory, cwd, id)
+      : { permissionMode: null, effort: null };
+    const transcriptPermissionMode = directPermissionMode === null
+      ? transcriptSettings.permissionMode
       : null;
     const permissionMode = directPermissionMode ?? transcriptPermissionMode;
     const profileValue = profileForClaudePermissionMode(permissionMode);
-    const effortValue = string(liveValue?.effort);
+    const effortValue = directEffort ?? transcriptSettings.effort;
     const pid = number(liveValue?.pid);
     byId.set(id, {
       ...baseRecord("claude", id, now),
@@ -276,7 +315,11 @@ export function discoverClaude(
         confidence: "exact",
       } : unknownModel(),
       effort: effortValue
-        ? providerEffort("claude", effortValue, "live-registry")
+        ? providerEffort(
+            "claude",
+            effortValue,
+            directEffort !== null ? "live-registry" : "transcript",
+          )
         : unknownEffort(),
       attention: status === "waiting" ? [{
         id: null,
@@ -321,7 +364,11 @@ export function discoverClaude(
     const pid = number(value.pid);
     const cwd = string(value.cwd);
     const status = claudeStatus(value.status, true);
-    const effortValue = string(value.effort);
+    const directEffort = string(value.effort);
+    const transcriptEffort = directEffort === null && cwd
+      ? latestTranscriptSettings(configDirectory, cwd, id).effort
+      : null;
+    const effortValue = directEffort ?? transcriptEffort;
     byId.set(id, {
       ...baseRecord("claude", id, now),
       name: normalizedText(value.name),
@@ -337,7 +384,11 @@ export function discoverClaude(
       statusSource: "live-registry",
       source: string(value.entrypoint),
       effort: effortValue
-        ? providerEffort("claude", effortValue, "live-registry")
+        ? providerEffort(
+            "claude",
+            effortValue,
+            directEffort !== null ? "live-registry" : "transcript",
+          )
         : unknownEffort(),
       attention: status === "waiting" ? [{
         id: null,

@@ -52,6 +52,12 @@ export interface LeasePrincipal {
   actorId: string;
 }
 
+/** Internal owner identity only; the bearer token is deliberately excluded. */
+export interface ControlLeaseOwner extends LeasePrincipal {
+  clientId: string;
+  expiresAt: string;
+}
+
 function publicLease(lease: StoredLease): ControlLease {
   return {
     sessionId: lease.sessionId,
@@ -151,6 +157,19 @@ export class ControlLeaseBroker {
   has(sessionId: string): boolean {
     this.#purge(sessionId);
     return this.#leases.has(sessionId);
+  }
+
+  owner(sessionId: string): ControlLeaseOwner | null {
+    this.#purge(sessionId);
+    const active = this.#leases.get(sessionId);
+    return active
+      ? {
+          clientId: active.clientId,
+          actorId: active.actorId,
+          authSessionId: active.authSessionId,
+          expiresAt: active.expiresAt,
+        }
+      : null;
   }
 
   release(sessionId: string, suppliedToken: string | string[] | undefined, principal: LeasePrincipal): boolean {

@@ -323,6 +323,49 @@ test("restart resumes a session whose writer has exited", async (t) => {
   }, "resume recovery with no live writer");
 });
 
+test("restart resolves unknown Claude effort before reconnecting managed control", async (t) => {
+  const database = new ManagerDatabase();
+  database.addWorkspace({ id: "workspace", label: "Workspace", path: "/tmp/workspace" });
+  persistClaude(database, "observed-effort", {
+    ownership: "shared",
+    managerControl: "active",
+  });
+  const state = new SessionStateStore();
+  let restoredEffort: ManagedSessionRecoveryRecord["effort"] = null;
+  const backend = await createAgentManagerServer({
+    host: "127.0.0.1",
+    port: 0,
+    database,
+    state,
+    managedClaudeEffortResolver(cwd, sessionId) {
+      assert.equal(cwd, "/tmp/workspace");
+      assert.equal(sessionId, "observed-effort");
+      return "xhigh";
+    },
+    adapters: {
+      claude: productionPersistenceRecoveryAdapter(database, state, (record) => {
+        restoredEffort = record.effort;
+      }),
+    },
+    discovery: false,
+    staticDir: false,
+    editorLauncher: false,
+  });
+  t.after(() => backend.close());
+  await backend.listen();
+
+  await waitFor(() => {
+    assert.equal(restoredEffort, "xhigh");
+    assert.equal(state.get("local:claude:observed-effort")?.effort.value, "xhigh");
+    assert.equal(
+      database.listManagedSessions().find(
+        (record) => record.id === "local:claude:observed-effort",
+      )?.metadata.effort,
+      "xhigh",
+    );
+  }, "exact transcript-backed Claude effort recovery");
+});
+
 
 test("legacy Claude managerControl migration uses durable End evidence exactly once", async (t) => {
   const database = new ManagerDatabase();

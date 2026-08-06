@@ -9,8 +9,8 @@ import {
  *
  * Three distinct cases, and conflating any two of them hides the control:
  *
- * - `undefined` — the catalog has not loaded. Offer nothing; a guess made
- *   before the provider has answered is not an offer, it is a fabrication.
+ * - `undefined` — the catalog has not loaded. A granted live write still
+ *   authorizes the harness's bounded provider vocabulary.
  * - a non-empty catalog — the provider has named the levels. Use exactly those.
  * - an empty loaded catalog — the provider named none that every row agrees on,
  *   but the harness has still granted the write. A granted `set-effort` is the
@@ -25,8 +25,9 @@ export function composerEffortOptions(
   catalogEfforts: readonly ReasoningEffort[] | undefined,
   canSetEffort: boolean,
 ): readonly ReasoningEffort[] {
-  if (catalogEfforts === undefined) return [];
-  if (catalogEfforts.length > 0) return catalogEfforts;
+  // A provider-declared scale remains useful for rendering the current effort
+  // even when this cockpit cannot mutate it.
+  if (catalogEfforts && catalogEfforts.length > 0) return catalogEfforts;
   if (!canSetEffort || provider === null) return [];
   return reasoningEffortsForProvider(provider);
 }

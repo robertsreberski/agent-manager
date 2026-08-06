@@ -6,7 +6,7 @@ import * as authModule from "../lib/auth";
 import * as sseModule from "../lib/sse";
 import type { ControlLease, HostOption, SessionView, StateEvent, WireActionUpdate, WireStateSnapshot, WorkspaceOption } from "../types";
 import { AGENT_MANAGER_BUILD_ID, WireUpgradeRequiredError, WIRE_SCHEMA_VERSION } from "../types";
-import { acquireAutomaticLease, applyStateEvent, generateBrowserClientId, isStaleActionUpdate, isStaleRequestRace, mutationsAreReady, releaseHeldSessionLease, releaseLeasesForPageExit, reloadForWireUpgrade, renewForegroundLease, resolveArchivedSelection, sensitiveBoundaryStatus, sessionNeedsForegroundLease, shouldRenewForegroundLease, useCockpit, WIRE_UPGRADE_RELOAD_STORAGE_KEY } from "./use-cockpit";
+import { acquireAutomaticLease, applyStateEvent, generateBrowserClientId, isStaleActionUpdate, isStaleRequestRace, mutationsAreReady, releaseHeldSessionLease, releaseLeasesForPageExit, reloadForWireUpgrade, renewForegroundLease, resolveArchivedSelection, sensitiveBoundaryStatus, sessionNeedsForegroundLease, shouldReleaseLeasesForPageHide, shouldRenewForegroundLease, useCockpit, WIRE_UPGRADE_RELOAD_STORAGE_KEY } from "./use-cockpit";
 
 function lease(token: string, seconds = 300): ControlLease {
   return { token, clientId: "browser", expiresAt: new Date(Date.now() + seconds * 1_000).toISOString() };
@@ -128,6 +128,10 @@ describe("internal writer acquisition", () => {
     expect(releaseLease).toHaveBeenCalledTimes(2);
     expect(releaseLease).toHaveBeenNthCalledWith(1, "local:codex:one", "one", true);
     expect(releaseLease).toHaveBeenNthCalledWith(2, "local:claude:two", "two", true);
+  });
+  it("preserves writers for a persisted page and releases them for a real exit", () => {
+    expect(shouldReleaseLeasesForPageHide(true)).toBe(false);
+    expect(shouldReleaseLeasesForPageHide(false)).toBe(true);
   });
   it("renews only a held foreground lease near expiry without provider-specific takeover", async () => {
     const now = Date.parse("2026-08-05T10:00:00.000Z");

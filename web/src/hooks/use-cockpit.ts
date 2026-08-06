@@ -261,6 +261,10 @@ export function releaseLeasesForPageExit(
   }
 }
 
+export function shouldReleaseLeasesForPageHide(persisted: boolean): boolean {
+  return !persisted;
+}
+
 function outboxState(session: SessionView): OutboxSessionState {
   return {
     id: session.id,
@@ -530,17 +534,23 @@ export function useCockpit() {
   useEffect(() => {
     if (!api) return;
     const leaseApi = api;
+    let released = false;
     function releasePageWriters() {
+      if (released) return;
+      released = true;
       const held = leasesRef.current;
       leasesRef.current = {};
       leaseOperationsRef.current.clear();
       setLeases({});
       releaseLeasesForPageExit(leaseApi, held);
     }
-    window.addEventListener("pagehide", releasePageWriters);
+    function pagehide(event: PageTransitionEvent) {
+      if (shouldReleaseLeasesForPageHide(event.persisted)) releasePageWriters();
+    }
+    window.addEventListener("pagehide", pagehide);
     window.addEventListener("beforeunload", releasePageWriters);
     return () => {
-      window.removeEventListener("pagehide", releasePageWriters);
+      window.removeEventListener("pagehide", pagehide);
       window.removeEventListener("beforeunload", releasePageWriters);
     };
   }, [api]);
@@ -740,10 +750,12 @@ export function useCockpit() {
     renew();
     const timer = window.setInterval(renew, 5_000);
     document.addEventListener("visibilitychange", renew);
+    window.addEventListener("pageshow", renew);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", renew);
+      window.removeEventListener("pageshow", renew);
     };
   }, [api, handleFailure, mutationsReady, rememberLease, selectedLeaseEligible, selectedLeaseSessionId]);
 

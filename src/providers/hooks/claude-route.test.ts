@@ -61,7 +61,7 @@ test("Fastify Claude hook route is loopback-only, bearer-authenticated, and empt
   assert.equal(accepted.statusCode, 200);
   assert.equal(accepted.body, "");
   assert.equal(accepted.headers["cache-control"], "no-store");
-  assert.equal(activity.length, 1);
+  assert.equal(activity.length, 0, "routine Stop hooks stay off the activity timeline");
 
   bridge.shutdown();
   await app.close();

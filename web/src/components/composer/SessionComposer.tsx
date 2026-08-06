@@ -212,23 +212,19 @@ export function SessionComposer(props: SessionComposerProps) {
     };
   });
   /*
-    Levels to offer while nothing is selected — and only when nothing is
-    chosen at all. A model that is named but absent from the catalog is
-    unknown, not unspecified, and borrows no levels from rows that are not it.
+    A granted effort write remains usable when the model catalog is unavailable
+    or does not contain the selected wire id. These are provider-level fallback
+    levels supplied by the caller, never levels borrowed from an unrelated row.
   */
-  const fallbackEfforts = model === null && effortOptions.length > 0
+  const fallbackEfforts = selectedOption === null && effortOptions.length > 0
     ? effortOptions.map((level) => ({ id: level, name: effortLabel(level) }))
     : null;
   const sendDisabled = busy || value.trim().length === 0 || !canQueue;
   const effortIndex = effort === null ? -1 : effortOptions.indexOf(effort);
   const hasEffortScale = effortOptions.length > 0 && effortIndex >= 0;
-  /*
-    A composer nobody can type into does not need room to type in. The 52px
-    floor is there so an empty writable field is a comfortable target; held on a
-    read-only session it was 52px of blank nothing above the toolbar, which is
-    most of what read as "excessive space" on observed sessions.
-  */
-  const minComposerHeight = readOnlyReason ? 24 : 52;
+  // One text line is the honest empty state. The bordered composer and toolbar
+  // remain the click target, while actual multiline input grows to 120px.
+  const minComposerHeight = 24;
   useEffect(() => {
     const element = textareaRef.current;
     if (!element) return;

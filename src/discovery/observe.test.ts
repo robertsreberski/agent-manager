@@ -8,6 +8,7 @@ import { DatabaseSync } from "node:sqlite";
 import type { Runtime } from "../core/types.ts";
 import { sessionRecordSchema } from "../shared/wire.ts";
 import { OBSERVE_ONLY_REASON } from "../shared/session.ts";
+import { resolveClaudeTranscriptEffort } from "./claude-observer.ts";
 
 import {
   analyzeCodexEvents,
@@ -524,7 +525,7 @@ test("resolves exact persisted Codex profile hints outside the discovery recency
   }
 });
 
-test("Claude profile resolution falls back to the latest transcript permission mode", () => {
+test("Claude settings resolution falls back to the latest valid main-thread transcript facts", () => {
   const root = mkdtempSync(join(tmpdir(), "agent-manager-claude-profile-"));
   // Matching by session identity remains reliable when Claude's project key no
   // longer matches the cwd reported by the provider registry.
@@ -534,7 +535,10 @@ test("Claude profile resolution falls back to the latest transcript permission m
   const sessionId = "d88345c7-36b7-4804-990f-db05a32916d4";
   writeFileSync(join(projectDirectory, `${sessionId}.jsonl`), [
     JSON.stringify({ type: "user", permissionMode: "plan" }),
-    JSON.stringify({ type: "assistant", message: { content: [] } }),
+    JSON.stringify({ type: "assistant", effort: "high", isSidechain: false, message: { content: [] } }),
+    JSON.stringify({ type: "assistant", effort: "max", isSidechain: true, message: { content: [] } }),
+    JSON.stringify({ type: "assistant", effort: "future-level", isSidechain: false, message: { content: [] } }),
+    "{partially-written",
     JSON.stringify({ type: "user", permissionMode: "acceptEdits" }),
   ].join("\n"));
 
@@ -573,9 +577,93 @@ test("Claude profile resolution falls back to the latest transcript permission m
       source: "transcript",
       confidence: "inferred",
     });
+    assert.deepEqual(session?.effort, {
+      value: "high",
+      providerValue: "high",
+      source: "transcript",
+      confidence: "exact",
+    });
+    assert.equal(
+      resolveClaudeTranscriptEffort(join(root, ".claude"), "/workspace", sessionId),
+      "high",
+    );
     assert.equal(session?.control.plane, "resume-only");
     assert.equal(session?.control.authority, "none");
     assert.deepEqual(session?.control.capabilities, ["resume"]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Claude live-registry effort takes precedence over transcript effort", () => {
+  const root = mkdtempSync(join(tmpdir(), "agent-manager-claude-live-effort-"));
+  const sessionId = "d88345c7-36b7-4804-990f-db05a32916d5";
+  const projectDirectory = join(root, ".claude", "projects", "-workspace");
+  const sessionsDirectory = join(root, ".claude", "sessions");
+  mkdirSync(projectDirectory, { recursive: true });
+  mkdirSync(sessionsDirectory, { recursive: true });
+  const now = Date.parse("2026-08-05T12:00:00.000Z");
+  writeFileSync(join(projectDirectory, `${sessionId}.jsonl`), `${JSON.stringify({
+    type: "assistant",
+    effort: "xhigh",
+    isSidechain: false,
+    message: { content: [] },
+  })}\n`);
+  writeFileSync(join(sessionsDirectory, "writer.json"), JSON.stringify({
+    pid: 123,
+    sessionId,
+    cwd: "/workspace",
+    status: "idle",
+    effort: "low",
+    entrypoint: "cli",
+    startedAt: now,
+    updatedAt: now,
+  }));
+
+  try {
+    const runtime: Runtime = {
+      now: () => now,
+      homeDir: root,
+      env: {},
+      run(command) {
+        if (command === "ps") {
+          return {
+            stdout: "  123  1 ?? S /usr/local/bin/claude\n",
+            stderr: "",
+            status: 0,
+            error: null,
+          };
+        }
+        if (command === "claude") {
+          return {
+            stdout: JSON.stringify([{
+              sessionId,
+              cwd: "/workspace",
+              kind: "interactive",
+              startedAt: now,
+              state: "idle",
+            }]),
+            stderr: "",
+            status: 0,
+            error: null,
+          };
+        }
+        if (command === "tmux") {
+          return { stdout: "", stderr: "unavailable", status: 1, error: null };
+        }
+        throw new Error(`Unexpected command: ${command}`);
+      },
+    };
+    const [session] = scanObservedSessions({
+      recentWindowSeconds: 60,
+      providers: new Set(["claude"]),
+    }, runtime).sessions;
+    assert.deepEqual(session?.effort, {
+      value: "low",
+      providerValue: "low",
+      source: "live-registry",
+      confidence: "exact",
+    });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

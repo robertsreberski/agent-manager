@@ -1471,33 +1471,14 @@ export class ClaudeActivityProjector {
       case "hook_started":
       case "hook_progress":
       case "hook_response": {
-        const state = message.subtype === "hook_started"
-          ? "running"
-          : message.subtype === "hook_progress"
-            ? "running"
-            : message.outcome === "success"
-              ? "complete"
-              : message.outcome === "cancelled"
-                ? "interrupted"
-                : "failed";
-        const details = message.subtype === "hook_started"
-          ? null
-          : message.output || message.stderr || message.stdout || null;
-        mutations.push({
-          type: "upsert",
-          item: {
-            id: itemId("hook", message.hook_id),
-            kind: "lifecycle",
-            event: "hook",
-            level: state === "failed" ? "error" : "info",
-            title: `${message.hook_name} · ${message.hook_event}`,
-            details,
-            state,
-            source: "provider-api",
-            confidence: "exact",
-            exposure: "provider-exposed",
-          },
-        });
+        /*
+          `includeHookEvents` reports the hook runner's transport lifecycle, not
+          another piece of conversation activity. Projecting it produced rows
+          such as `Stop · Stop`, `SessionStart:resume · SessionStart`, and
+          `MessageDisplay · MessageDisplay` beside the semantic message/tool
+          item emitted by the hook itself. Keep consuming the SDK envelopes for
+          compatibility, but never turn this plumbing into timeline content.
+        */
         break;
       }
       case "permission_denied":

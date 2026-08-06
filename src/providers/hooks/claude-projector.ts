@@ -188,29 +188,9 @@ export class ClaudeHookActivityProjector {
 
     switch (input.hook_event_name) {
       case "SessionStart":
-        mutations.push(upsert({
-          ...base,
-          id: itemId(input, "lifecycle", "session"),
-          kind: "lifecycle",
-          event: "status",
-          level: "info",
-          title: input.source === "resume" ? "Claude session resumed" : "Claude session started",
-          details: [text(input.model), text(input.session_title)].filter(Boolean).join(" · ") || null,
-          state: "running",
-        }));
-        break;
-
       case "SessionEnd":
-        mutations.push(upsert({
-          ...base,
-          id: itemId(input, "lifecycle", "session"),
-          kind: "lifecycle",
-          event: "status",
-          level: "info",
-          title: "Claude session ended",
-          details: text(input.reason),
-          state: "complete",
-        }));
+        // Session state is already carried by the session record. A hook firing
+        // is transport metadata, not another conversational timeline item.
         break;
 
       case "UserPromptSubmit": {
@@ -544,31 +524,9 @@ export class ClaudeHookActivityProjector {
 
       case "PreCompact":
       case "PostCompact":
-        mutations.push(upsert({
-          ...base,
-          id: itemId(input, "compact", input.prompt_id ?? "session"),
-          kind: "lifecycle",
-          event: "context-compaction",
-          level: "info",
-          title: input.hook_event_name === "PreCompact"
-            ? "Claude is compacting context"
-            : "Claude compacted context",
-          details: input.hook_event_name === "PreCompact" ? text(input.trigger) : null,
-          state: input.hook_event_name === "PreCompact" ? "running" : "complete",
-        }));
-        break;
-
       case "Stop":
-        mutations.push(upsert({
-          ...base,
-          id: itemId(input, "turn", input.prompt_id ?? digest(input.last_assistant_message ?? "stop")),
-          kind: "lifecycle",
-          event: "turn-completed",
-          level: "info",
-          title: "Claude turn completed",
-          details: null,
-          state: "complete",
-        }));
+        // The message/tool projection is the useful result. Routine hook-only
+        // milestones add no information and make one turn look duplicated.
         break;
 
       case "StopFailure":

@@ -1626,6 +1626,95 @@ test("keeps full-access profile independent from automatic writer coordination",
   assert.equal(calls, 2);
 });
 
+test("recovers an orphaned PWA lease but preserves a live second-window conflict", async (t) => {
+  const backend = await createAgentManagerServer({
+    host: "127.0.0.1",
+    port: 0,
+    allowedHosts: [host],
+    allowedOrigins: [origin],
+    discovery: false,
+    staticDir: false,
+    adapters: {
+      codex: {
+        async createSession() { return session(); },
+        async performAction() { return { status: "succeeded" }; },
+      },
+    },
+    initialSessions: [session()],
+  });
+  const streams = new Set<import("node:http").IncomingMessage>();
+  t.after(async () => {
+    for (const stream of streams) stream.destroy();
+    await backend.close();
+  });
+  const address = new URL(await backend.listen());
+  const headers = await authenticatedHeaders(backend);
+  const openGlobal = async (clientId: string) => {
+    const stream = await new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
+      const request = httpGet({
+        hostname: address.hostname,
+        port: Number(address.port),
+        path: `/api/v1/events?clientId=${clientId}`,
+        headers: {
+          host,
+          cookie: headers.cookie,
+          accept: "text/event-stream",
+        },
+      }, resolve);
+      request.once("error", reject);
+    });
+    streams.add(stream);
+    assert.equal(stream.statusCode, 200);
+    await nextSseChunk(stream, `${clientId} global snapshot`);
+    return stream;
+  };
+
+  const ownerStream = await openGlobal("pwa-before-restart");
+  const first = await backend.app.inject({
+    method: "POST",
+    url: "/api/v1/sessions/local:codex:thread-1/control-lease",
+    headers,
+    payload: { clientId: "pwa-before-restart" },
+  });
+  assert.equal(first.statusCode, 200, first.body);
+  const firstToken = first.json<{ lease: { token: string } }>().lease.token;
+
+  await openGlobal("pwa-after-restart");
+  const liveConflict = await backend.app.inject({
+    method: "POST",
+    url: "/api/v1/sessions/local:codex:thread-1/control-lease",
+    headers,
+    payload: { clientId: "pwa-after-restart" },
+  });
+  assert.equal(liveConflict.statusCode, 409, liveConflict.body);
+  assert.equal(liveConflict.json<{ error: { code: string } }>().error.code, "LEASE_CONFLICT");
+
+  ownerStream.destroy();
+  streams.delete(ownerStream);
+  await delay(30);
+  const recovered = await backend.app.inject({
+    method: "POST",
+    url: "/api/v1/sessions/local:codex:thread-1/control-lease",
+    headers,
+    payload: { clientId: "pwa-after-restart" },
+  });
+  assert.equal(recovered.statusCode, 200, recovered.body);
+  const recoveredToken = recovered.json<{ lease: { token: string } }>().lease.token;
+  assert.notEqual(recoveredToken, firstToken);
+
+  const oldToken = await backend.app.inject({
+    method: "POST",
+    url: "/api/v1/sessions/local:codex:thread-1/actions",
+    headers: { ...headers, "x-control-lease": firstToken },
+    payload: {
+      type: "interrupt",
+      expectedGeneration: backend.state.get("local:codex:thread-1")!.generation,
+      idempotencyKey: "orphaned-pwa-old-token",
+    },
+  });
+  assert.equal(oldToken.statusCode, 409, oldToken.body);
+});
+
 test("serves newly published static assets and the production SPA fallback without weakening Host checks", async (t) => {
   const directory = mkdtempSync(join(tmpdir(), "agent-manager-static-"));
   writeFileSync(join(directory, "index.html"), "<!doctype html><title>Agent Manager Fixture</title>");

@@ -637,20 +637,36 @@ test("projects tasks, hooks, errors, supersedes, retractions, and provider reset
     "Reading auth middleware",
   );
 
-  const hook = projector.projectMessage(sdk({
-    ...baseMessage("system", "hook-response-event"),
-    subtype: "hook_response",
-    hook_id: "hook-1",
-    hook_name: "lint",
-    hook_event: "PostToolUse",
-    output: "passed",
-    stdout: "",
-    stderr: "",
-    outcome: "success",
-  }));
-  const hookItem = upserts(hook).find((item) => item.kind === "lifecycle");
-  assert.equal(hookItem?.event, "hook");
-  assert.equal(hookItem?.state, "complete");
+  for (const message of [
+    {
+      subtype: "hook_started",
+      hook_id: "hook-start",
+      hook_name: "SessionStart:resume",
+      hook_event: "SessionStart",
+    },
+    {
+      subtype: "hook_progress",
+      hook_id: "hook-display",
+      hook_name: "MessageDisplay",
+      hook_event: "MessageDisplay",
+      output: "streaming",
+    },
+    {
+      subtype: "hook_response",
+      hook_id: "hook-stop",
+      hook_name: "Stop",
+      hook_event: "Stop",
+      output: "done",
+      stdout: "",
+      stderr: "",
+      outcome: "success",
+    },
+  ]) {
+    assert.deepEqual(projector.projectMessage(sdk({
+      ...baseMessage("system", `event-${message.hook_id}`),
+      ...message,
+    })), [], "raw hook transport events never become timeline items");
+  }
 
   const first = projector.projectMessage(sdk({
     ...baseMessage("assistant", "old-assistant"),
