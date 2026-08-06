@@ -315,9 +315,7 @@ export async function createAgentManagerServer(
               : "active",
             ...(session.control.authority === "manager"
               ? {
-                  ownership: "manager-exclusive",
-                  nativeOwner: null,
-                  handoffId: null,
+                  ownership: "shared",
                   recovery: null,
                 }
               : {}),

@@ -1161,9 +1161,13 @@ export async function createAgentManagerServer(
           effort: original.effort.value,
           hostId: "local",
           ...canonicalCodexIdentityMetadata(adopted),
-          ownership: adopted.provider === "codex" ? "shared" : "manager-exclusive",
+          // Every managed session is shared. Persisting the retired
+          // `manager-exclusive` here made the record unreadable on restart:
+          // `managedOwnershipSchema` rejects it, so recovery skipped the session
+          // and web control was lost across a restart.
+          ownership: "shared",
           ...(adopted.provider === "claude"
-            ? { managerControl: "active", nativeOwner: null, handoffId: null }
+            ? { managerControl: "active" }
             : { managerControl: undefined }),
           recovery: null,
         },
@@ -1585,8 +1589,7 @@ export async function createAgentManagerServer(
       ...persisted,
       metadata: {
         ...persisted.metadata,
-        ownership: persisted.metadata.ownership
-          ?? (record.provider === "codex" ? "shared" : "manager-exclusive"),
+        ownership: persisted.metadata.ownership ?? "shared",
         recovery,
       },
       updatedAt: new Date().toISOString(),
@@ -3204,7 +3207,7 @@ export async function createAgentManagerServer(
             effort: input.effort,
             hostId: workspace.hostId,
             ...canonicalCodexIdentityMetadata(created),
-            ownership: created.provider === "codex" ? "shared" : "manager-exclusive",
+            ownership: "shared",
             ...(created.provider === "claude" ? { managerControl: "active" } : {}),
             recovery: null,
           },

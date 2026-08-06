@@ -324,3 +324,86 @@ test("legacy Claude managerControl migration uses durable End evidence exactly o
   assert.equal(records.get("local:claude:legacy-active")?.updatedAt, createdAt);
   assert.equal(records.get("local:claude:legacy-stopped")?.updatedAt, createdAt);
 });
+
+/*
+  A restart-survival regression, found by testing the real deployed server rather
+  than fixtures. Four production sites persisted `ownership: "manager-exclusive"`
+  for Claude while the reader's `managedOwnershipSchema` accepts only `"shared"`,
+  so every adopted or created Claude session became unreadable on the next
+  restart: recovery skipped it as an invalid persisted identity and web control
+  was silently lost. It typechecked because `ManagedSessionMetadata.metadata` is
+  `Record<string, unknown>`, so nothing connected the writer to the reader.
+
+  This asserts the round trip the types cannot: what the server writes is what the
+  server can read back.
+*/
+test("a persisted managed Claude identity survives its own write on restart", async (t) => {
+  const database = new ManagerDatabase();
+  database.addWorkspace({ id: "workspace", label: "Workspace", path: "/tmp/workspace" });
+  persistClaude(database, "round-trip", { ownership: "shared", managerControl: "active" });
+  const state = new SessionStateStore();
+  let restores = 0;
+  const backend = await createAgentManagerServer({
+    host: "127.0.0.1",
+    port: 0,
+    database,
+    state,
+    adapters: {
+      claude: recoveryAdapter(state, (record) => {
+        restores += 1;
+        assert.equal(record.ownership, "shared");
+      }),
+    },
+    cliTakeoverInspector: {
+      inspect() { return { state: "exited" }; },
+      findAssociated() { return { state: "exited" }; },
+      terminate() {},
+    },
+    cliTakeoverTimings: { inspectionTimeoutMs: 20, pollIntervalMs: 2 },
+    discovery: false,
+    staticDir: false,
+    editorLauncher: false,
+  });
+  t.after(() => backend.close());
+  await backend.listen();
+
+  await waitFor(() => {
+    assert.equal(restores, 1, "the persisted identity must be recovered, not skipped");
+    assert.equal(state.get("local:claude:round-trip")?.control.recovery, null);
+  }, "managed Claude restart round trip");
+  assert.deepEqual(
+    state.snapshot().diagnostics.filter((d) => /Skipped invalid persisted/u.test(d.message)),
+    [],
+    "a record the server wrote itself must never be rejected as invalid",
+  );
+});
+
+test("a pre-cutover exclusive ownership record fails closed instead of being migrated", async (t) => {
+  const database = new ManagerDatabase();
+  database.addWorkspace({ id: "workspace", label: "Workspace", path: "/tmp/workspace" });
+  // Spec 13 recreates rather than migrates, so an old-shape row is rejected —
+  // loudly, with a diagnostic, never silently resurrected as writable.
+  persistClaude(database, "pre-cutover", { ownership: "manager-exclusive", managerControl: "active" });
+  const state = new SessionStateStore();
+  let restores = 0;
+  const backend = await createAgentManagerServer({
+    host: "127.0.0.1",
+    port: 0,
+    database,
+    state,
+    adapters: { claude: recoveryAdapter(state, () => { restores += 1; }) },
+    discovery: false,
+    staticDir: false,
+    editorLauncher: false,
+  });
+  t.after(() => backend.close());
+  await backend.listen();
+
+  await waitFor(() => {
+    assert.equal(
+      state.snapshot().diagnostics.some((d) => /Skipped invalid persisted/u.test(d.message)),
+      true,
+    );
+  }, "pre-cutover ownership rejection");
+  assert.equal(restores, 0);
+});
