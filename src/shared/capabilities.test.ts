@@ -3,6 +3,7 @@ import test from "node:test";
 
 import { CONTROL_CAPABILITIES, OBSERVE_ONLY_REASON, observeOnlyControl } from "./session.ts";
 import { assertCapabilityContract } from "../providers/shared/session-view.conformance.test.ts";
+import { RESUME_ONLY_REASON, observedResumeControl } from "../discovery/observe-values.ts";
 import {
   DEFERRED,
   allCapabilities,
@@ -112,4 +113,18 @@ test("an observed session refuses every write it cannot do, and says why", () =>
     assert.equal(withheld.has(capability), false, `${capability} must stay deferred`);
     assert.equal(control.capabilities.includes(capability), false, `${capability} must stay deferred`);
   }
+});
+
+test("a resumable session refuses every write it cannot do, and says why", () => {
+  const control = observedResumeControl("codex");
+  assertCapabilityContract(control);
+
+  // Same hole as the observed case, in a second projection the plan missed —
+  // caught by checking every live session rather than only the one under repair.
+  assert.deepEqual(control.capabilities, ["resume"]);
+  const withheld = new Map(control.withheld.map(({ capability, reason }) => [capability, reason]));
+  assert.equal(withheld.get("set-model"), RESUME_ONLY_REASON);
+  assert.match(RESUME_ONLY_REASON, /resume it/iu, "the reason names the remedy");
+  assert.doesNotMatch(RESUME_ONLY_REASON, /harness/iu, "the reason blames no harness limitation");
+  assert.equal(withheld.has("resume"), false, "the one thing it can do is not also refused");
 });

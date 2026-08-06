@@ -1,4 +1,10 @@
 import {
+  DEFERRED,
+  allCapabilities,
+  deferredToLaterLayers,
+  resolveControlCapabilities,
+} from "../shared/capabilities.ts";
+import {
   emptyChildSummary,
   observeOnlyControl,
   providerControlCoordination,
@@ -45,14 +51,29 @@ export function iso(value: number, fallback: number): string {
  * projection: the server proves the provider-specific owner policy and commits
  * adoption before publishing any manager write capabilities.
  */
+/** Why a conversation with no loaded provider process refuses a write. */
+export const RESUME_ONLY_REASON =
+  "This session is not running. Resume it to change it.";
+
 export function observedResumeControl(provider: Provider): SessionControl {
   return {
     plane: "resume-only",
     authority: "none",
     coordination: providerControlCoordination(provider),
     recovery: null,
-    capabilities: ["resume"],
-    withheld: [],
+    /*
+      Rule on every control, for the same reason an observed session does: a
+      capability in neither list is disabled by the cockpit and then explained
+      by whatever fallback string it reaches for. `resume` is granted here
+      rather than deferred, because this projection exists precisely to say the
+      conversation can be resumed.
+    */
+    ...resolveControlCapabilities({
+      ...allCapabilities(RESUME_ONLY_REASON),
+      ...deferredToLaterLayers(),
+      attach: DEFERRED,
+      resume: true,
+    }),
     takeover: null,
   };
 }
