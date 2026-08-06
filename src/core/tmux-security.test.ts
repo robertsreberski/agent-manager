@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -75,6 +76,69 @@ test("tmux discovery bounds aggregate configured-socket probing", () => {
   assert.equal(timeouts.length, 4);
   assert.deepEqual(timeouts, [750, 750, 750, 750]);
   assert.ok(result.diagnostics.some((diagnostic) => diagnostic.message.includes("probe budget")));
+});
+
+test("tmux discovery treats a failed auto-discovered socket as ordinary absence", async () => {
+  const root = mkdtempSync(join(tmpdir(), "agent-manager-tmux-race-"));
+  const uid = typeof process.getuid === "function" ? process.getuid() : 501;
+  const privateDirectory = join(root, `tmux-${uid}`);
+  const socketPath = join(privateDirectory, "stale-discovery");
+  mkdirSync(privateDirectory, { mode: 0o700 });
+  const socket = createServer();
+  await new Promise<void>((resolve, reject) => {
+    socket.once("error", reject);
+    socket.listen(socketPath, resolve);
+  });
+
+  const calls: string[][] = [];
+  const runtime: Runtime = {
+    now: Date.now,
+    homeDir: root,
+    env: { TMUX_TMPDIR: root },
+    run(_command, args) {
+      calls.push(args);
+      return { stdout: "", stderr: `no server running on ${socketPath}`, status: 1, error: null };
+    },
+  };
+
+  try {
+    const result = discoverTmuxPanes(runtime);
+    assert.equal(
+      calls.some((args) => args[0] === "-S" && args[1]?.endsWith("/stale-discovery")),
+      true,
+      "the owned socket should still be probed",
+    );
+    assert.equal(
+      result.diagnostics.some((diagnostic) => diagnostic.message.includes(socketPath)),
+      false,
+      "an opportunistically discovered socket can disappear without becoming a warning",
+    );
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      socket.close((error) => error ? reject(error) : resolve());
+    });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("tmux discovery still reports an explicitly configured socket failure", () => {
+  const runtime: Runtime = {
+    now: Date.now,
+    homeDir: "/tmp",
+    env: { AGENT_MANAGER_TMUX_SOCKETS: "operator-socket" },
+    run() {
+      return { stdout: "", stderr: "explicit socket unavailable", status: 1, error: null };
+    },
+  };
+
+  const result = discoverTmuxPanes(runtime);
+  assert.equal(
+    result.diagnostics.some((diagnostic) =>
+      diagnostic.message.includes("operator-socket")
+      && diagnostic.message.includes("explicit socket unavailable")
+    ),
+    true,
+  );
 });
 
 test("tmux discovery uses the pinned executable from its runtime", () => {

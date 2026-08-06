@@ -570,6 +570,15 @@ function codexIdentityBaselineMissing(record: ManagedSessionRecoveryRecord): boo
   );
 }
 
+function isLegacyClaudeSharedRecoveryCandidate(record: ManagedSessionMetadata): boolean {
+  // Only the old steady manager-owned state has an unambiguous shared-join
+  // meaning. Transitional handoff/native ownership remains fail-closed.
+  return record.provider === "claude"
+    && record.metadata.ownership === "manager-exclusive"
+    && (record.metadata.nativeOwner ?? null) === null
+    && (record.metadata.handoffId ?? null) === null;
+}
+
 function managedRecoveryRecords(database: ManagerDatabase, provider: Provider): {
   records: ManagedSessionRecoveryRecord[];
   diagnostics: Diagnostic[];
@@ -611,8 +620,9 @@ function managedRecoveryRecords(database: ManagerDatabase, provider: Provider): 
     const sandbox = sandboxPolicySchema.nullable().safeParse(persisted.metadata.sandbox ?? null);
     const name = persisted.metadata.name;
     const model = persisted.metadata.model;
+    const legacyClaudeSharedRecovery = isLegacyClaudeSharedRecoveryCandidate(persisted);
     const ownership = managedOwnershipSchema.safeParse(
-      persisted.metadata.ownership ?? "shared",
+      legacyClaudeSharedRecovery ? "shared" : persisted.metadata.ownership ?? "shared",
     );
     const managerControl = managedControlSchema.safeParse(
       persisted.metadata.managerControl ?? (provider === "codex" ? "active" : undefined),
@@ -1585,13 +1595,25 @@ export async function createAgentManagerServer(
       (candidate) => candidate.id === record.managerSessionId,
     );
     if (!persisted) return false;
+    const canonicalizeLegacyClaudeOwnership = recovery === null
+      && isLegacyClaudeSharedRecoveryCandidate(persisted);
+    // `recovery === null` is published only after the adapter confirmed the
+    // exact provider session and workspace. Until then, leave durable legacy
+    // ownership untouched so a failed or cancelled attempt cannot authorize it.
+    const metadata: Record<string, unknown> = {
+      ...persisted.metadata,
+      ownership: canonicalizeLegacyClaudeOwnership
+        ? "shared"
+        : persisted.metadata.ownership ?? "shared",
+      recovery,
+    };
+    if (canonicalizeLegacyClaudeOwnership) {
+      delete metadata.nativeOwner;
+      delete metadata.handoffId;
+    }
     database.upsertManagedSession({
       ...persisted,
-      metadata: {
-        ...persisted.metadata,
-        ownership: persisted.metadata.ownership ?? "shared",
-        recovery,
-      },
+      metadata,
       updatedAt: new Date().toISOString(),
     });
     return true;

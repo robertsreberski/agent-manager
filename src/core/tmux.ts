@@ -30,7 +30,7 @@ interface SocketCandidate {
   socketName: string | null;
   socketPath: string | null;
   selector: string[];
-  explicit: boolean;
+  reportFailure: boolean;
 }
 
 function canonicalSocketPath(value: string): string {
@@ -64,7 +64,7 @@ function socketCandidates(runtime: Runtime): SocketCandidate[] {
     socketName: "default",
     socketPath: null,
     selector: [],
-    explicit: false,
+    reportFailure: false,
   }];
   const seen = new Set<string>(["default"]);
 
@@ -76,7 +76,7 @@ function socketCandidates(runtime: Runtime): SocketCandidate[] {
       socketName: basename(socketPath),
       socketPath,
       selector: ["-S", socketPath],
-      explicit: true,
+      reportFailure: true,
     });
   }
 
@@ -93,7 +93,7 @@ function socketCandidates(runtime: Runtime): SocketCandidate[] {
       socketName: name,
       socketPath: null,
       selector: ["-L", name],
-      explicit: true,
+      reportFailure: true,
     });
   }
 
@@ -131,7 +131,10 @@ function socketCandidates(runtime: Runtime): SocketCandidate[] {
         socketName: entry.name,
         socketPath,
         selector: ["-S", socketPath],
-        explicit: true,
+        // Enumeration is opportunistic and races normal tmux shutdown. A
+        // vanished or stale socket is therefore ordinary absence unless the
+        // operator explicitly named it in the service environment.
+        reportFailure: configuredNames.includes(entry.name),
       });
       accepted += 1;
     }
@@ -246,7 +249,7 @@ export function discoverTmuxPanes(runtime: Runtime): TmuxDiscoveryResult {
       Math.min(TMUX_PROBE_TIMEOUT_MS, remaining),
     );
     if (result.status !== 0 || result.error) {
-      if (candidate.explicit) {
+      if (candidate.reportFailure) {
         const message = result.error?.message ?? result.stderr.trim();
         diagnostics.push({
           provider: "system",

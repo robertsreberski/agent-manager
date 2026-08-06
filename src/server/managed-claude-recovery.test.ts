@@ -378,12 +378,169 @@ test("a persisted managed Claude identity survives its own write on restart", as
   );
 });
 
-test("a pre-cutover exclusive ownership record fails closed instead of being migrated", async (t) => {
+test("an exact pre-cutover Claude identity canonicalizes only after shared recovery succeeds", async (t) => {
   const database = new ManagerDatabase();
   database.addWorkspace({ id: "workspace", label: "Workspace", path: "/tmp/workspace" });
-  // Spec 13 recreates rather than migrates, so an old-shape row is rejected —
-  // loudly, with a diagnostic, never silently resurrected as writable.
-  persistClaude(database, "pre-cutover", { ownership: "manager-exclusive", managerControl: "active" });
+  persistClaude(database, "pre-cutover", {
+    ownership: "manager-exclusive",
+    managerControl: "active",
+    nativeOwner: null,
+    handoffId: null,
+  });
+  const state = new SessionStateStore();
+  let restores = 0;
+  const backend = await createAgentManagerServer({
+    host: "127.0.0.1",
+    port: 0,
+    database,
+    state,
+    adapters: {
+      claude: recoveryAdapter(state, (record) => {
+        restores += 1;
+        assert.equal(record.ownership, "shared");
+      }),
+    },
+    discovery: false,
+    staticDir: false,
+    editorLauncher: false,
+  });
+  t.after(() => backend.close());
+  await backend.listen();
+
+  await waitFor(() => {
+    assert.equal(restores, 1);
+    assert.equal(state.get("local:claude:pre-cutover")?.control.recovery, null);
+    assert.equal(
+      database.listManagedSessions().find(
+        (record) => record.id === "local:claude:pre-cutover",
+      )?.metadata.ownership,
+      "shared",
+    );
+  }, "legacy Claude shared recovery");
+  const persisted = database.listManagedSessions().find(
+    (record) => record.id === "local:claude:pre-cutover",
+  );
+  assert.equal(persisted?.metadata.ownership, "shared");
+  assert.equal("nativeOwner" in (persisted?.metadata ?? {}), false);
+  assert.equal("handoffId" in (persisted?.metadata ?? {}), false);
+  assert.equal(persisted?.createdAt, createdAt);
+  assert.equal(
+    state.snapshot().diagnostics.some((d) => /Skipped invalid persisted/u.test(d.message)),
+    false,
+  );
+});
+
+test("a deliberately stopped pre-cutover Claude identity canonicalizes without becoming active", async (t) => {
+  const database = new ManagerDatabase();
+  database.addWorkspace({ id: "workspace", label: "Workspace", path: "/tmp/workspace" });
+  persistClaude(database, "legacy-stopped-control", {
+    ownership: "manager-exclusive",
+    managerControl: "stopped",
+    nativeOwner: null,
+    handoffId: null,
+  });
+  const state = new SessionStateStore();
+  let restores = 0;
+  const backend = await createAgentManagerServer({
+    host: "127.0.0.1",
+    port: 0,
+    database,
+    state,
+    adapters: {
+      claude: recoveryAdapter(state, (record) => {
+        restores += 1;
+        assert.equal(record.managerControl, "stopped");
+        assert.equal(record.ownership, "shared");
+      }),
+    },
+    discovery: false,
+    staticDir: false,
+    editorLauncher: false,
+  });
+  t.after(() => backend.close());
+  await backend.listen();
+
+  await waitFor(() => {
+    assert.equal(restores, 1);
+    assert.equal(
+      database.listManagedSessions().find(
+        (record) => record.id === "local:claude:legacy-stopped-control",
+      )?.metadata.ownership,
+      "shared",
+    );
+  }, "stopped legacy Claude canonicalization");
+});
+
+test("a failed exact Claude recovery leaves legacy ownership unchanged", async (t) => {
+  const database = new ManagerDatabase();
+  database.addWorkspace({ id: "workspace", label: "Workspace", path: "/tmp/workspace" });
+  persistClaude(database, "legacy-failure", {
+    ownership: "manager-exclusive",
+    managerControl: "active",
+    nativeOwner: null,
+    handoffId: null,
+  });
+  const state = new SessionStateStore();
+  let attempts = 0;
+  const adapter: ProviderControlAdapter = {
+    async createSession() { throw new Error("not used"); },
+    async performAction() { return { status: "succeeded" }; },
+    async restoreManagedSessions(records) {
+      attempts += 1;
+      return {
+        restoredSessionIds: [],
+        failures: records.map((record) => ({
+          managerSessionId: record.managerSessionId,
+          providerThreadId: record.providerThreadId,
+          reason: "provider rejected the exact identity",
+        })),
+        truncated: false,
+      };
+    },
+  };
+  const backend = await createAgentManagerServer({
+    host: "127.0.0.1",
+    port: 0,
+    database,
+    state,
+    adapters: { claude: adapter },
+    discovery: false,
+    staticDir: false,
+    editorLauncher: false,
+  });
+  t.after(() => backend.close());
+  await backend.listen();
+
+  await waitFor(() => {
+    assert.equal(attempts, 1);
+    assert.match(
+      state.get("local:claude:legacy-failure")?.control.recovery?.error ?? "",
+      /provider rejected the exact identity/u,
+    );
+  }, "failed legacy Claude recovery");
+  const persisted = database.listManagedSessions().find(
+    (record) => record.id === "local:claude:legacy-failure",
+  );
+  assert.equal(persisted?.metadata.ownership, "manager-exclusive");
+  assert.equal(persisted?.metadata.nativeOwner, null);
+  assert.equal(persisted?.metadata.handoffId, null);
+});
+
+test("ambiguous pre-cutover Claude ownership still fails closed", async (t) => {
+  const database = new ManagerDatabase();
+  database.addWorkspace({ id: "workspace", label: "Workspace", path: "/tmp/workspace" });
+  persistClaude(database, "handoff", {
+    ownership: "handoff-prepared",
+    managerControl: "active",
+    handoffId: "handoff-before-restart",
+    nativeOwner: null,
+  });
+  persistClaude(database, "native", {
+    ownership: "manager-exclusive",
+    managerControl: "active",
+    handoffId: null,
+    nativeOwner: { pid: 42_424 },
+  });
   const state = new SessionStateStore();
   let restores = 0;
   const backend = await createAgentManagerServer({
@@ -401,9 +558,9 @@ test("a pre-cutover exclusive ownership record fails closed instead of being mig
 
   await waitFor(() => {
     assert.equal(
-      state.snapshot().diagnostics.some((d) => /Skipped invalid persisted/u.test(d.message)),
-      true,
+      state.snapshot().diagnostics.filter((d) => /Skipped invalid persisted/u.test(d.message)).length,
+      2,
     );
-  }, "pre-cutover ownership rejection");
+  }, "ambiguous legacy ownership rejection");
   assert.equal(restores, 0);
 });
