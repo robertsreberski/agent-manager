@@ -1,18 +1,13 @@
 import { CircleX, LoaderCircle, Server } from "lucide-react";
+import { Button } from "../ui";
 import type { BoardSession, PhoneBoardBand } from "./model";
 import { relativeTime } from "./SessionCard";
+import { SessionIdentityBadges } from "./SessionIdentityBadges";
 import { TodoProgressMeter } from "./TodoProgressMeter";
 
 export interface PhoneBoardBandsProps {
   bands: readonly PhoneBoardBand[];
   onOpenSession: (session: BoardSession) => void;
-}
-
-function workspaceLine(session: BoardSession): string | null {
-  const identity = session.workspaceIdentity;
-  if (!identity) return null;
-  const branch = identity.detached ? "detached" : identity.branch;
-  return [identity.repoName, branch].filter(Boolean).join(" · ") || null;
 }
 
 /**
@@ -35,7 +30,6 @@ export function PhoneBoardBands({ bands, onOpenSession }: PhoneBoardBandsProps) 
               const heuristic = session.boardState === "wants-you" && !session.attentionExact;
               const wantsYou = session.boardState === "wants-you";
               const working = session.boardState === "working";
-              const workspace = workspaceLine(session);
               return (
                 <li
                   key={session.id}
@@ -43,9 +37,11 @@ export function PhoneBoardBands({ bands, onOpenSession }: PhoneBoardBandsProps) 
                   data-board-state={session.boardState}
                   data-attention-confidence={heuristic ? "heuristic" : session.attentionExact ? "exact" : undefined}
                 >
-                  <button
+                  <Button
                     type="button"
-                    className={`relative block min-h-[52px] w-full text-left focus-visible:z-10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--accent)] ${wantsYou ? "bg-[var(--wants-field)] py-3.5 pl-4 pr-[15px]" : "bg-[var(--surface-raised)] px-[15px] py-3"}`}
+                    variant="ghost"
+                    size="touch"
+                    className={`relative block h-auto min-h-[52px] w-full shrink-0 justify-start rounded-none text-left focus-visible:z-10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--accent)] ${wantsYou ? "bg-[var(--wants-field)] py-3.5 pl-4 pr-[15px] hover:bg-[var(--wants-field)] active:bg-[var(--wants-field)]" : "bg-[var(--surface-raised)] px-[15px] py-3 hover:bg-[var(--surface-raised)] active:bg-[var(--surface-raised)]"}`}
                     onClick={() => onOpenSession(session)}
                   >
                     {wantsYou && (
@@ -78,10 +74,8 @@ export function PhoneBoardBands({ bands, onOpenSession }: PhoneBoardBandsProps) 
                     {session.todo && session.todo.total > 0 && (
                       <TodoProgressMeter todo={session.todo} className="mt-2" />
                     )}
-                    {wantsYou && workspace && (
-                      <span className="mt-[9px] block truncate font-mono text-code-xs leading-none text-[var(--accent-quiet)]">{workspace}</span>
-                    )}
-                  </button>
+                    <SessionIdentityBadges session={session} className="mt-[9px]" />
+                  </Button>
                 </li>
               );
             })}

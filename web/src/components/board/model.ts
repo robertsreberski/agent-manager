@@ -6,6 +6,8 @@ export type BoardScope = "all" | "wants-you" | "working" | "idle";
 export interface BoardSession extends CockpitSessionView {
   boardState: BoardState;
   attentionExact: boolean;
+  harnessLabel: "Claude" | "Codex";
+  projectName: string;
   stateLine: string;
 }
 
@@ -106,12 +108,20 @@ function stateLine(session: CockpitSessionView, state: BoardState): string {
   return session.activity === "completed" ? "Finished" : "Idle";
 }
 
+function projectName(session: CockpitSessionView): string {
+  if (session.workspaceIdentity?.repoName) return session.workspaceIdentity.repoName;
+  const path = session.cwd?.replace(/\/+$/u, "");
+  return path?.split("/").filter(Boolean).at(-1) ?? "Unknown project";
+}
+
 export function toBoardSession(session: CockpitSessionView): BoardSession {
   const boardState = deriveBoardState(session);
   return {
     ...session,
     boardState,
     attentionExact: isExactAttention(session),
+    harnessLabel: session.provider === "claude" ? "Claude" : "Codex",
+    projectName: projectName(session),
     stateLine: stateLine(session, boardState),
   };
 }
@@ -302,11 +312,19 @@ export function buildBoard(
   const desktopGroups: DesktopGroupOrder[] = [];
   let columns = [...columnMap.values()];
   for (const column of columns) {
+    const hasExactProjectName = column.worktrees.some((group) => group.identity !== null);
     column.worktrees.sort((left, right) => {
       const mainDelta = Number(Boolean(left.identity?.linked)) - Number(Boolean(right.identity?.linked));
       return mainDelta || left.label.localeCompare(right.label) || left.key.localeCompare(right.key);
     });
     for (const group of column.worktrees) {
+      // An identity-less session can share a column with a session whose git
+      // probe resolved the repository. Both card presentations use these same
+      // objects, so adopting the column's exact name here keeps desktop and
+      // phone labels aligned without deriving a second project identity.
+      if (hasExactProjectName) {
+        for (const session of group.sessions) session.projectName = column.repoName;
+      }
       const reconciled = reconcileSessionStates(
         group.sessions,
         previousDesktopGroup(options.previousOrder?.desktopGroups, column.key, group.key)?.states,

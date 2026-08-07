@@ -60,7 +60,13 @@ edge, and a state-driven fill:
 | Idle | `oklch(0.145 0 0)` | `oklch(0.28 0 0)` | `oklch(0.48 0 0)` |
 
 Title 600 13.5px truncating; time right-aligned in 10.5px mono; a state line in 12.5px/18px.
-Optional rows beneath: a host row (server glyph, violet) and a subagent row (branch glyph).
+Two compact fact chips follow: `Harness · Codex|Claude` and `Project · <repo name>`. Project is
+the repository name only — never a path, branch, or worktree. When git identity is absent, use the
+last cwd segment; when cwd is absent too, state `Unknown project`. Desktop and phone consume these
+same board-model facts, and the phone does not add a second `repo · branch` footer. The clickable
+card and fact chips use the local shadcn `Button` and `Badge` components; assistant-ui remains the
+thread renderer inside the drawer. An optional host row (server glyph, violet) follows for remote
+sessions.
 
 ### R4 — State derivation
 
@@ -228,3 +234,5 @@ Restated from `00-overview.md` because this spec is where they are most at risk:
 9. Heuristic attention is visually distinct, non-actionable, and covered by a regression test.
 10. One board domain model feeds two presentations: desktop columns and the spec 11 mobile
     bands. Session ordering/state derivation is shared; only layout components differ.
+11. Every desktop and phone card labels its harness as Codex or Claude and its project with only
+    the resolved repository name; neither card presentation exposes the project path or branch.

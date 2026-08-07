@@ -1,5 +1,7 @@
 import { Check, Server } from "lucide-react";
+import { Button } from "../ui";
 import type { BoardSession } from "./model";
+import { SessionIdentityBadges } from "./SessionIdentityBadges";
 import { TodoProgressMeter } from "./TodoProgressMeter";
 
 export interface SessionCardProps {
@@ -31,14 +33,14 @@ export function SessionCard({
   // Frame 7a fills the card from its state and 12a replaces that fill on a
   // selected card, so the two are resolved together rather than layered.
   const fillClass = selected
-    ? "bg-[var(--selected-field)]"
+    ? "bg-[var(--selected-field)] hover:bg-[var(--selected-field)] active:bg-[var(--selected-field)]"
     : heuristic
-      ? "bg-[var(--surface-raised)]"
+      ? "bg-[var(--surface-raised)] hover:bg-[var(--surface-raised)] active:bg-[var(--surface-raised)]"
       : session.boardState === "wants-you"
-        ? "bg-[var(--wants-field)]"
+        ? "bg-[var(--wants-field)] hover:bg-[var(--wants-field)] active:bg-[var(--wants-field)]"
         : session.boardState === "failed"
-          ? "bg-[var(--danger-field)]"
-          : "bg-[var(--surface-raised)]";
+          ? "bg-[var(--danger-field)] hover:bg-[var(--danger-field)] active:bg-[var(--danger-field)]"
+          : "bg-[var(--surface-raised)] hover:bg-[var(--surface-raised)] active:bg-[var(--surface-raised)]";
   const tickClass = session.boardState === "wants-you"
     ? "bg-[var(--accent)]"
     : session.boardState === "failed"
@@ -67,9 +69,11 @@ export function SessionCard({
     onOpen(session);
   }
   return (
-    <button
+    <Button
       type="button"
-      className={`group relative mb-1.5 block w-full border-0 py-3 pl-[15px] pr-3.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] ${fillClass} ${edgeClass}`}
+      variant="ghost"
+      size="touch"
+      className={`group relative mb-1.5 block h-auto w-full shrink-0 rounded-none border-0 py-3 pl-[15px] pr-3.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] ${fillClass} ${edgeClass}`}
       data-board-state={session.boardState}
       data-attention-confidence={heuristic ? "heuristic" : session.attentionExact ? "exact" : undefined}
       aria-pressed={selectionActive ? selected : undefined}
@@ -109,6 +113,7 @@ export function SessionCard({
           {session.todo && session.todo.total > 0 && (
             <TodoProgressMeter todo={session.todo} className="mt-2" />
           )}
+          <SessionIdentityBadges session={session} className="mt-2.5" />
           {session.remote && (
             <span className={`mt-[9px] flex items-center gap-1.5 font-mono text-code-xs leading-none ${session.boardState === "idle" ? "text-[var(--remote-dim)]" : "text-[var(--remote)]"}`}>
               <Server size={11} strokeWidth={1.75} />{session.hostLabel}
@@ -116,6 +121,6 @@ export function SessionCard({
           )}
         </span>
       </span>
-    </button>
+    </Button>
   );
 }

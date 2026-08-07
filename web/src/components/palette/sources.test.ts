@@ -37,6 +37,8 @@ function session(overrides: Partial<BoardSession> & Pick<BoardSession, "id">): B
     todo: null,
     boardState: "working",
     attentionExact: false,
+    harnessLabel: "Codex",
+    projectName: "app",
     stateLine: "Working",
     ...rest,
   };

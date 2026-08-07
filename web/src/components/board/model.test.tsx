@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { CockpitSessionView } from "../../lib/cockpit-view";
 import { DesktopBoard } from "./DesktopBoard";
 import { PhoneBoardBands } from "./PhoneBoardBands";
-import { buildBoard, type BoardModel } from "./model";
+import { buildBoard, toBoardSession, type BoardModel } from "./model";
 
 function session(overrides: Partial<CockpitSessionView> & Pick<CockpitSessionView, "id">): CockpitSessionView {
   return {
@@ -67,6 +67,7 @@ describe("buildBoard", () => {
     expect(model.columns[0]!.worktrees).toHaveLength(1);
     expect(model.columns[0]!.worktrees[0]!.label).toBe("master");
     expect(desktopSessionIds(model)).toEqual(["codex:managed", "codex:scanned"]);
+    expect(model.bands[0]!.sessions.find((item) => item.id === "codex:managed")?.projectName).toBe("paola-bot");
   });
 
   it("adopts repository facts for a column first created by an identity-less session", () => {
@@ -95,6 +96,27 @@ describe("buildBoard", () => {
       "local:path:/work/two",
       "remote:path:/work/one",
     ]);
+  });
+
+  it("derives concise harness and project labels for every card", () => {
+    expect(toBoardSession(session({ id: "codex:known" }))).toMatchObject({
+      harnessLabel: "Codex",
+      projectName: "app",
+    });
+    expect(toBoardSession(session({
+      id: "claude:fallback",
+      provider: "claude",
+      cwd: "/work/fallback-project/",
+      workspaceIdentity: null,
+    }))).toMatchObject({
+      harnessLabel: "Claude",
+      projectName: "fallback-project",
+    });
+    expect(toBoardSession(session({
+      id: "codex:unknown",
+      cwd: null,
+      workspaceIdentity: null,
+    }))).toMatchObject({ projectName: "Unknown project" });
   });
 
   it("keeps desktop cards and phone cards still when only updatedAt facts change", () => {
@@ -189,6 +211,55 @@ describe("buildBoard", () => {
 });
 
 describe("board presentations", () => {
+  it("renders shadcn Harness and Project chips on desktop and phone cards", () => {
+    const projectName = "particularly-long-project-name-without-a-break";
+    const projectPath = `/Users/operator/Personal_Repositories/${projectName}`;
+    const model = buildBoard([session({
+      id: "claude:labeled",
+      provider: "claude",
+      name: "Ship labeled cards",
+      cwd: projectPath,
+      workspaceIdentity: {
+        repoRoot: projectPath,
+        repoName: projectName,
+        worktreePath: projectPath,
+        linked: false,
+        branch: "feature/card-labels",
+        detached: false,
+        dirtyCount: null,
+        ahead: null,
+        behind: null,
+        insertions: null,
+        deletions: null,
+      },
+    })]);
+
+    function expectIdentityChips() {
+      const card = screen.getByText("Ship labeled cards").closest("button");
+      expect(card).not.toBeNull();
+      expect(card).toHaveAttribute("data-slot", "button");
+      const harness = card!.querySelector("[data-session-fact='harness']");
+      const project = card!.querySelector("[data-session-fact='project']");
+      expect(harness).toHaveAttribute("data-slot", "badge");
+      expect(harness).toHaveAccessibleName("Harness: Claude");
+      expect(harness).toHaveTextContent(/Harness.*Claude/u);
+      expect(project).toHaveAttribute("data-slot", "badge");
+      expect(project).toHaveAccessibleName(`Project: ${projectName}`);
+      expect(project).toHaveTextContent(new RegExp(`Project.*${projectName}`, "u"));
+      expect(project).toHaveAttribute("title", projectName);
+      expect(project?.lastElementChild).toHaveClass("truncate");
+      expect(within(card!).queryByText(projectPath)).not.toBeInTheDocument();
+      expect(within(card!).queryByText("feature/card-labels")).not.toBeInTheDocument();
+    }
+
+    const desktop = render(<DesktopBoard columns={model.columns} onOpenSession={vi.fn()} />);
+    expectIdentityChips();
+    desktop.unmount();
+
+    render(<PhoneBoardBands bands={model.bands} onOpenSession={vi.fn()} />);
+    expectIdentityChips();
+  });
+
   it("shows the current todo and n of m tick bar on every desktop card", () => {
     const model = buildBoard([session({
       id: "codex:progress",
