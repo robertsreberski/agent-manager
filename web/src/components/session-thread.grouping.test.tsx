@@ -73,6 +73,8 @@ function renderThread(items: readonly ActivityItem[], options: {
     busy={false}
     mutationsReady
     onRespond={vi.fn(async () => undefined)}
+    onAcceptProposedPlan={vi.fn(async () => undefined)}
+    onRefineProposedPlan={vi.fn(async () => undefined)}
     onRemoveQueued={vi.fn(async () => undefined)}
     onOpenEditor={vi.fn(async () => undefined)}
     onResumeInWeb={options.onResumeInWeb ?? vi.fn(async () => undefined)}
@@ -225,7 +227,9 @@ describe("tool grouping in a rendered thread", () => {
     ]);
 
     expect(container.querySelectorAll("[data-tool-group-status]")).toHaveLength(2);
-    expect(screen.getAllByText("1 tool call")).toHaveLength(2);
+    for (const trigger of container.querySelectorAll("[data-tool-group-status] [data-slot='tool-group-trigger']")) {
+      expect(trigger.textContent).toContain("1 tool call");
+    }
   });
 
   it("does not reach across an assistant message inside one stated turn", () => {
@@ -240,15 +244,18 @@ describe("tool grouping in a rendered thread", () => {
     expect(screen.getByText("The first file is clear.")).toBeInTheDocument();
   });
 
-  it("keeps a todo written mid-run from splitting the run in two", () => {
+  it("keeps a todo marker in chronology and starts a new run after it", () => {
     const { container } = renderThread([
       tool("t-1", "Read", 1, "turn-1"),
-      { ...common, id: "todo-1", seq: 2, turnId: "turn-1", kind: "todo", steps: [], added: 0, removed: 0 },
+      { ...common, id: "todo-1", seq: 2, turnId: "turn-1", state: "running", completedAt: null, kind: "todo", steps: [], added: 0, removed: 0 },
       tool("t-2", "Grep", 3, "turn-1"),
     ]);
 
-    expect(container.querySelectorAll("[data-tool-group-status]")).toHaveLength(1);
-    expect(screen.getByText("2 tool calls")).toBeInTheDocument();
+    expect(container.querySelectorAll("[data-tool-group-status]")).toHaveLength(2);
+    for (const trigger of container.querySelectorAll("[data-tool-group-status] [data-slot='tool-group-trigger']")) {
+      expect(trigger.textContent).toContain("1 tool call");
+    }
+    expect(screen.getByText("Made a todo list")).toBeInTheDocument();
   });
 });
 
@@ -278,6 +285,28 @@ describe("a tool run reported as active across the gaps between its calls", () =
     return container.querySelectorAll("[data-tool-group-status] [data-slot='tool-group-trigger']")[index]!;
   }
 
+  function question(resolved = false): ActivityItem {
+    return {
+      ...common,
+      id: "question-1",
+      seq: 2,
+      turnId: "turn-1",
+      parentId: "t-1",
+      state: resolved ? "complete" : "waiting",
+      completedAt: resolved ? common.completedAt : null,
+      kind: "attention",
+      requestId: "request-1",
+      attentionKind: "question",
+      title: "request_user_input",
+      summary: null,
+      questions: [{ id: "choice", text: "Continue?", options: [], multiSelect: false, allowFreeText: true, isSecret: false }],
+      approvalFacts: null,
+      respondable: true,
+      resolved,
+      isSecret: false,
+    };
+  }
+
   it("still reads active while every call in it has settled and the turn has not", () => {
     const { container } = renderThread([
       turnStarted,
@@ -302,6 +331,17 @@ describe("a tool run reported as active across the gaps between its calls", () =
     ]);
 
     expect(group(container).textContent).not.toContain("active");
+  });
+
+  it("shows a parented question as waiting, then leaves completed pre-question work settled", () => {
+    const open = renderThread([turnStarted, tool("t-1", "Read", 1, "turn-1"), question()]);
+    expect(group(open.container).textContent).toContain("waiting for answer");
+    expect(group(open.container).textContent).not.toContain("active");
+    open.unmount();
+
+    const answered = renderThread([turnStarted, tool("t-1", "Read", 1, "turn-1"), question(true)]);
+    expect(group(answered.container).textContent).not.toContain("waiting for answer");
+    expect(group(answered.container).textContent).not.toContain("active");
   });
 
   it("reports only the run the next call will join as active", () => {

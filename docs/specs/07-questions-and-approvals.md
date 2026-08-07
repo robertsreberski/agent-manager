@@ -138,6 +138,13 @@ Delete the banner and Sheet; keep the form, in the timeline, and keep every test
 semantics (radio/checkbox, "Other" exclusivity, secret masking, offline disabling, metadata-only
 read-only).
 
+The questionnaire or approval is the sole inline **needs-you** indicator. When the request names a
+parent tool call, that call and its group read `waiting for answer` or `waiting for approval` with
+no spinner. A completed group before the request is settled even though the provider turn remains
+open; resolving the request does not make old completed work look active again. If the parent call
+itself is still running after the answer, its real running state may resume, and any later tool call
+starts a new run after the request boundary.
+
 ## Removals (spec 13)
 
 The "Needs you" banner and its Sheet from `pending-requests.tsx` (R11). The question form itself
@@ -164,3 +171,5 @@ survives, relocated.
     collection; it is omitted when the collection is stale.
 11. Repository searches find no global stop command, state, middleware, sentinel, banner, or
     documentation. Approval safety relies on exact capability/request gates.
+12. A parented open request replaces the parent tool's active spinner with a static waiting label;
+    after resolution, completed pre-request work remains settled.

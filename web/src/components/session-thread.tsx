@@ -20,6 +20,7 @@ import {
   ActivityRetentionBoundary,
   activityToThreadMessages,
   currentContext,
+  currentActionableProposedPlanId,
   currentQueue,
   currentTodo,
   exactCurrentActivityRequestIds,
@@ -30,6 +31,7 @@ import {
   todoView,
   type ActivityDataControls,
 } from "./session-activity";
+import type { ProposedPlanExecutionProfile } from "./plans";
 import type {
   ActivityItem,
   AttachInstruction,
@@ -303,6 +305,8 @@ export function SessionThread({
   busy,
   mutationsReady,
   onRespond,
+  onAcceptProposedPlan,
+  onRefineProposedPlan,
   onRemoveQueued,
   onOpenEditor,
   onResumeInWeb,
@@ -321,6 +325,8 @@ export function SessionThread({
   busy: boolean;
   mutationsReady: boolean;
   onRespond: (requestId: string, response: RequestResponse) => Promise<void>;
+  onAcceptProposedPlan: (planId: string, profile: ProposedPlanExecutionProfile) => Promise<void>;
+  onRefineProposedPlan: (planId: string, notes: string) => Promise<void>;
   onRemoveQueued: (messageId: string) => Promise<void>;
   onOpenEditor: (relativePath: string) => Promise<void>;
   onResumeInWeb: () => Promise<void>;
@@ -352,6 +358,7 @@ export function SessionThread({
   const [factsStatus, setFactsStatus] = useState<"loading" | "loaded" | "error">("loading");
   const exactRequestIds = useMemo(() => exactCurrentActivityRequestIds(activity.items), [activity.items]);
   const planApprovalRequestIds = useMemo(() => exactPlanApprovalRequestIds(activity.items, exactRequestIds), [activity.items, exactRequestIds]);
+  const proposedPlanId = useMemo(() => currentActionableProposedPlanId(activity.items), [activity.items]);
   // Exactly the requests a plan artifact offers controls for. A plan that
   // cannot offer them — truncated or superseded — keeps its approval card, so
   // the operator is never left without a way to answer.
@@ -392,6 +399,23 @@ export function SessionThread({
     }
   }
   const canRespond = session.control.capabilities.includes("respond");
+  const proposedPlanReadOnlyReason = proposedPlanId === null
+    ? null
+    : session.archived
+      ? "Archived sessions are read-only."
+      : !mutationsReady
+        ? "Reconnect before acting on this plan."
+        : busy
+          ? "Wait for the current action to finish."
+          : session.status !== "idle"
+            ? "Wait until this session is idle before acting on the plan."
+            : !session.control.capabilities.includes("set-profile")
+              ? session.control.withheld.find((item) => item.capability === "set-profile")?.reason
+                ?? "This session cannot change execution profile."
+              : !session.control.capabilities.includes("queue")
+                ? session.control.withheld.find((item) => item.capability === "queue")?.reason
+                  ?? "This session cannot queue the plan prompt."
+                : null;
   const controls: ActivityDataControls = {
     attention: {
       exactRequestIds,
@@ -421,11 +445,15 @@ export function SessionThread({
     },
     plans: {
       requestIds: planApprovalRequestIds,
+      proposedPlanId,
+      proposedPlanReadOnlyReason,
       mutationsReady,
       canRespond: session.control.capabilities.includes("respond"),
       busy,
       loadFile: loadPlanFile,
       onRespond,
+      onAcceptProposed: onAcceptProposedPlan,
+      onRefineProposed: onRefineProposedPlan,
     },
     queue: {
       canRemove: mutationsReady && session.control.capabilities.includes("remove-queued"),

@@ -159,8 +159,20 @@ and a duration in 11px mono. Opened, each call indents 22px and reads
 `status glyph · tool name (500 11.5px mono) · detail (truncating) · duration`. Arguments and
 results render in raised `pre` blocks at 12px/19px mono.
 
-Collapse rules carry over from `ActivityTurnDisclosure` (`session-activity.tsx:675-704`): forced
-open while active, forced open on `failed` or `interrupted`, otherwise the operator's toggle.
+Every group starts collapsed and remains operator-toggleable, including while work is active; a
+long command must not occupy the drawer merely because it is still running. The trigger has three
+semantic presentations:
+
+- **active** — at least one call is running, or a complete trailing run is in the provider's quiet
+  gap before its next call;
+- **waiting for answer/approval** — an unresolved attention item names a call in the group as its
+  parent; this is static, never a spinner;
+- **settled** — a message, thought, todo marker, plan, or attention request has closed the run, or
+  the turn ended.
+
+Aggregate diff, usage, and lifecycle bookkeeping do not manufacture a work boundary. A resolved
+question keeps the completed pre-question group settled; genuinely running parent work may become
+active again, and a later tool starts a new active run.
 
 ### R11 — Subagents, one level
 
@@ -206,8 +218,9 @@ Restated from `00-overview.md` because this spec is where they are most at risk:
 2. A linked worktree shows the lime glyph and `worktree` tag; the main checkout shows neither.
 3. A `null` dirty count renders nothing — verified by test, not by looking.
 4. Selecting a card opens the drawer with the board still visible and un-shifted.
-5. A turn with 6 tool calls renders one "6 tool calls" disclosure, collapsed, expanding to the
-   indented grammar; a failed turn is forced open.
+5. A turn with 6 adjacent tool calls renders one "6 tool calls" disclosure, collapsed, expanding
+   to the indented grammar. Active, waiting, and settled are distinguishable without forcing the
+   body open.
 6. A subagent renders its spine, brief, steps and return footer; a nested subagent shows a count.
 7. An evicted prefix shows the retention boundary; no UI or route claims to load content no
    longer retained.

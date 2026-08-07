@@ -4,6 +4,8 @@ import test from "node:test";
 import type { ActivityItemDraft, ActivityMutation } from "../../activity/index.ts";
 import {
   codexMessageCorrelationId,
+  codexProposedPlanCorrelationId,
+  codexProposedPlanId,
   codexRequestUserInputCorrelationId,
   codexActivityOffset,
   projectCodexNotification,
@@ -131,7 +133,7 @@ MEMORY.md:1-3|note=[prior project context]
   });
 });
 
-test("reasoning streams stay distinct and only structured Codex plans become todos", () => {
+test("reasoning streams stay distinct while proposals and execution todos keep separate shapes", () => {
   const part = onlyItem(projectCodexNotification(notification(
     "item/reasoning/summaryPartAdded",
     { threadId: "t", turnId: "turn", itemId: "reason", summaryIndex: 1 },
@@ -170,19 +172,22 @@ test("reasoning streams stay distinct and only structured Codex plans become tod
     ["reasoning", "reasoning", "reasoning"],
   );
 
-  const prose = projectCodexNotification(notification("item/completed", {
+  const prose = onlyItem(projectCodexNotification(notification("item/completed", {
     threadId: "t",
     turnId: "turn",
     completedAtMs: 1_787_500_000_000,
     item: { type: "plan", id: "plan-item", text: "Prose plan" },
-  }));
+  })));
   const proseDelta = projectCodexNotification(notification("item/plan/delta", {
     threadId: "t",
     turnId: "turn",
     itemId: "plan-item",
     delta: "Draft prose",
   }));
-  assert.equal(prose, null);
+  assert.equal(prose.kind, "plan");
+  assert.equal(prose.id, codexProposedPlanId("t", "turn"));
+  assert.equal(prose.correlationId, codexProposedPlanCorrelationId("t", "turn"));
+  if (prose.kind === "plan") assert.equal(prose.markdown, "Prose plan");
   assert.equal(proseDelta, null);
 
   const structured = onlyItem(projectCodexNotification(notification("turn/plan/updated", {
@@ -209,6 +214,52 @@ test("reasoning streams stay distinct and only structured Codex plans become tod
     assert.equal(structured.added, 0);
     assert.equal(structured.removed, 0);
   }
+});
+
+test("strict tagged final answers become one proposed plan without exposing wrapper XML", () => {
+  const projection = projectCodexNotification(notification("item/completed", {
+    threadId: "t",
+    turnId: "turn",
+    item: {
+      type: "agentMessage",
+      id: "message-plan",
+      phase: "final_answer",
+      text: "<proposed_plan>\n# Repair chronology\n\n- Verify ordering\n</proposed_plan>",
+    },
+  }));
+  assert.ok(projection);
+  assert.equal(projection.mutations.length, 1);
+  const plan = upsertItem(projection.mutations[0] as ActivityMutation);
+  assert.equal(plan.kind, "plan");
+  assert.equal(plan.id, codexProposedPlanId("t", "turn"));
+  if (plan.kind === "plan") assert.equal(plan.markdown, "# Repair chronology\n\n- Verify ordering");
+
+  const ordinary = onlyItem(projectCodexNotification(notification("item/completed", {
+    threadId: "t",
+    turnId: "turn-2",
+    item: {
+      type: "agentMessage",
+      id: "ordinary",
+      phase: "final_answer",
+      text: "I can mention <proposed_plan> without becoming one.",
+    },
+  })));
+  assert.equal(ordinary.kind, "message");
+});
+
+test("a structured plan wins when a tagged compatibility message arrives later", () => {
+  const planId = codexProposedPlanId("t", "turn");
+  const projection = projectCodexNotification(notification("item/completed", {
+    threadId: "t",
+    turnId: "turn",
+    item: {
+      type: "agentMessage",
+      id: "message-plan",
+      phase: "final_answer",
+      text: "<proposed_plan>fallback</proposed_plan>",
+    },
+  }), undefined, undefined, (id) => id === planId);
+  assert.equal(projection, null);
 });
 
 test("structured Codex todo rewrites retain stable steps and count churn", () => {

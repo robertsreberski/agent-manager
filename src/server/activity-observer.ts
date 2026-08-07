@@ -85,6 +85,23 @@ function activityDraft(item: TranscriptItem): ActivityItemDraft {
       ...TRANSCRIPT_PROVENANCE,
     };
   }
+  if (item.kind === "plan") {
+    return {
+      kind: "plan",
+      id: `${TRANSCRIPT_ID_PREFIX}${item.id}`,
+      correlationId: item.correlationId ?? null,
+      turnId: item.turnId,
+      path: null,
+      version: null,
+      markdown: item.markdown,
+      supersededBy: null,
+      approvalRequestId: null,
+      approvedAt: null,
+      state: transcriptState(item.status),
+      ...timing,
+      ...TRANSCRIPT_PROVENANCE,
+    };
+  }
   if (item.kind === "tool") {
     if (item.name === "request_user_input") {
       const argumentRecord = typeof item.arguments === "object"
@@ -164,6 +181,28 @@ function activityDraft(item: TranscriptItem): ActivityItemDraft {
   };
 }
 
+function activityDrafts(item: TranscriptItem): ActivityItemDraft[] {
+  const primary = activityDraft(item);
+  if (item.kind !== "plan" || !item.memoryCitation) return [primary];
+  const complete = item.status === "complete";
+  return [primary, {
+    kind: "message",
+    id: `${TRANSCRIPT_ID_PREFIX}${item.id}:memory-citation`,
+    correlationId: item.correlationId ? `${item.correlationId}:memory-citation` : null,
+    turnId: item.turnId,
+    role: "assistant",
+    phase: null,
+    text: "",
+    label: null,
+    memoryCitation: item.memoryCitation,
+    state: transcriptState(item.status),
+    startedAt: item.createdAt,
+    updatedAt: item.createdAt,
+    completedAt: complete ? item.createdAt : null,
+    ...TRANSCRIPT_PROVENANCE,
+  }];
+}
+
 function sameArguments(previous: TranscriptItem, next: TranscriptItem): boolean {
   if (previous.kind !== "tool" || next.kind !== "tool") return true;
   return JSON.stringify(previous.arguments ?? null) === JSON.stringify(next.arguments ?? null);
@@ -188,6 +227,10 @@ function changed(previous: TranscriptItem, next: TranscriptItem): boolean {
     return previous.role !== next.role
       || previous.text !== next.text
       || previous.label !== next.label
+      || JSON.stringify(previous.memoryCitation) !== JSON.stringify(next.memoryCitation);
+  }
+  if (previous.kind === "plan" && next.kind === "plan") {
+    return previous.markdown !== next.markdown
       || JSON.stringify(previous.memoryCitation) !== JSON.stringify(next.memoryCitation);
   }
   if (previous.kind === "reasoning" && next.kind === "reasoning") {
@@ -466,8 +509,8 @@ export class SelectedTranscriptActivityObserver {
         warning without a second pass.
       */
       next.forked
-        ? [...next.items.map(activityDraft), forkedActivity()]
-        : next.items.map(activityDraft),
+        ? [...next.items.flatMap(activityDrafts), forkedActivity()]
+        : next.items.flatMap(activityDrafts),
       next.truncated,
       reason,
     );

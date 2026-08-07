@@ -10,7 +10,7 @@ them well.
 
 | | Plan | Todos |
 | --- | --- | --- |
-| what | a markdown document on disk | an in-memory checklist |
+| what | provider-authored markdown proposal or document | an in-memory checklist |
 | path | shown only when the provider supplies one | none |
 | history | only versions the provider actually preserves | one live list that rewrites itself |
 | you | approve it or send it back | read it |
@@ -53,15 +53,16 @@ Delete the merged type rather than aliasing it (spec 13). `PlanRow`
 | Claude `ExitPlanMode` input (`plan`, optional `planFilePath`) | `plan`; path only when supplied |
 | Claude `TodoWrite` | `todo` |
 | Claude `TaskCreated` / `TaskCompleted` hooks (spec 03) | `todo` |
+| Codex completed structured `plan` item | `plan`; `path` and `version` are `null` |
+| Codex final assistant message consisting entirely of one `<proposed_plan>` wrapper | `plan` compatibility fallback |
 | Codex structured `turn/plan/updated` | **`todo`** |
 
-**Codex has no plan document.** Its structured `turn/plan/updated` notification emits steps.
-Rendering those as a "plan artifact" with a version tag and a path chip would be inventing a
-file that does not exist. Ignore unstructured `item/plan/delta` and completed plan-item prose;
-do not synthesize either into a one-step todo.
-
-So: Codex plan mode renders in the **todo grammar** — neutral chrome, no lime tile, no path, no
-version. If Codex later gains a plan document, it gets the plan grammar then.
+Codex has no path-backed plan file, but it does expose provider-authored proposal markdown. A
+completed structured `plan` item is authoritative. The compatibility parser accepts a tagged final
+answer only when the wrapper owns the entire citation-stripped message; malformed, nested, repeated,
+or embedded tags remain ordinary prose. Both surfaces share one turn-scoped identity, so they render
+one card and the structured item wins in either arrival order. Ignore `item/plan/delta`; completed
+snapshots are authoritative. Never turn proposal prose into a one-step todo.
 
 `path` is `null` unless the harness supplied it. A live pinned Claude payload has exposed
 `planFilePath`, but directory listing or newest-file inference is prohibited. The design's path shape
@@ -85,12 +86,22 @@ headings 600, body near-white.
 > twice. A plan is prose the operator is being asked to approve — reformatting it changes what
 > they are approving.
 
-Actions: `Send it back with notes` and `Execute this plan` (lime pill, bolt glyph). A line states
-`nothing has run — the profile is Plan`.
+Claude actions are `Send it back with notes` and `Execute this plan` (lime pill, bolt glyph). A line
+states `nothing has run — the profile is Plan`.
 
 Both actions require the plan's exact provider-emitted/callback request identity. A plan and an
 approval merely appearing in the same turn is not correlation; when the harness does not expose
 an exact edge, keep the document but omit both actions.
+
+A current Codex proposal instead offers `Accept and execute` and `Refine plan`. Acceptance requires
+an explicit profile choice on every card: **Execute** is the default and **Full access** is the
+alternative; sandbox remains an independent, unchanged setting. The cockpit changes the profile,
+refreshes until that exact profile and an idle fresh session generation are confirmed, then queues
+the canonical `Implement the proposed plan.` prompt against that generation. An unconfirmed profile
+change sends nothing. If the profile changed but the send failed, the card states the partial result
+and a retry sends only the message. Refinement first confirms **Plan**, then sends the operator's
+trimmed custom notes exactly. These controls require live `set-profile` and `queue` capabilities and
+an idle, non-archived session. A later user message makes the older proposal historical/read-only.
 
 ### R4 — After executing
 
@@ -130,9 +141,11 @@ A grey list glyph, no lime tile, no path, no version — *because there is no ar
 Call it **Todos** everywhere; never "task list". The header reads
 `Made a todo list · 5 todos`, and the items are **todos**, not "tasks".
 
-### R7 — Pinned while running
+### R7 — Chronological marker, pinned live detail
 
-Created inline like any tool result. While the turn runs it **pins just above the composer** in a
+Creation stays inline at its immutable sequence position as a compact
+`Made a todo list · N todos` marker. Later messages and tools remain below it; rewrites never move
+new work above the marker. While the list runs, its full live detail **pins just above the composer** in a
 bordered box, header reading `Todos · 2 of 6` with a tick bar (16px × 3px segments: done lime,
 current dim-lime, pending grey).
 
@@ -149,7 +162,8 @@ This is the most faithful thing in the whole design: a list that keeps growing i
 about how the turn is going, and a UI that silently replaced the list would hide it. `added` /
 `removed` on the item (R1) exist for this.
 
-Finished, the list collapses to one line with the tick bar and duration.
+The same todo identity rewrites in place. Finished, it leaves the composer pin and its timeline
+marker becomes the one-line completion summary with tick bar and duration.
 
 ### R9 — Todos become the session's progress everywhere
 
@@ -180,8 +194,8 @@ The merged `ActivityPlanItem` and `PlanRow`.
 1. A Claude `ExitPlanMode` payload produces a `plan` item, renders its markdown verbatim, and
    includes a path/version/history UI only for fields the provider supplied.
 2. A Codex structured `turn/plan/updated` produces `todo` items with **no path chip and no
-   version tag**. Unstructured plan deltas/completed prose produce no todo — no synthesised
-   file or one-step checklist.
+   version tag**. A completed plan item or strict whole-message fallback produces one pathless,
+   unversioned plan card; plan deltas produce nothing and proposal prose never becomes a todo.
 3. Approving a plan collapses it to a reference line; **no progress ever renders against plan
    steps**.
 4. A plan path outside the provider-declared set, or reached through a symlink, is refused.
@@ -194,3 +208,8 @@ The merged `ActivityPlanItem` and `PlanRow`.
    unregistered/symlink path.
 10. Execute/send-back appear only through an exact plan-to-request identity edge; same-turn
     proximity never creates controls, and an accepted linked request collapses the plan.
+11. A running todo has one compact marker at its original transcript position and one detailed
+    composer pin; later activity never renders above that marker.
+12. A current Codex proposal defaults to Execute, can explicitly select Full access, and supports
+    exact custom refinement notes. Profile confirmation precedes send, and partial failure is
+    recoverable without repeating the profile change.

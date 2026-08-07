@@ -5,9 +5,9 @@ import type {
   MessageTiming,
   ThreadMessageLike,
 } from "@assistant-ui/react";
-import { AlertTriangle, BookOpen, CircleAlert, Radio } from "lucide-react";
+import { AlertTriangle, BookOpen, CircleAlert, ListTodo, Radio } from "lucide-react";
 import { DiffViewer, diffIdentityKey, fileChangeIsUpserting, relativeEditorPath, type FileChangeView } from "./diffs";
-import { PlanArtifact, TodoList, type PlanArtifactView, type TodoListView } from "./plans";
+import { PlanArtifact, TodoList, type PlanArtifactView, type ProposedPlanExecutionProfile, type TodoListView } from "./plans";
 import { ApprovalRequest, QuestionRequest, type ExactQuestionRequest } from "./requests";
 import { QueuedMessages } from "./composer";
 import { buildSubagentHierarchy, TurnMarker, type SubagentFrameData, type TurnFacts } from "./thread";
@@ -65,11 +65,15 @@ export interface ActivityFileControls {
 
 export interface ActivityPlanControls {
   requestIds: ReadonlyMap<string, string>;
+  proposedPlanId: string | null;
+  proposedPlanReadOnlyReason: string | null;
   mutationsReady: boolean;
   canRespond: boolean;
   busy: boolean;
   loadFile: (itemId: string) => Promise<PlanFileResponse>;
   onRespond: (requestId: string, response: RequestResponse) => Promise<void>;
+  onAcceptProposed: (planId: string, profile: ProposedPlanExecutionProfile) => Promise<void>;
+  onRefineProposed: (planId: string, notes: string) => Promise<void>;
 }
 
 export interface ActivityQueueControls {
@@ -131,6 +135,12 @@ function itemTiming(item: ActivityItem): { startedAt: number; completedAt?: numb
     : { startedAt };
 }
 
+function attentionWaitingLabel(item: ActivityAttentionItem): string {
+  if (item.attentionKind === "question") return "waiting for answer";
+  if (["approval", "permission", "sandbox"].includes(item.attentionKind)) return "waiting for approval";
+  return "waiting for input";
+}
+
 function activityParts(
   item: ActivityItem,
   subagents: ReadonlyMap<string, SubagentFrameData>,
@@ -159,6 +169,11 @@ function activityParts(
   if (item.kind === "tool") {
     const hasResult = item.result !== null || item.output.length > 0 || !["pending", "running", "waiting"].includes(item.state);
     const timing = itemTiming(item);
+    const attention = groupItems.find((candidate): candidate is ActivityAttentionItem => (
+      candidate.kind === "attention"
+      && candidate.parentId === item.id
+      && !candidate.resolved
+    ));
     return [{
       type: "tool-call",
       toolCallId: item.toolCallId,
@@ -168,6 +183,12 @@ function activityParts(
       ...(hasResult ? { result: item.result ?? item.output } : {}),
       ...(item.state === "failed" ? { isError: true } : {}),
       ...(timing ? { timing } : {}),
+      providerMetadata: {
+        [PART_METADATA_KEY]: {
+          activityItemId: item.id,
+          ...(attention ? { waitingLabel: attentionWaitingLabel(attention) } : {}),
+        },
+      },
     }];
   }
   if (item.kind === "subagent") {
@@ -371,13 +392,11 @@ function semanticTurnOrder(items: readonly ActivityItem[]): ActivityItem[] {
     item.kind === "usage" && item.scope === "turn"
   ));
   const artifacts = ordered.filter((item) => (
-    item.kind === "todo"
-    || item.kind === "file-change"
+    item.kind === "file-change"
     || (item.kind === "usage" && item.id === latestTurnUsage?.id)
   ));
   const body = ordered.filter((item) => (
-    item.kind !== "todo"
-    && item.kind !== "file-change"
+    item.kind !== "file-change"
     && item.kind !== "usage"
   ));
   return [...body, ...artifacts];
@@ -602,6 +621,31 @@ export function exactPlanApprovalRequestIds(
   return result;
 }
 
+/**
+ * The latest unfinished Codex proposal, until an operator message moves the
+ * conversation on. Capability and connection gates are applied by the thread;
+ * this function answers only which artifact is current.
+ */
+export function currentActionableProposedPlanId(items: readonly ActivityItem[]): string | null {
+  const candidates = items.filter((item): item is Extract<ActivityItem, { kind: "plan" }> => (
+    item.kind === "plan"
+    && item.provider === "codex"
+    && item.approvalRequestId === null
+    && item.approvedAt === null
+    && item.supersededBy === null
+    && item.state === "complete"
+    && !item.truncated
+  ));
+  const current = candidates.sort((left, right) => right.seq - left.seq || right.id.localeCompare(left.id))[0];
+  if (!current) return null;
+  const movedOn = items.some((item) => (
+    item.seq > current.seq
+    && item.kind === "message"
+    && item.role === "user"
+  ));
+  return movedOn ? null : current.id;
+}
+
 export function currentQueue(activity: SessionActivityView) {
   const queue = [...activity.items].reverse().find((item) => item.kind === "queue");
   return queue?.kind === "queue" ? queue.messages.filter((message) => message.status !== "dispatched") : [];
@@ -814,10 +858,32 @@ function Plan({ item, controls }: { item: Extract<ActivityItem, { kind: "plan" }
   const requestId = controls.requestIds.get(item.id) ?? null;
   const actionable = requestId !== null && controls.canRespond;
   const disabled = !controls.mutationsReady || controls.busy;
-  return <div className="my-3"><PlanArtifact plan={plan} disabled={disabled} loadFile={controls.loadFile} {...(actionable ? {
+  const proposed = item.provider === "codex" && item.approvalRequestId === null;
+  const currentProposal = controls.proposedPlanId === item.id;
+  return <div className="my-3"><PlanArtifact plan={plan} disabled={disabled} loadFile={controls.loadFile} {...(proposed ? {
+    proposed: true,
+    readOnlyReason: currentProposal
+      ? controls.proposedPlanReadOnlyReason
+      : "This proposal is historical because the conversation has moved on.",
+    ...(currentProposal && controls.proposedPlanReadOnlyReason === null ? {
+      onAccept: (_plan: PlanArtifactView, profile: ProposedPlanExecutionProfile) => controls.onAcceptProposed(item.id, profile),
+      onRefine: (_plan: PlanArtifactView, notes: string) => controls.onRefineProposed(item.id, notes),
+    } : {}),
+  } : actionable ? {
     onExecute: () => controls.onRespond(requestId, { kind: "decision", decision: "allow" }),
     onSendBack: (_plan: PlanArtifactView, notes: string) => controls.onRespond(requestId, { kind: "decision", decision: "deny", reason: notes }),
   } : {})} />{item.truncated && <p className="mt-1 text-code-sm text-[var(--warning)]">The plan is truncated.</p>}</div>;
+}
+
+function TodoTimelineMarker({ item }: { item: ActivityTodoItem }) {
+  const total = item.steps.filter((step) => step.status !== "removed").length;
+  return (
+    <p className="my-1.5 flex min-h-7 items-center gap-2 font-mono text-code-sm text-[var(--text-muted)]" data-todo-timeline-marker={item.id}>
+      <ListTodo size={14} strokeWidth={1.75} aria-hidden="true" />
+      <span>Made a todo list</span>
+      <span className="text-[var(--text-faint)]">· {total} {total === 1 ? "todo" : "todos"}</span>
+    </p>
+  );
 }
 
 function MemoryCitationSources({ citation }: { citation: ActivityMemoryCitation }) {
@@ -853,7 +919,9 @@ export function renderActivityData(name: string, data: unknown, controls: Activi
   if (!item || typeof item !== "object" || !("kind" in item)) return null;
   switch (item.kind) {
     case "plan": return <Plan item={item} controls={controls.plans} />;
-    case "todo": return <div className="my-3"><TodoList list={todoView(item)} /></div>;
+    case "todo": return item.state === "pending" || item.state === "running" || item.state === "waiting"
+      ? <TodoTimelineMarker item={item} />
+      : <div className="my-3"><TodoList list={todoView(item)} /></div>;
     case "file-change": return <FileChanges item={item} controls={controls.files} />;
     case "attention": return <Attention item={item} controls={controls.attention} />;
     case "queue": return <div className="my-3"><QueuedMessages messages={item.messages.flatMap((message) => message.status === "dispatched" ? [] : [{ id: message.id, text: message.text, status: message.status }])} canRemove={controls.queue.canRemove && !controls.queue.busy} withheldReason={controls.queue.withheldReason} /></div>;

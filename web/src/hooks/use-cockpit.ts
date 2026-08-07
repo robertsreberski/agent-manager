@@ -63,6 +63,81 @@ export function mutationsAreReady(authenticated: boolean, connection: Connection
   return authenticated && connection === "open" && !stale && availability === "online";
 }
 
+export const PROPOSED_PLAN_EXECUTION_PROMPT = "Implement the proposed plan.";
+export type ProposedPlanExecutionProfile = Extract<ExecutionProfile, "execute" | "full-access">;
+
+interface ProfileConfirmedSendOperations {
+  currentSession: (sessionId: string) => SessionView | null;
+  refresh: () => Promise<void>;
+  setProfile: (session: SessionView, profile: ExecutionProfile) => Promise<void>;
+  send: (session: SessionView, text: string) => Promise<void>;
+  attempts?: number;
+  delay?: () => Promise<void>;
+}
+
+function profileLabel(profile: ExecutionProfile): string {
+  return profile === "full-access" ? "Full access"
+    : profile === "execute" ? "Execute"
+    : profile === "plan" ? "Plan"
+    : "Ask first";
+}
+
+/**
+ * Changes profile, confirms the new provider generation, then sends against
+ * that fresh session view. A failed or unconfirmed profile change never leaks
+ * the follow-up prompt under the old execution policy.
+ */
+export async function profileConfirmedSend(
+  initial: SessionView,
+  profile: ExecutionProfile,
+  text: string,
+  operations: ProfileConfirmedSendOperations,
+): Promise<void> {
+  const prompt = text.trim();
+  if (!prompt) throw new Error("Enter a prompt before sending.");
+  const baseline = operations.currentSession(initial.id) ?? initial;
+  if (baseline.archived) throw new Error("Archived sessions are read-only.");
+  if (baseline.status !== "idle") throw new Error("Wait until this session is idle before acting on the plan.");
+  for (const capability of ["set-profile", "queue"] as const) {
+    if (!baseline.control.capabilities.includes(capability)) {
+      throw new Error(baseline.control.withheld.find((item) => item.capability === capability)?.reason
+        ?? `This session cannot ${capability === "queue" ? "queue messages" : "change execution profile"}.`);
+    }
+  }
+
+  const changedProfile = baseline.profile.value !== profile;
+  if (changedProfile) await operations.setProfile(baseline, profile);
+
+  const attempts = Math.max(1, Math.min(10, Math.floor(operations.attempts ?? 4)));
+  let current: SessionView | null = null;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    await operations.refresh();
+    current = operations.currentSession(initial.id);
+    if (
+      current?.profile.value === profile
+      && current.status === "idle"
+      && (!changedProfile || current.generation !== baseline.generation)
+    ) break;
+    current = null;
+    if (attempt + 1 < attempts) await (operations.delay?.() ?? new Promise<void>((resolve) => setTimeout(resolve, 100)));
+  }
+  if (!current) {
+    throw new Error(`Could not confirm the ${profileLabel(profile)} profile on an idle session. The prompt was not sent.`);
+  }
+  if (!current.control.capabilities.includes("queue")) {
+    throw new Error(current.control.withheld.find((item) => item.capability === "queue")?.reason
+      ?? "The session can no longer queue messages. The prompt was not sent.");
+  }
+
+  try {
+    await operations.send(current, prompt);
+  } catch (error) {
+    if (!changedProfile) throw error;
+    const detail = error instanceof Error ? ` ${error.message}` : "";
+    throw new Error(`Profile changed to ${profileLabel(profile)}, but the prompt was not sent. Retry sends only the message.${detail}`);
+  }
+}
+
 export function sensitiveBoundaryStatus(error: unknown): 401 | null {
   if (error instanceof ApiError && error.status === 401) return 401;
   if (error instanceof BrowserSessionError && error.status === 401) return 401;
@@ -702,6 +777,31 @@ export function useCockpit() {
   const retryControl = useCallback((session: SessionView) => perform(session, { type: "retry-control", ...expectedState(session) }), [perform]);
   const takeOverControl = useCallback(async (session: SessionView) => { await ensureLease(session, true); setNotice("This browser window can now steer the session."); }, [ensureLease]);
 
+  const sendWithConfirmedProfile = useCallback((session: SessionView, profile: ExecutionProfile, text: string) => profileConfirmedSend(
+    session,
+    profile,
+    text,
+    {
+      currentSession: (sessionId) => snapshotRef.current.sessions.find((item) => item.id === sessionId) ?? null,
+      refresh,
+      setProfile: (current, nextProfile) => perform(current, { type: "set-profile", profile: nextProfile, ...expectedState(current) }),
+      send: (current, prompt) => perform(current, {
+        type: "send",
+        delivery: "queue",
+        text: prompt,
+        ...expectedState(current),
+      }),
+    },
+  ), [perform, refresh]);
+
+  const executeProposedPlan = useCallback((session: SessionView, profile: ProposedPlanExecutionProfile) => (
+    sendWithConfirmedProfile(session, profile, PROPOSED_PLAN_EXECUTION_PROMPT)
+  ), [sendWithConfirmedProfile]);
+
+  const refineProposedPlan = useCallback((session: SessionView, notes: string) => (
+    sendWithConfirmedProfile(session, "plan", notes)
+  ), [sendWithConfirmedProfile]);
+
   const selectedLeaseSessionId = selectedSession?.id ?? null;
   const selectedLeaseEligible = Boolean(selectedSession && sessionNeedsForegroundLease(selectedSession));
   useEffect(() => {
@@ -909,7 +1009,7 @@ export function useCockpit() {
     clearNotice: () => setNotice(null), actionError, clearActionError: () => setActionError(null),
     refresh, retryConnection: recoverBrowserSession, controlConflict: selectedSession ? controlConflicts[selectedSession.id] : undefined,
     takeOverControl, hasBusyAction: Object.values(busy).some(Boolean),
-    sendMessage, respond, interrupt, setProfile, setSandbox, setModel, setEffort, removeQueued, resumeInWeb, lifecycleAction, openEditor, takeCliControl, cancelCliTakeover, retryControl,
+    sendMessage, respond, interrupt, setProfile, setSandbox, setModel, setEffort, removeQueued, resumeInWeb, lifecycleAction, openEditor, takeCliControl, cancelCliTakeover, retryControl, executeProposedPlan, refineProposedPlan,
     addHost, removeHost, createSession, createWorktree, completeWorkspacePath, loadGitContext, loadPreview, loadAttach, loadAttentionDetails, loadTodoDetail, searchTranscript, loadWorkspaceFiles, loadSettingsOptions, loadProviderSettingsOptions, loadSessionFacts, loadPlanFile, loadSetup, applySetupHook, outbox, offlineReview,
     dismissOfflineReview: (id: string) => setOfflineReview((items) => items.filter((item) => item.id !== id)),
   };

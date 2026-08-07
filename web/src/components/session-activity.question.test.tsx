@@ -73,7 +73,7 @@ describe("question activity projection", () => {
       supersededIds: new Set(),
       respondUnavailableReason: null, mutationsReady: true, canRespond: false, busy: false, workspaceRoot: null, remoteHost: null, sessionsOnHost: null, onRespond: vi.fn(async () => undefined) },
       files: { sessionId: queue.sessionId, canOpenEditor: false, workspaceRoot: null, readKeys: new Set(), onReadChange: vi.fn() },
-      plans: { requestIds: new Map(), mutationsReady: true, canRespond: false, busy: false, loadFile: vi.fn(async () => { throw new Error("unused"); }), onRespond: vi.fn(async () => undefined) },
+      plans: { requestIds: new Map(), proposedPlanId: null, proposedPlanReadOnlyReason: null, mutationsReady: true, canRespond: false, busy: false, loadFile: vi.fn(async () => { throw new Error("unused"); }), onRespond: vi.fn(async () => undefined), onAcceptProposed: vi.fn(async () => undefined), onRefineProposed: vi.fn(async () => undefined) },
       queue: { canRemove: true, busy: false, withheldReason: null },
     };
     // Removal now runs through the runtime queue adapter, which is what lets
@@ -100,7 +100,7 @@ function controls(): ActivityDataControls {
       supersededIds: new Set(),
       respondUnavailableReason: null, mutationsReady: true, canRespond: false, busy: false, workspaceRoot: null, remoteHost: null, sessionsOnHost: null, onRespond: vi.fn(async () => undefined) },
     files: { sessionId: "local:codex:thread-1", canOpenEditor: false, workspaceRoot: null, readKeys: new Set(), onReadChange: vi.fn() },
-    plans: { requestIds: new Map(), mutationsReady: true, canRespond: false, busy: false, loadFile: vi.fn(async () => { throw new Error("unused"); }), onRespond: vi.fn(async () => undefined) },
+    plans: { requestIds: new Map(), proposedPlanId: null, proposedPlanReadOnlyReason: null, mutationsReady: true, canRespond: false, busy: false, loadFile: vi.fn(async () => { throw new Error("unused"); }), onRespond: vi.fn(async () => undefined), onAcceptProposed: vi.fn(async () => undefined), onRefineProposed: vi.fn(async () => undefined) },
     queue: { canRemove: false, busy: false, withheldReason: null },
   };
 }
@@ -222,7 +222,7 @@ describe("a questionnaire this session cannot answer", () => {
         onRespond: vi.fn(async () => undefined),
       },
       files: { sessionId: attention.sessionId, canOpenEditor: false, workspaceRoot: null, readKeys: new Set(), onReadChange: vi.fn() },
-      plans: { requestIds: new Map(), mutationsReady: true, canRespond, busy: false, loadFile: vi.fn(async () => { throw new Error("unused"); }), onRespond: vi.fn(async () => undefined) },
+      plans: { requestIds: new Map(), proposedPlanId: null, proposedPlanReadOnlyReason: null, mutationsReady: true, canRespond, busy: false, loadFile: vi.fn(async () => { throw new Error("unused"); }), onRespond: vi.fn(async () => undefined), onAcceptProposed: vi.fn(async () => undefined), onRefineProposed: vi.fn(async () => undefined) },
       queue: { canRemove: false, busy: false, withheldReason: null },
     };
     return render(<>{renderActivityData("agent-manager.attention", attention, controls)}</>);

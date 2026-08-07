@@ -67,7 +67,7 @@ import {
   type NotificationPreferences,
 } from "./components/system";
 import { SessionRuntimeProvider, SessionThread, SessionThreadComposer } from "./components/session-thread";
-import { currentQueue, preferredFileChangeItems, sessionTodoProgress } from "./components/session-activity";
+import { currentActionableProposedPlanId, currentQueue, preferredFileChangeItems, sessionTodoProgress } from "./components/session-activity";
 import { useCockpit } from "./hooks/use-cockpit";
 import { usePhoneAttentionLabels } from "./hooks/use-phone-attention-labels";
 import { useSessionActivity } from "./hooks/use-session-activity";
@@ -1293,6 +1293,18 @@ export default function App() {
             busy={selectedBusy}
             mutationsReady={cockpit.mutationsReady}
             onRespond={(requestId, response) => cockpit.respond(selected, requestId, response)}
+            onAcceptProposedPlan={(planId, profile) => {
+              if (currentActionableProposedPlanId(activity.items) !== planId) {
+                return Promise.reject(new Error("This plan is no longer current."));
+              }
+              return cockpit.executeProposedPlan(selected, profile);
+            }}
+            onRefineProposedPlan={(planId, notes) => {
+              if (currentActionableProposedPlanId(activity.items) !== planId) {
+                return Promise.reject(new Error("This plan is no longer current."));
+              }
+              return cockpit.refineProposedPlan(selected, notes);
+            }}
             onRemoveQueued={(id) => cockpit.removeQueued(selected, id)}
             onOpenEditor={(path) => cockpit.openEditor(selected, path)}
             onResumeInWeb={() => cockpit.resumeInWeb(selected)}

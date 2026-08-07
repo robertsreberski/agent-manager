@@ -5,6 +5,7 @@ export interface GroupablePart {
   name?: string;
   data?: unknown;
   toolName?: string;
+  providerMetadata?: Record<string, unknown>;
 }
 
 /** Adjacent grouping only; provider order remains the rendered order. */
@@ -165,22 +166,67 @@ export function displayDuration(timing: { startedAt: number; completedAt?: numbe
 
 interface GroupedPart {
   type: string;
+  name?: string;
+  providerMetadata?: Record<string, unknown>;
+}
+
+const TOOL_RUN_BOUNDARY_DATA = new Set([
+  "agent-manager.attention",
+  "agent-manager.plan",
+  "agent-manager.todo",
+]);
+
+function closesToolRun(part: GroupedPart): boolean {
+  return part.type === "tool-call"
+    || part.type === "text"
+    || part.type === "reasoning"
+    || (part.type === "data" && typeof part.name === "string" && TOOL_RUN_BOUNDARY_DATA.has(part.name));
+}
+
+export function toolWaitingLabel(part: Pick<GroupedPart, "providerMetadata">): string | null {
+  const scoped = part.providerMetadata?.["agent-manager"];
+  if (!scoped || typeof scoped !== "object" || !("waitingLabel" in scoped)) return null;
+  const value = (scoped as { waitingLabel?: unknown }).waitingLabel;
+  return typeof value === "string" && value.length > 0 ? value : null;
 }
 
 /**
- * True when no tool call in the message comes after this group.
+ * True when no semantic turn event comes after this group.
  *
- * All tool calls sit in the same intra-turn band, and `turnRank` sorts the
- * turn's artifacts — the todo list, the turn diff, usage, the lifecycle events —
- * behind them, so "no `tool-call` part at a higher index" identifies the run the
- * provider is still adding to. A `TodoWrite` landing mid-run does not disturb it.
+ * Aggregate diffs, usage, and lifecycle bookkeeping do not close a run. Human
+ * visible work boundaries do: later tools, messages, thoughts, todos, plans,
+ * and attention requests.
  */
 export function isTrailingToolRun(
   parts: readonly GroupedPart[],
   indices: readonly number[],
 ): boolean {
   const last = indices.at(-1) ?? -1;
-  return !parts.some((part, index) => part.type === "tool-call" && index > last);
+  if (last < 0) return false;
+  return !parts.some((part, index) => index > last && closesToolRun(part));
+}
+
+export type ToolRunPresentation =
+  | { phase: "active"; label: null }
+  | { phase: "waiting"; label: string }
+  | { phase: "settled"; label: null };
+
+export function toolRunPresentation(
+  status: { type: string },
+  parts: readonly GroupedPart[],
+  indices: readonly number[],
+  turnInMotion: boolean,
+): ToolRunPresentation {
+  const waiting = indices
+    .map((index) => parts[index])
+    .filter((part): part is GroupedPart => part !== undefined)
+    .map(toolWaitingLabel)
+    .find((label): label is string => label !== null);
+  if (waiting) return { phase: "waiting", label: waiting };
+  if (status.type !== "complete") return { phase: "active", label: null };
+  return turnInMotion && isTrailingToolRun(parts, indices)
+    ? { phase: "active", label: null }
+    : { phase: "settled", label: null };
 }
 
 /**
@@ -204,8 +250,7 @@ export function toolRunActive(
   indices: readonly number[],
   turnInMotion: boolean,
 ): boolean {
-  if (status.type !== "complete") return true;
-  return turnInMotion && isTrailingToolRun(parts, indices);
+  return toolRunPresentation(status, parts, indices, turnInMotion).phase === "active";
 }
 
 interface TimedGroupPart {

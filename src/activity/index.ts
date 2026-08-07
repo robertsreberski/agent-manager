@@ -13,6 +13,7 @@ export {
 } from "./redaction.ts";
 export { ActivityWireError, parseActivityFrame, parseActivityItem } from "./wire.ts";
 export { extractTrailingMemoryCitation, parseMemoryCitation } from "./memory-citation.ts";
+export { parseProposedPlan } from "./proposed-plan.ts";
 export {
   reconcileTodoRewrite,
   type ActivityTodoInputStep,

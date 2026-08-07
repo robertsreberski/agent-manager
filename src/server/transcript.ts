@@ -23,6 +23,7 @@ import {
 import { DatabaseSync } from "node:sqlite";
 import {
   extractTrailingMemoryCitation,
+  parseProposedPlan,
   parseMemoryCitation,
   type ActivityJsonValue,
   type ActivityMemoryCitation,
@@ -31,6 +32,7 @@ import { redactActivityText } from "../activity/redaction.ts";
 import { claudeMessageCorrelationId } from "../providers/claude/correlation.ts";
 import {
   codexMessageCorrelationId,
+  codexProposedPlanCorrelationId,
   codexRequestUserInputKey,
 } from "../providers/codex/activity-projector.ts";
 import type {
@@ -125,6 +127,13 @@ export interface TranscriptReasoning extends TranscriptItemBase {
   label: string | null;
 }
 
+/** A Codex execution proposal, whether structured or strictly tag-wrapped. */
+export interface TranscriptPlan extends TranscriptItemBase {
+  kind: "plan";
+  markdown: string;
+  memoryCitation: ActivityMemoryCitation | null;
+}
+
 /**
  * One provider tool call, paired with its own result when the transcript
  * recorded one. `result === null` means the transcript has not paired an output
@@ -140,7 +149,7 @@ export interface TranscriptToolCall extends TranscriptItemBase {
   isError: boolean;
 }
 
-export type TranscriptItem = TranscriptMessage | TranscriptReasoning | TranscriptToolCall;
+export type TranscriptItem = TranscriptMessage | TranscriptReasoning | TranscriptPlan | TranscriptToolCall;
 
 export interface SessionTranscriptReader {
   read(session: SessionIdentity): TranscriptReadResult;
@@ -580,7 +589,7 @@ function itemBytes(item: TranscriptItem): number {
   return item.kind === "tool"
     ? Buffer.byteLength(argumentsText(item.arguments), "utf8")
       + Buffer.byteLength(item.result ?? "", "utf8")
-    : Buffer.byteLength(item.text, "utf8");
+    : Buffer.byteLength(item.kind === "plan" ? item.markdown : item.text, "utf8");
 }
 
 function capItems(input: TranscriptItem[]): ParsedItems {
@@ -594,11 +603,11 @@ function capItems(input: TranscriptItem[]): ParsedItems {
       truncated ||= args.truncated || (result?.truncated ?? false);
       return [{ ...item, arguments: args.value, result: result?.text ?? null }];
     }
-    const capped = utf8Prefix(item.text, TRANSCRIPT_LIMITS.messageBytes);
+    const capped = utf8Prefix(item.kind === "plan" ? item.markdown : item.text, TRANSCRIPT_LIMITS.messageBytes);
     truncated ||= capped.truncated;
     if (capped.text.length === 0) return [];
-    return [item.kind === "message"
-      ? { ...item, text: capped.text }
+    return [item.kind === "plan"
+      ? { ...item, markdown: capped.text }
       : { ...item, text: capped.text }];
   });
 
@@ -751,6 +760,8 @@ function codexItems(
   const citationByProviderId = new Map<string, ActivityMemoryCitation>();
   const assistantCandidates = new Map<string, number[]>();
   const canonicalAssistantTurns = new Set<string>();
+  const planIndexByTurn = new Map<string, number>();
+  const structuredPlanTurns = new Set<string>();
 
   const finalizeTurn = (turnId: string): void => {
     const candidates = assistantCandidates.get(turnId) ?? [];
@@ -836,6 +847,45 @@ function codexItems(
       continue;
     }
 
+    if (payload.type === "plan") {
+      const markdown = stringValue(payload.text)?.trim();
+      if (!markdown) continue;
+      const providerId = stringValue(payload.id);
+      const planTurnId = (providerId ? turnByProviderId.get(providerId) : null) ?? activeTurnId;
+      const planKey = planTurnId ?? `unassociated:${providerId ?? String(record.offset)}`;
+      const plan: TranscriptPlan = {
+        kind: "plan",
+        id: stableItemId("codex", providerId, fileIdentity, record.offset, "plan"),
+        correlationId: planTurnId
+          ? codexProposedPlanCorrelationId(sessionId, planTurnId)
+          : null,
+        turnId: planTurnId,
+        markdown,
+        memoryCitation: providerId ? citationByProviderId.get(providerId) ?? null : null,
+        createdAt,
+        status: "complete",
+      };
+      const existingIndex = planIndexByTurn.get(planKey);
+      if (existingIndex === undefined) {
+        planIndexByTurn.set(planKey, items.length);
+        items.push(plan);
+      } else {
+        const previous = items[existingIndex];
+        items[existingIndex] = {
+          ...plan,
+          // Preserve the first occurrence identity and source location so a
+          // later authoritative representation does not reorder the timeline.
+          id: previous?.id ?? plan.id,
+          createdAt: previous?.createdAt ?? plan.createdAt,
+          memoryCitation: plan.memoryCitation
+            ?? (previous?.kind === "plan" ? previous.memoryCitation : null),
+        };
+      }
+      structuredPlanTurns.add(planKey);
+      if (planTurnId) canonicalAssistantTurns.add(planTurnId);
+      continue;
+    }
+
     if (payload.type === "function_call" || payload.type === "custom_tool_call") {
       const name = stringValue(payload.name);
       const callId = stringValue(payload.call_id) ?? stringValue(payload.id);
@@ -913,6 +963,35 @@ function codexItems(
       ?? activeTurnId;
     const finalAssistant = messageTurnId !== null && role === "assistant" &&
       (payload.phase === "final_answer" || payload.phase === "final");
+    const memoryCitation = (providerId ? citationByProviderId.get(providerId) : null)
+      ?? extracted.memoryCitation;
+    const proposedPlan = finalAssistant ? parseProposedPlan(text) : null;
+    if (proposedPlan !== null) {
+      const planKey = messageTurnId ?? `unassociated:${id}`;
+      const existingIndex = planIndexByTurn.get(planKey);
+      if (structuredPlanTurns.has(planKey) && existingIndex !== undefined) {
+        const previous = items[existingIndex];
+        if (previous?.kind === "plan" && previous.memoryCitation === null && memoryCitation) {
+          previous.memoryCitation = memoryCitation;
+        }
+      } else if (existingIndex === undefined) {
+        planIndexByTurn.set(planKey, items.length);
+        items.push({
+          kind: "plan",
+          id,
+          correlationId: messageTurnId
+            ? codexProposedPlanCorrelationId(sessionId, messageTurnId)
+            : null,
+          turnId: messageTurnId,
+          markdown: proposedPlan,
+          memoryCitation,
+          createdAt,
+          status: "complete",
+        });
+      }
+      if (messageTurnId) canonicalAssistantTurns.add(messageTurnId);
+      continue;
+    }
     items.push({
       kind: "message",
       id,
@@ -927,8 +1006,7 @@ function codexItems(
       createdAt,
       status: "complete",
       label: null,
-      memoryCitation: (providerId ? citationByProviderId.get(providerId) : null)
-        ?? extracted.memoryCitation,
+      memoryCitation,
     });
     if (messageTurnId && role === "assistant") {
       const candidates = assistantCandidates.get(messageTurnId) ?? [];

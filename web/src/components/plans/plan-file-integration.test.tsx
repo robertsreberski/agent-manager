@@ -56,9 +56,11 @@ describe("plan file activity integration", () => {
         readKeys: new Set(), onReadChange: vi.fn(),
       },
       plans: {
-        requestIds: new Map(), mutationsReady: true, canRespond: false, busy: false,
+        requestIds: new Map(), proposedPlanId: null, proposedPlanReadOnlyReason: null, mutationsReady: true, canRespond: false, busy: false,
         loadFile: (itemId) => api.planFile(item.sessionId, itemId),
         onRespond: vi.fn(async () => undefined),
+        onAcceptProposed: vi.fn(async () => undefined),
+        onRefineProposed: vi.fn(async () => undefined),
       },
       queue: { canRemove: false, busy: false, withheldReason: null },
     };
@@ -117,9 +119,13 @@ describe("plan file activity integration", () => {
       },
       plans: {
         requestIds: new Map([["plan/owned", "plan-request"]]),
+        proposedPlanId: null,
+        proposedPlanReadOnlyReason: null,
         mutationsReady: true, canRespond: true, busy: false,
         loadFile: vi.fn(async () => { throw new Error("unused"); }),
         onRespond: vi.fn(async () => undefined),
+        onAcceptProposed: vi.fn(async () => undefined),
+        onRefineProposed: vi.fn(async () => undefined),
       },
       queue: { canRemove: false, busy: false, withheldReason: null },
     };

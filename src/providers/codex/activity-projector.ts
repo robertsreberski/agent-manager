@@ -16,6 +16,7 @@ import type {
 } from "../../activity/index.ts";
 import {
   extractTrailingMemoryCitation,
+  parseProposedPlan,
   parseMemoryCitation,
   reconcileTodoRewrite,
 } from "../../activity/index.ts";
@@ -48,6 +49,8 @@ export type CodexActivityTodoLookup = (
   id: string,
 ) => CodexTodoProjectionState | null;
 
+export type CodexStructuredPlanLookup = (id: string) => boolean;
+
 export interface CodexActivityProjection {
   threadId: string;
   mutations: readonly ActivityMutation[];
@@ -55,6 +58,7 @@ export interface CodexActivityProjection {
 
 const zeroOffset: CodexActivityOffsetLookup = () => 0;
 const noTodoState: CodexActivityTodoLookup = () => null;
+const noStructuredPlan: CodexStructuredPlanLookup = () => false;
 
 function record(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -97,6 +101,16 @@ export function codexMessageCorrelationId(
   text: string,
 ): string {
   return messageCorrelationId("codex", threadId, turnId, role, text);
+}
+
+/** One proposed-plan identity shared by structured and tagged-message surfaces. */
+export function codexProposedPlanId(threadId: string, turnId: string): string {
+  return scopedId("proposed-plan", threadId, turnId);
+}
+
+/** Reconciles a rollout fallback with the exact App Server plan item. */
+export function codexProposedPlanCorrelationId(threadId: string, turnId: string): string {
+  return scopedId("proposed-plan-correlation", threadId, turnId);
 }
 
 /**
@@ -525,6 +539,7 @@ function toolItem(
 function projectThreadItem(
   notification: JsonRpcNotification,
   completed: boolean,
+  structuredPlanFor: CodexStructuredPlanLookup,
 ): CodexActivityProjection | null {
   const { params } = notification;
   const threadId = stringValue(params.threadId);
@@ -576,28 +591,84 @@ function projectThreadItem(
         const text = extracted.text;
         const memoryCitation = parseMemoryCitation(item.memory_citation ?? item.memoryCitation)
           ?? extracted.memoryCitation;
-        const final = item.phase === "final_answer";
-        mutations.push(upsert({
-          ...baseItem(id, "message", turnId, state, times.startedAt, times.updatedAt, times.completedAt),
-          correlationId: final
-            ? codexMessageCorrelationId(threadId, turnId, "assistant", text)
-            : `message:${itemId}`,
-          role: "assistant",
-          phase: item.phase === "commentary"
-            ? "commentary"
-            : final
-            ? "final"
-            : null,
-          text,
-          label: null,
-          memoryCitation,
-        }));
+        const final = item.phase === "final_answer" || item.phase === "final";
+        const proposedPlan = final ? parseProposedPlan(text) : null;
+        const planId = codexProposedPlanId(threadId, turnId);
+        if (proposedPlan !== null && !structuredPlanFor(planId)) {
+          mutations.push(upsert({
+            ...baseItem(planId, "plan", turnId, state, times.startedAt, times.updatedAt, times.completedAt),
+            correlationId: codexProposedPlanCorrelationId(threadId, turnId),
+            path: null,
+            version: null,
+            markdown: proposedPlan,
+            supersededBy: null,
+            approvalRequestId: null,
+            approvedAt: null,
+          }));
+        } else if (proposedPlan === null) {
+          mutations.push(upsert({
+            ...baseItem(id, "message", turnId, state, times.startedAt, times.updatedAt, times.completedAt),
+            correlationId: final
+              ? codexMessageCorrelationId(threadId, turnId, "assistant", text)
+              : `message:${itemId}`,
+            role: "assistant",
+            phase: item.phase === "commentary"
+              ? "commentary"
+              : final
+              ? "final"
+              : null,
+            text,
+            label: null,
+            memoryCitation,
+          }));
+        }
+        // Plans have no citation field on the public activity shape. Keep the
+        // parsed source list as a neighbouring, textless message instead of
+        // discarding it or leaking the XML wrapper back into the transcript.
+        if (proposedPlan !== null && memoryCitation) {
+          mutations.push(upsert({
+            ...baseItem(
+              itemActivityId(threadId, turnId, itemId, "memory-citation"),
+              "message",
+              turnId,
+              state,
+              times.startedAt,
+              times.updatedAt,
+              times.completedAt,
+            ),
+            correlationId: `${codexProposedPlanCorrelationId(threadId, turnId)}:memory-citation`,
+            role: "assistant",
+            phase: null,
+            text: "",
+            label: null,
+            memoryCitation,
+          }));
+        }
       }
       break;
-    // Codex plan items are transient prose proposals, not provider-backed plan
-    // documents and not structured todos. The authoritative checklist arrives
-    // separately through turn/plan/updated.
-    case "plan": break;
+    case "plan": {
+      const markdown = stringValue(item.text) ?? textContent(item.content);
+      if (!markdown.trim()) break;
+      mutations.push(upsert({
+        ...baseItem(
+          codexProposedPlanId(threadId, turnId),
+          "plan",
+          turnId,
+          state,
+          times.startedAt,
+          times.updatedAt,
+          times.completedAt,
+        ),
+        correlationId: codexProposedPlanCorrelationId(threadId, turnId),
+        path: null,
+        version: null,
+        markdown: markdown.trim(),
+        supersededBy: null,
+        approvalRequestId: null,
+        approvedAt: null,
+      }));
+      break;
+    }
     case "reasoning": {
       const summaries = Array.isArray(item.summary) ? item.summary : [];
       const content = Array.isArray(item.content) ? item.content : [];
@@ -931,11 +1002,12 @@ export function projectCodexNotification(
   notification: JsonRpcNotification,
   offsetFor: CodexActivityOffsetLookup = zeroOffset,
   todoFor: CodexActivityTodoLookup = noTodoState,
+  structuredPlanFor: CodexStructuredPlanLookup = noStructuredPlan,
 ): CodexActivityProjection | null {
   const { params } = notification;
   switch (notification.method) {
-    case "item/started": return projectThreadItem(notification, false);
-    case "item/completed": return projectThreadItem(notification, true);
+    case "item/started": return projectThreadItem(notification, false, structuredPlanFor);
+    case "item/completed": return projectThreadItem(notification, true, structuredPlanFor);
     case "item/agentMessage/delta":
       return deltaProjection(notification, null, "text", params.delta, offsetFor);
     case "item/plan/delta": return null;

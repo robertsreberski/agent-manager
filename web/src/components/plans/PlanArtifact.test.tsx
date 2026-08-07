@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { PlanArtifact } from "./PlanArtifact";
 import type { PlanArtifactView } from "./model";
@@ -24,22 +24,53 @@ describe("PlanArtifact", () => {
     expect(container.querySelector("[data-plan-row]")).not.toBeInTheDocument();
   });
 
-  it("exposes exact execute and send-back actions only when supplied", () => {
+  it("exposes exact execute and send-back actions only when supplied", async () => {
     const onExecute = vi.fn();
     const onSendBack = vi.fn();
     render(<PlanArtifact plan={plan} onExecute={onExecute} onSendBack={onSendBack} />);
     fireEvent.click(screen.getByRole("button", { name: "Execute this plan" }));
-    expect(onExecute).toHaveBeenCalledWith(plan);
+    await waitFor(() => expect(onExecute).toHaveBeenCalledWith(plan));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Send it back with notes" })).toBeEnabled());
     fireEvent.click(screen.getByRole("button", { name: "Send it back with notes" }));
     fireEvent.change(screen.getByRole("textbox", { name: "What should change?" }), { target: { value: "Keep the existing API." } });
     fireEvent.click(screen.getByRole("button", { name: "Send notes" }));
-    expect(onSendBack).toHaveBeenCalledWith(plan, "Keep the existing API.");
+    await waitFor(() => expect(onSendBack).toHaveBeenCalledWith(plan, "Keep the existing API."));
   });
 
   it("does not invent plan actions without an exact request", () => {
     render(<PlanArtifact plan={plan} />);
     expect(screen.queryByRole("button", { name: "Execute this plan" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Send it back/u })).not.toBeInTheDocument();
+  });
+
+  it("offers Execute by default and lets the operator choose Full access", async () => {
+    const onAccept = vi.fn(async () => undefined);
+    const { unmount } = render(<PlanArtifact plan={{ ...plan, path: null, version: null }} proposed onAccept={onAccept} onRefine={vi.fn()} />);
+    const profile = screen.getByRole("combobox", { name: "Execution profile" });
+    expect(profile).toHaveTextContent("Execute");
+    fireEvent.click(screen.getByRole("button", { name: "Accept and execute" }));
+    await waitFor(() => expect(onAccept).toHaveBeenCalledWith(expect.objectContaining({ id: plan.id }), "execute"));
+    expect(screen.getByText("Prompt sent. Waiting for Codex.")).toBeInTheDocument();
+    unmount();
+
+    render(<PlanArtifact plan={{ ...plan, path: null, version: null }} proposed onAccept={onAccept} onRefine={vi.fn()} />);
+    const fullAccessProfile = screen.getByRole("combobox", { name: "Execution profile" });
+    fireEvent.keyDown(fullAccessProfile, { key: "ArrowDown" });
+    fireEvent.click(await screen.findByRole("option", { name: "Full access" }));
+    fireEvent.click(screen.getByRole("button", { name: "Accept and execute" }));
+    await waitFor(() => expect(onAccept).toHaveBeenLastCalledWith(expect.objectContaining({ id: plan.id }), "full-access"));
+  });
+
+  it("submits exact custom refinement notes and reports action failures inline", async () => {
+    const onRefine = vi.fn(async () => { throw new Error("Profile changed to Plan, but the prompt was not sent."); });
+    render(<PlanArtifact plan={plan} proposed onAccept={vi.fn()} onRefine={onRefine} />);
+    fireEvent.click(screen.getByRole("button", { name: "Refine plan" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "What should change?" }), {
+      target: { value: "  Keep the API and add a regression test.  " },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Submit refinement" }));
+    await waitFor(() => expect(onRefine).toHaveBeenCalledWith(plan, "Keep the API and add a regression test."));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Profile changed to Plan, but the prompt was not sent.");
   });
 
   it("collapses when the exact approval is confirmed", () => {

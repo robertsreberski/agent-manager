@@ -87,7 +87,9 @@ function renderDrawer() {
             remote={false}
             busy={false}
             mutationsReady
-            onRespond={vi.fn(async () => undefined)}
+          onRespond={vi.fn(async () => undefined)}
+          onAcceptProposedPlan={vi.fn(async () => undefined)}
+          onRefineProposedPlan={vi.fn(async () => undefined)}
             onRemoveQueued={vi.fn(async () => undefined)}
             onOpenEditor={vi.fn(async () => undefined)}
             onResumeInWeb={vi.fn(async () => undefined)}

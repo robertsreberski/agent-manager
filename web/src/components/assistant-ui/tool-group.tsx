@@ -1,5 +1,5 @@
 import { useCallback, useRef, useState } from "react";
-import { ChevronDown, LoaderCircle } from "lucide-react";
+import { ChevronDown, Clock3, LoaderCircle } from "lucide-react";
 import { cva, type VariantProps } from "class-variance-authority";
 import { useScrollLock } from "@assistant-ui/react";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "../ui";
@@ -113,11 +113,13 @@ function ToolGroupTrigger({
   count,
   active = false,
   duration = null,
+  waitingLabel = null,
   className,
   ...props
 }: React.ComponentProps<typeof CollapsibleTrigger> & {
   count: number;
   active?: boolean;
+  waitingLabel?: string | null;
   /**
    * Wall-clock span, only where every call in the group reported one — and only
    * once the run has settled. A span is a fact about a finished run; beside the
@@ -140,6 +142,8 @@ function ToolGroupTrigger({
     >
       {active
         ? <LoaderCircle size={14} strokeWidth={1.75} className="shrink-0 motion-safe:animate-spin [animation-duration:0.6s]" aria-hidden="true" />
+        : waitingLabel
+        ? <Clock3 size={14} strokeWidth={1.75} className="shrink-0" aria-hidden="true" />
         : <ChevronDown
             size={16}
             strokeWidth={1.75}
@@ -162,8 +166,9 @@ function ToolGroupTrigger({
           </span>
         )}
       </span>
-      {!active && duration && <span className="shrink-0 text-meta-sm tabular-nums text-[var(--text-faint)]">{duration}</span>}
+      {!active && !waitingLabel && duration && <span className="shrink-0 text-meta-sm tabular-nums text-[var(--text-faint)]">{duration}</span>}
       {active && <span className="shrink-0 font-mono text-code-xs text-[var(--text-faint)]">active</span>}
+      {waitingLabel && <span className="shrink-0 font-mono text-code-xs text-[var(--text-faint)]">{waitingLabel}</span>}
     </CollapsibleTrigger>
   );
 }

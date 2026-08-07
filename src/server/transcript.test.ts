@@ -14,6 +14,7 @@ import { ActivityHub } from "../activity/hub.ts";
 import type { SessionView } from "../core/types.ts";
 import {
   codexMessageCorrelationId,
+  codexProposedPlanCorrelationId,
   codexRequestUserInputCorrelationId,
   projectCodexNotification,
   projectCodexServerRequest,
@@ -35,11 +36,19 @@ function messagesOf(result: TranscriptReadResult): Array<{ role: string; text: s
 }
 
 function textsOf(result: TranscriptReadResult): string[] {
-  return result.items.flatMap((item) => (item.kind === "tool" ? [] : [item.text]));
+  return result.items.flatMap((item) => (
+    item.kind === "message" || item.kind === "reasoning" ? [item.text]
+      : item.kind === "plan" ? [item.markdown]
+      : []
+  ));
 }
 
 function toolsOf(result: TranscriptReadResult): Extract<TranscriptItem, { kind: "tool" }>[] {
   return result.items.flatMap((item) => (item.kind === "tool" ? [item] : []));
+}
+
+function plansOf(result: TranscriptReadResult): Extract<TranscriptItem, { kind: "plan" }>[] {
+  return result.items.flatMap((item) => (item.kind === "plan" ? [item] : []));
 }
 
 const roots: string[] = [];
@@ -375,6 +384,87 @@ MEMORY.md:10-12|note=[workspace decision]
     entries: [{ path: "MEMORY.md", lineStart: 10, lineEnd: 12, note: "workspace decision" }],
     rolloutIds: ["019fcbd5-7a38-7c31-a5f7-e199f5b06f4e"],
   });
+});
+
+test("Codex turns an entirely tag-wrapped final answer into a reconciled plan artifact", () => {
+  const turnId = "turn-proposed-plan";
+  const fixture = codexFixture([
+    codexMeta(),
+    { type: "event_msg", payload: { type: "task_started", turn_id: turnId } },
+    codexMessage("assistant", `<proposed_plan>\n# Repair chronology\n\n- Keep todos in sequence\n</proposed_plan>
+<oai-mem-citation>
+<citation_entries>
+MEMORY.md:10-12|note=[prior behavior]
+</citation_entries>
+<rollout_ids>
+</rollout_ids>
+</oai-mem-citation>`, { id: "tagged-plan", phase: "final_answer" }),
+  ]);
+  const reader = new LocalSessionTranscriptReader({ codexHome: fixture.home });
+  const read = reader.read(codexSession());
+  const plan = plansOf(read)[0];
+  assert.ok(plan);
+  assert.equal(plan.markdown, "# Repair chronology\n\n- Keep todos in sequence");
+  assert.equal(plan.correlationId, codexProposedPlanCorrelationId(CODEX_ID, turnId));
+  assert.deepEqual(plan.memoryCitation?.entries, [{
+    path: "MEMORY.md",
+    lineStart: 10,
+    lineEnd: 12,
+    note: "prior behavior",
+  }]);
+  assert.equal(messagesOf(read).length, 0);
+
+  const managerSessionId = `local:codex:${CODEX_ID}`;
+  const hub = new ActivityHub({ streamEpoch: "proposed-plan" });
+  const observer = new SelectedTranscriptActivityObserver({ hub, reader });
+  observer.seedOnce({
+    id: managerSessionId,
+    provider: "codex",
+    providerThreadId: CODEX_ID,
+    providerTreeId: CODEX_ID,
+    parentId: null,
+    status: "idle",
+  } as SessionView);
+  assert.equal(hub.snapshot(managerSessionId)?.items.filter((item) => item.kind === "plan").length, 1);
+
+  const exact = projectCodexNotification({
+    method: "item/completed",
+    emittedAtMs: Date.parse("2026-08-03T10:00:02.000Z"),
+    params: {
+      threadId: CODEX_ID,
+      turnId,
+      item: { type: "plan", id: "structured-plan", text: "# Repair chronology\n\n- Keep todos in sequence" },
+    },
+  });
+  assert.ok(exact);
+  for (const mutation of exact.mutations) hub.ingest(managerSessionId, "codex", mutation);
+  const reconciledPlans = hub.snapshot(managerSessionId)?.items.filter((item) => item.kind === "plan") ?? [];
+  assert.equal(reconciledPlans.length, 1);
+  assert.equal(reconciledPlans[0]?.source, "provider-api");
+  assert.equal(hub.snapshot(managerSessionId)?.items.some((item) => item.kind === "message" && item.memoryCitation !== null), true);
+
+  observer.dispose();
+  hub.dispose();
+});
+
+test("a structured Codex rollout plan wins over a later tagged fallback", () => {
+  const turnId = "turn-structured-plan";
+  const fixture = codexFixture([
+    codexMeta(),
+    { type: "event_msg", payload: { type: "task_started", turn_id: turnId } },
+    {
+      type: "response_item",
+      timestamp: "2026-08-03T10:00:01Z",
+      payload: { type: "plan", id: "structured", text: "# Structured plan" },
+    },
+    codexMessage("assistant", "<proposed_plan># Fallback plan</proposed_plan>", {
+      id: "tagged",
+      phase: "final_answer",
+    }),
+  ]);
+  const plans = plansOf(new LocalSessionTranscriptReader({ codexHome: fixture.home }).read(codexSession()));
+  assert.equal(plans.length, 1);
+  assert.equal(plans[0]?.markdown, "# Structured plan");
 });
 
 test("Codex derives the same turn-scoped message identity as the App Server without merging repeated prompts", () => {

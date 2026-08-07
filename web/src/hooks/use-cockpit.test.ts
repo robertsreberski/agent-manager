@@ -6,7 +6,7 @@ import * as authModule from "../lib/auth";
 import * as sseModule from "../lib/sse";
 import type { ControlLease, HostOption, SessionView, StateEvent, WireActionUpdate, WireStateSnapshot, WorkspaceOption } from "../types";
 import { AGENT_MANAGER_BUILD_ID, WireUpgradeRequiredError, WIRE_SCHEMA_VERSION } from "../types";
-import { acquireAutomaticLease, applyStateEvent, generateBrowserClientId, isStaleActionUpdate, isStaleRequestRace, mutationsAreReady, releaseHeldSessionLease, releaseLeasesForPageExit, reloadForWireUpgrade, renewForegroundLease, resolveArchivedSelection, sensitiveBoundaryStatus, sessionNeedsForegroundLease, shouldReleaseLeasesForPageHide, shouldRenewForegroundLease, useCockpit, WIRE_UPGRADE_RELOAD_STORAGE_KEY } from "./use-cockpit";
+import { acquireAutomaticLease, applyStateEvent, generateBrowserClientId, isStaleActionUpdate, isStaleRequestRace, mutationsAreReady, profileConfirmedSend, PROPOSED_PLAN_EXECUTION_PROMPT, releaseHeldSessionLease, releaseLeasesForPageExit, reloadForWireUpgrade, renewForegroundLease, resolveArchivedSelection, sensitiveBoundaryStatus, sessionNeedsForegroundLease, shouldReleaseLeasesForPageHide, shouldRenewForegroundLease, useCockpit, WIRE_UPGRADE_RELOAD_STORAGE_KEY } from "./use-cockpit";
 
 function lease(token: string, seconds = 300): ControlLease {
   return { token, clientId: "browser", expiresAt: new Date(Date.now() + seconds * 1_000).toISOString() };
@@ -28,6 +28,21 @@ function actionUpdate(overrides: Partial<WireActionUpdate> = {}): WireActionUpda
 const target = { id: "local:codex:one" } as SessionView;
 const snapshot: WireStateSnapshot = { schemaVersion: WIRE_SCHEMA_VERSION, buildId: AGENT_MANAGER_BUILD_ID, generatedAt: "2026-08-04T12:00:00Z", seq: 3, stale: false, sessions: [], diagnostics: [] };
 
+function proposedPlanSession(profile: SessionView["profile"]["value"] = "plan", generation = 7): SessionView {
+  return {
+    id: "local:codex:plan",
+    provider: "codex",
+    archived: false,
+    status: "idle",
+    generation,
+    profile: { value: profile },
+    control: {
+      capabilities: ["set-profile", "queue"],
+      withheld: [],
+    },
+  } as unknown as SessionView;
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
   window.history.replaceState(null, "", "/");
@@ -44,6 +59,75 @@ describe("strict event reconciliation", () => {
   it("replaces diagnostics atomically", () => {
     const event = { schemaVersion: WIRE_SCHEMA_VERSION, buildId: AGENT_MANAGER_BUILD_ID, seq: 4, at: "2026-08-04T12:01:00Z", type: "diagnostic", payload: { stale: true, diagnostics: [{ provider: "system", level: "warning", message: "offline" }] } } satisfies StateEvent;
     expect(applyStateEvent(snapshot, event)).toMatchObject({ seq: 4, stale: true, diagnostics: event.payload.diagnostics });
+  });
+});
+
+describe("profile-confirmed proposed-plan sends", () => {
+  it("confirms a fresh profile generation before sending the canonical execution prompt", async () => {
+    const initial = proposedPlanSession("plan", 7);
+    let current = initial;
+    const order: string[] = [];
+    const setProfile = vi.fn(async (_session: SessionView, profile: SessionView["profile"]["value"]) => {
+      order.push(`profile:${profile}`);
+      current = proposedPlanSession(profile, 8);
+    });
+    const send = vi.fn(async (session: SessionView, text: string) => {
+      order.push(`send:${session.generation}`);
+      expect(text).toBe(PROPOSED_PLAN_EXECUTION_PROMPT);
+    });
+
+    await profileConfirmedSend(initial, "execute", PROPOSED_PLAN_EXECUTION_PROMPT, {
+      currentSession: () => current,
+      refresh: async () => { order.push("refresh"); },
+      setProfile,
+      send,
+      delay: async () => undefined,
+    });
+
+    expect(order).toEqual(["profile:execute", "refresh", "send:8"]);
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ generation: 8 }), PROPOSED_PLAN_EXECUTION_PROMPT);
+  });
+
+  it("does not send when the selected profile cannot be confirmed", async () => {
+    const initial = proposedPlanSession("plan", 7);
+    const send = vi.fn(async () => undefined);
+    await expect(profileConfirmedSend(initial, "full-access", PROPOSED_PLAN_EXECUTION_PROMPT, {
+      currentSession: () => initial,
+      refresh: async () => undefined,
+      setProfile: async () => undefined,
+      send,
+      attempts: 2,
+      delay: async () => undefined,
+    })).rejects.toThrow("Could not confirm the Full access profile");
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("states a partial failure and does not repeat an already-confirmed profile on retry", async () => {
+    const initial = proposedPlanSession("plan", 7);
+    let current = initial;
+    const setProfile = vi.fn(async (_session: SessionView, profile: SessionView["profile"]["value"]) => {
+      current = proposedPlanSession(profile, 8);
+    });
+    const failedSend = vi.fn(async () => { throw new Error("queue unavailable"); });
+    const operations = {
+      currentSession: () => current,
+      refresh: async () => undefined,
+      setProfile,
+      send: failedSend,
+      delay: async () => undefined,
+    };
+
+    await expect(profileConfirmedSend(initial, "execute", PROPOSED_PLAN_EXECUTION_PROMPT, operations))
+      .rejects.toThrow("Profile changed to Execute, but the prompt was not sent. Retry sends only the message.");
+    expect(setProfile).toHaveBeenCalledOnce();
+
+    const retrySend = vi.fn(async () => undefined);
+    await profileConfirmedSend(initial, "execute", PROPOSED_PLAN_EXECUTION_PROMPT, {
+      ...operations,
+      send: retrySend,
+    });
+    expect(setProfile).toHaveBeenCalledOnce();
+    expect(retrySend).toHaveBeenCalledOnce();
   });
 });
 

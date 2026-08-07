@@ -10,6 +10,7 @@ import {
 } from "./account-facts.ts";
 import {
   codexActivityOffset,
+  codexProposedPlanId,
   projectCodexDiagnostic,
   projectCodexNotification,
   projectCodexQueue,
@@ -478,6 +479,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
   #removeRpcListeners: Array<() => void> = [];
   #activityOffsets = new Map<string, number>();
   #activityTodos = new Map<string, CodexTodoProjectionState>();
+  #activityStructuredPlans = new Set<string>();
 
   constructor(options: CodexManagedAdapterOptions) {
     if (!isAbsolute(options.socketPath)) {
@@ -1328,6 +1330,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     this.#detachedThreads.clear();
     this.#activityOffsets.clear();
     this.#activityTodos.clear();
+    this.#activityStructuredPlans.clear();
   }
 
   async #call(
@@ -1764,8 +1767,18 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
           notification,
           (id, channel) => codexActivityOffset(this.#activityOffsets, id, channel),
           (id) => this.#activityTodos.get(id) ?? null,
+          (id) => this.#activityStructuredPlans.has(id),
         );
     this.#emitActivityProjection(projection);
+    const item = isObject(notification.params.item) ? notification.params.item : null;
+    const turnId = stringField(notification.params, "turnId");
+    if (
+      notification.method === "item/completed"
+      && threadId
+      && turnId
+      && item?.type === "plan"
+      && projection?.mutations.some((mutation) => mutation.type === "upsert" && mutation.item.kind === "plan")
+    ) this.#activityStructuredPlans.add(codexProposedPlanId(threadId, turnId));
   }
 
   #applyNotification(notification: JsonRpcNotification): void {

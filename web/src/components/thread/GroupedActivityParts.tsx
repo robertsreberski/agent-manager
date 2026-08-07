@@ -13,7 +13,8 @@ import {
   toolArgumentFields,
   toolCallDetail,
   toolGroupTiming,
-  toolRunActive,
+  toolRunPresentation,
+  toolWaitingLabel,
   type ToolArgumentField,
 } from "./grouping";
 import type { SubagentFrameData } from "./subagent";
@@ -38,6 +39,7 @@ interface ToolPart {
   status: { type: string };
   timing?: { startedAt: number; completedAt?: number } | undefined;
   toolUI?: React.ReactNode;
+  providerMetadata?: Record<string, unknown>;
 }
 
 /**
@@ -58,15 +60,15 @@ const BLOCK = "min-w-0 max-w-full overflow-x-hidden bg-[var(--surface-raised)] p
  * what report a run in motion, and holding the panel open buried each turn in
  * its own detail. `ToolGroupRoot` owns the open state and the scroll lock.
  */
-export function ToolGroupShell({ status, active, count, duration, defaultOpen = false, children }: { status: { type: string }; active: boolean; count: number; duration: string | null; defaultOpen?: boolean; children: React.ReactNode }) {
+export function ToolGroupShell({ status, active, waitingLabel = null, count, duration, defaultOpen = false, children }: { status: { type: string }; active: boolean; waitingLabel?: string | null; count: number; duration: string | null; defaultOpen?: boolean; children: React.ReactNode }) {
   return (
     <ToolGroupRoot
       active={active}
       defaultOpen={defaultOpen}
       className={CONTAINED}
-      data-tool-group-status={status.type}
+      data-tool-group-status={waitingLabel ? "waiting" : status.type}
     >
-      <ToolGroupTrigger count={count} active={active} duration={duration} />
+      <ToolGroupTrigger count={count} active={active} waitingLabel={waitingLabel} duration={duration} />
       <ToolGroupContent>{children}</ToolGroupContent>
     </ToolGroupRoot>
   );
@@ -85,10 +87,12 @@ function ToolGroup({ status, indices, children }: { status: { type: string }; in
     const type = state.message.status?.type;
     return type === "running" || type === "requires-action";
   });
+  const presentation = toolRunPresentation(status, parts, indices, turnInMotion);
   return (
     <ToolGroupShell
       status={status}
-      active={toolRunActive(status, parts, indices, turnInMotion)}
+      active={presentation.phase === "active"}
+      waitingLabel={presentation.phase === "waiting" ? presentation.label : null}
       count={indices.length}
       duration={displayDuration(toolGroupTiming(parts, indices))}
     >
@@ -138,13 +142,14 @@ export function ToolCall({ part }: { part: ToolPart }) {
   const rowRef = useRef<HTMLElement>(null);
   const lockScroll = useScrollLock(rowRef, DISCLOSURE_SCROLL_LOCK_MS);
   const duration = displayDuration(part.timing);
+  const waitingLabel = toolWaitingLabel(part);
   if (part.toolUI) return part.toolUI;
   const detail = toolCallDetail(part.args);
   const fields = toolArgumentFields(part.args);
   return (
     <section ref={rowRef} className={CONTAINED} data-tool-status={part.status.type}>
       <button type="button" data-compact-control className="flex min-h-8 w-full min-w-0 items-center gap-[9px] py-1.5 text-left" aria-expanded={open} onClick={() => { lockScroll(); setOpen((value) => !value); }}>
-        {part.status.type === "running" ? <LoaderCircle size={15} strokeWidth={1.75} className="shrink-0 text-[var(--text-muted)] motion-safe:animate-spin" /> : part.isError ? <Circle size={12} className="shrink-0 text-[var(--danger)]" /> : <Check size={15} strokeWidth={1.75} className="shrink-0 text-[var(--text-muted)]" />}
+        {!waitingLabel && part.status.type === "running" ? <LoaderCircle size={15} strokeWidth={1.75} className="shrink-0 text-[var(--text-muted)] motion-safe:animate-spin" /> : part.isError ? <Circle size={12} className="shrink-0 text-[var(--danger)]" /> : <Check size={15} strokeWidth={1.75} className="shrink-0 text-[var(--text-muted)]" />}
         {/*
           Frame 11b gives the tool name `flex-shrink: 0` so it is never the
           thing that gets clipped. It keeps a max-width all the same: Codex
@@ -155,6 +160,7 @@ export function ToolCall({ part }: { part: ToolPart }) {
         <strong className="min-w-0 max-w-[60%] shrink-0 truncate font-mono text-code-sm font-medium text-[var(--text)]" data-tool-name>{part.toolName}</strong>
         {detail !== null && <span className="min-w-0 flex-1 truncate font-mono text-code-sm text-[var(--text-muted)]" data-tool-detail>{detail}</span>}
         {duration && <span className="shrink-0 font-mono text-code-xs text-[var(--text-faint)]">{duration}</span>}
+        {waitingLabel && <span className="shrink-0 font-mono text-code-xs text-[var(--text-faint)]">{waitingLabel}</span>}
         <ChevronDown size={12} className={`shrink-0 text-[var(--text-faint)] ${open ? "rotate-180" : ""}`} />
       </button>
       {open && (

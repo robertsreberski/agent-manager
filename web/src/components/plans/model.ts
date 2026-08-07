@@ -8,6 +8,8 @@ export interface PlanArtifactView {
   approvedAt: string | null;
 }
 
+export type ProposedPlanExecutionProfile = "execute" | "full-access";
+
 export type TodoStatus = "pending" | "in-progress" | "completed" | "removed";
 
 export interface TodoStepView {

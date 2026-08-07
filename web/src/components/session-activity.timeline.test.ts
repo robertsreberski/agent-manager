@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { ACTIVITY_SCHEMA_VERSION, type ActivityItem } from "../types";
-import { activityToThreadMessages } from "./session-activity";
+import { activityToThreadMessages, currentActionableProposedPlanId } from "./session-activity";
 
 const common = {
   schemaVersion: ACTIVITY_SCHEMA_VERSION,
@@ -133,11 +133,10 @@ describe("turn timeline ordering", () => {
     expect(lifecycleTitles).toEqual(["Turn started", "Turn failed"]);
   });
 
-  it("bands the todo list and the turn diff with the turn facts so a tool run stays whole", () => {
-    // A provider emits one todo and one aggregate diff per turn, and the hub
-    // pins each to the seq of its first upsert — in the middle of a tool run.
-    // Left there, they split the run, because adjacent-prefix grouping closes a
-    // group at the first part that is not a tool call.
+  it("keeps a todo marker where the list was created while retaining aggregate turn facts", () => {
+    // The live details are pinned above the composer, but the timeline marker
+    // remains a real chronological boundary. Later tools must never jump above
+    // it just because the todo is still being rewritten in place.
     const items: ActivityItem[] = [
       ...invertedTurn(),
       {
@@ -157,8 +156,8 @@ describe("turn timeline ordering", () => {
       "data:agent-manager.lifecycle",
       "reasoning",
       "tool-call",
-      "tool-call",
       "data:agent-manager.todo",
+      "tool-call",
       "data:agent-manager.turn-marker",
     ]);
   });
@@ -174,6 +173,34 @@ describe("turn timeline ordering", () => {
     expect(parts.map((part) => part.type)).toEqual([
       "text", "data", "tool-call", "reasoning", "data",
     ]);
+  });
+});
+
+describe("current proposed plan", () => {
+  const plan: ActivityItem = {
+    ...common,
+    id: "plan-1",
+    seq: 10,
+    kind: "plan",
+    path: null,
+    version: null,
+    markdown: "# Plan",
+    supersededBy: null,
+    approvalRequestId: null,
+    approvedAt: null,
+  };
+
+  it("keeps only the latest complete Codex proposal actionable", () => {
+    expect(currentActionableProposedPlanId([plan])).toBe(plan.id);
+    expect(currentActionableProposedPlanId([{ ...plan, state: "running" }])).toBeNull();
+    expect(currentActionableProposedPlanId([{ ...plan, truncated: true }])).toBeNull();
+  });
+
+  it("makes a proposal historical after the next operator message", () => {
+    expect(currentActionableProposedPlanId([
+      plan,
+      { ...common, id: "next-user", seq: 11, kind: "message", role: "user", phase: null, text: "Refine it", label: null },
+    ])).toBeNull();
   });
 });
 
