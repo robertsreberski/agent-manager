@@ -88,6 +88,54 @@ describe("DraftThread", () => {
     expect(within(recents).queryByText(/fix-auth/u)).not.toBeInTheDocument();
   });
 
+  it("wraps every displayed draft path without shortening it", async () => {
+    vi.useFakeTimers();
+    try {
+      const longRoot = "/Users/operator/Personal_Repositories/organization/particularly-long-project-name-without-a-break";
+      const suggestion = `${longRoot}/nested-directory-with-an-equally-long-name`;
+      const context: WorkspaceGitContext = {
+        status: "repo",
+        repoRoot: longRoot,
+        repoName: "particularly-long-project-name-without-a-break",
+        defaultBranch: "main",
+        worktrees: [
+          { path: longRoot, branch: "main", isMain: true, locked: false },
+          { path: `${longRoot}/.worktrees/feature-with-a-long-name`, branch: "feature-with-a-long-name", isMain: false, locked: false },
+        ],
+      };
+      draftThread({
+        draft: newDraftSession({
+          workspace: { hostId: "local", path: longRoot, worktree: { kind: "new", name: "", repoRoot: longRoot } },
+        }),
+        workspaces: [workspaceRow({ path: longRoot, repoRoot: longRoot, repoName: context.repoName })],
+        onCompletePath: () => Promise.resolve([suggestion]),
+        onLoadGitContext: () => Promise.resolve(context),
+      });
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(400); });
+
+      const recentPath = within(screen.getByLabelText("Recent projects")).getByText(longRoot);
+      expect(recentPath).toHaveClass("whitespace-normal", "break-words", "[overflow-wrap:anywhere]");
+      expect(recentPath).not.toHaveClass("truncate");
+
+      const suggestedPath = within(screen.getByRole("option", { name: suggestion })).getByText(suggestion);
+      expect(suggestedPath).toHaveClass("whitespace-normal", "break-words", "[overflow-wrap:anywhere]");
+      expect(suggestedPath).not.toHaveClass("truncate");
+
+      const worktreePaths = within(screen.getByRole("radiogroup", { name: "Worktree" })).getAllByText(longRoot);
+      expect(worktreePaths).toHaveLength(2);
+      for (const path of worktreePaths) {
+        expect(path).toHaveClass("whitespace-normal", "break-words", "[overflow-wrap:anywhere]");
+        expect(path).not.toHaveClass("truncate");
+      }
+
+      const explanation = screen.getByText((text) => text.includes(`${longRoot}/.worktrees/`));
+      expect(explanation).toHaveClass("max-w-full", "break-words", "[overflow-wrap:anywhere]");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("returns to the worktree that project was last worked in", async () => {
     vi.useFakeTimers();
     try {

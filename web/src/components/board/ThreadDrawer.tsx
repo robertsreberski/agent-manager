@@ -19,7 +19,7 @@ const FACT_TONE = { default: "neutral", dirty: "warning", remote: "remote" } as 
 export interface ThreadDrawerProps {
   open: boolean;
   title: string;
-  facts?: readonly { label: string; tone?: FactTone; icon?: LucideIcon }[];
+  facts?: readonly { label: string; tone?: FactTone; icon?: LucideIcon; wrap?: boolean }[];
   todo?: TodoProgressView | null;
   onClose: () => void;
   children: React.ReactNode;
@@ -55,6 +55,7 @@ export function ThreadDrawer({ open, title, facts = [], todo = null, onClose, ch
     leaves the desktop drawer untouched because a pointer device reports none.
   */
   const keyboard = useKeyboardInset();
+  const hasWrappingFact = facts.some((fact) => fact.wrap);
   // There is no `DialogTrigger` to hand focus back to — the drawer is opened by
   // a board card, a shortcut or the palette — so it remembers its own opener.
   const openerRef = useRef<HTMLElement | null>(null);
@@ -83,26 +84,26 @@ export function ThreadDrawer({ open, title, facts = [], todo = null, onClose, ch
           className="flex shrink-0 items-center gap-2 bg-inherit pt-[calc(0.25rem_+_max(0px,env(safe-area-inset-top)))] pr-[calc(1rem_+_max(0px,env(safe-area-inset-right)))] pb-3 pl-[calc(1rem_+_max(0px,env(safe-area-inset-left)))] min-[901px]:px-[22px] min-[901px]:pt-4 min-[901px]:pb-3"
           data-thread-header
         >
-          <div className="min-w-0 flex-1 min-[901px]:flex min-[901px]:items-center min-[901px]:gap-2">
+          <div className={`min-w-0 flex-1 min-[901px]:flex min-[901px]:items-center min-[901px]:gap-2 ${hasWrappingFact ? "min-[901px]:flex-wrap" : ""}`}>
             <DialogPrimitive.Title className="truncate text-title-sm min-[901px]:min-w-0 min-[901px]:shrink">{title}</DialogPrimitive.Title>
             {facts.length > 0 && (
               <>
                 {/* Phone (9a-2) states the same facts as one mono subtitle; the drawer (4a) chips them. */}
-                <p className="truncate font-mono text-code-xs text-[var(--text-muted)] min-[901px]:hidden">
+                <p className={`${hasWrappingFact ? "max-w-full whitespace-normal break-words [overflow-wrap:anywhere]" : "truncate"} font-mono text-code-xs text-[var(--text-muted)] min-[901px]:hidden`}>
                   {facts.map((fact) => fact.label).join(" · ")}
                 </p>
-                <div className="hidden min-w-0 shrink-0 gap-1.5 min-[901px]:flex">
+                <div className={`hidden min-w-0 gap-1.5 min-[901px]:flex ${hasWrappingFact ? "max-w-full flex-1 flex-wrap" : "shrink-0"}`}>
                   {facts.map((fact, index) => {
                     const Icon = fact.icon;
                     return (
                       <Badge
                         key={`${fact.label}:${index}`}
                         tone={FACT_TONE[fact.tone ?? "default"]}
-                        className="px-[9px] py-1 leading-none"
+                        className={`${fact.wrap ? "min-w-0 max-w-full shrink whitespace-normal" : ""} px-[9px] py-1 leading-none`}
                         data-tone={fact.tone ?? "default"}
                       >
                         {Icon && <Icon strokeWidth={1.75} aria-hidden="true" />}
-                        {fact.label}
+                        {fact.wrap ? <span className="min-w-0 break-words [overflow-wrap:anywhere]">{fact.label}</span> : fact.label}
                       </Badge>
                     );
                   })}

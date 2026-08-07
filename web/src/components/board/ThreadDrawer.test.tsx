@@ -141,4 +141,25 @@ describe("ThreadDrawer", () => {
     rerender(<ThreadDrawer open title="Session" todo={null} onClose={vi.fn()}>Thread activity</ThreadDrawer>);
     expect(screen.queryByLabelText(/todos completed/u)).not.toBeInTheDocument();
   });
+
+  it("wraps a long path fact on both phone and desktop header treatments", () => {
+    const path = "/Users/operator/Personal_Repositories/organization/particularly-long-project-name-without-a-break";
+    const { container } = render(
+      <ThreadDrawer open title="New thread" facts={[{ label: path, wrap: true }]} onClose={vi.fn()}>
+        Draft
+      </ThreadDrawer>,
+    );
+
+    const header = container.querySelector<HTMLElement>("[data-thread-header]")!;
+    const phoneFact = header.querySelector<HTMLElement>("p")!;
+    expect(phoneFact).toHaveTextContent(path);
+    expect(phoneFact).toHaveClass("max-w-full", "whitespace-normal", "break-words", "[overflow-wrap:anywhere]");
+    expect(phoneFact).not.toHaveClass("truncate");
+
+    const badge = header.querySelector<HTMLElement>('[data-slot="badge"]')!;
+    expect(badge).toHaveClass("min-w-0", "max-w-full", "shrink", "whitespace-normal");
+    expect(badge).not.toHaveClass("shrink-0", "whitespace-nowrap");
+    expect(badge.parentElement).toHaveClass("max-w-full", "flex-1", "flex-wrap");
+    expect(badge.querySelector("span")).toHaveClass("min-w-0", "break-words", "[overflow-wrap:anywhere]");
+  });
 });

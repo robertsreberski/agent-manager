@@ -1166,7 +1166,7 @@ export default function App() {
     : cockpitContentMode(cockpit.sessions.length, cockpit.workspaces.length);
   const draftWorkspace = draft?.workspace;
   const drawerTitle = selected ? selected.name ?? selected.providerThreadId : draftWorkspace ? draftWorkspace.path.split("/").filter(Boolean).at(-1) ?? "New thread" : "New thread";
-  const drawerInfo = selected ? drawerFacts(selected, selectedRemote) : draftWorkspace ? [{ label: draftWorkspace.path }] : [];
+  const drawerInfo = selected ? drawerFacts(selected, selectedRemote) : draftWorkspace ? [{ label: draftWorkspace.path, wrap: true }] : [];
 
   return (
     <main className="relative flex h-dvh min-h-0 flex-col overflow-hidden bg-[var(--app)] text-[var(--text)]">

@@ -119,7 +119,7 @@ export function FolderPicker({
                 onMouseDown={(event) => event.preventDefault()}
                 onClick={() => choose(suggestion)}
               >
-                <span className="min-w-0 flex-1 truncate">{suggestion}</span>
+                <span className="min-w-0 max-w-full flex-1 whitespace-normal break-words [overflow-wrap:anywhere]">{suggestion}</span>
               </button>
             </li>
           ))}

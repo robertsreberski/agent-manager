@@ -100,11 +100,11 @@ export function DraftThread({
                 variant="secondary"
                 size="sm"
                 data-compact-control
-                className="h-auto min-h-10 flex-col items-start justify-center gap-0 px-3 text-left"
+                className="h-auto min-h-10 max-w-full flex-col items-start justify-center gap-0 px-3 text-left"
                 onClick={() => chooseWorkspace(project.hostId, project.path, project.lastWorktreePath)}
               >
                 <strong className="block">{project.label}</strong>
-                <span className="block max-w-52 truncate font-mono text-code-xs text-[var(--text-muted)]">{project.path}</span>
+                <span className="block min-w-0 max-w-52 whitespace-normal break-words font-mono text-code-xs text-[var(--text-muted)] [overflow-wrap:anywhere]">{project.path}</span>
               </Button>
             ))}
           </div>
