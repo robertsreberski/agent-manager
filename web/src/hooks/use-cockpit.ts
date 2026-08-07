@@ -75,6 +75,15 @@ interface ProfileConfirmedSendOperations {
   delay?: () => Promise<void>;
 }
 
+interface ResumeConfirmedSendOperations {
+  currentSession: (sessionId: string) => SessionView | null;
+  refresh: () => Promise<void>;
+  resume: (session: SessionView) => Promise<void>;
+  send: (session: SessionView, text: string) => Promise<void>;
+  attempts?: number;
+  delay?: () => Promise<void>;
+}
+
 function profileLabel(profile: ExecutionProfile): string {
   return profile === "full-access" ? "Full access"
     : profile === "execute" ? "Execute"
@@ -135,6 +144,62 @@ export async function profileConfirmedSend(
     if (!changedProfile) throw error;
     const detail = error instanceof Error ? ` ${error.message}` : "";
     throw new Error(`Profile changed to ${profileLabel(profile)}, but the prompt was not sent. Retry sends only the message.${detail}`);
+  }
+}
+
+/**
+ * Resumes an ended, resume-only conversation, confirms the fresh writable
+ * generation, and sends the operator's draft exactly once against that view.
+ */
+export async function resumeConfirmedSend(
+  initial: SessionView,
+  text: string,
+  operations: ResumeConfirmedSendOperations,
+): Promise<void> {
+  const prompt = text.trim();
+  if (!prompt) throw new Error("Enter a prompt before sending.");
+  const baseline = operations.currentSession(initial.id) ?? initial;
+  if (baseline.archived) throw new Error("Archived sessions are read-only.");
+  if (baseline.control.capabilities.includes("queue")) {
+    await operations.send(baseline, prompt);
+    return;
+  }
+  if (!["completed", "failed", "interrupted"].includes(baseline.status)) {
+    throw new Error(baseline.control.withheld.find((item) => item.capability === "queue")?.reason
+      ?? "This session cannot queue messages.");
+  }
+  if (!baseline.control.capabilities.includes("resume")) {
+    throw new Error(baseline.control.withheld.find((item) => item.capability === "resume")?.reason
+      ?? "This session cannot resume. The prompt was not sent.");
+  }
+
+  await operations.resume(baseline);
+  const attempts = Math.max(1, Math.min(10, Math.floor(operations.attempts ?? 4)));
+  let current: SessionView | null = null;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    await operations.refresh();
+    const candidate = operations.currentSession(initial.id);
+    if (
+      candidate
+      && !candidate.archived
+      && candidate.generation !== baseline.generation
+      && candidate.status === "idle"
+      && candidate.control.capabilities.includes("queue")
+    ) {
+      current = candidate;
+      break;
+    }
+    if (attempt + 1 < attempts) await (operations.delay?.() ?? new Promise<void>((resolve) => setTimeout(resolve, 100)));
+  }
+  if (!current) {
+    throw new Error("Could not confirm a fresh writable session after resuming. The prompt was not sent.");
+  }
+
+  try {
+    await operations.send(current, prompt);
+  } catch (error) {
+    const detail = error instanceof Error ? ` ${error.message}` : "";
+    throw new Error(`Session resumed, but the prompt was not sent. Retry sends only the message.${detail}`);
   }
 }
 
@@ -230,6 +295,13 @@ export function isStaleRequestRace(error: unknown): boolean {
 
 export function isStaleActionUpdate(update: WireActionUpdate): boolean {
   return update.status === "failed" && update.error?.code === "REQUEST_STALE";
+}
+
+/** Generic successes stay quiet; a queued notice only lives until completion. */
+export function noticeAfterActionUpdate(current: string | null, update: WireActionUpdate): string | null {
+  if (update.status === "queued") return "Message queued.";
+  if (update.status === "succeeded" && current === "Message queued.") return null;
+  return current;
 }
 
 function conflictExpiry(error: unknown): string | null | undefined {
@@ -534,8 +606,9 @@ export function useCockpit() {
         if (event.type === "action.updated") {
           const reconciliation = reconcileStaleAction(event.payload);
           if (reconciliation) void reconciliation;
-          else if (event.payload.status === "queued") setNotice("Message queued.");
-          else if (event.payload.status === "succeeded") setNotice("Action completed.");
+          else if (event.payload.status === "queued" || event.payload.status === "succeeded") {
+            setNotice((current) => noticeAfterActionUpdate(current, event.payload));
+          }
           else if (event.payload.status === "failed" || event.payload.status === "unknown") setActionError(event.payload.error?.message ?? (event.payload.status === "unknown" ? "The action outcome is unknown and was not replayed." : "The action failed."));
         }
       },
@@ -744,14 +817,37 @@ export function useCockpit() {
 
   const sendMessage = useCallback(async (session: SessionView, text: string, delivery: "queue" | "steer") => {
     const trimmed = text.trim(); if (!trimmed) return;
-    if (!session.control.capabilities.includes(delivery)) throw new Error(session.control.withheld.find((item) => item.capability === delivery)?.reason ?? `This session cannot ${delivery} messages.`);
+    const latest = snapshotRef.current.sessions.find((item) => item.id === session.id) ?? session;
+    const resumeOnSend = delivery === "queue"
+      && !latest.archived
+      && ["completed", "failed", "interrupted"].includes(latest.status)
+      && !latest.control.capabilities.includes("queue")
+      && latest.control.capabilities.includes("resume");
+    if (!latest.control.capabilities.includes(delivery) && !resumeOnSend) {
+      throw new Error(latest.control.withheld.find((item) => item.capability === delivery)?.reason ?? `This session cannot ${delivery} messages.`);
+    }
+    if (resumeOnSend) {
+      if (!mutationsReady) throw new Error("Reconnect before resuming this session and sending the message.");
+      await resumeConfirmedSend(latest, trimmed, {
+        currentSession: (sessionId) => snapshotRef.current.sessions.find((item) => item.id === sessionId) ?? null,
+        refresh,
+        resume: (current) => perform(current, { type: "resume", ...expectedState(current) }),
+        send: (current, prompt) => perform(current, {
+          type: "send",
+          delivery: "queue",
+          text: prompt,
+          ...expectedState(current, idempotencyKey()),
+        }),
+      });
+      return;
+    }
     const key = idempotencyKey();
     if (!mutationsReady) {
-      setOutbox((current) => enqueueOfflineMessage(current, { id: key, sessionId: session.id, text: trimmed, delivery, idempotencyKey: key, baseline: outboxState(session), queuedAt: new Date().toISOString() }));
+      setOutbox((current) => enqueueOfflineMessage(current, { id: key, sessionId: latest.id, text: trimmed, delivery, idempotencyKey: key, baseline: outboxState(latest), queuedAt: new Date().toISOString() }));
       setNotice("Message held locally until the cockpit reconnects."); return;
     }
-    await perform(session, { type: "send", delivery, text: trimmed, ...expectedState(session, key) });
-  }, [mutationsReady, perform]);
+    await perform(latest, { type: "send", delivery, text: trimmed, ...expectedState(latest, key) });
+  }, [mutationsReady, perform, refresh]);
 
   const respond = useCallback((session: SessionView, requestId: string, response: RequestResponse) => perform(session, { type: "respond", requestId, response, ...expectedState(session) }), [perform]);
   const interrupt = useCallback((session: SessionView) => perform(session, { type: "interrupt", ...expectedState(session) }), [perform]);

@@ -30,14 +30,6 @@ import type { PlanFileResponse } from "../lib/api";
 const DATA_PREFIX = "agent-manager.";
 /** Namespace for cockpit-supplied part metadata, per assistant-ui's convention. */
 export const PART_METADATA_KEY = "agent-manager";
-/*
-  assistant-ui intentionally removes reasoning parts whose text trims empty.
-  Provider-opaque reasoning has no readable text, so an invisible word joiner
-  keeps the real chronological part in its runtime. The opaque renderer never
-  mounts ReasoningContent or ReasoningText, so this transport sentinel cannot
-  become displayed or copied reasoning content.
-*/
-const OPAQUE_REASONING_SENTINEL = "\u2060";
 type ThreadContent = Exclude<ThreadMessageLike["content"], string>;
 type ThreadContentPart = ThreadContent extends readonly (infer Part)[] ? Part : never;
 
@@ -163,17 +155,20 @@ function activityParts(
     ];
   }
   if (item.kind === "reasoning") {
+    // A provider record with no public summary contains nothing the operator
+    // can inspect. Keeping a disabled marker for every encrypted block made
+    // Codex look as though it emitted visible reasoning between every tool.
+    if (item.opaque || !item.text.trim()) return [];
     // Codex projects one thought twice — a `summary-N` labelled "Thinking" and a
     // `raw-N` labelled "Provider reasoning". Dropping the label rendered them as
     // two identical "Reasoning" rows, which reads as a duplicated event. The
     // label is the provider's own, so it travels in `providerMetadata`.
     const metadata = {
       ...(item.label ? { label: item.label } : {}),
-      ...(item.opaque ? { opaque: true } : {}),
     };
     return [{
       type: "reasoning",
-      text: item.opaque ? OPAQUE_REASONING_SENTINEL : item.text,
+      text: item.text,
       status: partStatus(item.state),
       ...(Object.keys(metadata).length > 0
         ? { providerMetadata: { [PART_METADATA_KEY]: metadata } }
@@ -375,14 +370,16 @@ function assistantMessage(
   const facts = turnFacts(factItems);
   const rendered = facts ? items.filter((item) => !restatedByTurnMarker(item, facts)) : items;
   const timing = turnTiming(factItems);
+  const content = [
+    ...rendered.flatMap((item) => activityParts(item, subagents, items)),
+    ...(facts ? [{ type: "data" as const, name: `${DATA_PREFIX}turn-marker`, data: facts }] : []),
+  ] satisfies ThreadContent;
+  if (content.length === 0) return null;
   return {
     id,
     role: "assistant",
     status: messageStatus(state),
-    content: [
-      ...rendered.flatMap((item) => activityParts(item, subagents, items)),
-      ...(facts ? [{ type: "data" as const, name: `${DATA_PREFIX}turn-marker`, data: facts }] : []),
-    ] satisfies ThreadContent,
+    content,
     ...(timing ? { metadata: { custom: {}, timing } } : {}),
     ...(itemDate(items[0]!) ? { createdAt: itemDate(items[0]!) } : {}),
   };
@@ -540,17 +537,12 @@ function turnKeys(ordered: readonly ActivityItem[]): readonly string[] {
 export function activityToThreadMessages(items: readonly ActivityItem[]): ThreadMessageLike[] {
   const ordered = [...items];
   const keys = turnKeys(ordered);
-  const turns = new Map<string, ActivityItem[]>();
   const entries: Array<{ order: number; key: string; items: ActivityItem[] }> = [];
   ordered.forEach((item, order) => {
     const key = keys[order]!;
-    const previous = turns.get(key);
-    if (previous) previous.push(item);
-    else {
-      const grouped = [item];
-      turns.set(key, grouped);
-      entries.push({ order, key, items: grouped });
-    }
+    const previous = entries.at(-1);
+    if (previous?.key === key) previous.items.push(item);
+    else entries.push({ order, key, items: [item] });
   });
   return entries.flatMap((entry) => messagesForTurn(entry.key, entry.items));
 }
@@ -688,7 +680,14 @@ export function currentContext(activity: SessionActivityView): ActivityUsageItem
     item.kind === "usage" && item.contextWindow !== null && item.contextWindow > 0
   ));
   const turns = withWindow.filter((item) => item.scope === "turn");
-  return (turns.length > 0 ? turns : withWindow).at(-1) ?? null;
+  return (turns.length > 0 ? turns : withWindow).reduce<ActivityUsageItem | null>((latest, item) => {
+    if (!latest) return item;
+    const latestAt = latest.updatedAt ? Date.parse(latest.updatedAt) : Number.NaN;
+    const itemAt = item.updatedAt ? Date.parse(item.updatedAt) : Number.NaN;
+    if (Number.isFinite(itemAt) && (!Number.isFinite(latestAt) || itemAt > latestAt)) return item;
+    if (itemAt === latestAt && item.revision > latest.revision) return item;
+    return latest;
+  }, null);
 }
 
 export function todoView(item: ActivityTodoItem, progress: SessionView["todoProgress"] = null): TodoListView {

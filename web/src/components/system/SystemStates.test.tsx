@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { SetupHookOffer, SetupHostProbe } from "../../../../src/shared/setup.ts";
 import type { SelectedSessionFactsResponse } from "../../../../src/shared/session-facts.ts";
 import type { CockpitSessionView } from "../../lib/cockpit-view";
-import { EmptyState, FirstRun, HookSetupStep, HostSetupStep, SessionCapabilityPanel, SessionEndedState } from "./SystemStates";
+import { EmptyState, FirstRun, HookSetupStep, HostSetupStep, SessionCapabilityPanel } from "./SystemStates";
 
 function hook(provider: "claude", overrides: Partial<SetupHookOffer> = {}): SetupHookOffer {
   return {
@@ -76,33 +76,6 @@ const facts: SelectedSessionFactsResponse = {
     rateLimits: [{ label: "Codex", planType: "plus", primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: null }, secondary: null, spendControlReached: false }],
   },
 };
-
-describe("SessionEndedState", () => {
-  it("resumes the exact session in the web app before offering a new worktree thread", () => {
-    const onResume = vi.fn();
-    const onContinue = vi.fn();
-    render(<SessionEndedState canResume canContinue onResume={onResume} onContinue={onContinue} />);
-    fireEvent.click(screen.getByRole("button", { name: "Resume here" }));
-    expect(onResume).toHaveBeenCalledOnce();
-    expect(screen.getByText("Continue this exact provider conversation in Agent Manager.")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Start a new thread in this worktree" })).toBeInTheDocument();
-  });
-
-  it("does not imply resume when the harness withdrew it", () => {
-    render(<SessionEndedState canResume={false} canContinue resumeUnavailableReason="Resume is unavailable because the provider queue did not drain." />);
-
-    expect(screen.queryByRole("button", { name: "Resume here" })).not.toBeInTheDocument();
-    expect(screen.getByText("Resume is unavailable because the provider queue did not drain.")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Start a new thread in this worktree" })).toBeInTheDocument();
-  });
-
-  it("shows a busy semantic resume state without exposing a terminal command", () => {
-    render(<SessionEndedState canResume resuming canContinue={false} />);
-
-    expect(screen.getByRole("button", { name: "Resuming…" })).toBeDisabled();
-    expect(screen.queryByText(/agent-manager attach|codex resume/iu)).not.toBeInTheDocument();
-  });
-});
 
 describe("SessionCapabilityPanel", () => {
   it("renders the ordered facts and describes resume as an exact web action", () => {

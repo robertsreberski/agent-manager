@@ -42,7 +42,7 @@ describe("CockpitToast", () => {
     expect(onTakeOver).toHaveBeenCalledOnce();
     expect(onDismiss).not.toHaveBeenCalled();
 
-    rerender(<CockpitToast actionError={null} notice="Action completed." canTakeOver onTakeOver={onTakeOver} onDismiss={onDismiss} />);
+    rerender(<CockpitToast actionError={null} notice="Message held locally until the cockpit reconnects." canTakeOver onTakeOver={onTakeOver} onDismiss={onDismiss} />);
     expect(screen.queryByRole("button", { name: "Use here" })).not.toBeInTheDocument();
   });
 });

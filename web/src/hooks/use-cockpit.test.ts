@@ -6,7 +6,7 @@ import * as authModule from "../lib/auth";
 import * as sseModule from "../lib/sse";
 import type { ControlLease, HostOption, SessionView, StateEvent, WireActionUpdate, WireStateSnapshot, WorkspaceOption } from "../types";
 import { AGENT_MANAGER_BUILD_ID, WireUpgradeRequiredError, WIRE_SCHEMA_VERSION } from "../types";
-import { acquireAutomaticLease, applyStateEvent, generateBrowserClientId, isStaleActionUpdate, isStaleRequestRace, mutationsAreReady, profileConfirmedSend, PROPOSED_PLAN_EXECUTION_PROMPT, releaseHeldSessionLease, releaseLeasesForPageExit, reloadForWireUpgrade, renewForegroundLease, resolveArchivedSelection, sensitiveBoundaryStatus, sessionNeedsForegroundLease, shouldReleaseLeasesForPageHide, shouldRenewForegroundLease, useCockpit, WIRE_UPGRADE_RELOAD_STORAGE_KEY } from "./use-cockpit";
+import { acquireAutomaticLease, applyStateEvent, generateBrowserClientId, isStaleActionUpdate, isStaleRequestRace, mutationsAreReady, noticeAfterActionUpdate, profileConfirmedSend, PROPOSED_PLAN_EXECUTION_PROMPT, releaseHeldSessionLease, releaseLeasesForPageExit, reloadForWireUpgrade, renewForegroundLease, resolveArchivedSelection, resumeConfirmedSend, sensitiveBoundaryStatus, sessionNeedsForegroundLease, shouldReleaseLeasesForPageHide, shouldRenewForegroundLease, useCockpit, WIRE_UPGRADE_RELOAD_STORAGE_KEY } from "./use-cockpit";
 
 function lease(token: string, seconds = 300): ControlLease {
   return { token, clientId: "browser", expiresAt: new Date(Date.now() + seconds * 1_000).toISOString() };
@@ -39,6 +39,21 @@ function proposedPlanSession(profile: SessionView["profile"]["value"] = "plan", 
     control: {
       capabilities: ["set-profile", "queue"],
       withheld: [],
+    },
+  } as unknown as SessionView;
+}
+
+function resumeSession(generation = 7, writable = false): SessionView {
+  return {
+    id: "local:codex:ended",
+    provider: "codex",
+    archived: false,
+    status: writable ? "idle" : "completed",
+    generation,
+    profile: { value: "execute" },
+    control: {
+      capabilities: writable ? ["queue"] : ["resume"],
+      withheld: writable ? [] : [{ capability: "queue", reason: "The provider session is dormant." }],
     },
   } as unknown as SessionView;
 }
@@ -128,6 +143,82 @@ describe("profile-confirmed proposed-plan sends", () => {
     });
     expect(setProfile).toHaveBeenCalledOnce();
     expect(retrySend).toHaveBeenCalledOnce();
+  });
+});
+
+describe("resume-confirmed sends", () => {
+  it("resumes once, confirms a fresh writable generation, then sends once", async () => {
+    const initial = resumeSession();
+    let current = initial;
+    const order: string[] = [];
+    const resume = vi.fn(async () => { order.push("resume"); });
+    const refresh = vi.fn(async () => {
+      order.push("refresh");
+      current = resumeSession(8, true);
+    });
+    const send = vi.fn(async (session: SessionView, prompt: string) => {
+      order.push(`send:${session.generation}:${prompt}`);
+    });
+
+    await resumeConfirmedSend(initial, " Continue ", {
+      currentSession: () => current,
+      refresh,
+      resume,
+      send,
+      delay: async () => undefined,
+    });
+
+    expect(order).toEqual(["resume", "refresh", "send:8:Continue"]);
+    expect(resume).toHaveBeenCalledOnce();
+    expect(send).toHaveBeenCalledOnce();
+  });
+
+  it("does not send when the fresh writable generation cannot be confirmed", async () => {
+    const initial = resumeSession();
+    const resume = vi.fn(async () => undefined);
+    const send = vi.fn(async () => undefined);
+
+    await expect(resumeConfirmedSend(initial, "Continue", {
+      currentSession: () => initial,
+      refresh: async () => undefined,
+      resume,
+      send,
+      attempts: 2,
+      delay: async () => undefined,
+    })).rejects.toThrow("The prompt was not sent");
+
+    expect(resume).toHaveBeenCalledOnce();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("sends directly when a previous retry already made the session writable", async () => {
+    const writable = resumeSession(8, true);
+    const resume = vi.fn(async () => undefined);
+    const refresh = vi.fn(async () => undefined);
+    const send = vi.fn(async () => undefined);
+
+    await resumeConfirmedSend(writable, "Continue", {
+      currentSession: () => writable,
+      refresh,
+      resume,
+      send,
+    });
+
+    expect(resume).not.toHaveBeenCalled();
+    expect(refresh).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledOnce();
+  });
+});
+
+describe("action notices", () => {
+  it("shows queue state but keeps generic completion silent", () => {
+    const queued = actionUpdate({ status: "queued", completedAt: null });
+    const succeeded = actionUpdate({ status: "succeeded" });
+
+    expect(noticeAfterActionUpdate(null, queued)).toBe("Message queued.");
+    expect(noticeAfterActionUpdate("Message queued.", succeeded)).toBeNull();
+    expect(noticeAfterActionUpdate("This browser window can now steer the session.", succeeded))
+      .toBe("This browser window can now steer the session.");
   });
 });
 

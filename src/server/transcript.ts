@@ -614,9 +614,7 @@ function capItems(input: TranscriptItem[]): ParsedItems {
     }
     const capped = utf8Prefix(item.kind === "plan" ? item.markdown : item.text, TRANSCRIPT_LIMITS.messageBytes);
     truncated ||= capped.truncated;
-    if (capped.text.length === 0) {
-      return item.kind === "reasoning" && item.opaque ? [item] : [];
-    }
+    if (capped.text.length === 0) return [];
     return [item.kind === "plan"
       ? { ...item, markdown: capped.text }
       : { ...item, text: capped.text }];
@@ -834,10 +832,11 @@ function codexItems(
     const createdAt = timestamp(outer.timestamp);
 
     if (payload.type === "reasoning") {
-      // `encrypted_content` is intentionally never read. An empty public
-      // summary still represents a real chronological reasoning block, so the
-      // UI receives an opaque marker instead of silently dropping the event.
+      // `encrypted_content` is intentionally never read. Without a public
+      // summary there is no operator-visible content to project; one marker per
+      // encrypted block only produces misleading Reasoning rows between tools.
       const text = codexReasoningSummary(payload);
+      if (!text.trim()) continue;
       const providerId = stringValue(payload.id);
       const id = stableItemId("codex", providerId, fileIdentity, record.offset, "reasoning");
       if (seenIds.has(id)) continue;
@@ -851,7 +850,7 @@ function codexItems(
         createdAt,
         status: "complete",
         label: null,
-        opaque: text.length === 0,
+        opaque: false,
       });
       continue;
     }

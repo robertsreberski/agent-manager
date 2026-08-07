@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { keyboardInset } from "./use-keyboard-inset";
+import { isKeyboardEditor, keyboardInset } from "./use-keyboard-inset";
 
 /*
   iOS does not resize the layout viewport for the keyboard — it paints over the
@@ -27,9 +27,26 @@ describe("keyboard inset", () => {
     // A zoom that hides 60px is not a keyboard, and treating it as one would
     // shove the composer up the screen while the operator is reading.
     expect(keyboardInset({ height: 784, offsetTop: 0 } as VisualViewport, 844)).toBe(0);
+    expect(keyboardInset({ height: 500, offsetTop: 0, scale: 1.5 } as VisualViewport, 844)).toBe(0);
   });
 
   it("never reports a negative strip when the visual viewport is the taller one", () => {
     expect(keyboardInset({ height: 900, offsetTop: 0 } as VisualViewport, 844)).toBe(0);
+  });
+});
+
+describe("keyboard editor focus", () => {
+  it("accepts typing fields and rejects controls that cannot summon the keyboard", () => {
+    const textarea = document.createElement("textarea");
+    const text = document.createElement("input");
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    const select = document.createElement("select");
+
+    expect(isKeyboardEditor(textarea)).toBe(true);
+    expect(isKeyboardEditor(text)).toBe(true);
+    expect(isKeyboardEditor(checkbox)).toBe(false);
+    expect(isKeyboardEditor(select)).toBe(false);
+    expect(isKeyboardEditor(null)).toBe(false);
   });
 });

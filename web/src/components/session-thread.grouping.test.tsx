@@ -146,7 +146,7 @@ describe("thread-level transport and archive states", () => {
     expect(screen.queryByText("No retained transcript is available for this archived session.")).not.toBeInTheDocument();
   });
 
-  it("resumes a dormant exact session in the web app without revealing a CLI command", () => {
+  it("does not add an ended-session dialog to a self-explanatory dormant thread", () => {
     const onResumeInWeb = vi.fn(async () => undefined);
     const dormant = {
       ...session,
@@ -164,9 +164,9 @@ describe("thread-level transport and archive states", () => {
     } as SessionView;
     renderThread([], { session: dormant, onResumeInWeb });
 
-    const resume = screen.getByRole("button", { name: "Resume here" });
-    resume.click();
-    expect(onResumeInWeb).toHaveBeenCalledOnce();
+    expect(screen.queryByText("This session ended")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Resume here" })).not.toBeInTheDocument();
+    expect(onResumeInWeb).not.toHaveBeenCalled();
     expect(screen.queryByRole("button", { name: /Claude Code resume|handoff/iu })).not.toBeInTheDocument();
   });
 });
@@ -198,7 +198,7 @@ describe("memory citations in a rendered thread", () => {
 });
 
 describe("reasoning in a rendered thread", () => {
-  it("renders provider-opaque reasoning as a collapsed non-expandable assistant-ui marker", () => {
+  it("renders no marker for provider reasoning with no readable summary", () => {
     const { container } = renderThread([{
       ...common,
       id: "opaque-reasoning",
@@ -211,15 +211,10 @@ describe("reasoning in a rendered thread", () => {
       opaque: true,
     }]);
 
-    const marker = screen.getByRole("button", { name: "Reasoning" });
-    expect(marker).toBeDisabled();
-    expect(marker).toHaveAttribute("aria-expanded", "false");
-    expect(container.querySelector("[data-reasoning-opaque='true']")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Reasoning" })).not.toBeInTheDocument();
+    expect(container.querySelector("[data-reasoning-opaque]")).not.toBeInTheDocument();
     expect(container.querySelector("[data-slot='reasoning-content']")).toBeNull();
     expect(container.querySelector("[data-slot='reasoning-text']")).toBeNull();
-    expect(container.textContent).not.toContain("\u2060");
-    fireEvent.click(marker);
-    expect(marker).toHaveAttribute("aria-expanded", "false");
   });
 });
 

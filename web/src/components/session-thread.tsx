@@ -15,7 +15,7 @@ import { DISCLOSURE_SCROLL_LOCK_MS, GroupedActivityParts } from "./thread";
 import { MarkdownText } from "./assistant-ui/markdown-text";
 import { QueuedMessageCount, SessionComposer, type ComposerDelivery, type ComposerModelOption } from "./composer";
 import { TodoList } from "./plans";
-import { SessionCapabilityPanel, SessionEndedState } from "./system";
+import { SessionCapabilityPanel } from "./system";
 import {
   ActivityRetentionBoundary,
   activityToThreadMessages,
@@ -309,13 +309,11 @@ export function SessionThread({
   onRefineProposedPlan,
   onRemoveQueued,
   onOpenEditor,
-  onResumeInWeb,
   readKeys,
   onReadChange,
   loadAttach,
   loadSessionFacts,
   loadPlanFile,
-  onContinueInWorkspace,
   onRetryActivity,
   sessionsOnHost,
 }: {
@@ -476,7 +474,6 @@ export function SessionThread({
         <ThreadPrimitive.Messages>
           {({ message }) => message.role === "user" ? <UserMessage /> : message.role === "system" ? <SystemMessage label={systemMessageLabel(message)} /> : <AssistantMessage controls={controls} />}
         </ThreadPrimitive.Messages>
-        {!session.archived && ["completed", "failed", "interrupted"].includes(session.status) && <div><SessionEndedState canResume={session.control.capabilities.includes("resume")} resumeUnavailableReason={session.control.withheld.find(({ capability }) => capability === "resume")?.reason ?? null} resuming={busy} resumeDisabled={!mutationsReady} onResume={() => void onResumeInWeb().catch(() => undefined)} canContinue={Boolean(session.workspaceIdentity?.worktreePath ?? session.cwd)} onContinue={onContinueInWorkspace} /></div>}
         {/*
           Auto-scroll detaches the moment the operator scrolls up, so a long
           turn needs a way back. The primitive renders nothing while the view is
@@ -603,13 +600,20 @@ export function SessionThreadComposer({
   const canSetModel = session.control.capabilities.includes("set-model");
   const canSetEffort = session.control.capabilities.includes("set-effort");
   const active = session.status === "running" || session.status === "waiting";
+  const sessionEnded = ["completed", "failed", "interrupted"].includes(session.status);
+  const canResumeOnSend = sessionEnded
+    && !session.archived
+    && !canQueue
+    && !canSteer
+    && session.control.capabilities.includes("resume");
+  const canComposeQueue = canQueue || canResumeOnSend;
   async function send(delivery: ComposerDelivery) {
     const message = text.trim();
     if (!message) return;
     await onSend(message, delivery);
     setText("");
   }
-  const noWriteReason = !canQueue && !canSteer
+  const noWriteReason = !canComposeQueue && !canSteer
     ? session.control.withheld.find((item) => item.capability === "queue")?.reason ?? "Replies are unavailable."
     : null;
   const takeover = session.control.takeover;
@@ -658,7 +662,6 @@ export function SessionThreadComposer({
     session.control.plane === "observe-only"
     || session.control.withheld.some((item) => /hook (?:bridge|setup)/iu.test(item.reason))
   );
-  const sessionEnded = ["completed", "failed", "interrupted"].includes(session.status);
   const canResumeHere = !sessionEnded
     && !canQueue
     && !canSteer
@@ -788,7 +791,7 @@ export function SessionThreadComposer({
         height on a session that had stopped. The timeline still renders it
         where it happened.
       */}
-      {pinnedTodo?.running && <TodoList list={pinnedTodo} placement="pinned" canMessage={canQueue} canStop={canStop && mutationsReady} onAsk={() => setText("What is happening with the current todo?")} onStop={() => void onInterrupt()} />}
+      {pinnedTodo?.running && <TodoList list={pinnedTodo} placement="pinned" canMessage={canComposeQueue} canStop={canStop && mutationsReady} onAsk={() => setText("What is happening with the current todo?")} onStop={() => void onInterrupt()} />}
       <QueuedMessageCount count={queued.length} />
       {showControlStatus && (
         <Collapsible
@@ -875,14 +878,14 @@ export function SessionThreadComposer({
           )}
         </Collapsible>
       )}
-      {!mutationsReady && (canQueue || canSteer) && <p className="text-center font-mono text-code-xs text-[var(--warning)]">Offline drafts stay on this device and are sent only if the session state is unchanged.</p>}
+      {!mutationsReady && (canComposeQueue || canSteer) && <p className="text-center font-mono text-code-xs text-[var(--warning)]">Offline drafts stay on this device and are sent only if the session state is unchanged.</p>}
       <SessionComposer
         value={text}
         onChange={setText}
         onSend={send}
         onStop={onInterrupt}
         isRunning={active}
-        canQueue={canQueue}
+        canQueue={canComposeQueue}
         canSteer={canSteer}
         canStop={canStop && mutationsReady}
         readOnlyReason={noWriteReason}

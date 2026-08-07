@@ -166,7 +166,7 @@ function claudeRow(input: {
   };
 }
 
-test("Codex reads ordered messages, preserves opaque reasoning, and ignores other internals", () => {
+test("Codex reads ordered messages, drops unreadable reasoning, and ignores other internals", () => {
   const fixture = codexFixture([
     codexMeta(),
     { type: "event_msg", payload: { type: "agent_reasoning", text: "secret" } },
@@ -185,16 +185,14 @@ test("Codex reads ordered messages, preserves opaque reasoning, and ignores othe
 
   assert.equal(result.transcript.state, "available");
   assert.equal(result.transcript.source, "codex-rollout");
-  assert.equal(result.transcript.itemCount, 3);
+  assert.equal(result.transcript.itemCount, 2);
   assert.equal(result.transcript.truncated, false);
   assert.deepEqual(messagesOf(result), [
     { role: "user", text: "Hello" },
     { role: "assistant", text: "Hi there" },
   ]);
   assert.equal(result.items[0]?.id, "codex:user-provider-id");
-  assert.equal(result.items[1]?.kind, "reasoning");
-  assert.equal(result.items[1]?.kind === "reasoning" ? result.items[1].opaque : null, true);
-  assert.match(result.items[2]?.id ?? "", /^codex:file:\d+:\d+:\d+$/);
+  assert.match(result.items[1]?.id ?? "", /^codex:file:\d+:\d+:\d+$/);
   assert.equal(result.items[0]?.createdAt, "2026-08-03T10:00:01.000Z");
   assert.equal(result.items[0]?.correlationId, "message:user-provider-id");
 });
@@ -1067,13 +1065,11 @@ test("Codex exposes reasoning summaries and paired tool calls without leaking en
   assert.deepEqual(result.items.map((item) => item.kind), [
     "message",
     "reasoning",
-    "reasoning",
     "tool",
     "tool",
     "message",
   ]);
-  assert.deepEqual(result.items.slice(1, 5).map((item) => item.id), [
-    "codex:reasoning:rs_encrypted",
+  assert.deepEqual(result.items.slice(1, 4).map((item) => item.id), [
     "codex:reasoning:rs_visible",
     "codex:tool:call_shell",
     "codex:tool:call_fn",
@@ -1082,7 +1078,6 @@ test("Codex exposes reasoning summaries and paired tool calls without leaking en
 
   const reasoning = result.items.filter((item) => item.kind === "reasoning");
   assert.deepEqual(reasoning.map((item) => ({ text: item.text, opaque: item.opaque })), [
-    { text: "", opaque: true },
     { text: "Listing the workspace.", opaque: false },
   ]);
 

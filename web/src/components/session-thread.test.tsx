@@ -400,7 +400,8 @@ describe("SessionThreadComposer", () => {
     expect(screen.queryByText(/agent-manager attach/iu)).not.toBeInTheDocument();
   });
 
-  it("leaves a stopped Claude session's single resume action to the ended-session panel", () => {
+  it("lets an ended resume-only session send through transparent resume", async () => {
+    const onSend = vi.fn(async () => undefined);
     const dormantClaude = {
       ...session,
       provider: "claude",
@@ -419,7 +420,7 @@ describe("SessionThreadComposer", () => {
       activity={activity}
       busy={false}
       mutationsReady
-      onSend={vi.fn(async () => undefined)}
+      onSend={onSend}
       onInterrupt={vi.fn(async () => undefined)}
       onSetProfile={vi.fn(async () => undefined)}
       onSetSandbox={vi.fn()}
@@ -429,7 +430,13 @@ describe("SessionThreadComposer", () => {
       modelOptionsStatus={null}
     />);
 
-    expect(screen.queryByRole("button", { name: /Claude Code (?:resume|handoff)|Move control/iu })).not.toBeInTheDocument();
+    const textbox = screen.getByRole("textbox", { name: "Message" });
+    expect(textbox).toBeEnabled();
+    expect(screen.queryByText("This session ended")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Resume here" })).not.toBeInTheDocument();
+    fireEvent.change(textbox, { target: { value: "Continue from here" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith("Continue from here", "queue"));
   });
 
   it("resumes a non-ended resume-only session directly in the web app", async () => {

@@ -72,7 +72,7 @@ function partLabels(message: { content: unknown }): string[] {
 }
 
 describe("turn timeline ordering", () => {
-  it("carries an opaque reasoning marker through assistant-ui metadata", () => {
+  it("drops reasoning records that expose no readable summary", () => {
     const item: ActivityItem = {
       ...common,
       id: "reasoning-opaque",
@@ -83,18 +83,7 @@ describe("turn timeline ordering", () => {
       text: "",
       opaque: true,
     };
-    const message = activityToThreadMessages([item])[0]!;
-    const part = (message.content as ReadonlyArray<{
-      type: string;
-      text?: string;
-      providerMetadata?: Record<string, unknown>;
-    }>)[0];
-
-    expect(part).toMatchObject({
-      type: "reasoning",
-      providerMetadata: { "agent-manager": { opaque: true } },
-    });
-    expect(part?.text).not.toContain("encrypted");
+    expect(activityToThreadMessages([item])).toEqual([]);
   });
 
   it("keeps a recorded assistant message in sequence with body activity", () => {
@@ -198,6 +187,31 @@ describe("turn timeline ordering", () => {
     expect(parts.map((part) => part.type)).toEqual([
       "text", "data", "tool-call", "reasoning", "data",
     ]);
+  });
+
+  it("keeps late activity at the end when an older turn id resumes after another turn", () => {
+    const items: ActivityItem[] = [
+      {
+        ...common, id: "todo-a", seq: 1, turnId: "turn-a",
+        kind: "todo", steps: [], added: 0, removed: 0,
+      },
+      {
+        ...common, id: "tool-b", seq: 2, turnId: "turn-b",
+        kind: "tool", toolCallId: "tool-b", name: "exec", category: "command",
+        arguments: null, result: "ok", output: "",
+      },
+      {
+        ...common, id: "late-a", seq: 3, turnId: "turn-a",
+        kind: "message", role: "assistant", phase: "commentary", text: "Appended after the todo", label: null,
+      },
+    ];
+
+    const messages = activityToThreadMessages(items);
+    expect(messages).toHaveLength(3);
+    expect(partLabels(messages[0]!)).toEqual(["data:agent-manager.todo"]);
+    expect(partLabels(messages[1]!)).toEqual(["tool-call"]);
+    expect(partLabels(messages[2]!)).toEqual(["text"]);
+    expect((messages[2]!.content as ReadonlyArray<{ text?: string }>)[0]?.text).toBe("Appended after the todo");
   });
 });
 

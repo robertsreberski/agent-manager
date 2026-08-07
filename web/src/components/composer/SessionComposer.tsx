@@ -630,11 +630,10 @@ export function SessionComposer(props: SessionComposerProps) {
           is noise, where attachments are tracked work.
         */}
         <Button variant="ghost" size="icon" disabled aria-label="Attach files unavailable" title="Attachments are not supported yet — tracked in #6" className={`hidden size-8 text-[var(--text-faint)] sm:inline-flex ${KEEPS_ITS_TOOLTIP}`}><Paperclip size={16} strokeWidth={1.75} /></Button>
-        {isRunning && canStop ? (
+        {isRunning && canStop && (
           <Button variant="ghost" size="icon" data-compact-control className="size-[30px] rounded-full bg-[var(--text)] text-[var(--app)] hover:bg-[var(--text-secondary)] hover:text-[var(--app)]" aria-label="Stop turn" onClick={() => void onStop?.()}><Square size={11} strokeWidth={2} /></Button>
-        ) : (
-          <Button variant="primary" size="icon" data-compact-control disabled={sendDisabled} className="size-[30px]" aria-label={isRunning ? "Queue message" : "Send message"} onClick={() => void send("queue")}><ArrowUp size={15} strokeWidth={2} /></Button>
         )}
+        <Button variant="primary" size="icon" data-compact-control disabled={sendDisabled} className="size-[30px]" aria-label={isRunning ? "Queue message" : "Send message"} onClick={() => void send("queue")}><ArrowUp size={15} strokeWidth={2} /></Button>
         </div>
       </div>
     </div>

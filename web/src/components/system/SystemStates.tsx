@@ -1,4 +1,4 @@
-import { AlertTriangle, Check, ChevronRight, CircleHelp, CircleX, Copy, FolderGit2, LoaderCircle, Plus, PlugZap, RotateCcw, Server, Trash2, WifiOff, X } from "lucide-react";
+import { AlertTriangle, Check, ChevronRight, CircleHelp, CircleX, Copy, FolderGit2, LoaderCircle, Plus, PlugZap, Server, Trash2, WifiOff, X } from "lucide-react";
 import { workspaceChangeFacts, workspaceChangeLabel, type CockpitSessionView, type SessionCapability } from "../../lib/cockpit-view";
 import type { SetupHookOffer, SetupHostProbe, SetupNearbyWorkspace } from "../../../../src/shared/setup.ts";
 import type { SelectedSessionFactsResponse, SessionTurnUsage } from "../../../../src/shared/session-facts.ts";
@@ -46,33 +46,6 @@ export function EmptyState({ repositories, onOpen }: { repositories: readonly { 
     <section className="mx-auto max-w-lg p-8 text-center">
       <FolderGit2 size={24} className="mx-auto text-[var(--text-muted)]" /><h2 className="mt-4 text-title">No agent sessions yet</h2><p className="mt-1 text-meta text-[var(--text-muted)]">Start a thread in a repository already visible to Agent Manager.</p>
       <div className="mt-5 grid gap-2">{repositories.map((repo) => <Button key={repo.id} variant="secondary" size="touch" className="w-full justify-start border-[var(--border)] px-3 text-left" onClick={() => onOpen(repo.id)}><span className="min-w-0 flex-1"><strong className="block text-meta">{repo.name}</strong><span className="block truncate font-mono text-code-xs text-[var(--text-muted)]">{repo.path}</span></span><ChevronRight size={14} /></Button>)}</div>
-    </section>
-  );
-}
-
-export function SessionEndedState({
-  canResume,
-  resumeUnavailableReason,
-  resuming = false,
-  resumeDisabled = false,
-  onResume,
-  canContinue,
-  onContinue,
-}: {
-  canResume: boolean;
-  resumeUnavailableReason?: string | null;
-  resuming?: boolean;
-  resumeDisabled?: boolean;
-  onResume?: () => void;
-  canContinue: boolean;
-  onContinue?: () => void;
-}) {
-  return (
-    <section className="border border-[var(--border)] p-4 text-center"><Check size={18} className="mx-auto text-[var(--text-muted)]" /><h3 className="mt-2 text-body-sm font-semibold">This session ended</h3>
-      {canResume && <><p className="mt-1 text-meta-sm text-[var(--text-muted)]">Continue this exact provider conversation in Agent Manager.</p><Button variant="primary" size="touch" className="mx-auto mt-3 gap-1.5" disabled={resuming || resumeDisabled} onClick={onResume}><RotateCcw size={13} />{resuming ? "Resuming…" : "Resume here"}</Button></>}
-      {!canResume && resumeUnavailableReason && <p className="mt-2 text-code-sm text-[var(--text-muted)]">{resumeUnavailableReason}</p>}
-      {canContinue && <Button variant={canResume ? "ghost" : "primary"} size="touch" className={`mx-auto gap-1.5 ${canResume ? "mt-2 underline" : "mt-3"}`} onClick={onContinue}><RotateCcw size={13} />Start a new thread in this worktree</Button>}
-      {!canResume && !canContinue && !resumeUnavailableReason && <p className="mt-1 text-meta-sm text-[var(--text-muted)]">This harness does not expose a safe continuation.</p>}
     </section>
   );
 }

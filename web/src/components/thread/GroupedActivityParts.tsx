@@ -198,30 +198,24 @@ function ReasoningDisclosure({
   text,
   label,
   streaming = false,
-  opaque = false,
 }: {
   text: string;
   label?: string | undefined;
   streaming?: boolean;
-  opaque?: boolean;
 }) {
+  if (!text.trim()) return null;
   return (
     <ReasoningRoot
-      streaming={!opaque && streaming}
-      {...(opaque ? { open: false } : {})}
+      streaming={streaming}
       className={CONTAINED}
-      data-reasoning-opaque={opaque ? "true" : "false"}
     >
       <ReasoningTrigger
-        active={!opaque && streaming}
-        disabled={opaque}
+        active={streaming}
         {...(label ? { label } : {})}
       />
-      {!opaque && (
-        <ReasoningContent aria-busy={streaming}>
-          <ReasoningText>{text}</ReasoningText>
-        </ReasoningContent>
-      )}
+      <ReasoningContent aria-busy={streaming}>
+        <ReasoningText>{text}</ReasoningText>
+      </ReasoningContent>
     </ReasoningRoot>
   );
 }
@@ -258,7 +252,10 @@ function SubagentStep({ item, renderData }: { item: ActivityItem; renderData?: (
       ...(itemTiming ? { timing: itemTiming } : {}),
     }} />;
   }
-  if (item.kind === "reasoning") return <ReasoningDisclosure text={item.text} opaque={item.opaque === true} {...(item.label ? { label: item.label } : {})} />;
+  if (item.kind === "reasoning") {
+    if (item.opaque || !item.text.trim()) return null;
+    return <ReasoningDisclosure text={item.text} {...(item.label ? { label: item.label } : {})} />;
+  }
   if (item.kind === "message") {
     return (
       <div className={`py-1 text-meta-sm ${CONTAINED}`} data-subagent-message-role={item.role}>
@@ -287,6 +284,7 @@ interface SubagentStepRun {
 function subagentStepRuns(steps: readonly ActivityItem[]): readonly SubagentStepRun[] {
   const runs: SubagentStepRun[] = [];
   for (const step of steps) {
+    if (step.kind === "reasoning" && (step.opaque || !step.text.trim())) continue;
     const previous = runs.at(-1);
     if (step.kind !== "tool") {
       runs.push({ kind: "single", key: step.id, items: [step] });
@@ -359,15 +357,14 @@ export interface GroupedActivityPartsProps {
 /** Provider-supplied reasoning display facts carried through assistant-ui. */
 function reasoningMetadata(
   part: { providerMetadata?: Record<string, unknown> | undefined },
-): { label?: string; opaque?: boolean } {
+): { label?: string } {
   const scoped = part.providerMetadata?.["agent-manager"];
   const metadata = scoped && typeof scoped === "object"
-    ? scoped as { label?: unknown; opaque?: unknown }
+    ? scoped as { label?: unknown }
     : null;
   const label = metadata?.label;
-  const result: { label?: string; opaque?: boolean } = {};
+  const result: { label?: string } = {};
   if (typeof label === "string" && label.length > 0) result.label = label;
-  if (metadata?.opaque === true) result.opaque = true;
   return result;
 }
 

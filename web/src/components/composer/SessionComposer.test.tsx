@@ -386,6 +386,16 @@ describe("SessionComposer", () => {
     expect(screen.queryByRole("button", { name: "Stop turn" })).not.toBeInTheDocument();
   });
 
+  it("keeps queue delivery available beside Stop while a turn is running", () => {
+    const onSend = renderComposer({ isRunning: true, canQueue: true, canStop: true, value: "Follow up" });
+
+    expect(screen.getByRole("button", { name: "Stop turn" })).toBeInTheDocument();
+    const queue = screen.getByRole("button", { name: "Queue message" });
+    expect(queue).toBeEnabled();
+    fireEvent.click(queue);
+    expect(onSend).toHaveBeenCalledWith("queue");
+  });
+
   it("groups every control into a composer-width responsive toolbar", () => {
     renderComposer({
       model: "gpt-5.6-sol",
@@ -427,5 +437,6 @@ describe("SessionComposer", () => {
 
     render(<SessionComposer value="" onChange={vi.fn()} onSend={vi.fn()} onStop={vi.fn()} isRunning canQueue canSteer={false} canStop provider="codex" model="gpt" effort="medium" profile="execute" />);
     expect(screen.getByRole("button", { name: "Stop turn" })).toHaveAttribute("data-compact-control");
+    expect(screen.getByRole("button", { name: "Queue message" })).toHaveAttribute("data-compact-control");
   });
 });

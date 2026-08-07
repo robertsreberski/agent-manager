@@ -148,6 +148,33 @@ describe("context usage", () => {
     expect(currentContext(view)?.id).toBe("usage-turn");
   });
 
+  it("uses the most recently updated turn after compaction, not its original timeline slot", () => {
+    const compacted = {
+      ...usage,
+      id: "usage-compacted",
+      revision: 7,
+      totalTokens: 8_568,
+      contextWindow: 200_000,
+      updatedAt: "2026-08-07T02:27:01.771Z",
+    };
+    const insertedLaterButStale = {
+      ...usage,
+      id: "usage-later-slot",
+      revision: 1,
+      totalTokens: 180_754,
+      contextWindow: 200_000,
+      updatedAt: "2026-08-07T02:18:20.913Z",
+    };
+    const view = {
+      items: [compacted, insertedLaterButStale],
+      truncated: false,
+      connection: "open",
+    } as unknown as SessionActivityView;
+
+    expect(currentContext(view)?.id).toBe("usage-compacted");
+    expect(currentContext(view)?.totalTokens).toBe(8_568);
+  });
+
   it("states no context at all where no provider stated a window", () => {
     const view = {
       items: [{ ...usage, contextWindow: null }],
