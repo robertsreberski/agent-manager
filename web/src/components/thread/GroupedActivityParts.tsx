@@ -194,13 +194,34 @@ export function ToolCall({ part }: { part: ToolPart }) {
  * labels are what tell them apart, and a fixed "Reasoning" made the pair read
  * as one event rendered twice.
  */
-function ReasoningDisclosure({ text, label, streaming = false }: { text: string; label?: string | undefined; streaming?: boolean }) {
+function ReasoningDisclosure({
+  text,
+  label,
+  streaming = false,
+  opaque = false,
+}: {
+  text: string;
+  label?: string | undefined;
+  streaming?: boolean;
+  opaque?: boolean;
+}) {
   return (
-    <ReasoningRoot streaming={streaming} className={CONTAINED}>
-      <ReasoningTrigger active={streaming} {...(label ? { label } : {})} />
-      <ReasoningContent aria-busy={streaming}>
-        <ReasoningText>{text}</ReasoningText>
-      </ReasoningContent>
+    <ReasoningRoot
+      streaming={!opaque && streaming}
+      {...(opaque ? { open: false } : {})}
+      className={CONTAINED}
+      data-reasoning-opaque={opaque ? "true" : "false"}
+    >
+      <ReasoningTrigger
+        active={!opaque && streaming}
+        disabled={opaque}
+        {...(label ? { label } : {})}
+      />
+      {!opaque && (
+        <ReasoningContent aria-busy={streaming}>
+          <ReasoningText>{text}</ReasoningText>
+        </ReasoningContent>
+      )}
     </ReasoningRoot>
   );
 }
@@ -237,7 +258,7 @@ function SubagentStep({ item, renderData }: { item: ActivityItem; renderData?: (
       ...(itemTiming ? { timing: itemTiming } : {}),
     }} />;
   }
-  if (item.kind === "reasoning") return <ReasoningDisclosure text={item.text} {...(item.label ? { label: item.label } : {})} />;
+  if (item.kind === "reasoning") return <ReasoningDisclosure text={item.text} opaque={item.opaque === true} {...(item.label ? { label: item.label } : {})} />;
   if (item.kind === "message") {
     return (
       <div className={`py-1 text-meta-sm ${CONTAINED}`} data-subagent-message-role={item.role}>
@@ -335,13 +356,19 @@ export interface GroupedActivityPartsProps {
   renderData?: (name: string, data: unknown) => React.ReactNode;
 }
 
-/** The provider's own reasoning label, where it supplied one. */
-function reasoningLabel(part: { providerMetadata?: Record<string, unknown> | undefined }): { label?: string } {
+/** Provider-supplied reasoning display facts carried through assistant-ui. */
+function reasoningMetadata(
+  part: { providerMetadata?: Record<string, unknown> | undefined },
+): { label?: string; opaque?: boolean } {
   const scoped = part.providerMetadata?.["agent-manager"];
-  const label = scoped && typeof scoped === "object" && "label" in scoped
-    ? (scoped as { label?: unknown }).label
-    : undefined;
-  return typeof label === "string" && label.length > 0 ? { label } : {};
+  const metadata = scoped && typeof scoped === "object"
+    ? scoped as { label?: unknown; opaque?: unknown }
+    : null;
+  const label = metadata?.label;
+  const result: { label?: string; opaque?: boolean } = {};
+  if (typeof label === "string" && label.length > 0) result.label = label;
+  if (metadata?.opaque === true) result.opaque = true;
+  return result;
 }
 
 export function GroupedActivityParts({ renderData }: GroupedActivityPartsProps) {
@@ -358,7 +385,7 @@ export function GroupedActivityParts({ renderData }: GroupedActivityPartsProps) 
           case "group-tools": return <ToolGroup status={part.status} indices={part.indices}>{children}</ToolGroup>;
           case "group-subagent": return <div className={`gap-2 ${STACK}`}>{children}</div>;
           case "text": return <MarkdownText />;
-          case "reasoning": return <ReasoningDisclosure text={part.text} {...reasoningLabel(part)} />;
+          case "reasoning": return <ReasoningDisclosure text={part.text} {...reasoningMetadata(part)} />;
           case "tool-call": return <ToolCall part={part} />;
           case "data": {
             if (part.dataRendererUI) return part.dataRendererUI;

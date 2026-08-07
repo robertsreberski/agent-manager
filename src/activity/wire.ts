@@ -256,6 +256,7 @@ export function parseActivityItem(value: unknown, label = "activity item"): Acti
       break;
     case "reasoning":
       specific.push("reasoningKind", "label", "text");
+      if (Object.hasOwn(item, "opaque")) specific.push("opaque");
       break;
     case "plan":
       specific.push("path", "version", "markdown", "supersededBy", "approvalRequestId", "approvedAt");
@@ -300,6 +301,7 @@ export function parseActivityItem(value: unknown, label = "activity item"): Acti
       enumeration(item.reasoningKind, ["summary", "raw"], `${label}.reasoningKind`);
       nullableString(item.label, `${label}.label`);
       string(item.text, `${label}.text`);
+      if (Object.hasOwn(item, "opaque")) boolean(item.opaque, `${label}.opaque`);
       break;
     case "plan":
       nullableString(item.path, `${label}.path`);

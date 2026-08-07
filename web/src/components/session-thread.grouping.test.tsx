@@ -197,6 +197,32 @@ describe("memory citations in a rendered thread", () => {
   });
 });
 
+describe("reasoning in a rendered thread", () => {
+  it("renders provider-opaque reasoning as a collapsed non-expandable assistant-ui marker", () => {
+    const { container } = renderThread([{
+      ...common,
+      id: "opaque-reasoning",
+      seq: 1,
+      turnId: "turn-1",
+      kind: "reasoning",
+      reasoningKind: "summary",
+      label: null,
+      text: "",
+      opaque: true,
+    }]);
+
+    const marker = screen.getByRole("button", { name: "Reasoning" });
+    expect(marker).toBeDisabled();
+    expect(marker).toHaveAttribute("aria-expanded", "false");
+    expect(container.querySelector("[data-reasoning-opaque='true']")).toBeInTheDocument();
+    expect(container.querySelector("[data-slot='reasoning-content']")).toBeNull();
+    expect(container.querySelector("[data-slot='reasoning-text']")).toBeNull();
+    expect(container.textContent).not.toContain("\u2060");
+    fireEvent.click(marker);
+    expect(marker).toHaveAttribute("aria-expanded", "false");
+  });
+});
+
 describe("tool grouping in a rendered thread", () => {
   it("coalesces a run of tool calls a provider never assigned a turn to", () => {
     const { container } = renderThread([

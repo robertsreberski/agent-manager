@@ -19,6 +19,7 @@ import { workspaceResolutionResponseSchema } from "../shared/workspace.ts";
 import type {
   PanePreviewAdapter,
   ProviderControlAdapter,
+  ProviderSessionObservation,
   SessionAction,
 } from "./contracts.ts";
 import type { LocalCliProcessInspector } from "./cli-takeover.ts";
@@ -2352,4 +2353,50 @@ test("durable idempotency receipts prevent replay after a server restart", async
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("discovery observations reach a retained manager-owned Codex session", async (t) => {
+  const observations: ProviderSessionObservation[] = [];
+  const adapter: ProviderControlAdapter = {
+    async createSession() { return session(); },
+    observeSession(observation) { observations.push(structuredClone(observation)); },
+    async performAction() { return { status: "succeeded" }; },
+  };
+  const managed = session({ status: "idle", providerStatus: "idle" });
+  const backend = await createAgentManagerServer({
+    discovery: false,
+    staticDir: false,
+    adapters: { codex: adapter },
+    initialSessions: [managed],
+  });
+  t.after(() => backend.close());
+
+  backend.replaceSessions([session({
+    status: "running",
+    providerStatus: "task_started",
+    statusSource: "rollout-events",
+    updatedAt: "2026-08-06T10:00:00.000Z",
+    control: observeOnlyControl(),
+  })]);
+
+  assert.equal(observations.length, 1);
+  assert.deepEqual(observations[0], {
+    managerSessionId: managed.id,
+    provider: "codex",
+    providerThreadId: managed.providerThreadId,
+    status: "running",
+    providerStatus: "task_started",
+    statusSource: "rollout-events",
+    observedTurnId: null,
+    observedAt: "2026-08-06T10:00:00.000Z",
+    profile: managed.profile,
+    sandbox: managed.sandbox,
+    model: managed.model,
+    effort: managed.effort,
+  });
+  assert.equal(
+    backend.state.get(managed.id)?.control.authority,
+    "manager",
+    "the manager record is retained while its observation is reconciled by the adapter",
+  );
 });

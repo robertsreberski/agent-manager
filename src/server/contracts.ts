@@ -411,6 +411,22 @@ export const sessionSettingsOptionsSchema: z.ZodType<SessionSettingsOptions> = z
  * arbitrary RPC method or shell command. Implementations must still verify
  * provider request/turn identifiers immediately before dispatch.
  */
+export interface ProviderSessionObservation {
+  managerSessionId: string;
+  provider: Provider;
+  providerThreadId: string;
+  status: SessionView["status"];
+  providerStatus: string | null;
+  statusSource: SessionView["statusSource"];
+  /** Rollout identity for ordering only; never exact mutation authority. */
+  observedTurnId: string | null;
+  observedAt: string | null;
+  profile: SessionView["profile"] | null;
+  sandbox: SessionView["sandbox"] | null;
+  model: SessionView["model"] | null;
+  effort: SessionView["effort"] | null;
+}
+
 export interface ProviderControlAdapter {
   createSession(input: CreateSessionInput, context: RequestContext): Promise<SessionView>;
   /**
@@ -465,6 +481,12 @@ export interface ProviderControlAdapter {
     session: SessionView,
     context: RequestContext,
   ): Promise<() => void | Promise<void>>;
+  /**
+   * Reconcile provider-owned transcript/discovery facts without promoting them
+   * to exact control authority. Used when another CLI is writing the same
+   * shared conversation but this adapter connection receives stale idle state.
+   */
+  observeSession?(observation: ProviderSessionObservation): void;
   performAction(
     session: SessionView,
     action: SessionAction,

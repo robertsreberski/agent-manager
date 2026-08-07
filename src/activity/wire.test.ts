@@ -34,6 +34,36 @@ test("accepts and clones an exact activity frame", () => {
   );
 });
 
+test("round-trips an opaque reasoning marker and validates its flag", () => {
+  const frame = new ActivityHub({ streamEpoch: "opaque-reasoning" }).ingest(
+    "remote-session",
+    "codex",
+    {
+      type: "upsert",
+      item: {
+        id: "reasoning-1",
+        kind: "reasoning",
+        reasoningKind: "summary",
+        text: "",
+        opaque: true,
+      },
+    },
+  );
+  const parsed = parseActivityFrame(frame);
+  assert.equal(
+    parsed.type === "activity.upsert" && parsed.item.kind === "reasoning"
+      ? parsed.item.opaque
+      : null,
+    true,
+  );
+
+  const invalid = structuredClone(frame) as unknown as {
+    item: Record<string, unknown>;
+  };
+  invalid.item.opaque = "true";
+  assert.throws(() => parseActivityFrame(invalid), /opaque/u);
+});
+
 test("strictly validates structured message memory citations", () => {
   const frame = validFrame();
   if (frame.type !== "activity.upsert" || frame.item.kind !== "message") return;

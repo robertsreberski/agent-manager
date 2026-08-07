@@ -30,6 +30,14 @@ import type { PlanFileResponse } from "../lib/api";
 const DATA_PREFIX = "agent-manager.";
 /** Namespace for cockpit-supplied part metadata, per assistant-ui's convention. */
 export const PART_METADATA_KEY = "agent-manager";
+/*
+  assistant-ui intentionally removes reasoning parts whose text trims empty.
+  Provider-opaque reasoning has no readable text, so an invisible word joiner
+  keeps the real chronological part in its runtime. The opaque renderer never
+  mounts ReasoningContent or ReasoningText, so this transport sentinel cannot
+  become displayed or copied reasoning content.
+*/
+const OPAQUE_REASONING_SENTINEL = "\u2060";
 type ThreadContent = Exclude<ThreadMessageLike["content"], string>;
 type ThreadContentPart = ThreadContent extends readonly (infer Part)[] ? Part : never;
 
@@ -159,11 +167,17 @@ function activityParts(
     // `raw-N` labelled "Provider reasoning". Dropping the label rendered them as
     // two identical "Reasoning" rows, which reads as a duplicated event. The
     // label is the provider's own, so it travels in `providerMetadata`.
+    const metadata = {
+      ...(item.label ? { label: item.label } : {}),
+      ...(item.opaque ? { opaque: true } : {}),
+    };
     return [{
       type: "reasoning",
-      text: item.text,
+      text: item.opaque ? OPAQUE_REASONING_SENTINEL : item.text,
       status: partStatus(item.state),
-      ...(item.label ? { providerMetadata: { [PART_METADATA_KEY]: { label: item.label } } } : {}),
+      ...(Object.keys(metadata).length > 0
+        ? { providerMetadata: { [PART_METADATA_KEY]: metadata } }
+        : {}),
     }];
   }
   if (item.kind === "tool") {

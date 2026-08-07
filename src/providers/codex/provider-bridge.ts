@@ -18,6 +18,7 @@ import {
 } from "../shared/capabilities.ts";
 import {
   DEFAULT_SANDBOX_POLICY,
+  normalizeProviderReasoningEffort,
   providerControlCoordination,
   providerEffort,
   sandboxEquals,
@@ -32,6 +33,7 @@ import type {
   ManagedSessionRecoveryRecord,
   ManagedSessionRecoveryReport,
   ProviderControlAdapter,
+  ProviderSessionObservation,
   RequestContext,
   SessionAction,
   SessionSettingsOptions,
@@ -58,6 +60,8 @@ interface ManagedMetadata {
   name: string | null;
   requestedProfile: CreateSessionInput["profile"];
   requestedSandbox: SandboxPolicy;
+  requestedModel: string | null;
+  requestedEffort: CodexThreadState["effort"];
   createdAt: string;
   creationIssue: CodexManagedCreationIssue | null;
   workspaceId: string;
@@ -286,6 +290,50 @@ function sessionStatus(state: CodexThreadState): SessionView["status"] {
   return "unknown";
 }
 
+function observationBusy(observation: ProviderSessionObservation | null): boolean {
+  return observation?.status === "running" || observation?.status === "waiting";
+}
+
+function observationClock(observation: ProviderSessionObservation): number | null {
+  if (!observation.observedAt) return null;
+  const value = Date.parse(observation.observedAt);
+  return Number.isFinite(value) ? value : null;
+}
+
+function resolveManagedSettings(
+  options: SessionSettingsOptions,
+  requestedModel: string | null,
+  requestedEffort: string | null,
+): { model: string; effort: NonNullable<CreateSessionInput["effort"]> } {
+  const selected = requestedModel === null
+    ? options.models.find((model) => model.isDefault) ?? options.models[0]
+    : options.models.find((model) =>
+        model.value === requestedModel || model.resolvedModel === requestedModel
+      );
+  if (!selected) {
+    throw new Error(
+      requestedModel === null
+        ? "Codex did not advertise a default model"
+        : `Codex did not advertise model ${requestedModel}`,
+    );
+  }
+  const normalizedEffort = normalizeProviderReasoningEffort("codex", requestedEffort);
+  if (requestedEffort !== null && normalizedEffort === null) {
+    throw new Error(`Codex reported unsupported reasoning effort ${requestedEffort}`);
+  }
+  const effort = normalizedEffort ?? selected.defaultEffort;
+  if (!effort) {
+    throw new Error(`Codex did not advertise a default effort for ${selected.value}`);
+  }
+  if (selected.efforts && !selected.efforts.includes(effort)) {
+    throw new Error(`Codex model ${selected.value} does not support effort ${effort}`);
+  }
+  return {
+    model: requestedModel ?? selected.resolvedModel ?? selected.value,
+    effort,
+  };
+}
+
 
 /**
  * The App Server did not advertise this control at all, which is a different
@@ -302,6 +350,7 @@ function codexCapabilityRulings(
   adapter: CodexManagedAdapter,
   state: CodexThreadState,
   creationIssue: CodexManagedCreationIssue | null,
+  observedBusy = false,
 ): CapabilityRulings {
   const controls = new Set(adapter.capabilities.controls);
   const advertised = (
@@ -334,7 +383,7 @@ function codexCapabilityRulings(
     } as CapabilityRulings;
   }
 
-  const idle = !state.activeTurnId && state.status !== "running";
+  const idle = !state.activeTurnId && state.status !== "running" && !observedBusy;
   const busy = "Available when the Codex turn is idle";
   /*
     Profile and sandbox stay idle-only: they govern the approval policy and
@@ -352,7 +401,13 @@ function codexCapabilityRulings(
     queue: !adapter.capabilities.compatible && adapter.capabilities.reason
       ? adapter.capabilities.reason
       : advertised("turn.queue", true, busy),
-    steer: advertised("turn.steer", true, busy),
+    steer: advertised(
+      "turn.steer",
+      !observedBusy || Boolean(state.activeTurnId),
+      observedBusy
+        ? "Exact Codex turn control is unavailable for a turn observed from another client"
+        : busy,
+    ),
     interrupt: advertised("turn.interrupt", Boolean(state.activeTurnId), "Available while a Codex turn is running"),
     respond: advertised(
       "request.respond",
@@ -570,6 +625,7 @@ export class CodexProviderBridge implements ProviderControlAdapter {
   #onSessionRemoved: CodexProviderBridgeOptions["onSessionRemoved"];
   #metadata = new Map<string, ManagedMetadata>();
   #knownStates = new Map<string, CodexThreadState>();
+  #observations = new Map<string, ProviderSessionObservation>();
   #recovering = new Map<string, symbol>();
   /** One durable App Server subscription per managed provider thread. */
   #managedThreads = new Map<string, ManagedThreadSubscription>();
@@ -636,6 +692,14 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     // The resolver's own budget bounds this; it cannot stall creation.
     await this.#resolveWorkspaceIdentity(cwd);
     context.signal.throwIfAborted();
+    const resolvedRequest = input.model === null || input.effort === null
+      ? resolveManagedSettings(
+          await this.getCreateSettingsOptions(context),
+          input.model,
+          input.effort,
+        )
+      : { model: input.model, effort: input.effort };
+    context.signal.throwIfAborted();
     let state: CodexThreadState;
     let creationIssue: CodexManagedCreationIssue | null = null;
     // The profile decides only whether Codex asks before acting. What it may
@@ -664,6 +728,8 @@ export class CodexProviderBridge implements ProviderControlAdapter {
       name: input.name ?? null,
       requestedProfile: input.profile,
       requestedSandbox: sandbox,
+      requestedModel: state.pendingSettings?.model ?? state.model ?? resolvedRequest.model,
+      requestedEffort: state.pendingSettings?.effort ?? state.effort ?? resolvedRequest.effort,
       createdAt: this.#now().toISOString(),
       creationIssue,
       workspaceId: input.workspaceId,
@@ -678,6 +744,7 @@ export class CodexProviderBridge implements ProviderControlAdapter {
       settled: Promise.resolve(),
     });
     this.#flushBufferedActivity(state.threadId);
+    this.#assertResolvedSettings(state, this.#metadata.get(state.threadId)!);
     return this.toSessionView(state);
   }
 
@@ -734,10 +801,20 @@ export class CodexProviderBridge implements ProviderControlAdapter {
 
       // An unproven sandbox is contained, never assumed to be what it was.
       const sandbox = session.sandbox.value ?? DEFAULT_SANDBOX_POLICY;
+      const resolvedRequest = session.model.value === null || session.effort.value === null
+        ? resolveManagedSettings(
+            await this.getCreateSettingsOptions(context),
+            session.model.value,
+            session.effort.value,
+          )
+        : { model: session.model.value, effort: session.effort.value };
+      context.signal.throwIfAborted();
       const metadata: ManagedMetadata = {
         name: session.name,
         requestedProfile: profile,
         requestedSandbox: sandbox,
+        requestedModel: resolvedRequest.model,
+        requestedEffort: resolvedRequest.effort,
         createdAt: session.startedAt ?? this.#now().toISOString(),
         creationIssue: null,
         workspaceId: context.workspace.id,
@@ -754,7 +831,8 @@ export class CodexProviderBridge implements ProviderControlAdapter {
         cwd: metadata.workspacePath,
         sandbox,
         approvalPolicy: profile === "full-access" ? "never" : "on-request",
-        ...(session.model.value === null ? {} : { model: session.model.value }),
+        model: resolvedRequest.model,
+        effort: resolvedRequest.effort,
       };
       const adopted = await this.adapter.adoptThread(threadId, {
         threadId: read.threadId,
@@ -767,11 +845,11 @@ export class CodexProviderBridge implements ProviderControlAdapter {
 
       if (adopted.profile !== profile) await this.adapter.setProfile(threadId, profile);
       if (!sandboxEquals(adopted.sandbox, sandbox)) await this.adapter.setSandbox(threadId, sandbox);
-      if (session.model.value && adopted.model !== session.model.value) {
-        await this.adapter.setModel(threadId, session.model.value);
+      if (adopted.model !== resolvedRequest.model) {
+        await this.adapter.setModel(threadId, resolvedRequest.model);
       }
-      if (session.effort.value && adopted.effort !== session.effort.value) {
-        await this.adapter.setEffort(threadId, session.effort.value);
+      if (adopted.effort !== resolvedRequest.effort) {
+        await this.adapter.setEffort(threadId, resolvedRequest.effort);
       }
       context.signal.throwIfAborted();
       // thread/settings/update acknowledges request acceptance with `{}` and
@@ -786,9 +864,10 @@ export class CodexProviderBridge implements ProviderControlAdapter {
         cwd: metadata.workspacePath,
         profile,
         sandbox,
-        model: session.model.value,
-        effort: session.effort.value,
+        model: resolvedRequest.model,
+        effort: resolvedRequest.effort,
       }, context.signal);
+      this.#assertResolvedSettings(confirmed, metadata);
 
       await this.#resolveWorkspaceIdentity(confirmed.cwd);
       context.signal.throwIfAborted();
@@ -901,6 +980,14 @@ export class CodexProviderBridge implements ProviderControlAdapter {
       return { restoredSessionIds: [], failures: [], truncated: truncatedByRecordLimit };
     }
 
+    let recoverySettingsOptions: Promise<SessionSettingsOptions> | null = null;
+    const settingsOptions = (): Promise<SessionSettingsOptions> => {
+      recoverySettingsOptions ??= this.adapter.listModels(signal).then((models) =>
+        sessionSettingsOptionsSchema.parse({ source: "provider-api", models })
+      );
+      return recoverySettingsOptions;
+    };
+
     const seenThreadIds = new Set<string>();
     const candidates: Array<{
       index: number;
@@ -942,6 +1029,8 @@ export class CodexProviderBridge implements ProviderControlAdapter {
           name: record.name,
           requestedProfile: record.profile,
           requestedSandbox: record.sandbox ?? DEFAULT_SANDBOX_POLICY,
+          requestedModel: record.model ?? null,
+          requestedEffort: record.effort ?? null,
           createdAt: record.createdAt,
           creationIssue: null,
           workspaceId: record.workspaceId,
@@ -973,6 +1062,20 @@ export class CodexProviderBridge implements ProviderControlAdapter {
           const metadata = this.#metadata.get(record.providerThreadId);
           if (!metadata) throw new Error("Managed Codex recovery metadata disappeared");
           this.#assertSelectedIdentity(adopted, read, metadata);
+          const providerModel = adopted.pendingSettings?.model ?? adopted.model
+            ?? metadata.requestedModel;
+          const providerEffortValue = adopted.pendingSettings?.effort ?? adopted.effort
+            ?? metadata.requestedEffort;
+          if (providerModel === null || providerEffortValue === null) {
+            const resolved = resolveManagedSettings(
+              await settingsOptions(),
+              providerModel,
+              providerEffortValue,
+            );
+            metadata.requestedModel = resolved.model;
+            metadata.requestedEffort = resolved.effort;
+          }
+          this.#assertResolvedSettings(adopted, metadata);
           await this.#resolveWorkspaceIdentity(read.cwd ?? record.workspacePath);
           assertActive();
           this.#knownStates.set(record.providerThreadId, adopted);
@@ -987,6 +1090,7 @@ export class CodexProviderBridge implements ProviderControlAdapter {
             this.#recovering.delete(record.providerThreadId);
             this.#metadata.delete(record.providerThreadId);
             this.#knownStates.delete(record.providerThreadId);
+            this.#observations.delete(record.providerThreadId);
             this.#managedThreads.delete(record.providerThreadId);
             this.#dropBufferedActivity(record.providerThreadId);
           }
@@ -1128,6 +1232,75 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     // subscription. Closing this browser consumer must not turn a managed
     // Codex thread read-only or disconnect its shared native clients.
     return () => undefined;
+  }
+
+  observeSession(observation: ProviderSessionObservation): void {
+    const threadId = observation.providerThreadId;
+    if (
+      observation.provider !== "codex"
+      || observation.managerSessionId !== sessionRecordId("local", "codex", threadId)
+      || !this.#metadata.has(threadId)
+    ) return;
+
+    const previous = this.#observations.get(threadId) ?? null;
+    const previousClock = previous ? observationClock(previous) : null;
+    const nextClock = observationClock(observation);
+    if (previousClock !== null && nextClock !== null && nextClock < previousClock) return;
+    // A named terminal row must match the active observed turn. Discovery
+    // deliberately omits that identity from SessionView, but reaches this path
+    // only after the shared rollout reducer has rejected stale completions.
+    if (
+      previous && observationBusy(previous) && !observationBusy(observation)
+      && previous.observedTurnId
+      && observation.observedTurnId
+      && previous.observedTurnId !== observation.observedTurnId
+    ) return;
+
+    const statusUnknown = observation.status === "unknown";
+    const next: ProviderSessionObservation = structuredClone({
+      ...observation,
+      status: statusUnknown && previous ? previous.status : observation.status,
+      providerStatus: statusUnknown && previous
+        ? previous.providerStatus
+        : observation.providerStatus,
+      statusSource: statusUnknown && previous
+        ? previous.statusSource
+        : observation.statusSource,
+      observedTurnId: observation.observedTurnId
+        ?? (observationBusy(observation) ? previous?.observedTurnId ?? null : null),
+      profile: observation.profile !== null && observation.profile.value !== null
+        ? observation.profile
+        : previous?.profile ?? null,
+      sandbox: observation.sandbox !== null && observation.sandbox.value !== null
+        ? observation.sandbox
+        : previous?.sandbox ?? null,
+      model: observation.model !== null && observation.model.value !== null
+        ? observation.model
+        : previous?.model ?? null,
+      effort: observation.effort !== null && observation.effort.value !== null
+        ? observation.effort
+        : previous?.effort ?? null,
+    });
+    const unchanged = previous !== null && JSON.stringify(previous) === JSON.stringify(next);
+    if (unchanged) return;
+    this.#observations.set(threadId, next);
+
+    const metadata = this.#metadata.get(threadId);
+    if (metadata) {
+      if (next.profile?.value) metadata.requestedProfile = next.profile.value;
+      if (next.sandbox?.value) metadata.requestedSandbox = next.sandbox.value;
+      if (next.model?.value) metadata.requestedModel = next.model.value;
+      if (next.effort?.value) metadata.requestedEffort = next.effort.value;
+    }
+
+    const previousBusy = observationBusy(previous);
+    const nextBusy = observationBusy(next);
+    const adapterState = this.adapter.getThreadState(threadId);
+    this.adapter.setExternalTurnActive(threadId, nextBusy);
+    if (previousBusy === nextBusy || adapterState === null) {
+      const state = this.adapter.getThreadState(threadId) ?? this.#knownStates.get(threadId);
+      if (state && this.#acceptsLiveEvents(threadId)) this.#publishSession(state);
+    }
   }
 
   async performAction(
@@ -1347,20 +1520,36 @@ export class CodexProviderBridge implements ProviderControlAdapter {
       this.adapter.getThreadState(state.threadId) !== null && quarantine === null &&
       !this.#provisionalAdoptions.has(state.threadId);
     const liveDetail = controlsLoaded;
+    const observation = this.#observations.get(state.threadId) ?? null;
+    const observedBusy = observationBusy(observation);
     const metadata = this.#metadata.get(state.threadId) ?? {
       name: null,
       requestedProfile: "plan" as const,
       requestedSandbox: DEFAULT_SANDBOX_POLICY,
+      requestedModel: state.model,
+      requestedEffort: state.effort,
       createdAt: this.#now().toISOString(),
       creationIssue: null,
       workspaceId: "",
       workspacePath: state.cwd ?? "",
     };
     const cwd = state.cwd ?? metadata.workspacePath;
-    const effectiveProfile = state.pendingSettings?.profile ?? state.profile;
-    const effectiveSandbox = state.pendingSettings?.sandbox ?? state.sandbox;
-    const effectiveModel = state.pendingSettings?.model ?? state.model;
-    const effectiveEffort = state.pendingSettings?.effort ?? state.effort;
+    const providerProfile = state.pendingSettings?.profile ?? state.profile;
+    const providerSandbox = state.pendingSettings?.sandbox ?? state.sandbox;
+    const providerModel = state.pendingSettings?.model ?? state.model;
+    const providerEffortValue = state.pendingSettings?.effort ?? state.effort;
+    const effectiveProfile = providerProfile
+      ?? observation?.profile?.value
+      ?? metadata.requestedProfile;
+    const effectiveSandbox = providerSandbox
+      ?? observation?.sandbox?.value
+      ?? metadata.requestedSandbox;
+    const effectiveModel = providerModel
+      ?? observation?.model?.value
+      ?? metadata.requestedModel;
+    const effectiveEffort = providerEffortValue
+      ?? observation?.effort?.value
+      ?? metadata.requestedEffort;
     const updatedAt = this.#now().toISOString();
     const recoveryAttention: SessionView["attention"] = metadata.creationIssue
       ? [{
@@ -1382,9 +1571,16 @@ export class CodexProviderBridge implements ProviderControlAdapter {
           },
         }]
       : [];
-    const normalizedStatus = metadata.creationIssue && !state.activeTurnId
+    const exactStatus = metadata.creationIssue && !state.activeTurnId
       ? "waiting"
       : sessionStatus(state);
+    const observedStatus = observation?.status === "completed"
+      ? "idle"
+      : observation?.status ?? "unknown";
+    const usesObservedStatus = metadata.creationIssue === null
+      && (exactStatus === "idle" || exactStatus === "unknown")
+      && observedStatus !== "unknown";
+    const normalizedStatus = usesObservedStatus ? observedStatus : exactStatus;
     const pendingAttention: SessionView["attention"] = state.pendingRequests.map(
       (request) => {
         const details = attentionDetails(request);
@@ -1412,33 +1608,44 @@ export class CodexProviderBridge implements ProviderControlAdapter {
       cwd,
       presence: liveDetail ? "live" : "recent",
       status: normalizedStatus,
-      providerStatus: state.status,
+      providerStatus: usesObservedStatus
+        ? observation?.providerStatus ?? state.status
+        : state.status,
       pid: null,
       runtimePid: null,
       startedAt: metadata.createdAt,
       updatedAt,
       source: state.source ?? "appServer",
-      profile: {
-        value: effectiveProfile,
-        providerValue: effectiveProfile,
-        source: "provider-api",
-        confidence: effectiveProfile === null ? "heuristic" : "exact",
-      },
-      sandbox: {
-        value: effectiveSandbox,
-        providerValue: effectiveSandbox
-          ? `${effectiveSandbox.mode};network=${String(effectiveSandbox.networkAccess)}`
-          : null,
-        source: "provider-api",
-        confidence: effectiveSandbox === null ? "heuristic" : "exact",
-      },
-      model: {
-        value: effectiveModel,
-        providerValue: effectiveModel,
-        source: "provider-api",
-        confidence: effectiveModel === null ? "heuristic" : "exact",
-      },
-      effort: providerEffort("codex", effectiveEffort, "provider-api"),
+      statusSource: usesObservedStatus ? observation?.statusSource ?? "rollout-events" : "provider-api",
+      profile: providerProfile === null && observation?.profile?.value
+        ? observation.profile
+        : {
+            value: effectiveProfile,
+            providerValue: effectiveProfile,
+            source: "provider-api",
+            confidence: effectiveProfile === null ? "heuristic" : "exact",
+          },
+      sandbox: providerSandbox === null && observation?.sandbox?.value
+        ? observation.sandbox
+        : {
+            value: effectiveSandbox,
+            providerValue: effectiveSandbox
+              ? `${effectiveSandbox.mode};network=${String(effectiveSandbox.networkAccess)}`
+              : null,
+            source: "provider-api",
+            confidence: effectiveSandbox === null ? "heuristic" : "exact",
+          },
+      model: providerModel === null && observation?.model?.value
+        ? observation.model
+        : {
+            value: effectiveModel,
+            providerValue: effectiveModel,
+            source: "provider-api",
+            confidence: effectiveModel === null ? "heuristic" : "exact",
+          },
+      effort: providerEffortValue === null && observation?.effort?.value
+        ? observation.effort
+        : providerEffort("codex", effectiveEffort, "provider-api"),
       attention: [...recoveryAttention, ...pendingAttention],
       control: {
         plane: "codex-private",
@@ -1467,7 +1674,12 @@ export class CodexProviderBridge implements ProviderControlAdapter {
                 "retry-control": QUARANTINE_REASON,
               } as CapabilityRulings
             : controlsLoaded
-            ? codexCapabilityRulings(this.adapter, state, metadata.creationIssue)
+            ? codexCapabilityRulings(
+                this.adapter,
+                state,
+                metadata.creationIssue,
+                observedBusy,
+              )
             : {
                 /*
                   A state, not an instruction. Every reader of `withheld` is
@@ -1503,6 +1715,7 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     this.#unsubscribe();
     this.#metadata.clear();
     this.#knownStates.clear();
+    this.#observations.clear();
     this.#recovering.clear();
     this.#managedThreads.clear();
     this.#resumeTransactions.clear();
@@ -1573,6 +1786,7 @@ export class CodexProviderBridge implements ProviderControlAdapter {
         this.#provisionalAdoptions.delete(threadId);
         this.#metadata.delete(threadId);
         this.#knownStates.delete(threadId);
+        this.#observations.delete(threadId);
         this.#managedThreads.delete(threadId);
         this.#dropBufferedActivity(threadId);
         this.#quarantinedResumes.delete(threadId);
@@ -1715,6 +1929,23 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     }
   }
 
+  #assertResolvedSettings(state: CodexThreadState, metadata: ManagedMetadata): void {
+    const missing: string[] = [];
+    const profile = state.pendingSettings?.profile ?? state.profile ?? metadata.requestedProfile;
+    const sandbox = state.pendingSettings?.sandbox ?? state.sandbox ?? metadata.requestedSandbox;
+    const model = state.pendingSettings?.model ?? state.model ?? metadata.requestedModel;
+    const effort = state.pendingSettings?.effort ?? state.effort ?? metadata.requestedEffort;
+    if (!profile) missing.push("profile");
+    if (!sandbox) missing.push("sandbox");
+    if (!model) missing.push("model");
+    if (!normalizeProviderReasoningEffort("codex", effort)) missing.push("effort");
+    if (missing.length > 0) {
+      throw new Error(
+        `Managed Codex settings could not be resolved: ${missing.join(", ")}`,
+      );
+    }
+  }
+
   #publishSession(state: CodexThreadState): void {
     try {
       this.#onSessionChanged?.(this.toSessionView(state));
@@ -1733,6 +1964,7 @@ export class CodexProviderBridge implements ProviderControlAdapter {
     const quarantined = this.#quarantinedResumes.delete(threadId);
     this.#metadata.delete(threadId);
     this.#knownStates.delete(threadId);
+    this.#observations.delete(threadId);
     this.#recovering.delete(threadId);
     this.#managedThreads.delete(threadId);
     this.#dropBufferedActivity(threadId);

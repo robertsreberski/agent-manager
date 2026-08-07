@@ -94,6 +94,8 @@ interface InternalThreadState {
   sandbox: SandboxPolicy | null;
   status: CodexThreadStatus;
   activeTurnId: string | null;
+  /** A retained rollout says another client is running a turn this RPC peer cannot name. */
+  externalTurnActive: boolean;
   /**
    * The turn a provider-authoritative `idle` status retired before its
    * `turn/completed` notification arrived. It keeps a late completion from
@@ -1044,6 +1046,18 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     return this.#enqueueMessage(state, text);
   }
 
+  setExternalTurnActive(threadId: string, active: boolean): void {
+    const state = this.#threads.get(threadId);
+    if (!state || state.externalTurnActive === active) return;
+    state.externalTurnActive = active;
+    this.#touch(state);
+    if (!active) {
+      void this.#drainQueue(state).catch((error) =>
+        this.#diagnostic("codex.queue.dispatch_failed", error, threadId)
+      );
+    }
+  }
+
   async #enqueueMessage(
     state: InternalThreadState,
     text: string,
@@ -1211,7 +1225,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     this.#assertControl("thread.archive");
     const state = this.#requireThread(threadId);
     this.#assertThreadWritable(state);
-    if (state.activeTurnId || state.status === "running") {
+    if (state.activeTurnId || state.status === "running" || state.externalTurnActive) {
       throw new Error("A running Codex thread cannot be archived");
     }
     await this.#call("thread.archive", "thread/archive", { threadId });
@@ -1222,7 +1236,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     this.#assertControl("thread.delete");
     const state = this.#requireThread(threadId);
     this.#assertThreadWritable(state);
-    if (state.activeTurnId || state.status === "running") {
+    if (state.activeTurnId || state.status === "running" || state.externalTurnActive) {
       throw new Error("A running Codex thread cannot be deleted");
     }
     await this.#call("thread.delete", "thread/delete", { threadId });
@@ -1370,7 +1384,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
   ): Promise<void> {
     const state = this.#requireThread(threadId);
     this.#assertThreadWritable(state);
-    const busy = Boolean(state.activeTurnId) || state.status === "running";
+    const busy = Boolean(state.activeTurnId) || state.status === "running" || state.externalTurnActive;
     if (busy && !deferWhileBusy) {
       throw new Error("Codex settings can only be changed while the thread is idle");
     }
@@ -1503,6 +1517,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
         sandbox: null,
         status: "unknown",
         activeTurnId: null,
+        externalTurnActive: false,
         retiredTurnId: null,
         lastTurnStatus: null,
         pendingRequests: new Map(),
@@ -1686,7 +1701,7 @@ export class CodexManagedAdapter implements ManagedCodexAdapter {
     if (state.dispatchPromise) return state.dispatchPromise;
     const statusAllowsDispatch = state.status === "idle" ||
       (dispatchWhenStatusUnknown && state.status === "unknown");
-    if (state.activeTurnId || !statusAllowsDispatch || state.queue.length === 0) {
+    if (state.activeTurnId || state.externalTurnActive || !statusAllowsDispatch || state.queue.length === 0) {
       return;
     }
 

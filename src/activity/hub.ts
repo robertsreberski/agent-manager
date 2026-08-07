@@ -957,7 +957,8 @@ export class ActivityHub {
       }
       case "reasoning": {
         const old = previous?.kind === "reasoning" ? previous : undefined;
-        return { ...common, kind: "reasoning", reasoningKind: draft.reasoningKind, label: draft.label === undefined ? old?.label ?? null : draft.label === null ? null : text(draft.label), text: text(draft.text ?? old?.text ?? ""), truncated };
+        const opaque = draft.opaque ?? old?.opaque ?? false;
+        return { ...common, kind: "reasoning", reasoningKind: draft.reasoningKind, label: draft.label === undefined ? old?.label ?? null : draft.label === null ? null : text(draft.label), text: text(draft.text ?? old?.text ?? ""), ...(opaque ? { opaque: true } : {}), truncated };
       }
       case "plan": {
         const old = previous?.kind === "plan" ? previous : undefined;

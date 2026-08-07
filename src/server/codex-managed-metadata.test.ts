@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import type { SessionView } from "../shared/session.ts";
+import { sandboxPolicy, unknownSandbox, type SessionView } from "../shared/session.ts";
 import {
   codexProfileRepairCandidateIds,
   mergeCodexManagedSessionMetadata,
@@ -119,10 +119,12 @@ test("keeps heuristic unknowns and oversized provider titles out of durable meta
       source: "provider-api",
       confidence: "heuristic",
     },
-  } satisfies Pick<SessionView, "name" | "profile" | "model" | "effort">;
+    sandbox: unknownSandbox(),
+  } satisfies Pick<SessionView, "name" | "profile" | "sandbox" | "model" | "effort">;
   const persisted = {
     name: "Manager title",
     profile: "execute",
+    sandbox: sandboxPolicy("workspace-write"),
     model: "gpt-5.6",
     effort: "high",
     ownership: "shared",
@@ -134,6 +136,7 @@ test("keeps heuristic unknowns and oversized provider titles out of durable meta
     ...persisted,
     name: "Manager title",
     profile: "execute",
+    sandbox: sandboxPolicy("workspace-write"),
     model: "gpt-5.6",
     effort: "high",
     ownership: "shared",
@@ -148,12 +151,18 @@ test("keeps heuristic unknowns and oversized provider titles out of durable meta
     ...heuristicUnknown,
     name: "Confirmed title",
     profile: { ...heuristicUnknown.profile, value: "full-access", confidence: "exact" },
+    sandbox: {
+      ...heuristicUnknown.sandbox,
+      value: sandboxPolicy("danger-full-access", true),
+      confidence: "exact",
+    },
     model: { ...heuristicUnknown.model, value: "gpt-5.6-sol", confidence: "exact" },
     effort: { ...heuristicUnknown.effort, value: "ultra", confidence: "exact" },
-  } satisfies Pick<SessionView, "name" | "profile" | "model" | "effort">;
+  } satisfies Pick<SessionView, "name" | "profile" | "sandbox" | "model" | "effort">;
   const merged = mergeCodexManagedSessionMetadata(persisted, confirmed);
   assert.equal(merged.name, "Confirmed title");
   assert.equal(merged.profile, "full-access");
+  assert.deepEqual(merged.sandbox, sandboxPolicy("danger-full-access", true));
   assert.equal(merged.model, "gpt-5.6-sol");
   assert.equal(merged.effort, "ultra");
 });

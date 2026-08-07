@@ -367,6 +367,7 @@ test("projects transcript tool and reasoning items with transcript-derived prove
           createdAt: "2026-08-03T00:00:01.000Z",
           status: "complete",
           label: null,
+          opaque: false,
           turnId: null,
         },
         {
@@ -421,6 +422,40 @@ test("projects transcript tool and reasoning items with transcript-derived prove
   assert.equal(read?.kind === "tool" ? read.result : null, "# Agent Manager");
   assert.equal(read?.state, "complete");
   assert.equal(items[2]?.state, "failed");
+
+  release();
+  observer.dispose();
+  hub.dispose();
+});
+
+test("reports Codex rollout facts from each selected transcript read", () => {
+  const hub = new ActivityHub({ streamEpoch: "observer-codex-facts" });
+  const session = externalSession();
+  const reads: TranscriptReadResult[] = [];
+  const result: TranscriptReadResult = {
+    ...available([]),
+    codexFacts: {
+      status: "running",
+      providerStatus: "task_started",
+      activeTurnId: "turn-from-cli",
+      lifecycleTurnId: "turn-from-cli",
+      observedAt: "2026-08-06T10:00:00.000Z",
+      profile: null,
+      sandbox: null,
+      model: null,
+      effort: null,
+    },
+  };
+  const observer = new SelectedTranscriptActivityObserver({
+    hub,
+    reader: { read: () => structuredClone(result) },
+    onRead: (_selected, read) => reads.push(structuredClone(read)),
+  });
+
+  const release = observer.acquire(session);
+  assert.equal(reads.length, 1);
+  assert.equal(reads[0]?.codexFacts?.status, "running");
+  assert.equal(reads[0]?.codexFacts?.activeTurnId, "turn-from-cli");
 
   release();
   observer.dispose();

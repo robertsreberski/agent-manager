@@ -24,6 +24,8 @@ import {
   type ProcessInfo,
   type Provider,
   type Runtime,
+  type SessionEffort,
+  type SessionModel,
   type SessionAttention,
   type SessionProfile,
   type SessionRecord,
@@ -32,7 +34,14 @@ import {
 } from "../core/types.ts";
 import { attachTmuxTerminals, discoverTmuxPanes } from "../core/tmux.ts";
 import { WIRE_SCHEMA_VERSION } from "../shared/wire.ts";
-import { sandboxPolicy, sessionRecordId, unknownSandbox } from "../shared/session.ts";
+import { sessionRecordId, unknownSandbox } from "../shared/session.ts";
+import {
+  analyzeCodexRolloutFacts,
+  codexFactType,
+  codexProfileEvidence,
+  codexSandboxEvidence,
+  unrestrictedCodexApproval,
+} from "../providers/codex/rollout-facts.ts";
 import { discoverClaude } from "./claude-observer.ts";
 import {
   baseRecord,
@@ -526,32 +535,18 @@ export function analyzeCodexEvents(
   attention: SessionAttention[];
   profile: SessionProfile | null;
   sandbox: SessionSandbox | null;
+  model: SessionModel | null;
+  effort: SessionEffort | null;
 } {
-  let status: SessionStatus = live ? "running" : "unknown";
-  let providerStatus: string | null = null;
-  let profile: SessionProfile | null = null;
-  let sandbox: SessionSandbox | null = null;
+  const rollout = analyzeCodexRolloutFacts(events);
+  let status: SessionStatus = rollout.status === "unknown"
+    ? live ? "running" : "unknown"
+    : rollout.status === "idle" && !live
+      ? "completed"
+      : rollout.status;
   const pendingQuestions = new Map<string, string | null>();
   for (const event of events) {
     const payload = object(event.payload);
-    if (event.type === "turn_context" && payload) {
-      profile = codexProfileFromTurnContext(payload) ?? profile;
-      sandbox = codexSandboxFromTurnContext(payload) ?? sandbox;
-    }
-    if (event.type === "event_msg") {
-      const type = string(payload?.type);
-      if (!type) continue;
-      if (type === "task_started") {
-        providerStatus = type;
-        status = "running";
-      } else if (type === "task_complete") {
-        providerStatus = type;
-        status = live ? "idle" : "completed";
-      } else if (type === "turn_aborted") {
-        providerStatus = type;
-        status = "interrupted";
-      }
-    }
     if (event.type !== "response_item" || !payload) continue;
     if (payload.type === "function_call" && payload.name === "request_user_input") {
       const callId = string(payload.call_id) ?? string(payload.id);
@@ -577,35 +572,14 @@ export function analyzeCodexEvents(
     },
   }));
   if (attention.length > 0 && live) status = "waiting";
-  return { status, providerStatus, attention, profile, sandbox };
-}
-
-function codexFactType(value: unknown): string | null {
-  const direct = string(value);
-  if (direct) {
-    try {
-      return codexFactType(JSON.parse(direct)) ?? direct.toLowerCase();
-    } catch {
-      return direct.toLowerCase();
-    }
-  }
-  return string(object(value)?.type)?.toLowerCase() ?? null;
-}
-
-function codexCollaborationMode(value: unknown): string | null {
-  return string(object(value)?.mode)?.toLowerCase() ?? string(value)?.toLowerCase() ?? null;
-}
-
-function codexProfileEvidence(
-  value: ExecutionProfile,
-  source: SessionProfile["source"],
-  facts: ReadonlyArray<readonly [string, string | null]>,
-): SessionProfile {
   return {
-    value,
-    providerValue: facts.flatMap(([name, fact]) => fact ? [`${name}=${fact}`] : []).join("; ") || null,
-    source,
-    confidence: "inferred",
+    status,
+    providerStatus: rollout.providerStatus,
+    attention,
+    profile: rollout.profile,
+    sandbox: rollout.sandbox,
+    model: rollout.model,
+    effort: rollout.effort,
   };
 }
 
@@ -615,61 +589,8 @@ function codexProfileEvidence(
  * implies the profile: an observed CLI running wide open under on-request
  * approval truthfully reads as `execute` with a full-access sandbox.
  */
-function unrestrictedCodexApproval(...values: Array<string | null>): boolean {
-  return values.some((value) => value === "never" || value === "disabled");
-}
-
-/** The sandbox is stated outright, so it is evidence rather than inference. */
-function codexSandboxEvidence(
-  raw: string | null,
-  networkAccess: boolean | null,
-  source: SessionSandbox["source"],
-): SessionSandbox | null {
-  const mode = raw === "danger-full-access" || raw === "dangerfullaccess"
-    ? "danger-full-access"
-    : raw === "workspace-write" || raw === "workspacewrite"
-      ? "workspace-write"
-      : raw === "read-only" || raw === "readonly"
-        ? "read-only"
-        : null;
-  if (mode === null) return null;
-  return {
-    value: sandboxPolicy(mode, networkAccess === true),
-    providerValue: networkAccess === null ? raw : `${raw ?? mode}; network=${String(networkAccess)}`,
-    source,
-    confidence: "exact",
-  };
-}
-
-function codexSandboxFromTurnContext(payload: JsonObject): SessionSandbox | null {
-  const policy = object(payload.sandbox_policy);
-  const network = typeof policy?.network_access === "boolean" ? policy.network_access : null;
-  return codexSandboxEvidence(codexFactType(payload.sandbox_policy), network, "rollout-events");
-}
-
 function codexSandboxFromRow(row: CodexRow): SessionSandbox | null {
   return codexSandboxEvidence(codexFactType(row.sandboxPolicy), null, "provider-cli");
-}
-
-function codexProfileFromTurnContext(payload: JsonObject): SessionProfile | null {
-  const approval = string(payload.approval_policy)?.toLowerCase() ?? null;
-  const sandbox = codexFactType(payload.sandbox_policy);
-  const permission = codexFactType(payload.permission_profile);
-  const collaboration = codexCollaborationMode(payload.collaboration_mode);
-  const facts = [
-    ["approval", approval],
-    ["sandbox", sandbox],
-    ["permission", permission],
-    ["collaboration", collaboration],
-  ] as const;
-  if (unrestrictedCodexApproval(approval, permission)) {
-    return codexProfileEvidence("full-access", "rollout-events", facts);
-  }
-  if (collaboration === "plan") return codexProfileEvidence("plan", "rollout-events", facts);
-  if (collaboration === "default" || approval || sandbox || permission) {
-    return codexProfileEvidence("execute", "rollout-events", facts);
-  }
-  return null;
 }
 
 function codexProfile(row: CodexRow): SessionProfile | null {
@@ -771,15 +692,15 @@ function discoverCodex(
         source: row.threadSource ?? row.source,
         profile: profile ?? unknownProfile(),
         sandbox: sandbox ?? unknownSandbox(),
-        model: row.model ? {
+        model: analysis.model ?? (row.model ? {
           value: row.model,
           providerValue: row.model,
           source: "provider-cli",
           confidence: "exact",
-        } : unknownModel(),
-        effort: row.effort
+        } : unknownModel()),
+        effort: analysis.effort ?? (row.effort
           ? providerEffort("codex", row.effort, "provider-cli")
-          : unknownEffort(),
+          : unknownEffort()),
         attention: analysis.attention,
         ...(parent === null && cwd && active === null
           ? { control: observedResumeControl("codex") }

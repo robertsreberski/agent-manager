@@ -102,6 +102,7 @@ function ReasoningTrigger({
   label = "Reasoning",
   active = false,
   duration = null,
+  disabled = false,
   className,
   ...props
 }: React.ComponentProps<typeof CollapsibleTrigger> & {
@@ -116,8 +117,9 @@ function ReasoningTrigger({
       data-slot="reasoning-trigger"
       data-reasoning-label={label}
       data-compact-control="height"
+      disabled={disabled}
       className={cn(
-        "group/trigger flex min-h-8 max-w-full origin-left items-center gap-2 py-1.5 text-meta-sm text-[var(--text-muted)] transition-[color,scale] hover:text-[var(--text-secondary)] active:scale-[0.98]",
+        "group/trigger flex min-h-8 max-w-full origin-left items-center gap-2 py-1.5 text-meta-sm text-[var(--text-muted)] transition-[color,scale] hover:text-[var(--text-secondary)] active:scale-[0.98] disabled:cursor-default disabled:hover:text-[var(--text-muted)] disabled:active:scale-100",
         className,
       )}
       {...props}
@@ -131,12 +133,14 @@ function ReasoningTrigger({
           </span>
         )}
       </span>
-      <ChevronDown
-        size={14}
-        strokeWidth={1.75}
-        aria-hidden="true"
-        className="shrink-0 -rotate-90 transition-transform duration-(--animation-duration) ease-[cubic-bezier(0.32,0.72,0,1)] group-data-[state=open]/trigger:rotate-0 motion-reduce:transition-none"
-      />
+      {!disabled && (
+        <ChevronDown
+          size={14}
+          strokeWidth={1.75}
+          aria-hidden="true"
+          className="shrink-0 -rotate-90 transition-transform duration-(--animation-duration) ease-[cubic-bezier(0.32,0.72,0,1)] group-data-[state=open]/trigger:rotate-0 motion-reduce:transition-none"
+        />
+      )}
     </CollapsibleTrigger>
   );
 }

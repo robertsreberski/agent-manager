@@ -72,6 +72,31 @@ function partLabels(message: { content: unknown }): string[] {
 }
 
 describe("turn timeline ordering", () => {
+  it("carries an opaque reasoning marker through assistant-ui metadata", () => {
+    const item: ActivityItem = {
+      ...common,
+      id: "reasoning-opaque",
+      seq: 1,
+      kind: "reasoning",
+      reasoningKind: "summary",
+      label: null,
+      text: "",
+      opaque: true,
+    };
+    const message = activityToThreadMessages([item])[0]!;
+    const part = (message.content as ReadonlyArray<{
+      type: string;
+      text?: string;
+      providerMetadata?: Record<string, unknown>;
+    }>)[0];
+
+    expect(part).toMatchObject({
+      type: "reasoning",
+      providerMetadata: { "agent-manager": { opaque: true } },
+    });
+    expect(part?.text).not.toContain("encrypted");
+  });
+
   it("keeps a recorded assistant message in sequence with body activity", () => {
     const messages = activityToThreadMessages(invertedTurn());
 

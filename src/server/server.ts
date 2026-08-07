@@ -105,6 +105,7 @@ import {
   type AttachInstruction,
   type ManagedSessionRecoveryRecord,
   type ProviderControlAdapters,
+  type ProviderSessionObservation,
   type PanePreviewAdapter,
   type RequestContext,
   type SessionAction,
@@ -1183,8 +1184,8 @@ export async function createAgentManagerServer(
           // What the adoption actually applied, which for an unproven
           // sandbox is the conservative one rather than the original.
           sandbox: adopted.sandbox.value,
-          model: original.model.value,
-          effort: original.effort.value,
+          model: adopted.model.value ?? original.model.value,
+          effort: adopted.effort.value ?? original.effort.value,
           hostId: "local",
           ...canonicalCodexIdentityMetadata(adopted),
           // Every managed session is shared. Persisting the retired
@@ -1502,11 +1503,32 @@ export async function createAgentManagerServer(
   // source while hooks/APIs contribute exact live events. ActivityHub
   // correlates overlaps atomically, so neither source has to erase the other.
   const transcriptMayPoll = (_session: SessionView): boolean => true;
+  const publishProviderObservation = (observation: ProviderSessionObservation): void => {
+    adapters[observation.provider]?.observeSession?.(observation);
+  };
   const transcriptActivity = new SelectedTranscriptActivityObserver({
     hub: activityHub,
     ...(transcriptReader ? { reader: transcriptReader } : {}),
     resolveSession: resolveTranscriptSession,
     eligible: transcriptMayPoll,
+    onRead: (session, result) => {
+      const facts = result.codexFacts;
+      if (session.provider !== "codex" || !facts) return;
+      publishProviderObservation({
+        managerSessionId: session.id,
+        provider: "codex",
+        providerThreadId: session.providerThreadId,
+        status: facts.status,
+        providerStatus: facts.providerStatus,
+        statusSource: "rollout-events",
+        observedTurnId: facts.activeTurnId ?? facts.lifecycleTurnId,
+        observedAt: facts.observedAt,
+        profile: facts.profile,
+        sandbox: facts.sandbox,
+        model: facts.model,
+        effort: facts.effort,
+      });
+    },
   });
   const shouldObserveTranscript = (session: SessionView): boolean =>
     session.hostId === "local" && transcriptMayPoll(session);
@@ -1528,6 +1550,30 @@ export async function createAgentManagerServer(
     diagnostics: readonly Diagnostic[],
   ): void => {
     let nextDiagnostics = [...diagnostics];
+    for (const session of sessions) {
+      try {
+        publishProviderObservation({
+          managerSessionId: session.id,
+          provider: session.provider,
+          providerThreadId: session.providerThreadId,
+          status: session.status,
+          providerStatus: session.providerStatus,
+          statusSource: session.statusSource,
+          observedTurnId: null,
+          observedAt: session.updatedAt,
+          profile: session.profile,
+          sandbox: session.sandbox,
+          model: session.model,
+          effort: session.effort,
+        });
+      } catch (error) {
+        nextDiagnostics.push({
+          provider: session.provider,
+          level: "warning",
+          message: `Observed state for ${session.id} could not be reconciled: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
+    }
     try {
       persistDiscoveredWorkspaces(database, sessions);
     } catch {
@@ -3254,10 +3300,12 @@ export async function createAgentManagerServer(
           metadata: {
             managerRequestId: begun.intent.managerRequestId,
             name: input.name ?? null,
-            profile: input.profile,
-            sandbox: input.sandbox,
-            model: input.model,
-            effort: input.effort,
+            profile: created.profile.value ?? input.profile,
+            sandbox: created.provider === "codex"
+              ? created.sandbox.value ?? input.sandbox
+              : input.sandbox,
+            model: created.model.value ?? input.model,
+            effort: created.effort.value ?? input.effort,
             hostId: workspace.hostId,
             ...canonicalCodexIdentityMetadata(created),
             ownership: "shared",

@@ -326,6 +326,15 @@ async function initializedAdapter(
   transport = new FakeCodexTransport(),
   requestTimeoutMs = 30_000,
 ): Promise<{ adapter: CodexManagedAdapter; transport: FakeCodexTransport }> {
+  transport.handlers.set("model/list", () => ({
+    data: [modelCatalogEntry({
+      model: "gpt-5.6",
+      displayName: "GPT-5.6",
+      isDefault: true,
+      defaultEffort: "medium",
+    })],
+    nextCursor: null,
+  }));
   const adapter = new CodexManagedAdapter({
     transport,
     socketPath: "/tmp/agent-manager-test/codex.sock",
@@ -4098,6 +4107,144 @@ test("bridge reports manager provenance and the created thread name", async () =
   }, context);
   assert.equal(created.source, "agent-manager");
   assert.equal(created.name, "Fix the stranded queue");
+  assert.equal(created.model.value, "gpt-5.6");
+  assert.equal(created.effort.value, "medium");
+  bridge.dispose();
+  await adapter.dispose();
+});
+
+test("rollout observation keeps a CLI-resumed Codex turn running without granting exact turn control", async () => {
+  const { adapter, transport } = await initializedAdapter();
+  transport.handlers.set("thread/start", () => ({
+    ...threadResult(),
+    reasoningEffort: "medium",
+  }));
+  transport.handlers.set("thread/settings/update", () => ({}));
+  const turnIds = ["turn-bootstrap", "turn-queued"];
+  transport.handlers.set("turn/start", () => ({
+    turn: { id: turnIds.shift()!, status: "inProgress", items: [] },
+  }));
+  const bridge = new CodexProviderBridge({ adapter, resolveWorkspace: () => "/workspace" });
+  const context = {
+    actor: { id: "local", kind: "local" as const, displayName: "Local user" },
+    requestId: "observed-cli-turn",
+    signal: new AbortController().signal,
+    workspace: { id: "workspace", label: "Workspace", path: "/workspace" },
+  };
+  const created = await bridge.createSession({
+    provider: "codex",
+    workspaceId: "workspace",
+    initialMessage: "bootstrap",
+    profile: "execute",
+    sandbox: sandboxPolicy("workspace-write"),
+    model: "gpt-5.6",
+    effort: "medium",
+    idempotencyKey: "observed-cli-turn",
+  }, context);
+  transport.notify("turn/completed", {
+    threadId: "thread-1",
+    turn: { id: "turn-bootstrap", status: "completed", items: [] },
+  });
+  assert.equal(bridge.getManagedSession("thread-1")?.status, "idle");
+
+  const observedSettings = {
+    profile: {
+      value: "full-access" as const,
+      providerValue: "approval=never",
+      source: "rollout-events" as const,
+      confidence: "inferred" as const,
+    },
+    sandbox: {
+      value: sandboxPolicy("danger-full-access", true),
+      providerValue: "danger-full-access; network=true",
+      source: "rollout-events" as const,
+      confidence: "exact" as const,
+    },
+    model: {
+      value: "gpt-5.6-sol",
+      providerValue: "gpt-5.6-sol",
+      source: "rollout-events" as const,
+      confidence: "exact" as const,
+    },
+    effort: {
+      value: "max" as const,
+      providerValue: "max",
+      source: "rollout-events" as const,
+      confidence: "exact" as const,
+    },
+  };
+  bridge.observeSession({
+    managerSessionId: created.id,
+    provider: "codex",
+    providerThreadId: "thread-1",
+    status: "running",
+    providerStatus: "task_started",
+    statusSource: "rollout-events",
+    observedTurnId: "turn-from-cli",
+    observedAt: "2026-08-06T10:00:00.000Z",
+    ...observedSettings,
+  });
+
+  const observed = bridge.getManagedSession("thread-1");
+  assert.ok(observed);
+  assert.equal(observed.status, "running");
+  assert.equal(observed.providerStatus, "task_started");
+  assert.equal(observed.statusSource, "rollout-events");
+  assert.equal(observed.providerTurnId, null, "rollout identity is not exact mutation authority");
+  assert.equal(observed.profile.value, "execute");
+  assert.deepEqual(observed.sandbox.value, sandboxPolicy("workspace-write"));
+  assert.equal(observed.model.value, "gpt-5.6");
+  assert.equal(observed.effort.value, "medium");
+  assert.ok(observed.control.capabilities.includes("queue"));
+  assert.equal(observed.control.capabilities.includes("steer"), false);
+  assert.equal(observed.control.capabilities.includes("interrupt"), false);
+  for (const capability of ["set-profile", "set-sandbox", "archive", "delete"] as const) {
+    assert.equal(observed.control.capabilities.includes(capability), false);
+  }
+
+  const queued = await bridge.performAction(observed, {
+    type: "send",
+    delivery: "queue",
+    text: "run after the CLI turn",
+    expectedGeneration: observed.generation,
+    idempotencyKey: "queue-behind-cli",
+  }, context);
+  assert.equal(queued.status, "queued");
+  assert.equal(methodMessages(transport, "turn/start").length, 1);
+
+  bridge.observeSession({
+    managerSessionId: created.id,
+    provider: "codex",
+    providerThreadId: "thread-1",
+    status: "idle",
+    providerStatus: "task_complete",
+    statusSource: "rollout-events",
+    observedTurnId: "another-turn",
+    observedAt: "2026-08-06T10:00:01.000Z",
+    ...observedSettings,
+  });
+  assert.equal(bridge.getManagedSession("thread-1")?.status, "running");
+  assert.equal(methodMessages(transport, "turn/start").length, 1);
+
+  bridge.observeSession({
+    managerSessionId: created.id,
+    provider: "codex",
+    providerThreadId: "thread-1",
+    status: "idle",
+    providerStatus: "task_complete",
+    statusSource: "rollout-events",
+    // Discovery intentionally does not expose its rollout turn identity. Its
+    // shared lifecycle reducer has already rejected stale completions, so this
+    // terminal observation must still release the externally-busy queue.
+    observedTurnId: null,
+    observedAt: "2026-08-06T10:00:02.000Z",
+    ...observedSettings,
+  });
+  await eventually(() => {
+    assert.equal(methodMessages(transport, "turn/start").length, 2);
+    assert.equal(bridge.getManagedSession("thread-1")?.providerTurnId, "turn-queued");
+  });
+
   bridge.dispose();
   await adapter.dispose();
 });

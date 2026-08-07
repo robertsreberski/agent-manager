@@ -238,6 +238,8 @@ export interface ManagedCodexAdapter {
     options?: ResumeCodexThreadOptions,
   ): Promise<CodexThreadState>;
   releaseThread(threadId: string): Promise<void>;
+  /** Observational cross-client busy hint; never an exact provider turn identity. */
+  setExternalTurnActive(threadId: string, active: boolean): void;
   queueMessage(threadId: string, text: string): Promise<CodexQueuedMessage>;
   steer(
     threadId: string,

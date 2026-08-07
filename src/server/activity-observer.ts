@@ -39,6 +39,7 @@ export interface SelectedTranscriptActivityObserverOptions {
   reader?: SessionTranscriptReader;
   resolveSession?: (id: string) => SessionView | null;
   eligible?: (session: SessionView) => boolean;
+  onRead?: (session: SessionView, result: TranscriptReadResult) => void;
   runningPollMs?: number;
   idlePollMs?: number;
 }
@@ -80,6 +81,7 @@ function activityDraft(item: TranscriptItem): ActivityItemDraft {
       reasoningKind: "summary",
       label: item.label,
       text: item.text,
+      ...(item.opaque ? { opaque: true } : {}),
       state: transcriptState(item.status),
       ...timing,
       ...TRANSCRIPT_PROVENANCE,
@@ -234,7 +236,8 @@ function changed(previous: TranscriptItem, next: TranscriptItem): boolean {
       || JSON.stringify(previous.memoryCitation) !== JSON.stringify(next.memoryCitation);
   }
   if (previous.kind === "reasoning" && next.kind === "reasoning") {
-    return previous.text !== next.text || previous.label !== next.label;
+    return previous.text !== next.text || previous.label !== next.label
+      || previous.opaque !== next.opaque;
   }
   return true;
 }
@@ -339,6 +342,7 @@ export class SelectedTranscriptActivityObserver {
   readonly #reader: SessionTranscriptReader | undefined;
   readonly #resolveSession: ((id: string) => SessionView | null) | undefined;
   readonly #eligible: ((session: SessionView) => boolean) | undefined;
+  readonly #onRead: ((session: SessionView, result: TranscriptReadResult) => void) | undefined;
   readonly #runningPollMs: number;
   readonly #active = new Map<string, ActiveObservation>();
 
@@ -347,6 +351,7 @@ export class SelectedTranscriptActivityObserver {
     this.#reader = options.reader;
     this.#resolveSession = options.resolveSession;
     this.#eligible = options.eligible;
+    this.#onRead = options.onRead;
     this.#runningPollMs = Math.max(100, options.runningPollMs ?? 500);
   }
 
@@ -441,6 +446,11 @@ export class SelectedTranscriptActivityObserver {
           forked: false,
         },
       };
+    }
+    try {
+      this.#onRead?.(observation.session, result);
+    } catch {
+      // State reconciliation is supplementary; it cannot break transcript activity.
     }
     const next: TranscriptObservation = result.transcript.state === "available"
       ? {

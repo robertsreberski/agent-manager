@@ -35,6 +35,11 @@ import {
   codexProposedPlanCorrelationId,
   codexRequestUserInputKey,
 } from "../providers/codex/activity-projector.ts";
+import {
+  analyzeCodexRolloutFacts,
+  codexReasoningSummary,
+  type CodexRolloutFacts,
+} from "../providers/codex/rollout-facts.ts";
 import type {
   Provider,
   SessionView,
@@ -80,6 +85,8 @@ export interface TranscriptAvailability {
 export interface TranscriptReadResult {
   items: TranscriptItem[];
   transcript: TranscriptAvailability;
+  /** Present only for Codex rollout reads; never an exact mutation-authority fact. */
+  codexFacts?: CodexRolloutFacts;
 }
 
 export interface TranscriptSearchMatch {
@@ -117,14 +124,13 @@ export interface TranscriptMessage extends TranscriptItemBase {
   memoryCitation: ActivityMemoryCitation | null;
 }
 
-/**
- * A provider-written reasoning summary. Encrypted or opaque reasoning payloads
- * are never surfaced — only text the provider itself wrote in the clear.
- */
+/** A provider reasoning record. Only provider-written cleartext enters `text`. */
 export interface TranscriptReasoning extends TranscriptItemBase {
   kind: "reasoning";
   text: string;
   label: string | null;
+  /** The provider recorded reasoning but exposed no cleartext summary. */
+  opaque: boolean;
 }
 
 /** A Codex execution proposal, whether structured or strictly tag-wrapped. */
@@ -203,6 +209,7 @@ interface ParsedItems {
   items: TranscriptItem[];
   truncated: boolean;
   forked?: boolean;
+  codexFacts?: CodexRolloutFacts;
 }
 
 class TranscriptReadFailure extends Error {
@@ -267,9 +274,11 @@ function available(
   items: TranscriptItem[],
   truncated: boolean,
   forked = false,
+  codexFacts?: CodexRolloutFacts,
 ): TranscriptReadResult {
   return {
     items,
+    ...(codexFacts ? { codexFacts } : {}),
     transcript: {
       state: "available",
       truncated,
@@ -605,7 +614,9 @@ function capItems(input: TranscriptItem[]): ParsedItems {
     }
     const capped = utf8Prefix(item.kind === "plan" ? item.markdown : item.text, TRANSCRIPT_LIMITS.messageBytes);
     truncated ||= capped.truncated;
-    if (capped.text.length === 0) return [];
+    if (capped.text.length === 0) {
+      return item.kind === "reasoning" && item.opaque ? [item] : [];
+    }
     return [item.kind === "plan"
       ? { ...item, markdown: capped.text }
       : { ...item, text: capped.text }];
@@ -694,22 +705,6 @@ function syntheticCodexUserContext(text: string): boolean {
   return SYNTHETIC_CODEX_USER_ENVELOPES.some((pattern) => pattern.test(candidate));
 }
 
-/**
- * Codex writes the visible reasoning summary into `summary[].text`. The raw
- * chain of thought is only ever present as `encrypted_content`, which this
- * reader never touches — an opaque blob is not a fact about the session.
- */
-function codexReasoningText(payload: Record<string, unknown>): string {
-  if (!Array.isArray(payload.summary)) return "";
-  return payload.summary
-    .flatMap((value) => {
-      const block = objectValue(value);
-      return typeof block?.text === "string" ? [block.text] : [];
-    })
-    .join("\n\n")
-    .trim();
-}
-
 function codexArguments(payload: Record<string, unknown>): ActivityJsonValue | string | null {
   const encoded = payload.arguments;
   if (typeof encoded === "string") {
@@ -749,6 +744,17 @@ function codexItems(
   fileIdentity: string,
   sessionId: string,
 ): ParsedItems {
+  // Lifecycle cannot be carried across an omitted physical window: a skipped
+  // completion would otherwise leave an opening task_started looking active.
+  // The newest contiguous segment is sufficient for current observed state;
+  // discovery separately performs its reverse lifecycle scan for huge files.
+  const latestFactBoundary = tail.records.reduce(
+    (boundary, record, index) => record.gapBefore ? index : boundary,
+    0,
+  );
+  const codexFacts = analyzeCodexRolloutFacts(
+    tail.records.slice(latestFactBoundary).map((record) => record.object),
+  );
   const items: TranscriptItem[] = [];
   const seenIds = new Set<string>();
   const seenAdjacent = new Set<string>();
@@ -828,8 +834,10 @@ function codexItems(
     const createdAt = timestamp(outer.timestamp);
 
     if (payload.type === "reasoning") {
-      const text = codexReasoningText(payload);
-      if (!text) continue;
+      // `encrypted_content` is intentionally never read. An empty public
+      // summary still represents a real chronological reasoning block, so the
+      // UI receives an opaque marker instead of silently dropping the event.
+      const text = codexReasoningSummary(payload);
       const providerId = stringValue(payload.id);
       const id = stableItemId("codex", providerId, fileIdentity, record.offset, "reasoning");
       if (seenIds.has(id)) continue;
@@ -843,6 +851,7 @@ function codexItems(
         createdAt,
         status: "complete",
         label: null,
+        opaque: text.length === 0,
       });
       continue;
     }
@@ -1019,7 +1028,7 @@ function codexItems(
   truncated ||= capped.truncated;
   // Codex rollouts are a flat event log with no parent pointers, so a fork is
   // not representable in one file and is never reported here.
-  return { items: capped.items, truncated };
+  return { items: capped.items, truncated, codexFacts };
 }
 
 function claudeAgentId(value: string): string {
@@ -1242,6 +1251,7 @@ function claudeAssistantBlocks(
         createdAt,
         status: "complete",
         label: null,
+        opaque: false,
       });
       return;
     }
@@ -1681,7 +1691,7 @@ export class LocalSessionTranscriptReader implements SessionTranscriptReader {
           file.identity,
           session.providerThreadId,
         );
-        return available("codex", parsed.items, parsed.truncated);
+        return available("codex", parsed.items, parsed.truncated, false, parsed.codexFacts);
       }
       const claude = claudeFile(this.#claudeHome, session, this.#uid);
       file = claude.file;

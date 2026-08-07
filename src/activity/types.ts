@@ -142,6 +142,8 @@ export interface ActivityReasoningItem extends ActivityItemBase {
   reasoningKind: "summary" | "raw";
   label: string | null;
   text: string;
+  /** True when the provider exposed the reasoning event but no readable summary. */
+  opaque?: boolean;
 }
 
 export interface ActivityPlanItem extends ActivityItemBase {
@@ -300,6 +302,7 @@ export type ActivityItemDraft =
       reasoningKind: ActivityReasoningItem["reasoningKind"];
       label?: string | null;
       text?: string;
+      opaque?: boolean;
     })
   | (ActivityItemDraftBase & {
       kind: "plan";

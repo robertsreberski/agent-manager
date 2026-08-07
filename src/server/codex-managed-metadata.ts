@@ -143,6 +143,22 @@ function durableEffort(
       : null;
 }
 
+function durableSandbox(
+  persisted: unknown,
+  observed: Pick<SessionView, "sandbox">["sandbox"],
+): SessionView["sandbox"]["value"] {
+  const persistedSandbox = sandboxPolicySchema.nullable().safeParse(persisted);
+  if (observed.value === null && observed.confidence === "heuristic") {
+    return persistedSandbox.success ? persistedSandbox.data : null;
+  }
+  const observedSandbox = sandboxPolicySchema.nullable().safeParse(observed.value);
+  return observedSandbox.success
+    ? observedSandbox.data
+    : persistedSandbox.success
+      ? persistedSandbox.data
+      : null;
+}
+
 /**
  * Provider views may truthfully carry heuristic unknowns while a setting is
  * still being confirmed. Those unknowns belong in the live view, not in the
@@ -150,7 +166,7 @@ function durableEffort(
  */
 export function mergeCodexManagedSessionMetadata(
   persisted: Readonly<Record<string, unknown>>,
-  observed: Pick<SessionView, "name" | "profile" | "model" | "effort">,
+  observed: Pick<SessionView, "name" | "profile" | "sandbox" | "model" | "effort">,
 ): Record<string, unknown> {
   const observedProfile = executionProfileSchema.safeParse(observed.profile.value);
   const persistedProfile = executionProfileSchema.safeParse(persisted.profile);
@@ -168,6 +184,7 @@ export function mergeCodexManagedSessionMetadata(
     ...persisted,
     name,
     profile,
+    sandbox: durableSandbox(persisted.sandbox, observed.sandbox),
     model: durableModel(persisted.model, observed.model),
     effort: durableEffort(persisted.effort, observed.effort),
     ownership: "shared",
